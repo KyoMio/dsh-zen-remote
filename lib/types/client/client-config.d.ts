@@ -44,7 +44,7 @@ export interface ClientConfig {
     turnFoldDesktop: boolean;
     keyboard: KeyboardTuning;
 }
-/** Parse one route body. Exported for scripts/check-client-config.mjs. */
+/** Parse one route body. Exported for test/mobile-viewport-compat.test.mjs. */
 export declare function parseClientConfig(body: unknown): ClientConfig;
 /** The row config, fetched at most once per page load. Never rejects. */
 export declare function clientConfig(): Promise<ClientConfig>;

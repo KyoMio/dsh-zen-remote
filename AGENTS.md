@@ -41,7 +41,7 @@
 | `src/fetch-route-intercept.ts` | 子客户端本机拦截的第二半：包装宿主连接服务 `fetchRoutes` 表的上传与导出两项——远程会话的非图片附件经 `relay/v1/upload` 流式转服务端（超限本地拒、失败回宿主自己的 200 失败信封）、虚拟 id 的导出后台 403（形态检测、懒装重试、卸载守卫） |
 | `src/virtual-id.ts` | `zr~<serverId>~<id>` 虚拟 id 算术（纯函数、零依赖；client-data 半边许可 import 它做 zr~ 判定，先例 remote-drop.ts / remote-status.ts） |
 | `src/log-ring.ts` | 诊断导出用内存日志环（CU-1）：上限 300 条、进程内不落盘；index.ts 两分支的 logWarn/logInfo 收口双写（ctx.logger + 环），生命周期事件（row apply/reload、网关 spawn/exit、relay online/offline、fetch-route 安装含 via）push 进环 |
-| `src/debug-report.ts` + `src/debug-redact.ts` | 诊断报告装配与脱敏器（CU-2，纯逻辑零 DSH import）：装配 getter 注入拼 `_meta/config/status/gateway/logs` 五板块、配置按字段名挑选（秘密构造性缺席）；脱敏器 URL 走**哨兵摘出-还原**（userinfo→`<token>@`、host→地址类型、端口与 path 保留、query 长值单独 token 化）、家目录折叠先于 token 趟；`scripts/check-debug-report.mjs` 真值表钉住全部形态（含哨兵伪造） |
+| `src/debug-report.ts` + `src/debug-redact.ts` | 诊断报告装配与脱敏器（CU-2，纯逻辑零 DSH import）：装配 getter 注入拼 `_meta/config/status/gateway/logs` 五板块、配置按字段名挑选（秘密构造性缺席）；脱敏器 URL 走**哨兵摘出-还原**（userinfo→`<token>@`、host→地址类型、端口与 path 保留、query 长值单独 token 化）、家目录折叠先于 token 趟；`test/debug-report.test.mjs` 真值表钉住全部形态（含哨兵伪造） |
 | `src/merge-streams.ts` | 三条全局流/列表的本地 + 远程合并状态机（侧边栏远程分组） |
 | `src/fingerprint.ts` | DSH 接口指纹：规范化描述符 → 分组 JSON Schema 哈希，供握手比对 |
 | `src/restart-fields.ts` / `restart-watcher.ts` | 需重启字段的指纹监测，变化即重载插件行 |
@@ -52,10 +52,11 @@
 | `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，Node stdlib + `web-push`）：设备角色、标记头与共享密钥、desktop-client 只放行中继前缀 |
 | `dsh-push.mjs` | 推送子插件（与网关一起由主入口加载）：回合结束推送 + `push_notify` 工具 |
 | `bin/zen-remote.mjs` + `src/cli/**` → `lib/cli/` | 命令行工具 `dsh-zen-remote`（bin 入口只加载 `lib/cli/main.js`）：插件进程内的 0600 IPC socket 服务端与 CLI 侧发现/客户端（`ipc-server.ts` / `ipc-client.ts`）、防遮蔽配置写入（`config-writer.ts`）、参数解析与双语 i18n（`args.ts` / `i18n.ts`）、`status` / `host *` / `client *` / `peer *` 子命令（`commands-*.ts`）、`setup` 三步向导与三角色切换联动（`command-setup.ts`）、多选 profile 安装与 DSH 自动拉起（`bootstrap.ts`）；全部经 IPC 驱动插件进程，CLI 自己绝不 spawn caddy / cloudflared |
-| `gateway-server/` | 独立自建中继网关与 Web 控制台子包（源码同仓维护，**不进入** `dsh-zen-remote` npm 发布包；独立 `tsconfig` / `pnpm --dir gateway-server build|verify|test`）：虚拟网络管理、五态成员准入（`pending` / `authorized` / `paused` / `mismatch` / `revoked`）、双端口 UDP STUN 打洞协调与零知识 E2EE 密文中转（网关无私钥、只路由密文帧），Docker 单容器交付；部署与运维文档见 `gateway-server/README.md`（只写给最终部署者，不含内部过程文档） |
+| `gateway-server/` | 独立自建中继网关与 Web 控制台子包（源码同仓维护，**不进入** `dsh-zen-remote` npm 发布包；独立 `tsconfig` / `pnpm --dir gateway-server build\|verify\|test`，含 `gateway-server/test/peer-client-e2e.test.mjs` 跨端 E2E 与 `test/helpers/fixtures.mjs` 共享夹具，由 `.github/workflows/gateway-ci.yml` 独立守护，与主仓 `publish.yml` 及 `npm test` 保持零跨包依赖）：虚拟网络管理、五态成员准入（`pending` / `authorized` / `paused` / `mismatch` / `revoked`）、双端口 UDP STUN 打洞协调与零知识 E2EE 密文中转（网关无私钥、只路由密文帧），Docker 单容器交付；部署与运维文档见 `gateway-server/README.md`（只写给最终部署者，不含内部过程文档） |
 | `pwa/**` | manifest / service worker / 注入脚本 / 手势 / 壳级 CSS / 图标 |
-| `test/*.test.cjs` | 网关侧测试（真子进程 + mock 上游）+ 中继端到端（`relay-e2e.test.cjs`）+ 纯逻辑导入测试 |
-| `scripts/check-*.mjs` | 界面侧自检（纯 `node:assert`，靠 Node ≥23.6 类型剥离直接 import `.ts`） |
+| `test/*.test.cjs` + `test/*.test.mjs` + `test/helpers/*.cjs` | 主仓统一 `node:test` 测试集（`.test.cjs` 驱动编译产物 `lib/*.js` 与 `lib/lan-gate-server.cjs`；`.test.mjs` 靠 Node ≥23.6 原生类型剥离直引 `src/client/**` / `src/client-data/**`、`.css.ts` 样式契约与仓库静态守卫；`test/helpers/` 放跨文件共用夹具） |
+| `scripts/run-tests.mjs` | 自适应并发测试运行器：扫描 `test/*.test.{cjs,mjs}`，按 `ZR_TEST_CONCURRENCY`（默认 `min(availableParallelism(), 6)`）驱动 `node --test` |
+| `scripts/verify-better-sidebar-tarballs.mjs` | 离线维护者脚本：按需校验 `/tmp/bs-versions/` 历史 tarball 与 `better-sidebar` 适配器表（不进默认 `npm test`） |
 | `scripts/build-client.mjs` | client 打包器（内联相对模块 → `__ModuleLoader__.load({id:"dsh-zen-remote"})`） |
 | `docs/**` | 深度文档，见下 |
 
@@ -65,7 +66,8 @@
 pnpm install
 pnpm build     # tsc host + tsc client + build-client.mjs → lib/（产物入库，改 src/ 必须重跑并提交 lib/）
 pnpm verify    # 两个 tsconfig 的 --noEmit 类型检查
-pnpm test      # 网关 node:test 用例 + 三个界面自检脚本 + 文档版本号一致性检查，一条命令全跑
+pnpm test      # 经 scripts/run-tests.mjs 跑全量 test/*.test.{cjs,mjs} + 文档版本号一致性检查（支持 ZR_TEST_CONCURRENCY=2）
+pnpm --dir gateway-server verify && pnpm --dir gateway-server build && pnpm --dir gateway-server test  # 网关子包三件套（含 prebuild）
 ```
 
 **版本号**：两份 README（`README.md` 英文为主文档，`README.zh-CN.md` 中文）里的
@@ -108,6 +110,28 @@ patch` 的 version commit 一起提交（脚本只同步 README 徽章，CHANGEL
 workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `permissions` 里
 `contents` 必须是 `write`（原来是 `read`）。
 
+## 测试体系与新增测试规范
+
+1. **分层与后缀归属**：
+   - **主仓运行时与后端单测**（宿主、网关 `lan-gate`、中继、拦截、CLI、插件桥、Peer）：放在 `test/<domain>.test.cjs`。统一导入编译产物 `lib/*.js` 与 `lib/lan-gate-server.cjs` 测试；**严禁**在测试运行时 `require('typescript')`、`registerHooks` 或用 `ts.createSourceFile` 抠源码，也**严禁**主仓测试反向引用 `gateway-server/dist/`。
+   - **主仓客户端逻辑、样式契约与仓库守卫**：放在 `test/<domain>.test.mjs`。借助 Node ≥23.6 原生类型剥离静态 `import` `src/client/**`、`src/client-data/**` 与 `.css.ts` 展开后真实常量；**禁止再在 `scripts/` 下新增 `check-*.mjs`**。
+   - **网关子包与跨端 Peer 全栈 E2E**：放在 `gateway-server/test/<domain>.test.mjs`（含跨端联调 `gateway-server/test/peer-client-e2e.test.mjs`）。复用 `gateway-server/test/helpers/fixtures.mjs` 预计算 `scrypt` 哈希与自签 TLS 证书，由 `.github/workflows/gateway-ci.yml`（含真实 PostgreSQL 服务）独立守护；主仓 `.github/workflows/publish.yml` 与 `npm test` 保持零跨包依赖。
+2. **防膨胀与组织原则**：
+   - 新功能或修 bug 一律优先追加进已有对应领域测试文件，**禁止**按工单号（如 `t0xx-*`、`*-v2`）或单条 CSS 规则拆出独立小文件。
+   - 仅当单文件超过 ~2,000 行且内部子域正交时，才按子域拆分成清晰的多文件，跨文件共享夹具下沉至 `test/helpers/` 或 `gateway-server/test/helpers/`。
+3. **快时钟、防竞态与低配机兼容铁律**：
+   - 轮询、退避与宽限期一律走 `t.mock.timers`、注入虚拟 `clock` 或可选短超时（`20–150ms`），禁止秒级真实 `sleep`。
+   - `Promise.race` 创建的定时器必须在 `finally` 中 `clearTimeout`（并按需 `.unref()`）；所有子进程、端口、监听器与全局 mock 必须挂 `t.after` 清理；只读网关测试优先在文件级 `before`/`after` 共享子进程。
+   - 端口分配一律传 `0`（含 `startGateway(0, ...)`），模拟连接重置一律使用 `test/util.cjs` 的 `startResetServer()`，**禁止** `freePort()` / `deadPort()`（listen-close 后再用）TOCTOU 模式。
+   - 背压与排空测试使用可控 Mock `ServerResponse` 或注入小阈值，禁止灌几十 MiB 数据赌内核 `wmem`/`rmem`。
+   - 异步事件到达使用有界 `waitFor` 轮询替代固定短 `sleep`，禁止给真实时钟或回环 UDP 设置 `< 100ms` 紧上界。
+   - 禁止编写锁死源码局部变量名、缩进格式或精确调用次数的源码正则断言。
+   - 临时文件与测试 `HOME` 一律创建于 `os.tmpdir()` 并挂 `t.after` 回收，**严禁**写入 `.scratch/` 或调用 `process.chdir()`。
+4. **运行命令**：
+   - 单文件调试：`node --test <file>`（网关子包：`node --experimental-sqlite --test <file>`）。
+   - 主仓全量：`pnpm test` 或 `npm test`（通过 `scripts/run-tests.mjs` 跑全部 `test/*.test.{cjs,mjs}` 及版本同步检查；传 `ZR_TEST_CONCURRENCY=2` 可做低并发压测）。
+   - 网关全量：`pnpm --dir gateway-server test` 或 `npm --prefix gateway-server test`（`pretest` 自动先执行 `build`）。
+
 ## 深度文档
 
 | 文件 | 内容 |
@@ -131,7 +155,7 @@ workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `perm
 - **中继访问控制按方法登记，两张表同步**：新增远程方法必须同时登记
   `src/relay-access.ts` 的 `RELAY_METHODS`（服务端，授权看登记的归属字段）
   和 `src/intercept.ts` 的 `CLIENT_METHOD_FIELDS`（客户端，改写判定），
-  一致性由 `test/intercept.test.cjs` 的逐方法比对测试钉住。插件桥的授权另走一条：声明注册表 + 路径完全相等 + 会话共享（`src/plugin-route-intercept.ts` / relay 的 `/v1/plugin`），同样不扫描参数；
+  一致性由 `test/intercept-core.test.cjs` 的逐方法比对测试钉住。插件桥的授权另走一条：声明注册表 + 路径完全相等 + 会话共享（`src/plugin-route-intercept.ts` / relay 的 `/v1/plugin`），同样不扫描参数；
   禁止「从参数里
   通用扫描会话 id」的写法——DSH 会悄悄丢掉不认识的参数名，扫描会被诱饵
   字段骗过；全局读（`session/list` 等）安全靠输出过滤，不靠输入判定。

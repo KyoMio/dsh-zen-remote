@@ -2,187 +2,172 @@
  * Remote clients are simulated with X-Forwarded-* headers on a loopback socket
  * (exactly what a same-host reverse proxy produces). */
 'use strict'
-const { test } = require('node:test')
+const { test, before, after } = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const net = require('node:net')
+const http = require('node:http')
 const { REMOTE_HEADERS, startMockTarget, startGateway, startGatewayAt, request, cookieFrom, pairDevice, stopAll, freePort } = require('./util.cjs')
 
-// T31-fix (relay-e2e): every port is system-assigned so parallel test-run
-// copies cannot collide. Targets listen on 0 and report the kernel's pick;
-// the gateway child needs a number handed to it, so boots pre-grab one with
-// freePort(). Tests in one file run sequentially, so these carry the pair.
-let PORT = 0
-let TARGET_PORT = 0
+let SHARED_PORT = 0
+let sharedTarget
+let sharedGw
+
+before(async () => {
+  sharedTarget = await startMockTarget(0)
+  sharedGw = startGateway(0, sharedTarget.address().port)
+  SHARED_PORT = await sharedGw.ready
+})
+
+after(async () => {
+  await stopAll(sharedTarget, sharedGw && sharedGw.child)
+})
 
 async function boot(extraEnv) {
   const target = await startMockTarget(0)
-  TARGET_PORT = target.address().port
-  PORT = await freePort()
-  const gw = startGateway(PORT, TARGET_PORT, extraEnv)
-  await gw.ready
-  return { target, gw, stop: () => stopAll(target, gw.child) }
+  const targetPort = target.address().port
+  const gw = startGateway(0, targetPort, extraEnv)
+  const port = await gw.ready
+  return { port, targetPort, target, gw, stop: () => stopAll(target, gw.child) }
 }
 
 test('gate pages follow Accept-Language, and LAN_GATE_LANG pins them', async () => {
-  const { stop } = await boot()
-  try {
-    const zh = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, 'accept-language': 'zh-CN,zh;q=0.9' } })
-    assert.ok(zh.body.includes('设备配对') && zh.body.includes('lang="zh-CN"'), 'a Chinese browser gets the Chinese pairing page')
+  const zh = await request(SHARED_PORT, { path: '/', headers: { ...REMOTE_HEADERS, 'accept-language': 'zh-CN,zh;q=0.9' } })
+  assert.ok(zh.body.includes('设备配对') && zh.body.includes('lang="zh-CN"'), 'a Chinese browser gets the Chinese pairing page')
 
-    const en = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, 'accept-language': 'en-US,en;q=0.9' } })
-    assert.ok(en.body.includes('Device Pairing') && en.body.includes('lang="en"'), 'an English browser gets the English one')
+  const en = await request(SHARED_PORT, { path: '/', headers: { ...REMOTE_HEADERS, 'accept-language': 'en-US,en;q=0.9' } })
+  assert.ok(en.body.includes('Device Pairing') && en.body.includes('lang="en"'), 'an English browser gets the English one')
 
-    // No header at all keeps the pre-i18n behaviour rather than guessing.
-    const bare = await request(PORT, { path: '/', headers: REMOTE_HEADERS })
-    assert.ok(bare.body.includes('设备配对'), 'no Accept-Language falls back to zh')
-  } finally { await stop() }
+  // No header at all keeps the pre-i18n behaviour rather than guessing.
+  const bare = await request(SHARED_PORT, { path: '/', headers: REMOTE_HEADERS })
+  assert.ok(bare.body.includes('设备配对'), 'no Accept-Language falls back to zh')
 })
 
 test('LAN_GATE_LANG=en overrides what the browser asks for', async () => {
-  const { stop } = await boot({ LAN_GATE_LANG: 'en' })
+  const { port, stop } = await boot({ LAN_GATE_LANG: 'en' })
   try {
-    const page = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, 'accept-language': 'zh-CN,zh;q=0.9' } })
+    const page = await request(port, { path: '/', headers: { ...REMOTE_HEADERS, 'accept-language': 'zh-CN,zh;q=0.9' } })
     assert.ok(page.body.includes('Device Pairing'), 'a pinned language ignores Accept-Language')
   } finally { await stop() }
 })
 
 test('unpaired remote gets 401 pairing page; local-only surface rejects proxied requests', async () => {
-  const { stop } = await boot()
-  try {
-    const page = await request(PORT, { path: '/', headers: REMOTE_HEADERS })
-    assert.strictEqual(page.status, 401)
-    assert.ok(page.body.includes('/lan-gate/pair/claim'), 'pairing page shown')
-    assert.ok(!page.body.includes('?t='), 'no URL token flow anywhere')
+  const page = await request(SHARED_PORT, { path: '/', headers: REMOTE_HEADERS })
+  assert.strictEqual(page.status, 401)
+  assert.ok(page.body.includes('/lan-gate/pair/claim'), 'pairing page shown')
+  assert.ok(!page.body.includes('?t='), 'no URL token flow anywhere')
 
-    const api = await request(PORT, { path: '/api/session', headers: REMOTE_HEADERS })
-    assert.strictEqual(api.status, 401)
-    assert.strictEqual(JSON.parse(api.body).reason, 'unpaired')
+  const api = await request(SHARED_PORT, { path: '/api/session', headers: REMOTE_HEADERS })
+  assert.strictEqual(api.status, 401)
+  assert.strictEqual(JSON.parse(api.body).reason, 'unpaired')
 
-    for (const p of ['/lan-gate/admin', '/lan-gate/status', '/lan-gate/action', '/lan-gate/pair', '/pwa/push/send']) {
-      const isGet = p === '/lan-gate/admin' || p === '/lan-gate/status'
-      const r = await request(PORT, { method: isGet ? 'GET' : 'POST', path: p, headers: REMOTE_HEADERS, body: isGet ? undefined : {} })
-      assert.strictEqual(r.status, 403, p + ' must be local-only')
-    }
+  for (const p of ['/lan-gate/admin', '/lan-gate/status', '/lan-gate/action', '/lan-gate/pair', '/pwa/push/send']) {
+    const isGet = p === '/lan-gate/admin' || p === '/lan-gate/status'
+    const r = await request(SHARED_PORT, { method: isGet ? 'GET' : 'POST', path: p, headers: REMOTE_HEADERS, body: isGet ? undefined : {} })
+    assert.strictEqual(r.status, 403, p + ' must be local-only')
+  }
 
-    // Shell metadata (manifest + icons) is deliberately public — browsers
-    // fetch it credential-less, and behind the wall Chrome's install prompt
-    // silently broke (2026-08-17). Executable/app assets stay behind the wall.
-    const manifest = await request(PORT, { path: '/pwa/manifest.json', headers: REMOTE_HEADERS })
-    assert.strictEqual(manifest.status, 200)
-    const asset = await request(PORT, { path: '/pwa/sw.js', headers: REMOTE_HEADERS })
-    assert.strictEqual(asset.status, 401)
-  } finally { await stop() }
+  const manifest = await request(SHARED_PORT, { path: '/pwa/manifest.json', headers: REMOTE_HEADERS })
+  assert.strictEqual(manifest.status, 200)
+  const asset = await request(SHARED_PORT, { path: '/pwa/sw.js', headers: REMOTE_HEADERS })
+  assert.strictEqual(asset.status, 401)
 })
 
 test('pairing flow: code -> cookie -> proxied access; kind & revoke via admin', async () => {
-  const { stop } = await boot()
-  try {
-    const { claim, cookie, id } = await pairDevice(PORT, '手机A')
-    assert.strictEqual(claim.status, 200)
-    assert.ok(cookie && cookie.startsWith('lg_device='), 'device cookie issued')
-    assert.ok(String(claim.headers['set-cookie'][0]).includes('Secure'), 'Secure flag under https proxy')
-    assert.ok(String(claim.headers['set-cookie'][0]).includes('HttpOnly'))
+  const { claim, cookie, id } = await pairDevice(SHARED_PORT, '手机A')
+  assert.strictEqual(claim.status, 200)
+  assert.ok(cookie && cookie.startsWith('lg_device='), 'device cookie issued')
+  assert.ok(String(claim.headers['set-cookie'][0]).includes('Secure'), 'Secure flag under https proxy')
+  assert.ok(String(claim.headers['set-cookie'][0]).includes('HttpOnly'))
 
-    // Cookie unlocks proxying + PWA assets, one code is single-use.
-    const page = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
-    assert.strictEqual(page.status, 200)
-    assert.ok(page.body.includes('upstream-ok'), 'reached upstream')
-    assert.ok(page.body.includes('window.__DSH_PWA__'), 'PWA bootstrap injected')
-    assert.ok(!/<html[^>]*data-lan-device/.test(page.body), 'kind auto = no device attr on <html>')
-    const asset = await request(PORT, { path: '/pwa/manifest.json', headers: { ...REMOTE_HEADERS, cookie } })
-    assert.strictEqual(asset.status, 200)
+  const page = await request(SHARED_PORT, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
+  assert.strictEqual(page.status, 200)
+  assert.ok(page.body.includes('upstream-ok'), 'reached upstream')
+  assert.ok(page.body.includes('window.__DSH_PWA__'), 'PWA bootstrap injected')
+  assert.ok(!/<html[^>]*data-lan-device/.test(page.body), 'kind auto = no device attr on <html>')
+  const asset = await request(SHARED_PORT, { path: '/pwa/manifest.json', headers: { ...REMOTE_HEADERS, cookie } })
+  assert.strictEqual(asset.status, 200)
 
-    // Status (local) sees the device; set kind=phone; injection now labels the page.
-    const status = JSON.parse((await request(PORT, { path: '/lan-gate/status' })).body)
-    assert.strictEqual(status.devices.length, 1)
-    assert.strictEqual(status.devices[0].name, '手机A')
-    await request(PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'set-kind', id, kind: 'phone' } })
-    const phonePage = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
-    assert.ok(phonePage.body.includes('data-lan-device="phone"'), 'phone kind injected')
-    assert.ok(!phonePage.body.includes('href="/lan-gate/admin"'), 'no admin entry chip for anyone (removed in T13)')
+  const status = JSON.parse((await request(SHARED_PORT, { path: '/lan-gate/status' })).body)
+  const dev = status.devices.find((d) => d.id === id)
+  assert.ok(dev)
+  assert.strictEqual(dev.name, '手机A')
+  await request(SHARED_PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'set-kind', id, kind: 'phone' } })
+  const phonePage = await request(SHARED_PORT, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
+  assert.ok(phonePage.body.includes('data-lan-device="phone"'), 'phone kind injected')
+  assert.ok(!phonePage.body.includes('href="/lan-gate/admin"'), 'no admin entry chip for anyone (removed in T13)')
 
-    // Regression guard: the push opt-in must not be gated on device kind —
-    // devices left at the default 'auto' carry no data-lan-device attribute
-    // and were silently never offered push.
-    assert.ok(page.body.includes('askPush'), 'auto-kind device still gets the push opt-in entry')
-    assert.ok(page.body.includes('PushManager'), 'push support probe present for auto-kind device')
+  assert.ok(page.body.includes('askPush'), 'auto-kind device still gets the push opt-in entry')
+  assert.ok(page.body.includes('PushManager'), 'push support probe present for auto-kind device')
 
-    // Revoke kills the cookie immediately.
-    await request(PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id } })
-    const after = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
-    assert.strictEqual(after.status, 401)
-  } finally { await stop() }
+  await request(SHARED_PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id } })
+  const after = await request(SHARED_PORT, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
+  assert.strictEqual(after.status, 401)
 })
 
 test('websocket upgrade rejected without device cookie', async () => {
-  const { stop } = await boot()
-  try {
-    const reply = await new Promise((resolve, reject) => {
-      const sock = net.connect(PORT, '127.0.0.1', () => {
-        sock.write('GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.9\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n')
-      })
-      let buf = ''
-      sock.on('data', (d) => { buf += d })
-      sock.on('close', () => resolve(buf))
-      sock.on('error', reject)
-      setTimeout(() => { try { sock.destroy() } catch (e) {} resolve(buf) }, 2000)
+  const reply = await new Promise((resolve, reject) => {
+    const sock = net.connect(SHARED_PORT, '127.0.0.1', () => {
+      sock.write('GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-For: 203.0.113.9\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n')
     })
-    assert.ok(reply.includes('403'), 'upgrade got 403, saw: ' + reply.slice(0, 60))
-  } finally { await stop() }
+    let buf = ''
+    let timer
+    const finish = () => { clearTimeout(timer); resolve(buf) }
+    sock.on('data', (d) => { buf += d })
+    sock.on('close', finish)
+    sock.on('error', (err) => { clearTimeout(timer); reject(err) })
+    timer = setTimeout(() => { try { sock.destroy() } catch (e) {} finish() }, 2000)
+  })
+  assert.ok(reply.includes('403'), 'upgrade got 403, saw: ' + reply.slice(0, 60))
 })
 
 test('five wrong codes lock the client out', async () => {
-  const { stop } = await boot()
-  try {
-    await request(PORT, { method: 'POST', path: '/lan-gate/pair' })
-    for (let i = 0; i < 5; i++) {
-      const r = await request(PORT, { method: 'POST', path: '/lan-gate/pair/claim', headers: REMOTE_HEADERS, body: { code: 'WRONGAAA' } })
-      assert.strictEqual(r.status, 403)
-    }
-    const gen = await request(PORT, { method: 'POST', path: '/lan-gate/pair' })
-    const code = JSON.parse(gen.body).code
-    const locked = await request(PORT, { method: 'POST', path: '/lan-gate/pair/claim', headers: REMOTE_HEADERS, body: { code } })
-    assert.strictEqual(locked.status, 429, 'even the right code is refused while locked')
-    assert.strictEqual(JSON.parse(locked.body).reason, 'locked')
-  } finally { await stop() }
+  const lockHeaders = { 'x-forwarded-for': '203.0.113.55', 'x-forwarded-proto': 'https' }
+  await request(SHARED_PORT, { method: 'POST', path: '/lan-gate/pair' })
+  for (let i = 0; i < 5; i++) {
+    const r = await request(SHARED_PORT, { method: 'POST', path: '/lan-gate/pair/claim', headers: lockHeaders, body: { code: 'WRONGAAA' } })
+    assert.strictEqual(r.status, 403)
+  }
+  const gen = await request(SHARED_PORT, { method: 'POST', path: '/lan-gate/pair' })
+  const code = JSON.parse(gen.body).code
+  const locked = await request(SHARED_PORT, { method: 'POST', path: '/lan-gate/pair/claim', headers: lockHeaders, body: { code } })
+  assert.strictEqual(locked.status, 429, 'even the right code is refused while locked')
+  assert.strictEqual(JSON.parse(locked.body).reason, 'locked')
 })
 
 test('origin and referer are rewritten to the upstream origin', async () => {
-  const http = require('node:http')
   const captured = []
   const target = await new Promise((resolve, reject) => {
     const srv = http.createServer((req, res) => { captured.push(req.headers); res.writeHead(200, { 'Content-Type': 'application/json' }); res.end('{}') })
     srv.on('error', reject)
     srv.listen(0, '127.0.0.1', () => resolve(srv))
   })
-  TARGET_PORT = target.address().port
-  PORT = await freePort()
-  const gw = startGateway(PORT, TARGET_PORT)
-  await gw.ready
+  const targetPort = target.address().port
+  const gw = startGateway(0, targetPort)
+  const port = await gw.ready
   try {
-    const { cookie } = await pairDevice(PORT, '市场机')
-    await request(PORT, { method: 'POST', path: '/api/market/install', headers: { ...REMOTE_HEADERS, cookie, origin: 'https://dsh.example.com', referer: 'https://dsh.example.com/market?page=2' }, body: {} })
+    const { cookie } = await pairDevice(port, '市场机')
+    await request(port, { method: 'POST', path: '/api/market/install', headers: { ...REMOTE_HEADERS, cookie, origin: 'https://dsh.example.com', referer: 'https://dsh.example.com/market?page=2' }, body: {} })
     assert.strictEqual(captured.length, 1)
-    assert.strictEqual(captured[0].origin, 'http://127.0.0.1:' + TARGET_PORT, 'Origin rewritten to upstream origin')
-    assert.strictEqual(captured[0].referer, 'http://127.0.0.1:' + TARGET_PORT + '/market?page=2', 'Referer rewritten, path preserved')
-    assert.strictEqual(captured[0].host, '127.0.0.1:' + TARGET_PORT)
+    assert.strictEqual(captured[0].origin, 'http://127.0.0.1:' + targetPort, 'Origin rewritten to upstream origin')
+    assert.strictEqual(captured[0].referer, 'http://127.0.0.1:' + targetPort + '/market?page=2', 'Referer rewritten, path preserved')
+    assert.strictEqual(captured[0].host, '127.0.0.1:' + targetPort)
   } finally { await stopAll(target, gw.child) }
 })
 
 test('rate limit hits unpaired clients only', async () => {
-  const { stop } = await boot({ LAN_GATE_RATE_LIMIT: '5' })
+  const { port, stop } = await boot({ LAN_GATE_RATE_LIMIT: '5' })
   try {
-    const { cookie } = await pairDevice(PORT, '快手机')
+    const { cookie } = await pairDevice(port, '快手机')
     for (let i = 0; i < 12; i++) {
-      const r = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
+      const r = await request(port, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
       assert.strictEqual(r.status, 200, 'paired device is never rate limited (request ' + i + ')')
     }
     let saw429 = false
     for (let i = 0; i < 8; i++) {
-      const r = await request(PORT, { path: '/', headers: { 'x-forwarded-for': '203.0.113.77' } })
+      const r = await request(port, { path: '/', headers: { 'x-forwarded-for': '203.0.113.77' } })
       if (r.status === 429) { saw429 = true; break }
     }
     assert.ok(saw429, 'unpaired stranger hits the limit')
@@ -193,97 +178,78 @@ test('lan-gate.config.json configures the gateway (env absent)', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-pwa-test-'))
   fs.writeFileSync(path.join(home, 'lan-gate.config.json'), JSON.stringify({ rateLimit: 5 }))
   const target = await startMockTarget(0)
-  TARGET_PORT = target.address().port
-  PORT = await freePort()
-  const gw = startGatewayAt(home, PORT, TARGET_PORT)
-  await gw.ready
+  const gw = startGatewayAt(home, 0, target.address().port)
+  const port = await gw.ready
   try {
     let saw429 = false
     for (let i = 0; i < 8; i++) {
-      const r = await request(PORT, { path: '/', headers: { 'x-forwarded-for': '203.0.113.88' } })
+      const r = await request(port, { path: '/', headers: { 'x-forwarded-for': '203.0.113.88' } })
       if (r.status === 429) { saw429 = true; break }
     }
     assert.ok(saw429, 'file-configured rateLimit=5 enforced on unpaired client')
-  } finally { await stopAll(target, gw.child) }
+  } finally {
+    await stopAll(target, gw.child)
+    fs.rmSync(home, { recursive: true, force: true })
+  }
 })
 
 test('v1 state file is archived, not loaded', async () => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-pwa-test-'))
   fs.writeFileSync(path.join(home, 'lan-gate-state.json'), JSON.stringify({ decisions: { '192.168.1.5': { allow: true, token: 'x' } } }))
   const target = await startMockTarget(0)
-  TARGET_PORT = target.address().port
-  PORT = await freePort()
-  const gw = startGatewayAt(home, PORT, TARGET_PORT)
-  await gw.ready
+  const gw = startGatewayAt(home, 0, target.address().port)
+  const port = await gw.ready
   try {
-    const status = JSON.parse((await request(PORT, { path: '/lan-gate/status' })).body)
+    const status = JSON.parse((await request(port, { path: '/lan-gate/status' })).body)
     assert.strictEqual(status.devices.length, 0)
     assert.ok(fs.existsSync(path.join(home, 'lan-gate-state.json.v1.bak')), 'v1 archived')
-  } finally { await stopAll(target, gw.child) }
+  } finally {
+    await stopAll(target, gw.child)
+    fs.rmSync(home, { recursive: true, force: true })
+  }
 })
 
 test('paired devices survive a gateway restart', async () => {
   const target = await startMockTarget(0)
-  TARGET_PORT = target.address().port
-  PORT = await freePort()
-  const gw1 = startGateway(PORT, TARGET_PORT)
-  await gw1.ready
+  const targetPort = target.address().port
+  const gw1 = startGateway(0, targetPort)
+  const port1 = await gw1.ready
   let cookie
   try {
-    cookie = (await pairDevice(PORT, '重启机')).cookie
-  } finally { await stopAll(null, gw1.child) }
-  await new Promise((r) => setTimeout(r, 300))
-  const gw2 = startGatewayAt(gw1.home, PORT, TARGET_PORT)
+    cookie = (await pairDevice(port1, '重启机')).cookie
+  } finally { await stopAll(null, gw1.child, { keepHome: true }) }
+  const port2 = await freePort()
+  const gw2 = startGatewayAt(gw1.home, port2, targetPort)
+  gw2.child._zrHome = gw1.home
   await gw2.ready
   try {
-    const page = await request(PORT, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
+    const page = await request(port2, { path: '/', headers: { ...REMOTE_HEADERS, cookie } })
     assert.strictEqual(page.status, 200)
     assert.ok(page.body.includes('upstream-ok'))
   } finally { await stopAll(target, gw2.child) }
 })
 
-// Cloudflare Tunnel / any same-host tunnel: cloudflared talks to the gateway
-// over a LOOPBACK socket, so the only thing separating "internet visitor" from
-// "the human at this keyboard" is the forwarded headers the tunnel adds. Two
-// facts this pins down, both of which the README leans on:
-//   1. Listing 127.0.0.1 in LAN_GATE_TRUSTED_PROXIES is accepted and changes
-//      nothing — resolveClient() already trusts a loopback peer as a proxy, so
-//      the wall holds either way. (Users are told to run the step-2 403 probe
-//      rather than to trust a config line.)
-//   2. A tunnel that forwards NOTHING is indistinguishable from the local user
-//      and hands the admin surface to the internet. That is the actual footgun,
-//      and it is a property of the deployment, not something a gateway setting
-//      can fix — so it is asserted here rather than silently assumed.
-let TUNNEL_PORT = 0
-let TUNNEL_TARGET_PORT = 0
-
 for (const trustedProxies of ['', '127.0.0.1']) {
   test(`same-host tunnel: forwarded headers decide, LAN_GATE_TRUSTED_PROXIES="${trustedProxies}" is not what holds the wall`, async () => {
     const target = await startMockTarget(0)
-    TUNNEL_TARGET_PORT = target.address().port
-    TUNNEL_PORT = await freePort()
-    const gw = startGateway(TUNNEL_PORT, TUNNEL_TARGET_PORT, trustedProxies ? { LAN_GATE_TRUSTED_PROXIES: trustedProxies } : undefined)
-    await gw.ready
+    const gw = startGateway(0, target.address().port, trustedProxies ? { LAN_GATE_TRUSTED_PROXIES: trustedProxies } : undefined)
+    const port = await gw.ready
     try {
-      // What cloudflared actually sends: loopback socket + client IP + proto.
       const tunnel = { 'x-forwarded-for': '203.0.113.9', 'x-forwarded-proto': 'https' }
 
-      const page = await request(TUNNEL_PORT, { path: '/', headers: tunnel })
+      const page = await request(port, { path: '/', headers: tunnel })
       assert.strictEqual(page.status, 401, 'tunnel visitor hits the pairing wall')
       assert.ok(page.body.includes('/lan-gate/pair/claim'))
 
-      const admin = await request(TUNNEL_PORT, { path: '/lan-gate/admin', headers: tunnel })
+      const admin = await request(port, { path: '/lan-gate/admin', headers: tunnel })
       assert.strictEqual(admin.status, 403, 'tunnel visitor cannot reach the admin surface')
 
-      const { cookie } = await pairDevice(TUNNEL_PORT, 'tunnel-phone')
-      const proxied = await request(TUNNEL_PORT, { path: '/', headers: { ...tunnel, cookie } })
+      const { cookie } = await pairDevice(port, 'tunnel-phone')
+      const proxied = await request(port, { path: '/', headers: { ...tunnel, cookie } })
       assert.strictEqual(proxied.status, 200, 'paired tunnel device is proxied through')
       assert.ok(proxied.body.includes('upstream-ok'))
 
-      // Same socket, no forwarded headers: still the local admin. A tunnel that
-      // strips them therefore publishes the admin page — the 403 probe in the
-      // README's step 2 is what catches that, not this env var.
-      const bare = await request(TUNNEL_PORT, { path: '/lan-gate/admin' })
+      const bare = await request(port, { path: '/lan-gate/admin' })
       assert.strictEqual(bare.status, 200, 'loopback without forwarded headers is still the local user')
     } finally { await stopAll(target, gw.child) }
   })

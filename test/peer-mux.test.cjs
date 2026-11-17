@@ -1,0 +1,579 @@
+'use strict'
+const { test } = require('node:test')
+const assert = require('node:assert/strict')
+const { mkdtempSync, rmSync } = require('node:fs')
+const { tmpdir } = require('node:os')
+const { join } = require('node:path')
+const { once } = require('node:events')
+const { createHash } = require('node:crypto')
+
+const { PeerArqSession } = require('../lib/peer/arq.js')
+const { PeerMux } = require('../lib/peer/mux.js')
+const { generatePeerIdentity, generateEphemeralX25519, buildPeerHandshakeEnvelope } = require('../lib/peer/crypto.js')
+const { encodeFrameHeader, PeerFrameType, PEER_FRAME_MAGIC, PEER_FRAME_VERSION } = require('../lib/peer/wire.js')
+const { createRelayHandler } = require('../lib/relay-server.js')
+const { createShareStore } = require('../lib/share-store.js')
+
+const NETWORK_ID = '0123456789abcdef'
+const immediate = () => new Promise((resolve) => setImmediate(resolve))
+
+function pair(t, handler) {
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const options = { networkId: NETWORK_ID, sendGatewayBinary: null, relaySecret: () => 'test-secret' }
+  const A = new PeerMux({ ...options, identity: a, relayHandler: () => undefined })
+  const B = new PeerMux({ ...options, identity: b, relayHandler: () => handler })
+  A.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+  B.ensureSession(a.nodeId, a.publicKeyHex, 'A')
+  for (const [from, to, identity, target] of [[A, B, a, b], [B, A, b, a]]) {
+    from.setDirectPath(target.nodeId, (frameType, streamId, payload, ack) => {
+      setImmediate(() => to.handleOpenedFrame({ srcNodeId: identity.nodeId, frameType, streamId, ack }, payload))
+    })
+  }
+  t.after(() => { A.close(); B.close() })
+  return { A, B, fetch: A.createFetchForPeer(b.nodeId), sa: A.sessions.get(b.nodeId), sb: B.sessions.get(a.nodeId) }
+}
+
+function makeFakeClock(initialMs = 1_000_000) {
+  let nowMs = initialMs
+  let nextId = 1
+  const timers = new Map()
+  return {
+    now: () => nowMs,
+    setTimeout(fn, ms) {
+      const id = nextId++
+      timers.set(id, { id, at: nowMs + ms, fn })
+      return id
+    },
+    clearTimeout(id) {
+      timers.delete(id)
+    },
+    advance(ms) {
+      const target = nowMs + ms
+      for (;;) {
+        let earliest = null
+        for (const t of timers.values()) {
+          if (t.at <= target && (earliest === null || t.at < earliest.at)) earliest = t
+        }
+        if (earliest === null) break
+        timers.delete(earliest.id)
+        nowMs = earliest.at
+        earliest.fn()
+      }
+      nowMs = target
+    },
+    pendingCount: () => timers.size,
+  }
+}
+
+async function responseWithin(promise) {
+  let timer
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error('peer response did not settle')), 500)
+    })])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// -- 1. backpressure & HTTP response streaming (from peer-backpressure) ---------
+
+for (const method of ['follow', 'control']) {
+  test(`peer ${method}: large opening frame does not block later events`, { timeout: 5000 }, async (t) => {
+    const home = mkdtempSync(join(tmpdir(), 'zr-backpressure-'))
+    t.after(() => rmSync(home, { recursive: true, force: true }))
+    const store = createShareStore({ file: join(home, 'shares.json'), idleHours: 48 })
+    store.share('session-test')
+    const padding = 'x'.repeat(200000)
+    const frames = method === 'follow' ? [
+      { type: 'snapshot', header: { id: 'session-test' }, records: [], padding },
+      { type: 'assistant-stream', frame: { revision: 1, text: 'thinking' } },
+      { type: 'event', event: { type: 'tool/result', seq: 1 } },
+      { type: 'assistant-stream', frame: { revision: 2, text: 'reply' } },
+    ] : [
+      { type: 'baseline', value: { projections: { 'session-test': { asOfSeq: 0, values: { padding } } } } },
+      { type: 'projection', sessionId: 'session-test', changes: [{ key: 'modelSelection', value: { model: 'changed' } }], seq: 1 },
+    ]
+    let released = false
+    const handler = createRelayHandler({
+      secret: 'test-secret', store, heartbeatMs: 10000,
+      serverInfo: { serverId: '12345678', serverName: () => 'test', dshVersion: 'test', fingerprints: () => ({}) },
+      gateway: { stream: async ({ signal }) => (async function* () {
+        try {
+          for (const frame of frames) yield frame
+          await new Promise((resolve) => (signal.aborted ? resolve() : signal.addEventListener('abort', resolve, { once: true })))
+        } finally {
+          released = true
+        }
+      })() },
+    })
+    t.after(() => handler.closeAll())
+    const { fetch } = pair(t, handler)
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 2000)
+    t.after(() => { clearTimeout(timer); controller.abort() })
+    const res = await fetch('http://peer/_dsh/zen-remote/relay/v1/stream', {
+      method: 'POST', signal: controller.signal,
+      body: JSON.stringify({ namespace: 'session', method, args: method === 'follow' ? { request: { address: { kind: 'session', sessionId: 'session-test' } } } : {} }),
+    })
+    assert.equal(res.status, 200)
+    const reader = res.body.getReader()
+    const received = []
+    let buffer = ''
+    try {
+      while (received.length < frames.length) {
+        const { value, done } = await reader.read()
+        assert.equal(done, false)
+        buffer += Buffer.from(value).toString()
+        let nl
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          const line = JSON.parse(buffer.slice(0, nl))
+          buffer = buffer.slice(nl + 1)
+          if (line.type === 'frame') received.push(line.frame)
+        }
+      }
+      assert.deepEqual(received, frames)
+    } finally {
+      controller.abort()
+    }
+    await immediate()
+    await immediate()
+    assert.equal(released, true, 'cancellation releases the upstream subscription')
+  })
+}
+
+for (const status of [204, 205, 304]) {
+  test(`peer response: ${status} resolves with a null body`, { timeout: 3000 }, async (t) => {
+    const { fetch } = pair(t, async (_req, res) => { res.writeHead(status); res.end() })
+    const response = await responseWithin(fetch('http://peer/no-content', { signal: AbortSignal.timeout(1000) }))
+    assert.equal(response.status, status)
+    assert.equal(response.body, null)
+    assert.equal(await response.text(), '')
+  })
+}
+
+test('peer response: invalid response metadata rejects instead of stranding fetch', { timeout: 3000 }, async (t) => {
+  const { fetch } = pair(t, async (_req, res) => {
+    res.socket.write('HTTP/1.1 200 OK\r\nbad\u0001name: value\r\n\r\n')
+  })
+  await assert.rejects(responseWithin(fetch('http://peer/invalid-header', { signal: AbortSignal.timeout(1000) })), /header/i)
+})
+
+test('peer response: repeated large writes drain and complete a content-length body', { timeout: 5000 }, async (t) => {
+  const chunk = Buffer.alloc(200000, 'x')
+  let response
+  let drains = 0
+  const { fetch } = pair(t, async (_req, res) => {
+    response = res
+    res.on('drain', () => drains++)
+    res.setHeader('content-length', chunk.length * 3)
+    for (let i = 0; i < 3; i++) {
+      if (!res.write(chunk)) await once(res, 'drain')
+    }
+    res.end()
+  })
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 2000)
+  t.after(() => { clearTimeout(timer); controller.abort() })
+  const res = await fetch('http://peer/large-response', { signal: controller.signal })
+  assert.equal((await res.arrayBuffer()).byteLength, chunk.length * 3)
+  assert.equal(drains, 3)
+  response.socket.emit('drain')
+  assert.equal(drains, 3, 'ended response must not receive drain')
+  response.destroy()
+  response.socket?.emit('drain')
+  assert.equal(drains, 3, 'destroyed response must not receive drain')
+})
+
+// -- 2. flow control, handshake & 8MiB streams (from peer-flow-control) --------
+
+test('signed gateway ACK with low-order DH key cannot throw or replace cipher state', (t) => {
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const mux = new PeerMux({ identity: a, networkId: NETWORK_ID, sendGatewayBinary() {}, relayHandler: () => undefined, relaySecret: () => 'test' })
+  t.after(() => mux.close())
+  mux.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+  mux.enableRelayPath(b.nodeId)
+  const nonce = mux.sessions.get(b.nodeId).nonce
+  const timestamp = Date.now()
+  const ephPubHex = '00'.repeat(32)
+  const payload = buildPeerHandshakeEnvelope({
+    kind: 'ack',
+    networkId: NETWORK_ID,
+    identity: b,
+    selfEphPubHex: ephPubHex,
+    peerNodeId: a.nodeId,
+    peerEphPubHex: mux.sessions.get(b.nodeId).myEph.publicKeyHex,
+    nonce,
+    timestamp,
+  })
+  const header = encodeFrameHeader({ magic: PEER_FRAME_MAGIC, version: PEER_FRAME_VERSION, frameType: PeerFrameType.HELLO, srcNodeId: b.nodeId, dstNodeId: a.nodeId, streamId: 0, seq: 0n, ack: 0 })
+  const previous = { existing: true }
+  mux.sessions.get(b.nodeId).ciphers = previous
+  assert.doesNotThrow(() => mux.handleGatewayFrame(Buffer.concat([header, payload])))
+  assert.equal(mux.sessions.get(b.nodeId).ciphers, previous)
+  assert.equal(mux.sessions.get(b.nodeId).peerEphPubHex, null)
+})
+
+test('gateway key rotation requires a fresh ACK and cannot roll back via recorded HELLO or consumed ACK', () => {
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const mux = new PeerMux({ identity: a, networkId: NETWORK_ID, sendGatewayBinary() {}, relayHandler: () => undefined, relaySecret: () => 'test' })
+  try {
+    mux.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+    const state = mux.sessions.get(b.nodeId)
+    function control(kind, ephPubHex, nonce) {
+      const timestamp = Date.now()
+      const payload = buildPeerHandshakeEnvelope({
+        kind,
+        networkId: NETWORK_ID,
+        identity: b,
+        selfEphPubHex: ephPubHex,
+        peerNodeId: a.nodeId,
+        peerEphPubHex: kind === 'hello' ? null : state.myEph.publicKeyHex,
+        nonce,
+        timestamp,
+      })
+      const header = encodeFrameHeader({ magic: PEER_FRAME_MAGIC, version: PEER_FRAME_VERSION, frameType: PeerFrameType.HELLO, srcNodeId: b.nodeId, dstNodeId: a.nodeId, streamId: 0, seq: 0n, ack: 0 })
+      return Buffer.concat([header, payload])
+    }
+    const k1 = generateEphemeralX25519().publicKeyHex
+    const k2 = generateEphemeralX25519().publicKeyHex
+    mux.enableRelayPath(b.nodeId)
+    const n1 = state.nonce
+    const ack1 = control('ack', k1, n1)
+    mux.handleGatewayFrame(ack1)
+    assert.equal(state.peerEphPubHex, k1)
+    mux.handleGatewayFrame(control('hello', k2, 'abcdef0123456789'))
+    assert.equal(state.peerEphPubHex, k1, 'HELLO cannot commit a new key')
+    const n2 = state.nonce
+    assert.notEqual(n2, n1)
+    mux.handleGatewayFrame(control('ack', k2, n2))
+    const established = state.ciphers
+    mux.handleGatewayFrame(control('hello', k1, 'abcdef0123456789'))
+    mux.handleGatewayFrame(ack1)
+    mux.handleGatewayFrame(control('ack', k1, n2))
+    assert.equal(state.peerEphPubHex, k2)
+    assert.equal(state.ciphers, established)
+  } finally {
+    mux.close()
+  }
+})
+
+for (const simultaneous of [false, true]) {
+  test(`gateway fresh handshake converges ${simultaneous ? 'simultaneously' : 'from one initiator'}`, { timeout: 3000 }, async (t) => {
+    const a = generatePeerIdentity()
+    const b = generatePeerIdentity()
+    const common = { networkId: NETWORK_ID, relaySecret: () => 'test' }
+    let A, B
+    A = new PeerMux({ ...common, identity: a, sendGatewayBinary: (bytes) => setImmediate(() => B.handleGatewayFrame(bytes)), relayHandler: () => undefined })
+    B = new PeerMux({ ...common, identity: b, sendGatewayBinary: (bytes) => setImmediate(() => A.handleGatewayFrame(bytes)), relayHandler: () => async (_req, res) => { res.end('via relay') } })
+    t.after(() => { A.close(); B.close() })
+    A.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+    B.ensureSession(a.nodeId, a.publicKeyHex, 'A')
+    A.enableRelayPath(b.nodeId)
+    if (simultaneous) B.enableRelayPath(a.nodeId)
+    assert.equal(await (await A.createFetchForPeer(b.nodeId)('http://peer/ws')).text(), 'via relay')
+    assert.equal(A.sessions.get(b.nodeId).nonce, null)
+    assert.equal(B.sessions.get(a.nodeId).nonce, null)
+  })
+}
+
+test('1000 completed HTTP exchanges release mux streams and abort listeners', { timeout: 10000 }, async (t) => {
+  const p = pair(t, async (_req, res) => { res.end('ok') })
+  const controller = new AbortController()
+  let listeners = 0
+  const add = controller.signal.addEventListener.bind(controller.signal)
+  const remove = controller.signal.removeEventListener.bind(controller.signal)
+  controller.signal.addEventListener = (...args) => { listeners++; return add(...args) }
+  controller.signal.removeEventListener = (...args) => { listeners--; return remove(...args) }
+  for (let i = 0; i < 1000; i++) assert.equal(await (await p.fetch('http://peer/small', { signal: controller.signal })).text(), 'ok')
+  for (let i = 0; i < 5; i++) await immediate()
+  assert.equal(listeners, 0)
+  assert.equal(p.sa.streams.size, 0)
+  assert.equal(p.sb.streams.size, 0)
+  assert.equal(p.sa.arq.active.size, 0)
+  assert.equal(p.sb.arq.active.size, 0)
+})
+
+test('send admission is bounded per stream and peer, without one RTT per small write', async (t) => {
+  const arq = new PeerArqSession({ sendFrame() {}, maxStreamBytes: 1024, maxSessionBytes: 2048 })
+  t.after(() => arq.closeAll())
+  assert.equal(typeof arq.tryWrite, 'function')
+  for (let i = 0; i < 8; i++) assert.equal(arq.tryWrite(1, Buffer.alloc(100)), true)
+  assert.equal(arq.tryWrite(1, Buffer.alloc(300)), false)
+  assert.equal(arq.tryWrite(2, Buffer.alloc(800)), true)
+  assert.equal(arq.tryWrite(3, Buffer.alloc(800)), false)
+  await assert.rejects(arq.write(4, Buffer.alloc(8 * 1024 * 1024)), /capacity|budget/)
+})
+
+for (const contentLength of [true, false]) {
+  test(`8MiB ${contentLength ? 'content-length' : 'single chunked chunk'} streams with slow consumer and concurrent small response`, { timeout: 15000 }, async (t) => {
+    const body = Buffer.alloc(8 * 1024 * 1024, 0x6d)
+    let largeFinished = false
+    const p = pair(t, async (req, res) => {
+      if (req.url === '/small') { res.end('small'); return }
+      if (contentLength) res.setHeader('content-length', body.length)
+      res.end(body, () => { largeFinished = true })
+    })
+    const response = await p.fetch('http://peer/large')
+    for (let i = 0; i < 100; i++) await immediate()
+    assert.equal(largeFinished, false, 'unread consumer propagates backpressure to producer')
+    assert.ok(p.sb.arq.bufferedSendBytes() <= 256 * 1024)
+    assert.ok(p.sa.arq.bufferedReceiveBytes() <= 4 * 1024 * 1024)
+    assert.equal(await (await p.fetch('http://peer/small')).text(), 'small')
+    const digest = createHash('sha256')
+    let bytes = 0
+    for await (const chunk of response.body) {
+      digest.update(chunk)
+      bytes += chunk.length
+      if (bytes % 65536 < 1100) await immediate()
+    }
+    assert.equal(bytes, body.length)
+    assert.equal(digest.digest('hex'), createHash('sha256').update(body).digest('hex'))
+    for (let i = 0; i < 10; i++) await immediate()
+    assert.equal(p.sa.streams.size, 0)
+    assert.equal(p.sb.streams.size, 0)
+  })
+}
+
+test('8MiB upload keeps request readable bounded and cancellation releases producer', { timeout: 15000 }, async (t) => {
+  const body = Buffer.alloc(8 * 1024 * 1024, 0x5a)
+  let request, release
+  const gate = new Promise((resolve) => { release = resolve })
+  const p = pair(t, async (req, res) => {
+    request = req
+    await gate
+    let size = 0
+    const digest = createHash('sha256')
+    for await (const chunk of req) { size += chunk.length; digest.update(chunk) }
+    res.end(JSON.stringify({ size, hash: digest.digest('hex') }))
+  })
+  const pending = p.fetch('http://peer/upload', { method: 'POST', body })
+  for (let i = 0; i < 100; i++) await immediate()
+  assert.ok(request.readableLength <= 65536 + 1100)
+  release()
+  const result = await (await pending).json()
+  assert.equal(result.size, body.length)
+  assert.equal(result.hash, createHash('sha256').update(body).digest('hex'))
+})
+
+for (const timing of ['immediate', 'read-pending', 'read-completed']) {
+  test(`upload ${timing} abort cancels source and releases reader lock`, async (t) => {
+    const p = pair(t, async () => {})
+    const controller = new AbortController()
+    let cancellations = 0
+    let sourceController
+    const body = new ReadableStream({ start(c) { sourceController = c }, pull() {}, cancel() { cancellations++ } })
+    const pending = p.fetch('http://peer/upload', { method: 'POST', body, signal: controller.signal })
+    if (timing !== 'immediate') await immediate()
+    if (timing === 'read-completed') sourceController.enqueue(new Uint8Array([1]))
+    controller.abort()
+    await assert.rejects(pending, /abort/)
+    await immediate()
+    assert.equal(cancellations, 1)
+    assert.equal(body.locked, false)
+    assert.equal(p.sa.streams.size, 0)
+  })
+}
+
+test('consumer cancellation bypasses stalled DATA and releases abort listener', { timeout: 5000 }, async (t) => {
+  let responseClosed = false
+  const p = pair(t, async (_req, res) => {
+    res.on('close', () => { responseClosed = true })
+    for (let i = 0; i < 1024 && !res.destroyed; i++) if (!res.write(Buffer.alloc(16384))) await once(res, 'drain').catch(() => {})
+  })
+  const controller = new AbortController()
+  let added = 0
+  let removed = 0
+  const add = controller.signal.addEventListener.bind(controller.signal)
+  const remove = controller.signal.removeEventListener.bind(controller.signal)
+  controller.signal.addEventListener = (...args) => { added++; return add(...args) }
+  controller.signal.removeEventListener = (...args) => { removed++; return remove(...args) }
+  const response = await p.fetch('http://peer/live', { signal: controller.signal })
+  for (let i = 0; i < 100; i++) await immediate()
+  await response.body.cancel()
+  for (let i = 0; i < 10; i++) await immediate()
+  assert.equal(responseClosed, true)
+  assert.equal(added, removed)
+  assert.equal(p.sa.streams.size, 0)
+  assert.equal(p.sb.streams.size, 0)
+})
+
+// -- 3. resetSession, clock skew & cooldown self-heal (from peer-mux-heal) -----
+
+test('resetSession aborts pending streams immediately, clears ciphers, preserves monotonic streamId, and re-handshakes cleanly', { timeout: 2000 }, async (t) => {
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const pathEvents = []
+  let A, B
+  const dropBToA = false
+
+  A = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: a,
+    sendGatewayBinary: (bytes) => setImmediate(() => B.handleGatewayFrame(bytes)),
+    relayHandler: () => undefined,
+    relaySecret: () => 'test-secret',
+    onPathChanged: (nodeId, path) => pathEvents.push({ nodeId, path }),
+  })
+  B = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: b,
+    sendGatewayBinary: (bytes) => {
+      if (dropBToA) return
+      setImmediate(() => A.handleGatewayFrame(bytes))
+    },
+    relayHandler: () => async (req, res) => {
+      if (req.url === '/hang') return
+      res.end('ok-after-reset')
+    },
+    relaySecret: () => 'test-secret',
+  })
+  t.after(() => { A.close(); B.close() })
+
+  A.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+  B.ensureSession(a.nodeId, a.publicKeyHex, 'A')
+  A.enableRelayPath(b.nodeId)
+
+  const firstRes = await A.createFetchForPeer(b.nodeId)('http://peer/warm')
+  assert.equal(await firstRes.text(), 'ok-after-reset')
+  await immediate()
+  const prevStreamId = A.sessions.get(b.nodeId).nextStreamId
+
+  const pendingFetch = A.createFetchForPeer(b.nodeId)('http://peer/hang')
+  pendingFetch.catch(() => {})
+  await immediate()
+  assert.ok(A.sessions.get(b.nodeId).streams.size >= 1)
+
+  const startedAt = Date.now()
+  A.resetSession(b.nodeId)
+  await assert.rejects(pendingFetch, /peer session reset/)
+  assert.ok(Date.now() - startedAt < 500, 'pending stream must reject immediately without waiting 45s')
+
+  const resetSession = A.sessions.get(b.nodeId)
+  assert.ok(resetSession, 'session must be recreated cleanly')
+  assert.equal(resetSession.ciphers, null)
+  assert.equal(resetSession.path, 'none')
+  assert.ok(resetSession.nextStreamId >= prevStreamId, 'streamId must remain monotonic across reset')
+  assert.ok(pathEvents.some((e) => e.nodeId === b.nodeId && e.path === 'none'))
+
+  B.resetSession(a.nodeId)
+  A.enableRelayPath(b.nodeId)
+  const secondRes = await A.createFetchForPeer(b.nodeId)('http://peer/after')
+  assert.equal(await secondRes.text(), 'ok-after-reset')
+  assert.ok(A.sessions.get(b.nodeId).nextStreamId > prevStreamId)
+})
+
+test('gateway handshake envelope accepts +120s clock skew (within +/-5min) and rejects +360s skew', () => {
+  const clock = makeFakeClock(1_700_000_000_000)
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const mux = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: a,
+    sendGatewayBinary() {},
+    relayHandler: () => undefined,
+    relaySecret: () => 'test-secret',
+    clock,
+  })
+  try {
+    mux.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+    mux.enableRelayPath(b.nodeId)
+    const state = mux.sessions.get(b.nodeId)
+    const eph = generateEphemeralX25519()
+
+    const makeAck = (skewMs) => {
+      const payload = buildPeerHandshakeEnvelope({
+        kind: 'ack',
+        networkId: NETWORK_ID,
+        identity: b,
+        selfEphPubHex: eph.publicKeyHex,
+        peerNodeId: a.nodeId,
+        peerEphPubHex: state.myEph.publicKeyHex,
+        nonce: state.nonce,
+        timestamp: clock.now() + skewMs,
+      })
+      const header = encodeFrameHeader({
+        magic: PEER_FRAME_MAGIC,
+        version: PEER_FRAME_VERSION,
+        frameType: PeerFrameType.HELLO,
+        srcNodeId: b.nodeId,
+        dstNodeId: a.nodeId,
+        streamId: 0,
+        seq: 0n,
+        ack: 0,
+      })
+      return Buffer.concat([header, payload])
+    }
+
+    mux.handleGatewayFrame(makeAck(360_000))
+    assert.equal(state.ciphers, null)
+    assert.equal(state.path, 'none')
+
+    mux.handleGatewayFrame(makeAck(120_000))
+    assert.notEqual(state.ciphers, null)
+    assert.equal(state.path, 'ws')
+  } finally {
+    mux.close()
+  }
+})
+
+test('dispatchFrame self-heals beginHello after initial 2.4s retry exhaustion with 2s cooldown', { timeout: 2000 }, async (t) => {
+  const clock = makeFakeClock(1_000_000)
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  let signalingUp = false
+  let A, B
+
+  A = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: a,
+    clock,
+    sendGatewayBinary: (bytes) => {
+      if (!signalingUp) return
+      B.handleGatewayFrame(bytes)
+    },
+    relayHandler: () => undefined,
+    relaySecret: () => 'test-secret',
+  })
+  B = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: b,
+    clock,
+    sendGatewayBinary: (bytes) => {
+      if (!signalingUp) return
+      A.handleGatewayFrame(bytes)
+    },
+    relayHandler: () => async (_req, res) => { res.end('healed') },
+    relaySecret: () => 'test-secret',
+  })
+  t.after(() => { A.close(); B.close() })
+
+  A.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+  B.ensureSession(a.nodeId, a.publicKeyHex, 'A')
+
+  A.enableRelayPath(b.nodeId)
+  clock.advance(2_900)
+  const session = A.sessions.get(b.nodeId)
+  assert.equal(session.ciphers, null)
+  assert.equal(session.helloTimer, null)
+  assert.equal(session.nonce, null)
+
+  signalingUp = true
+  const fetchPromise = A.createFetchForPeer(b.nodeId)('http://peer/heal')
+  fetchPromise.catch(() => {})
+  await immediate()
+  clock.advance(200)
+  let timer
+  try {
+    const res = await Promise.race([
+      fetchPromise,
+      new Promise((_, rej) => { timer = setTimeout(() => rej(new Error('self-heal fetch timeout')), 300) }),
+    ])
+    assert.equal(await res.text(), 'healed')
+  } finally {
+    clearTimeout(timer)
+  }
+})

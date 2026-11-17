@@ -68,6 +68,7 @@ function makeParts(name, overrides = {}) {
     ...(overrides.getApiFetch ? { getApiFetch: overrides.getApiFetch } : {}),
     ...(overrides.uploadCapBytes !== undefined ? { uploadCapBytes: overrides.uploadCapBytes } : {}),
     ...(overrides.drainDeadlineMs !== undefined ? { drainDeadlineMs: overrides.drainDeadlineMs } : {}),
+    ...(overrides.drainSlackBytes !== undefined ? { drainSlackBytes: overrides.drainSlackBytes } : {}),
   })
   return { handler, calls, streamCalls, gateway, store, home }
 }
@@ -583,7 +584,11 @@ test('invoke: a client disconnect aborts the signal the gateway call received', 
     // actually guards — where teardown propagates in milliseconds.
     await new Promise((resolve) => setTimeout(resolve, 100))
     req.destroy()
-    const outcome = await Promise.race([settled, new Promise((resolve) => setTimeout(() => resolve('timeout'), 5000))])
+    let timer
+    const outcome = await Promise.race([
+      settled,
+      new Promise((resolve) => { timer = setTimeout(() => resolve('timeout'), 5000) }),
+    ]).finally(() => clearTimeout(timer))
     assert.equal(outcome, true, 'the abort listener on the gateway signal fired (no timeout)')
     assert.equal(sawAborted, true, 'the gateway call saw signal.aborted === true')
     assert.ok(clientError !== null || req.destroyed, 'the client really hung up')
@@ -1651,29 +1656,19 @@ function endlessUpload(server, { waitMs, chunkEveryMs = 0, chunkBytes = 64 * 102
   })
 }
 
-test('T5x drain: an unshared session\'s endless body is cut within read + 8 MiB, not fed forever', async () => {
+test('T5x drain: an unshared session\'s endless body is cut within read + injected slack, not fed forever', async () => {
   const api = fakeUploadApiFetch(new Response('{}', { status: 200 }))
-  const parts = makeUploadParts('t5x-drain-bytes', { getApiFetch: () => api.dispatch })
+  const parts = makeUploadParts('t5x-drain-bytes', { getApiFetch: () => api.dispatch, drainSlackBytes: 64 * 1024 })
   // Nothing shared: the not-shared refusal's drain is the bound under test
-  // (fromBytes 0, so the cut lands at read + DRAIN_SLACK_BYTES).
+  // (fromBytes 0, so the cut lands at read + drainSlackBytes).
   const server = await startServer(parts.handler)
   try {
     const outcome = await endlessUpload(server, { waitMs: 20_000 })
     assert.equal(outcome.cut, true, 'the connection was cut while the body kept coming')
-    // The cut must be the BYTE bound: acked ≈ 8 MiB plus whatever sat in
-    // kernel buffers — never an unbounded feed. (A lower floor guards the
-    // flip side: a cut that came too early would make this vacuous.) The
-    // ceiling's slack is deliberate (2026-10-28 forensics: this case passes
-    // 10/10 in isolation on both the pre-phase baseline and main, and flakes
-    // at the same rate on BOTH when the whole file runs — baseline 2/6,
-    // main 1/6 — whole-file load sensitivity, not a regression; under load
-    // the bytes already accepted by the kernel between the count tripping
-    // and the socket dying grow, so the acked ceiling widens while the
-    // semantics — "not fed forever" — stay exactly as they were).
-    assert.ok(outcome.acked >= 2 * 1024 * 1024, `data really flowed before the cut (${outcome.acked} bytes)`)
+    assert.ok(outcome.acked >= 64 * 1024, `data really flowed before the cut (${outcome.acked} bytes)`)
     assert.ok(
-      outcome.acked <= 16 * 1024 * 1024,
-      `cut within read + 8 MiB, kernel-buffer slack included (acked ${outcome.acked} bytes)`,
+      outcome.acked <= 4 * 1024 * 1024,
+      `cut within read + 64 KiB slack, kernel-buffer slack included (acked ${outcome.acked} bytes)`,
     )
     assert.equal(api.seen.length, 0, 'an unshared endless upload never reached the host handler')
   } finally { await server.stop() }

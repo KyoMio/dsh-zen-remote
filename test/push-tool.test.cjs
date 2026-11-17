@@ -21,10 +21,9 @@ const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 
 const MODULE_URL = pathToFileURL(path.join(__dirname, '..', 'dsh-push.mjs')).href
-let importSeq = 0
+let pushPromise
 function freshImport() {
-  importSeq++
-  return import(`${MODULE_URL}?t=${importSeq}`)
+  return (pushPromise ??= import(MODULE_URL))
 }
 
 // Fake Cordis context: only what dsh-push.mjs actually touches (ctx.on,

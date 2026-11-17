@@ -96,7 +96,7 @@ export type SessionField = 'request.sessionId' | 'request.address' | 'request.pa
 /**
  * The client-side half of the server's `RELAY_METHODS` registry: which
  * argument field locates the session for each method. METHODS AND FIELDS
- * MUST stay identical to the server table (test/intercept.test.cjs pins the
+ * MUST stay identical to the server table (test/intercept-core.test.cjs pins the
  * equality by reading relay-access's table directly) — a method the server
  * does not serve would answer `forbidden-method` forever, and a field the
  * server does not check would strand a virtual id un-rewritten.

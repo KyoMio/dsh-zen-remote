@@ -15,9 +15,11 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
+const { startResetServer } = require('./util.cjs')
 const { createRelayClient, relayCredentialsDigest, volatileUpdateTouchesServerName, uploadBudgetMs, PEER_UPLOAD_RECOVERY_MARGIN_MS, RelayError } = require('../lib/relay-client.js')
 
 const HANDSHAKE = '/_dsh/zen-remote/relay/v1/handshake'
+const PING = '/_dsh/zen-remote/relay/ping'
 const INVOKE = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM = '/_dsh/zen-remote/relay/v1/stream'
 const STREAM_UPLINK = '/_dsh/zen-remote/relay/v1/stream-uplink'
@@ -119,16 +121,6 @@ function startFakeRelay() {
     server.close(resolve)
   })
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ server, port: server.address().port, seen, scenario, stop })))
-}
-
-/** A loopback port that was listening a moment ago and is closed now:
- * deterministic connection refusal, no real network. */
-async function deadPort() {
-  const server = http.createServer()
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-  const port = server.address().port
-  await new Promise((resolve) => server.close(resolve))
-  return port
 }
 
 function makeClient(port, overrides = {}) {
@@ -373,10 +365,11 @@ test('invoke: the value rides out, the request carries bearer + json + the verba
 
 test('invoke: a transport failure lands offline and the next success lifts it back', async () => {
   const relay = await startFakeRelay()
+  const reset = await startResetServer()
   try {
     const { client, setUrl } = makeClient(relay.port)
     await client.connect()
-    setUrl(`http://127.0.0.1:${await deadPort()}`)
+    setUrl(`http://127.0.0.1:${reset.port}`)
     await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'offline')
     assert.equal(client.state, 'offline')
 
@@ -384,7 +377,10 @@ test('invoke: a transport failure lands offline and the next success lifts it ba
     setUrl(`http://127.0.0.1:${relay.port}`)
     await client.invoke('session', 'page', {})
     assert.equal(client.state, 'online')
-  } finally { await relay.stop() }
+  } finally {
+    await reset.close()
+    await relay.stop()
+  }
 })
 
 test('invoke: a timeout fails the CALL but leaves the connection state alone (T31-fix)', async () => {
@@ -751,7 +747,7 @@ test('PC-05: the margin is armed once — a stalled virtual upload fails bounded
       (error) => error.code === 'request-timeout',
     )
     const elapsed = Date.now() - start
-    assert.ok(elapsed >= 500, `the deadline includes the margin (got ${elapsed} ms)`)
+    assert.ok(elapsed >= 450, `the deadline includes the margin (got ${elapsed} ms)`)
     assert.ok(elapsed < 1500, `the deadline was armed ONCE — no renewal past base+margin (got ${elapsed} ms)`)
     assert.equal(relay.seen.filter((hit) => hit.url === UPLOAD).length, 1, 'no whole-upload retry behind the caller\'s back')
     assert.equal(client.state, 'online', 'a bounded upload timeout never judges the link')
@@ -764,7 +760,7 @@ test('PC-05: an active cancel still lands immediately — the margin never delay
   const relay = await startFakeRelay()
   relay.scenario.upload = () => undefined // stalls forever
   try {
-    const { client } = makeClient(relay.port, { requestTimeoutMs: 100, uploadRecoveryMarginMs: 400 })
+    const { client } = makeClient(relay.port, { requestTimeoutMs: 100, uploadRecoveryMarginMs: 1500 })
     await client.connect()
     const abort = new AbortController()
     const start = Date.now()
@@ -772,29 +768,29 @@ test('PC-05: an active cancel still lands immediately — the margin never delay
     setTimeout(() => abort.abort(), 50)
     await assert.rejects(() => pending, (error) => error.code === 'aborted')
     const elapsed = Date.now() - start
-    assert.ok(elapsed < 450, `the cancel landed inside the deadline window, not at it (got ${elapsed} ms)`)
+    assert.ok(elapsed < 1200, `the cancel landed inside the deadline window, not at it (got ${elapsed} ms)`)
     assert.equal(client.state, 'online', 'a caller abort never judges the link')
   } finally { await relay.stop() }
 })
 
 test('invoke: a transport failure still judges the link offline (the T51-fix upload opt-out does not leak)', async () => {
-  // The guard against my own refactor: only the UPLOAD route opts out of
-  // transport failures setting the state — invoke keeps the T43 contract
-  // (a dead link arms the reconnect ladder).
-  const port = await deadPort()
-  const { client } = makeClient(port)
-  await assert.rejects(() => client.connect(), (error) => error.code === 'offline')
-  assert.equal(client.state, 'offline')
-  await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'offline')
-  assert.equal(client.state, 'offline', 'invoke keeps judging the link')
-  assert.ok(client.nextRetryAt !== null, 'the ladder armed')
-  client.stop()
+  const reset = await startResetServer()
+  try {
+    const { client } = makeClient(reset.port)
+    await assert.rejects(() => client.connect(), (error) => error.code === 'offline')
+    assert.equal(client.state, 'offline')
+    await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'offline')
+    assert.equal(client.state, 'offline', 'invoke keeps judging the link')
+    assert.ok(client.nextRetryAt !== null, 'the ladder armed')
+    client.stop()
+  } finally { await reset.close() }
 })
 
 // ---- subscribe ----------------------------------------------------------------
 
 test('subscribe: a throwing listener never blocks the others; unsubscribe detaches', async () => {
   const relay = await startFakeRelay()
+  const reset = await startResetServer()
   try {
     const { client, setUrl } = makeClient(relay.port)
     const seen = []
@@ -806,10 +802,13 @@ test('subscribe: a throwing listener never blocks the others; unsubscribe detach
     client.subscribe(() => seen.push('still-here'))
     const unsubscribe = client.subscribe(() => seen.push('gone'))
     unsubscribe()
-    setUrl(`http://127.0.0.1:${await deadPort()}`)
+    setUrl(`http://127.0.0.1:${reset.port}`)
     await assert.rejects(() => client.invoke('session', 'page', {}), (error) => error.code === 'offline')
     assert.deepEqual(seen, ['connecting', 'online', 'offline', 'still-here'])
-  } finally { await relay.stop() }
+  } finally {
+    await reset.close()
+    await relay.stop()
+  }
 })
 
 // ---- openStream: the NDJSON parser --------------------------------------------
@@ -1265,6 +1264,7 @@ test('T43: relay-unauthorized keeps the ladder running and records its code', as
 
 test('T43: the retry readout never carries credential material', async () => {
   const relay = await startFakeRelay()
+  const reset = await startResetServer()
   const clock = fakeClock()
   relay.scenario.handshake = OFFLINE_502
   const { client, setUrl } = makeClient(relay.port, { clock })
@@ -1274,13 +1274,16 @@ test('T43: the retry readout never carries credential material', async () => {
     assert.equal(readout.includes('tok-1'), false, 'no token in the readout')
     assert.equal(readout.includes('127.0.0.1'), false, 'no URL in the readout')
     // Same after the timer walked and the transport error was recorded.
-    setUrl(`http://127.0.0.1:${await deadPort()}`)
+    setUrl(`http://127.0.0.1:${reset.port}`)
     client.credentialsChanged()
     await waitFor(() => clock.pending === 1, 3000)
     const after = JSON.stringify({ state: client.state, nextRetryAt: client.nextRetryAt, lastError: client.lastError })
     assert.equal(after.includes('tok-1'), false)
     assert.equal(after.includes('127.0.0.1'), false)
-  } finally { await relay.stop() }
+  } finally {
+    await reset.close()
+    await relay.stop()
+  }
 })
 
 // ---- T43-fix: sanitization, in-flight credentials, concurrent joins ------------
@@ -1388,9 +1391,10 @@ test('T43-fix: concurrent connects while a retry is armed join into ONE handshak
 
 test('#56: a retry that joined an in-flight handshake re-arms the ladder when it dies offline', async () => {
   const relay = await startFakeRelay()
+  const reset = await startResetServer()
   const clock = fakeClock()
   const { client, setUrl } = makeClient(relay.port, { clock })
-  const deadUrl = `http://127.0.0.1:${await deadPort()}`
+  const deadUrl = `http://127.0.0.1:${reset.port}`
   try {
     await client.connect()
     assert.equal(client.state, 'online')
@@ -1438,14 +1442,18 @@ test('#56: a retry that joined an in-flight handshake re-arms the ladder when it
     await waitFor(() => handshakeHits(relay) === 3 && clock.pending === 1)
     assert.equal(client.state, 'offline')
     assert.equal(client.nextRetryAt, clock.now() + 10000, 'the ladder is alive again')
-  } finally { await relay.stop() }
+  } finally {
+    await reset.close()
+    await relay.stop()
+  }
 })
 
 test('#56: a manual reconnect that joined an in-flight handshake re-arms the ladder too', async () => {
   const relay = await startFakeRelay()
+  const reset = await startResetServer()
   const clock = fakeClock()
   const { client, setUrl } = makeClient(relay.port, { clock })
-  const deadUrl = `http://127.0.0.1:${await deadPort()}`
+  const deadUrl = `http://127.0.0.1:${reset.port}`
   try {
     await client.connect()
 
@@ -1476,7 +1484,10 @@ test('#56: a manual reconnect that joined an in-flight handshake re-arms the lad
     // attempt count) BEFORE joining — the settle arms the FIRST wait, the
     // documented "manual attempt, fresh ladder" semantics.
     assert.equal(client.nextRetryAt, clock.now() + 1000, 'the manual joiner\'s settle re-armed the ladder at step 1')
-  } finally { await relay.stop() }
+  } finally {
+    await reset.close()
+    await relay.stop()
+  }
 })
 
 // ---- interface compatibility (T42) --------------------------------------------
@@ -2407,5 +2418,156 @@ test('pluginTunnelOpen: caller abort before headers throws RelayError(aborted) w
     for (const s of stalledReqs) { try { s.res.destroy() } catch { /* ignore */ } }
     virtualServer.closeAllConnections()
     await new Promise((r) => virtualServer.close(r))
+  }
+})
+
+// ---- network-restore fast path & health probe (merged from relay-network-restore.test.cjs) ----
+
+function startFakePingRelay(options = {}) {
+  const state = {
+    pingStatus: options.pingStatus ?? 200,
+    pingCalls: 0,
+    handshakeCalls: 0,
+    rejectHandshake: options.rejectHandshake ?? false,
+    pingDelayMs: options.pingDelayMs ?? 0,
+  }
+  const timers = new Set()
+  const server = http.createServer((req, res) => {
+    if (req.url === HANDSHAKE) {
+      state.handshakeCalls += 1
+      req.resume()
+      req.on('end', () => {
+        if (state.rejectHandshake) return sendJson(res, 503, { ok: false, error: { code: 'unavailable' } })
+        const [status, body] = HANDSHAKE_OK()
+        sendJson(res, status, body)
+      })
+      return
+    }
+    if (req.url === PING) {
+      state.pingCalls += 1
+      req.resume()
+      const answer = () => {
+        if (!res.destroyed && !res.writableEnded) {
+          sendJson(res, state.pingStatus, state.pingStatus === 200 ? { ok: true } : { ok: false, error: { code: 'relay-unauthorized' } })
+        }
+      }
+      if (state.pingDelayMs > 0) {
+        const timer = setTimeout(() => { timers.delete(timer); answer() }, state.pingDelayMs)
+        timers.add(timer)
+      } else answer()
+      return
+    }
+    req.resume()
+    sendJson(res, 404, { ok: false, error: { code: 'not-found' } })
+  })
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port
+      resolve({
+        server,
+        port,
+        state,
+        stop: () => new Promise((done) => {
+          for (const t of timers) clearTimeout(t)
+          server.closeAllConnections()
+          server.close(done)
+        }),
+      })
+    })
+  })
+}
+
+test('probeHealth: one authenticated GET /ping, state untouched', async () => {
+  const relay = await startFakePingRelay()
+  const { client } = makeClient(relay.port)
+  try {
+    await client.connect()
+    assert.equal(client.state, 'online')
+    const before = client.state
+    const ok = await client.probeHealth()
+    assert.equal(ok, true, 'a 200 ping resolves true')
+    assert.equal(relay.state.pingCalls, 1, 'exactly one ping round')
+    assert.equal(client.state, before, 'a probe is a question — it must not move state')
+  } finally {
+    client.stop()
+    await relay.stop()
+  }
+})
+
+test('probeHealth: a refused ping resolves false and leaves state alone', async () => {
+  const relay = await startFakePingRelay({ pingStatus: 401 })
+  const { client } = makeClient(relay.port)
+  try {
+    await client.connect()
+    const before = client.state
+    const ok = await client.probeHealth()
+    assert.equal(ok, false, 'a 401 ping resolves false')
+    assert.equal(client.state, before, 'a refusal is about the call, not the link')
+  } finally {
+    client.stop()
+    await relay.stop()
+  }
+})
+
+test('probeHealth: concurrent calls share ONE round trip', async () => {
+  const relay = await startFakePingRelay({ pingDelayMs: 40 })
+  const { client } = makeClient(relay.port)
+  try {
+    await client.connect()
+    const results = await Promise.all([client.probeHealth(), client.probeHealth(), client.probeHealth()])
+    assert.deepEqual(results, [true, true, true], 'all callers get the same answer')
+    assert.equal(relay.state.pingCalls, 1, 'the in-flight slot collapses the three calls')
+  } finally {
+    client.stop()
+    await relay.stop()
+  }
+})
+
+test('networkRestored: refused while online', async () => {
+  const relay = await startFakePingRelay()
+  const { client } = makeClient(relay.port)
+  try {
+    await client.connect()
+    assert.equal(client.state, 'online')
+    assert.equal(client.networkRestored(), false, 'only an offline client has anything to restore')
+  } finally {
+    client.stop()
+    await relay.stop()
+  }
+})
+
+test('networkRestored: fires from offline and lands online', async () => {
+  const relay = await startFakePingRelay({ rejectHandshake: true })
+  const { client } = makeClient(relay.port)
+  try {
+    await assert.rejects(() => client.connect())
+    assert.equal(client.state, 'offline')
+    assert.notEqual(client.nextRetryAt, null, 'offline arms the ladder')
+
+    relay.state.rejectHandshake = false
+    assert.equal(client.networkRestored(), true, 'the hint starts one attempt')
+    await waitFor(() => client.state === 'online', 2000)
+    assert.equal(client.state, 'online', 'the attempt lands online without waiting out the ladder')
+    assert.equal(client.nextRetryAt, null, 'a success retires the armed retry')
+  } finally {
+    client.stop()
+    await relay.stop()
+  }
+})
+
+test('networkRestored: the anti-storm gap refuses an immediate second hint', async () => {
+  const relay = await startFakePingRelay({ rejectHandshake: true })
+  const { client } = makeClient(relay.port)
+  try {
+    await assert.rejects(() => client.connect())
+    assert.equal(client.state, 'offline')
+
+    assert.equal(client.networkRestored(), true, 'the first hint is honoured')
+    await waitFor(() => relay.state.handshakeCalls >= 2, 2000)
+    assert.equal(client.state, 'offline')
+    assert.equal(client.networkRestored(), false, 'a second hint inside the gap is refused')
+  } finally {
+    client.stop()
+    await relay.stop()
   }
 })

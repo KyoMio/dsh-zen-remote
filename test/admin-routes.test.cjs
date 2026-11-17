@@ -19,7 +19,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
-const { request } = require('./util.cjs')
+const { request, startResetServer } = require('./util.cjs')
 
 const ADMIN_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'admin-routes.js')).href
 
@@ -276,14 +276,8 @@ test('a cross-site POST is refused before any forward', async () => {
 })
 
 test('an unreachable gateway degrades per route', async () => {
-  // A port that was listening a moment ago and is closed now: connection
-  // refused, deterministically, without waiting out the 5s timeout.
-  const dead = http.createServer()
-  await new Promise((resolve) => dead.listen(0, '127.0.0.1', resolve))
-  const deadPort = dead.address().port
-  await new Promise((resolve) => dead.close(resolve))
-
-  const { server, port } = await startAdminServer(makeOptions(gwPort, { gatewayBase: `http://127.0.0.1:${deadPort}` }))
+  const reset = await startResetServer()
+  const { server, port } = await startAdminServer(makeOptions(gwPort, { gatewayBase: `http://127.0.0.1:${reset.port}` }))
   try {
     const status = await request(port, { method: 'GET', path: admin.ADMIN_STATUS_ROUTE })
     assert.equal(status.status, 200)
@@ -299,6 +293,7 @@ test('an unreachable gateway degrades per route', async () => {
     assert.equal(JSON.parse(pair.body).error.code, 'gateway-unreachable')
   } finally {
     await closeServer(server)
+    await reset.close()
   }
 })
 

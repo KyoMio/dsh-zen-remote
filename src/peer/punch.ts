@@ -451,6 +451,9 @@ export interface PeerPunchOptions {
   /** Silent reprobe interval from the 3rd retry on (the first two fire
    *  at 5s/15s so a dead endpoint is abandoned quickly). */
   reprobeIntervalMs?: number
+  /** Initial delays (ms) for the first two silent reprobe attempts; defaults
+   *  to [5000, 15000]. Tests inject smaller values. */
+  reprobeInitialDelaysMs?: readonly [number, number]
   /** Encrypted PING cadence once direct (spec: 5s). */
   keepAliveMs?: number
   /** Silent keepalive cycles that declare the direct path lost (spec: 3). */
@@ -540,6 +543,13 @@ export class PeerPunchManager {
     knob(options.punchRounds, 10, 'punchRounds')
     knob(options.punchWindowMs, 1000, 'punchWindowMs')
     knob(options.reprobeIntervalMs, 60_000, 'reprobeIntervalMs')
+    if (options.reprobeInitialDelaysMs !== undefined) {
+      if (!Array.isArray(options.reprobeInitialDelaysMs) || options.reprobeInitialDelaysMs.length !== 2) {
+        throw new RangeError('reprobeInitialDelaysMs must be a 2-tuple of integers ≥ 1')
+      }
+      knob(options.reprobeInitialDelaysMs[0], 5_000, 'reprobeInitialDelaysMs[0]')
+      knob(options.reprobeInitialDelaysMs[1], 15_000, 'reprobeInitialDelaysMs[1]')
+    }
     knob(options.keepAliveMs, 5000, 'keepAliveMs')
     knob(options.keepAliveLostFrames, 3, 'keepAliveLostFrames')
     this.clock = options.clock ?? realClock
@@ -876,8 +886,9 @@ export class PeerPunchManager {
     // (5s/15s); the option governs the 3rd-and-later cadence. The count
     // resets on session rebuild (createSession) and on completeDirect.
     session.reprobeAttempts += 1
-    const delay = session.reprobeAttempts === 1 ? 5_000
-      : session.reprobeAttempts === 2 ? 15_000
+    const [firstDelayMs, secondDelayMs] = this.options.reprobeInitialDelaysMs ?? [5_000, 15_000]
+    const delay = session.reprobeAttempts === 1 ? firstDelayMs
+      : session.reprobeAttempts === 2 ? secondDelayMs
       : this.reprobeIntervalMsOrDefault()
     this.armTimer(session, () => {
       if (this.closed || session.state !== 'idle') return

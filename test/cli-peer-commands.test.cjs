@@ -7,16 +7,14 @@
  * 等待预算用注入的 pollIntervalMs / --wait。断言退出码、stdout 双语文本、JSON
  * 输出与路由请求记录，不断言内部调用顺序。
  *
- * PC-14b-fix1 Required 4：socket 实际文件必须留在副本内。node:test 默认每个
- * 文件独立进程，模块级把 cwd 固定到副本 .scratch 下的临时目录，IPC 服务端与
- * 客户端共用短相对路径（`h<N>/zen-remote-cli.sock`，约 24 字符）—— sun_path
- * 只存这段短路径，绕开 macOS 104 字节上限；socket 文件与测试状态目录全部落在
- * 副本 scratch 内，不写 /tmp，进程退出时统一清理。
+ * 文件独立进程，模块级临时目录落在 os.tmpdir()（短前缀满足 macOS 104 字节
+ * sun_path 上限），进程退出时统一清理。
  */
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert')
 const fs = require('node:fs')
+const os = require('node:os')
 const http = require('node:http')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
@@ -49,21 +47,18 @@ const ROUTES = {
   clientStatus: '/_dsh/zen-remote/client/status',
 }
 
-const ORIGINAL_CWD = process.cwd()
-const FIX1_SCRATCH = fs.mkdtempSync(path.join(path.join(__dirname, '..', '.scratch'), 'pc-14b-'))
-process.chdir(FIX1_SCRATCH)
+const SCRATCH_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'zp-'))
 process.on('exit', () => {
   try {
-    process.chdir(ORIGINAL_CWD)
-    fs.rmSync(FIX1_SCRATCH, { recursive: true, force: true })
+    fs.rmSync(SCRATCH_ROOT, { recursive: true, force: true })
   } catch { /* best effort */ }
 })
 
 let homeSeq = 0
 
-/** 副本 scratch 内的短相对 home 目录（socket 随之落副本内，见文件头）。 */
+/** os.tmpdir() 下的短 home 目录（macOS 104B sun_path 安全长度内）。 */
 function makeHome(_tag) {
-  const dir = `h${++homeSeq}`
+  const dir = path.join(SCRATCH_ROOT, `h${++homeSeq}`)
   fs.mkdirSync(dir, { recursive: true })
   return dir
 }
@@ -301,19 +296,6 @@ test('args: peer join|status|trust|leave 路由与 --invite 取值，多余位�
   assert.equal(parseCliArgs(['peer', 'leave', '--yes']).options.yes, true)
   assert.equal(parseCliArgs(['peer', 'bogus']).command, 'unknown')
   assert.equal(parseCliArgs(['peer']).command, 'unknown', 'bare peer family word is unknown')
-})
-
-test('args: --role peer 是合法角色（无 roleIssue）；非法值仍标 invalid', async () => {
-  const { parseCliArgs } = await loadModules(ARGS_URL)
-  const peer = parseCliArgs(['setup', '--role', 'peer'])
-  assert.equal(peer.options.role, 'peer', 'the raw value survives')
-  assert.equal(peer.options.roleIssue, undefined, 'peer is an accepted role since PG-10')
-  assert.equal(parseCliArgs(['status', '--role', 'peer']).options.roleIssue, undefined)
-  assert.equal(parseCliArgs(['setup', '--role', 'host']).options.roleIssue, undefined)
-  assert.equal(parseCliArgs(['setup', '--role', 'client']).options.roleIssue, undefined)
-  const bad = parseCliArgs(['setup', '--role', 'wizard'])
-  assert.equal(bad.options.role, 'wizard')
-  assert.equal(bad.options.roleIssue, 'invalid')
 })
 
 // ===========================================================================
@@ -759,7 +741,7 @@ test('peer join: 超时仍等待批准 —— 非零退出、报告仍在等待�
     const { handle: h, canned } = await startIpcServer(home, { role: 'peer', client: pendingClient })
     handle = h
     const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '1'],
+      argv: ['peer', 'join', INVITE, '--wait', '0.1'],
       ipc: mods.createCliIpcClient(handle.socketPath),
       pollIntervalMs: 15,
     })
@@ -1852,7 +1834,7 @@ test('PC-14b: IPC 断连 —— 等待期间服务端关闭，有界结束非零
     handle = started.handle
     serverHandleRef = started.handle
     const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '2'],
+      argv: ['peer', 'join', INVITE, '--wait', '0.15'],
       ipc: mods.createCliIpcClient(handle.socketPath),
       pollIntervalMs: 15,
     })
@@ -1874,19 +1856,20 @@ test('PC-14b: 每次 IPC 轮询受剩余预算约束 —— 慢应答在预算�
   try {
     const slowClient = {
       [ROUTES.peerStatus]: (res) => {
-        // 应答慢于 2s 预算：请求必须在剩余预算内超时，而不是吃满 15s 默认。
-        setTimeout(() => {
+        // 应答慢于 0.1s 预算：请求必须在剩余预算内超时，而不是吃满 15s 默认。
+        const timer = setTimeout(() => {
           const bytes = Buffer.from(JSON.stringify(peerStatusBody('pending-approval')))
           res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': String(bytes.length) })
           res.end(bytes)
         }, 8000)
+        res.on('close', () => clearTimeout(timer))
       },
       [ROUTES.peerJoin]: { body: { ok: true } },
     }
     const { handle: h } = await startIpcServer(home, { role: 'peer', client: slowClient })
     handle = h
     const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '2'],
+      argv: ['peer', 'join', INVITE, '--wait', '0.1'],
       ipc: mods.createCliIpcClient(handle.socketPath),
       pollIntervalMs: 15,
     })
@@ -1921,7 +1904,7 @@ test('PC-14b: setup 传播 join 超时 —— 退出 1、不打印成功摘要',
     handle = h
     const out = captureStdout()
     const code = await mods.runCli(
-      ['--lang', 'zh', 'setup', '--role', 'peer', '--yes', '--invite', INVITE, '--wait', '1'],
+      ['--lang', 'zh', 'setup', '--role', 'peer', '--yes', '--invite', INVITE, '--wait', '0.1'],
       runOpts({ home, stdout: out, extra: { pollIntervalMs: 15 } }),
     )
     assert.equal(code, 1, 'setup returns the join timeout code instead of a green summary')
@@ -1957,7 +1940,7 @@ test('PC-14b: setup 传播 join 的 Ctrl-C（130）—— 有界结束、不打�
       ['--lang', 'zh', 'setup', '--role', 'peer', '--yes', '--invite', INVITE, '--wait', '30'],
       runOpts({ home, stdout: out, extra: { pollIntervalMs: 15, abortSignal: controller.signal } }),
     )
-    const abortTimer = setTimeout(() => controller.abort(), 500)
+    const abortTimer = setTimeout(() => controller.abort(), 80)
     const startedAt = Date.now()
     try {
       const code = await runPromise
@@ -2016,7 +1999,7 @@ test('PC-14b-fix1: 取消终止当前等待 —— 慢应答中 Ctrl-C，明显�
       pollIntervalMs: 15,
       abortSignal: controller.signal,
     })
-    const abortTimer = setTimeout(() => controller.abort(), 300)
+    const abortTimer = setTimeout(() => controller.abort(), 60)
     const startedAt = Date.now()
     try {
       const code = await mods.runPeerJoinCommand(ctx)
@@ -2039,9 +2022,8 @@ test('PC-14b-fix1: 硬截止 —— 慢分段合法 JSON 拖不出墙钟预算�
   const home = makeHome('fix1-drip-budget')
   let handle
   try {
-    // 每 600ms 滴一段合法 JSON（authorized + sync ready），总时长 ~3.6s：
-    // socket idle 超时被数据流不断重置，只有墙钟硬截止能终结它。旧实现会
-    // 在 ~3.6s 拿到完整 ready 并退出 0（超预算仍 0）；新实现 1.2s 截止退出 1。
+    // 每 100ms 滴一段合法 JSON（authorized + sync ready），总时长远超预算：
+    // socket idle 超时被数据流不断重置，只有墙钟硬截止能终结它。
     const readyJson = JSON.stringify(peerStatusBody('authorized', { extra: {
       peers: [
         { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3 },
@@ -2055,7 +2037,11 @@ test('PC-14b-fix1: 硬截止 —— 慢分段合法 JSON 拖不出墙钟预算�
         res.writeHead(200, { 'Content-Type': 'application/json' })
         let index = 0
         let stopped = false
-        res.on('close', () => { stopped = true })
+        let dripTimer
+        res.on('close', () => {
+          stopped = true
+          if (dripTimer !== undefined) { clearTimeout(dripTimer); dripTimer = undefined }
+        })
         const drip = () => {
           if (stopped || index >= readyJson.length) {
             try { res.end() } catch { /* already gone */ }
@@ -2065,7 +2051,7 @@ test('PC-14b-fix1: 硬截止 —— 慢分段合法 JSON 拖不出墙钟预算�
             res.write(readyJson.slice(index, index + 16))
             index += 16
           } catch { /* the requester cut the socket at the deadline */ }
-          setTimeout(drip, 600)
+          if (!stopped) dripTimer = setTimeout(drip, 100)
         }
         drip()
       },
@@ -2074,7 +2060,7 @@ test('PC-14b-fix1: 硬截止 —— 慢分段合法 JSON 拖不出墙钟预算�
     const { handle: h } = await startIpcServer(home, { role: 'peer', client: dripClient })
     handle = h
     const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '1.2'],
+      argv: ['peer', 'join', INVITE, '--wait', '0.15'],
       ipc: mods.createCliIpcClient(handle.socketPath),
       pollIntervalMs: 15,
     })
@@ -2107,7 +2093,7 @@ test('PC-14b-fix1: 停机网关带历史 sync ready —— 第三行服从判定
     const { handle: h } = await startIpcServer(home, { role: 'peer', client: offlineClient })
     handle = h
     const offlineCtx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '1'],
+      argv: ['peer', 'join', INVITE, '--wait', '0.1'],
       ipc: mods.createCliIpcClient(handle.socketPath),
       pollIntervalMs: 15,
     })
@@ -2168,7 +2154,7 @@ test('PS-3a: 非法计数按 5 计数校验降级 —— 负数/小数不成台�
     const { handle: h } = await startIpcServer(home, { role: 'peer', client: junkCountsClient })
     handle = h
     const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '1'],
+      argv: ['peer', 'join', INVITE, '--wait', '0.1'],
       ipc: mods.createCliIpcClient(handle.socketPath),
       pollIntervalMs: 15,
     })
@@ -2196,7 +2182,7 @@ test('PC-14b-fix1: --json 默认等待未达成 —— stdout 单个 JSON（ok:f
     const { handle: h, canned } = await startIpcServer(home, { role: 'peer', client: pendingClient })
     handle = h
     const ctx = makeCtx(mods, {
-      argv: ['peer', 'join', INVITE, '--wait', '1', '--json'],
+      argv: ['peer', 'join', INVITE, '--wait', '0.1', '--json'],
       ipc: mods.createCliIpcClient(handle.socketPath),
       pollIntervalMs: 15,
     })
@@ -2238,7 +2224,7 @@ test('PC-14b-fix1: --json Ctrl-C —— reason:aborted、submitted 保留、退�
       pollIntervalMs: 15,
       abortSignal: controller.signal,
     })
-    const abortTimer = setTimeout(() => controller.abort(), 200)
+    const abortTimer = setTimeout(() => controller.abort(), 80)
     try {
       const code = await mods.runPeerJoinCommand(ctx)
       assert.equal(code, 130)

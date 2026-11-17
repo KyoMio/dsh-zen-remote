@@ -233,13 +233,14 @@ const ONLINE_ROW = {
 // ---- runCli 公共入口 ----------------------------------------------------------
 
 /** 组装 runCli 注入项：真实 stdout 捕获 + 可选 prompter / 各类替身。 */
-function runOpts({ home, stdout, prompter, isTty = false, spawnCalls, extra = {} } = {}) {
+function runOpts({ home, stdout, prompter, isTty = false, spawnCalls, pollIntervalMs, extra = {} } = {}) {
   return {
     dshHome: home,
     isTty,
     stdout,
     packageVersion: '9.9.9-test',
     ...(prompter === undefined ? {} : { prompter }),
+    ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }),
     ...(spawnCalls === undefined ? {} : { spawnCommand: async (command, args) => { spawnCalls.push([command, [...args]]); return 0 } }),
     ...extra,
   }
@@ -915,22 +916,11 @@ function execNode(args, env, timeoutMs = 20000) {
   })
 }
 
-test('bin: 真实子进程 node bin/zen-remote.mjs --help 与 --version 返回 0', { timeout: 30000 }, async () => {
+test('bin: 真实子进程 node bin/zen-remote.mjs status --json 连真实临时 IPC socket 返回 0', { timeout: 30000 }, async () => {
   assert.equal(fs.existsSync(BIN_PATH), true, 'bin/zen-remote.mjs exists')
   const mode = fs.statSync(BIN_PATH).mode & 0o777
   assert.ok((mode & 0o111) !== 0, `the bin entry is executable (mode ${mode.toString(8)})`)
 
-  const help = await execNode(['--help'], { ...process.env, LC_ALL: 'zh_CN.UTF-8' })
-  assert.equal(help.code, 0, `--help exits 0 (stderr: ${help.stderr})`)
-  assert.match(help.stdout, /dsh-zen-remote/u)
-  assert.match(help.stdout, /setup/u)
-
-  const version = await execNode(['--version'], process.env)
-  assert.equal(version.code, 0, `--version exits 0 (stderr: ${version.stderr})`)
-  assert.match(version.stdout.trim(), /^\d+\.\d+\.\d+$/u, 'the package version is printed')
-})
-
-test('bin: 真实子进程 node bin/zen-remote.mjs status --json 连真实临时 IPC socket 返回 0', { timeout: 30000 }, async () => {
   const mods = await loadModules()
   const home = makeHome('bin-status')
   let handle

@@ -59,7 +59,7 @@ function num(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
-/** Parse one route body. Exported for scripts/check-client-config.mjs. */
+/** Parse one route body. Exported for test/mobile-viewport-compat.test.mjs. */
 export function parseClientConfig(body: unknown): ClientConfig {
   const row: Record<string, unknown> = typeof body === 'object' && body !== null
     ? body as Record<string, unknown>

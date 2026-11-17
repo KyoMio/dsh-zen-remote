@@ -605,7 +605,7 @@ export class TlsManager {
     const certTarget = await this.resolveContainedWritePath(certFile);
     const keyTarget = await this.resolveContainedWritePath(keyFile);
 
-    this.suppressWatchUntilMs = Date.now() + this.debounceMs + 300;
+    this.suppressWatchUntilMs = this.now() + this.debounceMs + 300;
     await this.atomicWriteFile(certTarget.dirReal, certTarget.targetPath, input.certPem, 0o644);
     await this.atomicWriteFile(keyTarget.dirReal, keyTarget.targetPath, input.keyPem, 0o600);
     return parsed;
@@ -730,7 +730,7 @@ export class TlsManager {
       this.watcher = fs.watch(this.certDir, (_eventType, filename) => {
         if (this.closed) return;
         if (typeof filename === 'string' && filename.startsWith('.')) return;
-        if (Date.now() < this.suppressWatchUntilMs) return;
+        if (this.now() < this.suppressWatchUntilMs) return;
         this.scheduleDebouncedReload();
       });
       this.watcher.on('error', () => {

@@ -20,6 +20,7 @@ const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 const { request } = require('./util.cjs')
+const { waitFor } = require('./helpers/plugin-bridge-harness.cjs')
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-tunnel-'))
 process.on('exit', () => { try { fs.rmSync(ROOT, { recursive: true, force: true }) } catch { /* best effort */ } })
@@ -164,8 +165,17 @@ function readLines(res) {
       if (pending.length > 0) return Promise.resolve(pending.shift())
       if (done) return Promise.resolve(null)
       return new Promise((resolve) => {
-        waiters.push((line) => resolve(line === null ? null : line))
-        setTimeout(() => resolve(null), timeoutMs)
+        let timer
+        const onLine = (line) => {
+          clearTimeout(timer)
+          resolve(line === null ? null : line)
+        }
+        waiters.push(onLine)
+        timer = setTimeout(() => {
+          const idx = waiters.indexOf(onLine)
+          if (idx >= 0) waiters.splice(idx, 1)
+          resolve(null)
+        }, timeoutMs)
       })
     },
   }
@@ -257,7 +267,7 @@ test('PB-10 tunnel: consent gates server-scope upgrades; the happy path dials th
     assert.match(open.tunnel, /^[0-9a-f]{32}$/)
     // The upstream dialed: the upgrade request with Host, Upgrade headers,
     // the cookie, and NO Origin.
-    await new Promise((resolve) => setTimeout(resolve, 80))
+    await waitFor(() => wiring.upstream.state.connections.some((c) => c.headDone))
     const conn = wiring.upstream.state.connections.at(-1)
     assert.ok(conn, 'the upstream was dialed')
     assert.match(conn.head, /^GET \/panel\/ws\?sessionId=session-shared HTTP\/1\.1\r\n/)
@@ -271,7 +281,7 @@ test('PB-10 tunnel: consent gates server-scope upgrades; the happy path dials th
     // Client aborts the open stream → the upstream socket is destroyed.
     const conn2 = conn
     abortOpen.abort()
-    await new Promise((resolve) => setTimeout(resolve, 200))
+    await waitFor(() => conn2.closed === true)
     assert.ok(conn2.closed, 'the upstream socket was destroyed after the open stream died')
   } finally {
     await stop()
@@ -292,16 +302,15 @@ test('PB-10 tunnel: device binding, ordered sends, out-of-order closes, budget o
       body: 'x',
     })
   try {
-    const open = await openTunnel(base)
-    assert.equal(open.status, 200)
-    const openLine = await open.lines.next()
-    const tunnelId = JSON.parse(openLine).tunnel
-
     // Upstream answers 101 and records incoming bytes.
     wiring.upstream.hooks.onConnection = (entry) => {
       entry.socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
     }
-    await new Promise((resolve) => setTimeout(resolve, 60))
+    const open = await openTunnel(base)
+    assert.equal(open.status, 200)
+    const openLine = await open.lines.next()
+    const tunnelId = JSON.parse(openLine).tunnel
+    await waitFor(() => wiring.upstream.state.connections.some((c) => c.headDone))
 
     // Another device's send is tunnel-unknown.
     const foreign = await send(tunnelId, 0, 'dev-2')
@@ -337,10 +346,11 @@ test('PB-10 tunnel: device binding, ordered sends, out-of-order closes, budget o
     const ninth = await openTunnel(base)
     assert.equal(ninth.status, 429)
     assert.equal(ninth.marker, 'busy')
+    const targetClosed = wiring.upstream.state.connections.length
     for (const ac of aborts) {
       ac.abort()
     }
-    await new Promise((resolve) => setTimeout(resolve, 200))
+    await waitFor(() => wiring.upstream.state.closed.length >= targetClosed)
     const recovery = await openTunnel(base)
     assert.equal(recovery.status, 200, 'a freed slot is reusable')
 

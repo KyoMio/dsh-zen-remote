@@ -1,64 +1,128 @@
+'use strict'
 const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const path = require('node:path')
 const test = require('node:test')
 
-const read = (...parts) => fs.readFileSync(path.join(__dirname, '..', ...parts), 'utf8')
-const effect = read('src', 'client', 'effects', 'workbench-ref-close.ts')
-const index = read('src', 'client', 'index.tsx')
-const gestures = read('src', 'client', 'effects', 'gestures.ts')
-const header = read('src', 'client', 'MobileSessionHeader.tsx')
-const panels = read('src', 'client', 'sidebar-panels.ts')
+const ROOT = (p) => path.join(__dirname, '..', ...p)
+const loadRefClose = () => import('../src/client/effects/workbench-ref-close.ts?' + Math.random())
+const loadPanels = () => import('../src/client/sidebar-panels.ts?' + Math.random())
 
-/*
- * Phone: an @-file tap in the workbench closes the panel (real-device
- * report, 2026-08-26). The panel is full-screen over the conversation, so
- * the draft change the tap makes is invisible — closing the panel is the
- * feedback. These pin the load-bearing choices, each of which fails
- * silently if lost.
- */
-
-test('the effect is registered', () => {
-  assert.match(index, /installWorkbenchRefClose\(ctx\)/, 'never installed — the tap does nothing again')
+test('installWorkbenchRefClose: registered in index.tsx', () => {
+  const index = fs.readFileSync(ROOT(['src', 'client', 'index.tsx']), 'utf8')
+  assert.match(index, /installWorkbenchRefClose\(ctx\)/)
 })
 
-test('the listener is capture-phase, or the ref button silences it', () => {
-  // The @ button's own handler calls stopPropagation() (its row would open
-  // the file otherwise), so a bubble listener never hears the tap.
-  assert.match(effect, /addEventListener\('click', onClick, true\)/, 'must listen in capture phase')
-  assert.match(effect, /removeEventListener\('click', onClick, true\)/, 'and remove the SAME phase, or the listener leaks')
-})
+test('installWorkbenchRefClose: capture-phase tap on _explorerRef defers closeOpenSidebar, re-checks open state, and ignores desktop', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
 
-test('the close waits for the reference to land, and re-checks open state', () => {
-  // The button's handler writes the draft at target phase, inside the same
-  // dispatch — the deferral is what orders "mention lands" before "panel
-  // closes". The re-check matters because the toggle is a toggle: clicking
-  // it against an already-closed panel would reopen it.
-  assert.match(effect, /setTimeout\(\(\) => \{ closeOpenSidebar\(\) \}, 0\)/, 'the close must be deferred past the tap\'s own handler')
-  // closeOpenSidebar is the re-check: it reads the open state when it runs
-  // and never clicks a toggle against a closed panel.
-  assert.match(panels, /if \(officialSidebarOpen\(\)\)[\s\S]*?OFFICIAL_COLLAPSE[\s\S]*?if \(betterSidebarOpen\(\)\)[\s\S]*?BETTER_TOGGLE/, 'closeOpenSidebar must read open state before clicking either control')
-})
-
-test('phone-gated per tap, desktop untouched', () => {
-  assert.match(effect, /max-width: 767px/, 'same breakpoint as every phone-only effect')
-  assert.match(effect, /if \(!phone\.matches\) return/, 'checked per tap — a mid-session resize must not leave a stale arm')
-})
-
-test('the anchors live in one module, shared by every caller', () => {
-  // One convention, one place to update if better-sidebar or the host
-  // renames things: sidebar-panels.ts owns the selectors; the header
-  // button, the edge swipe-back and this effect all import from it.
-  assert.match(panels, /BETTER_TOGGLE = '\[data-dsh-better-sidebar\] button\[class\$="_toggleButton"\]'/, 'legacy toggle anchor drifted')
-  assert.match(panels, /BETTER_PANEL_OPEN = '\[data-dsh-better-sidebar\] \[class\$="_panel"\]'/, 'legacy open-state read drifted')
-  assert.match(panels, /OFFICIAL_PANEL_OPEN = '\[data-sidebar-right-panel\]\[data-sidebar-right-open\]'/, 'official open-state read drifted')
-  assert.match(panels, /OFFICIAL_COLLAPSE = '\[data-sidebar-right-toggle\]'/, 'official collapse anchor drifted')
-  for (const [name, src] of [['workbench-ref-close.ts', effect], ['gestures.ts', gestures], ['MobileSessionHeader.tsx', header]]) {
-    assert.match(src, /from '\.\.?\/sidebar-panels\.ts'/, `${name} no longer imports the shared anchors`)
-    assert.doesNotMatch(src, /'\[data-dsh-better-sidebar\] button\[class\$="_toggleButton"\]'|'\[data-sidebar-right-toggle\]'/, `${name} spells a sidebar anchor out again — use sidebar-panels.ts`)
+  class FakeElement {
+    constructor(opts = {}) {
+      this.matchesTags = opts.matchesTags ?? new Set()
+      this.clicks = 0
+    }
+    closest(selector) {
+      for (const tag of this.matchesTags) {
+        if (selector.includes(tag)) return this
+      }
+      return null
+    }
+    click() {
+      this.clicks += 1
+    }
   }
-  // The explorer's @ button is looked up under BOTH hosts: better-sidebar
-  // 0.19+ renders the tree inside the native right panel, older versions
-  // inside their own root.
-  assert.match(effect, /\$\{OFFICIAL_PANEL\} \[class\$="_explorerRef"\], \$\{BETTER_ROOT\} \[class\$="_explorerRef"\]/, 'REF_SELECTOR must cover the native panel and the legacy root')
+
+  const prevElement = Object.getOwnPropertyDescriptor(globalThis, 'Element')
+  const prevWindow = Object.getOwnPropertyDescriptor(globalThis, 'window')
+  const prevDocument = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  t.after(() => {
+    if (prevElement === undefined) delete globalThis.Element
+    else Object.defineProperty(globalThis, 'Element', prevElement)
+    if (prevWindow === undefined) delete globalThis.window
+    else Object.defineProperty(globalThis, 'window', prevWindow)
+    if (prevDocument === undefined) delete globalThis.document
+    else Object.defineProperty(globalThis, 'document', prevDocument)
+  })
+
+  const state = {
+    phone: true,
+    officialOpen: false,
+    betterOpen: false,
+    listeners: [],
+    officialCollapse: new FakeElement(),
+    betterToggle: new FakeElement(),
+  }
+
+  globalThis.Element = FakeElement
+  globalThis.window = {
+    matchMedia: () => ({ get matches() { return state.phone } }),
+  }
+  globalThis.document = {
+    addEventListener: (type, fn, capture) => {
+      state.listeners.push({ type, fn, capture })
+    },
+    removeEventListener: (type, fn, capture) => {
+      state.listeners = state.listeners.filter((l) => !(l.type === type && l.fn === fn && l.capture === capture))
+    },
+    querySelector: (sel) => {
+      if (sel === '[data-sidebar-right-panel][data-sidebar-right-open]') return state.officialOpen ? new FakeElement() : null
+      if (sel === '[data-sidebar-right-toggle]') return state.officialCollapse
+      if (sel === '[data-dsh-better-sidebar] [class$="_panel"]') return state.betterOpen ? new FakeElement() : null
+      if (sel === '[data-dsh-better-sidebar] button[class$="_toggleButton"]') return state.betterToggle
+      return null
+    },
+  }
+
+  const { installWorkbenchRefClose } = await loadRefClose()
+  const { closeOpenSidebar } = await loadPanels()
+  let stop
+  installWorkbenchRefClose({ effect: (fn) => { stop = fn() } })
+
+  assert.equal(state.listeners.length, 1)
+  assert.equal(state.listeners[0].type, 'click')
+  assert.equal(state.listeners[0].capture, true, 'must listen in capture phase')
+
+  const click = (target) => {
+    for (const l of [...state.listeners]) l.fn({ target })
+  }
+
+  // 1. Official panel open + tap on _explorerRef inside [data-sidebar-right-panel]
+  state.officialOpen = true
+  const officialRef = new FakeElement({ matchesTags: new Set(['[data-sidebar-right-panel] [class$="_explorerRef"]']) })
+  click(officialRef)
+  assert.equal(state.officialCollapse.clicks, 0, 'close is deferred past target handler')
+  t.mock.timers.tick(0)
+  assert.equal(state.officialCollapse.clicks, 1, 'official collapse clicked after setTimeout(0)')
+
+  // 2. If panel already closed before timer fires, closeOpenSidebar is a no-op (never re-opens toggle)
+  state.officialOpen = false
+  state.betterOpen = true
+  const betterRef = new FakeElement({ matchesTags: new Set(['[data-dsh-better-sidebar] [class$="_explorerRef"]']) })
+  click(betterRef)
+  state.betterOpen = false
+  t.mock.timers.tick(0)
+  assert.equal(state.betterToggle.clicks, 0, 'closed panel is never re-opened')
+  assert.equal(closeOpenSidebar(), false)
+
+  // 3. Open better-sidebar closes when still open at fire time
+  state.betterOpen = true
+  click(betterRef)
+  t.mock.timers.tick(0)
+  assert.equal(state.betterToggle.clicks, 1)
+
+  // 4. Desktop width and non-ref targets do nothing
+  state.phone = false
+  state.officialOpen = true
+  click(officialRef)
+  t.mock.timers.tick(0)
+  assert.equal(state.officialCollapse.clicks, 1)
+
+  state.phone = true
+  click(new FakeElement())
+  t.mock.timers.tick(0)
+  assert.equal(state.officialCollapse.clicks, 1)
+
+  // 5. Teardown removes the exact capture-phase listener
+  stop()
+  assert.equal(state.listeners.length, 0)
 })

@@ -21,7 +21,6 @@ const { readFileSync } = require('node:fs')
 const { join } = require('node:path')
 
 const ROOT = join(__dirname, '..')
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
 // -- the CSS half -------------------------------------------------------------
 

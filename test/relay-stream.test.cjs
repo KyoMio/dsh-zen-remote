@@ -12,6 +12,8 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
+const { EventEmitter } = require('node:events')
+const { Readable } = require('node:stream')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -911,43 +913,89 @@ test('ownership cache: a session that left and rejoined the table starts from an
 
 // ---- T22b-fix: backpressure -------------------------------------------------------------
 
+/** Controllable mock req/res for deterministic backpressure & end-drain tests
+ * without OS socket buffer dependence. */
+function makeMockStreamIo(body, headers = AUTH) {
+  const req = Readable.from([Buffer.from(JSON.stringify(body), 'utf8')])
+  req.method = 'POST'
+  req.url = '/_dsh/zen-remote/relay/v1/stream'
+  req.headers = { ...headers, 'content-type': 'application/json' }
+
+  const res = new EventEmitter()
+  res.headers = {}
+  res.statusCode = 0
+  res.headersSent = false
+  res.writableEnded = false
+  res.destroyed = false
+  res.paused = false
+  res.chunks = []
+  let doneResolve
+  res.done = new Promise((r) => { doneResolve = r })
+  res.setHeader = (k, v) => { res.headers[String(k).toLowerCase()] = v }
+  res.writeHead = (status, h = {}) => {
+    res.statusCode = status
+    res.headersSent = true
+    for (const [k, v] of Object.entries(h)) res.setHeader(k, v)
+  }
+  res.flushHeaders = () => { res.headersSent = true }
+  res.write = (chunk) => {
+    if (res.destroyed || res.writableEnded) return false
+    res.chunks.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk))
+    return !res.paused
+  }
+  res.end = (chunk) => {
+    if (chunk !== undefined) res.chunks.push(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk))
+    res.writableEnded = true
+    if (!res.paused) {
+      res.emit('finish')
+      res.emit('close')
+      doneResolve()
+    }
+  }
+  res.destroy = () => {
+    if (res.destroyed) return
+    res.destroyed = true
+    res.emit('close')
+    doneResolve()
+  }
+  res.drain = () => {
+    res.paused = false
+    res.emit('drain')
+    if (res.writableEnded && !res.destroyed) {
+      res.emit('finish')
+      res.emit('close')
+      doneResolve()
+    }
+  }
+  res.parsedLines = () => res.chunks.join('').split('\n').filter(Boolean).map((line) => JSON.parse(line))
+  return { req, res }
+}
+
 test('backpressure: the pump parks on a full socket and resumes in order after drain', async () => {
   const parts = makeParts('backpressure', { shared: ['session-a'], heartbeatMs: 60_000 })
-  const server = await startServer(parts.handler)
-  try {
-    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
-    open.res.pause()
-    const gate = parts.streams[0]
-    const big = 'x'.repeat(2 * 1024 * 1024)
-    const frame = (seq) => ({ type: 'event', event: { type: 'big', seq, time: seq, data: { pad: big } } })
-    // The parked state must hold by MARGIN, not by luck: the total volume has
-    // to exceed every buffer on the path combined. 2026-10-30: the old 3×2 MiB
-    // fitted entirely through the CI runner's loopback path (kernel wmem +
-    // client rmem keep draining while the app is paused) within the 500 ms
-    // settle sleep — the pump unparked, the queue drained to 0, and the
-    // "still queued" assert read an empty queue (twice, ~504 ms each, on the
-    // ubuntu-24.04 image; the 2026-10-28 whole-file flake is the same
-    // mechanism racing). 48×2 MiB = 96 MiB leaves ≥16 frames queued under any
-    // plausible buffer pair; the waits below keep their slack.
-    const FRAMES = 48
-    for (let seq = 1; seq <= FRAMES; seq++) gate.push(frame(seq))
-    gate.finish()
-    // Frame 1 exceeds every buffer on the path: its write must return false,
-    // the pump must park on drain, and the rest must stay QUEUED — not
-    // pulled, not buffered line-by-line.
-    await waitFor(() => gate.queued >= 2, 10_000)
-    await new Promise((resolve) => setTimeout(resolve, 500))
-    assert.equal(open.lines.length, 0, 'the paused client has parsed no complete line')
-    assert.ok(gate.queued >= 2, `the frames beyond the buffers are still queued (got ${gate.queued})`)
+  const { req, res } = makeMockStreamIo({ namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
+  res.paused = true
+  const handlerPromise = parts.handler(req, res)
+  await waitFor(() => parts.streams.length === 1)
+  const gate = parts.streams[0]
+  const FRAMES = 6
+  const frame = (seq) => ({ type: 'event', event: { type: 'small', seq, time: seq, data: { n: seq } } })
+  for (let seq = 1; seq <= FRAMES; seq++) gate.push(frame(seq))
+  gate.finish()
 
-    open.res.resume()
-    await open.done
-    assert.deepEqual(
-      open.lines.map((line) => line.frame?.event?.seq ?? line.type),
-      Array.from({ length: FRAMES }, (_, i) => i + 1).concat('end'),
-      'everything arrives, in order, after the drain',
-    )
-  } finally { await server.stop() }
+  // Frame 1's res.write() returned false; pump parks on 'drain' before pulling frame 2.
+  await waitFor(() => res.chunks.length === 1)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(res.chunks.length, 1, 'only the first frame was written before drain')
+  assert.ok(gate.queued >= FRAMES - 1, `remaining frames stay queued until drain (got ${gate.queued})`)
+
+  res.drain()
+  await Promise.all([res.done, handlerPromise])
+  assert.deepEqual(
+    res.parsedLines().map((line) => line.frame?.event?.seq ?? line.type),
+    Array.from({ length: FRAMES }, (_, i) => i + 1).concat('end'),
+    'everything arrives, in order, after the drain',
+  )
 })
 
 // ---- T22b-fix: subagent reachability over parentOf ---------------------------------------
@@ -981,41 +1029,28 @@ test('parentOf: a child streams through its shared parent and dies when the pare
 
 // ---- T43-A: the finish drain watchdog --------------------------------------------
 
-test('T43-A: a finish with a full buffer and a stopped reader destroys the response and releases the viewer', async () => {
-  // The injected watchdog is 80ms: a viewer that never reads must lose its
-  // stream (and its count) within milliseconds of the close, not pin the
-  // count and the device budget forever.
+test('T43-A: a finish with a full buffer and a stopped reader destroys the response and releases the viewer', async (t) => {
   const parts = makeParts('t43-end-drain', { shared: ['session-a'], heartbeatMs: 60_000, endDrainTimeoutMs: 80 })
-  const server = await startServer(parts.handler)
-  try {
-    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
-    const gate = parts.streams[0]
-    // The client stops reading; a 2MB frame overflows every buffer on the
-    // path and parks the pump mid-write (the same shape the backpressure
-    // test drives).
-    open.res.pause()
-    const big = 'x'.repeat(2 * 1024 * 1024)
-    const frame = (seq) => ({ type: 'event', event: { type: 'big', seq, time: seq, data: { pad: big } } })
-    gate.push(frame(1))
-    gate.push(frame(2))
-    gate.push(frame(3))
-    await waitFor(() => gate.queued >= 2)
-    await new Promise((resolve) => setTimeout(resolve, 150))
+  const { req, res } = makeMockStreamIo({ namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
+  res.paused = true
+  const handlerPromise = parts.handler(req, res)
+  await waitFor(() => parts.streams.length === 1)
+  const gate = parts.streams[0]
+  const frame = (seq) => ({ type: 'event', event: { type: 'small', seq, time: seq, data: { n: seq } } })
+  gate.push(frame(1))
+  gate.push(frame(2))
+  gate.push(frame(3))
+  await waitFor(() => res.chunks.length === 1 && gate.queued === 2)
 
-    parts.handler.closeAll('t43 watchdog test')
-    const started = Date.now()
-    await waitFor(() => parts.handler.viewerCount('session-a') === 0, 2000)
-    assert.ok(Date.now() - started < 1500, `the watchdog released the viewer promptly (took ${Date.now() - started} ms)`)
-    assert.equal(gate.aborted, true, 'the upstream subscription was aborted')
-    // NOTE: open.done is NOT awaited here — a paused client whose server
-    // destroyed the socket sits half-open forever (its own buffered bytes
-    // stay unread, so the client-side res never ends). The assertion target
-    // is the SERVER side, and it released within the watchdog budget.
-  } finally {
-    // Nothing to drain: the client was never reading. The connections go
-    // first, like every teardown here.
-    await server.stop()
-  }
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  parts.handler.closeAll('t43 watchdog test')
+  const started = Date.now()
+  t.mock.timers.tick(80)
+  await Promise.all([res.done, handlerPromise])
+  assert.equal(res.destroyed, true, 'watchdog destroyed the stalled response')
+  assert.equal(parts.handler.viewerCount('session-a'), 0)
+  assert.ok(Date.now() - started < 1500, `the watchdog released the viewer promptly (took ${Date.now() - started} ms)`)
+  assert.equal(gate.aborted, true, 'the upstream subscription was aborted')
 })
 
 test('T43-A: a finish with a READING client still ends normally with its tail line', async () => {
@@ -1091,33 +1126,27 @@ test('T43-B: closeAll unsubscribes every share-table listener — table changes 
 })
 
 test('T43-fix: resuming before the watchdog still finishes the response cleanly (tail line + end)', async () => {
-  // The closeWith watchdog now arms unconditionally and only `finish` or
-  // `close` disarms it. A client that resumes reading INSIDE the budget
-  // must get the tail line and a clean end — the queued error line
-  // included — and the viewer count releases through the normal teardown.
   const parts = makeParts('t43-end-resume', { shared: ['session-a'], heartbeatMs: 60_000, endDrainTimeoutMs: 400 })
-  const server = await startServer(parts.handler)
-  try {
-    const open = await openStream(server, { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
-    const gate = parts.streams[0]
-    open.res.pause()
-    const big = 'x'.repeat(2 * 1024 * 1024)
-    const frame = (seq) => ({ type: 'event', event: { type: 'big', seq, time: seq, data: { pad: big } } })
-    gate.push(frame(1))
-    gate.push(frame(2))
-    gate.push(frame(3))
-    await waitFor(() => gate.queued >= 2)
-    parts.handler.closeAll('t43 resume test')
+  const { req, res } = makeMockStreamIo({ namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } })
+  res.paused = true
+  const handlerPromise = parts.handler(req, res)
+  await waitFor(() => parts.streams.length === 1)
+  const gate = parts.streams[0]
+  const frame = (seq) => ({ type: 'event', event: { type: 'small', seq, time: seq, data: { n: seq } } })
+  gate.push(frame(1))
+  gate.push(frame(2))
+  gate.push(frame(3))
+  await waitFor(() => res.chunks.length === 1 && gate.queued === 2)
+  parts.handler.closeAll('t43 resume test')
 
-    // Back inside the 400ms budget, the client starts reading again.
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    open.res.resume()
-    await open.done
-    const last = open.lines[open.lines.length - 1]
-    assert.equal(last.type, 'error', 'the queued server-restart tail line arrived')
-    assert.equal(last.error.code, 'server-restart')
-    assert.equal(parts.handler.viewerCount('session-a'), 0)
-  } finally { await server.stop() }
+  // Back inside the 400ms budget, the client drains and finishes cleanly.
+  res.drain()
+  await Promise.all([res.done, handlerPromise])
+  const lines = res.parsedLines()
+  const last = lines[lines.length - 1]
+  assert.equal(last.type, 'error', 'the queued server-restart tail line arrived')
+  assert.equal(last.error.code, 'server-restart')
+  assert.equal(parts.handler.viewerCount('session-a'), 0)
 })
 
 // ---- T34: the structured close reason ---------------------------------------------------

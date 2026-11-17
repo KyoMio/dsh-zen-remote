@@ -357,3 +357,10 @@ test('DSH 0.2.2-rc.1 AppFrame: centerCol is pinned to column 1 and drawerMask/le
     'chips portal fix must match [class$="_sidebarCol"] and override 0.2.2-rc.1 visibility:hidden',
   )
 })
+
+test('activity dot pulses when running, warns on failure, rests green, and respects prefers-reduced-motion', () => {
+  assert.match(HEADER_CSS, /\[data-activity-state="running"\][\s\S]*?animation: dsh-zen-activity-pulse/)
+  assert.match(HEADER_CSS, /\[data-activity-state="warning"\][\s\S]*?--dsw-alias-state-warn-primary/)
+  assert.match(HEADER_CSS, /\[data-mobile-nav="activity-dot"\]\s*\{[^}]*--dsw-alias-state-success-primary/)
+  assert.match(HEADER_CSS, /prefers-reduced-motion: reduce\)\s*\{\s*\[data-activity-state="running"\][^}]*\{\s*animation: none/)
+})

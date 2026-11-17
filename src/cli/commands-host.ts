@@ -805,7 +805,7 @@ async function startLan(ctx: CliExecutionContext, sources: IngressSources): Prom
     ingressPublicUrl: lanUrl,
   }))) return 1
 
-  const waitSeconds = Math.max(1, args.options.wait)
+  const waitSeconds = Math.max(0.05, args.options.wait)
   out.write(`${t('host.ingress.lanWaiting', { seconds: waitSeconds })}\n`)
   const interval = ctx.pollIntervalMs ?? LAN_POLL_INTERVAL_DEFAULT_MS
   const deadline = Date.now() + waitSeconds * 1000

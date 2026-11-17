@@ -66,6 +66,7 @@ export interface PeerEnginePunchTimings {
     punchRounds?: number;
     punchWindowMs?: number;
     reprobeIntervalMs?: number;
+    reprobeInitialDelaysMs?: readonly [number, number];
     keepAliveMs?: number;
     keepAliveLostFrames?: number;
 }
@@ -96,6 +97,10 @@ export interface PeerEngineOptions {
     punch?: PeerEnginePunchTimings;
     /** path-report 周期（缺省 15000ms）。 */
     pathReportMs?: number;
+    /** STUN NAT 探测超时（缺省 2000ms）。 */
+    stunProbeTimeoutMs?: number;
+    /** leaveNetwork HTTP 超时（缺省 3000ms）。 */
+    leaveTimeoutMs?: number;
     /** WS 重连退避（缺省 1000ms 起、30000ms 封顶）。 */
     wsReconnectBaseMs?: number;
     wsReconnectMaxMs?: number;

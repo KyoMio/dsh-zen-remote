@@ -540,7 +540,7 @@ export async function runSetupCommand(ctx: SetupCommandContext): Promise<number>
   if (up === undefined) return 1
   const { ipc } = up
   const { t } = ctx
-  const waitSeconds = Math.max(1, ctx.args.options.wait)
+  const waitSeconds = Math.max(0.05, ctx.args.options.wait)
 
   const target = await resolveTargetRole(ctx, up.ping)
   if (target === undefined) return 1

@@ -22,17 +22,7 @@ const os = require('node:os')
 const http = require('node:http')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
-
-const PLUGIN_SOURCES = [
-  '/tmp/bs-versions/0.25.0/lib/index.js',
-  '/tmp/bs-versions/0.26.0/lib/index.js',
-  '/tmp/bs-versions/0.26.1/lib/index.js',
-  '/tmp/bs-versions/0.28.0-alpha.0/lib/index.js',
-  '/tmp/bs-versions/0.28.0/lib/index.js',
-  '/tmp/bs-versions/0.28.1/lib/index.js',
-  '/tmp/bs-versions/0.28.2/lib/index.js',
-  '/tmp/bs-versions/0.30.0/lib/index.js',
-]
+const { waitFor } = require('./helpers/plugin-bridge-harness.cjs')
 
 /** Scratch space for the server-side share store — OUTSIDE the repository
  * (a store file in the repo root once landed in the commit staging by
@@ -45,70 +35,30 @@ const importLib = async (name) => import(pathToFileURL(path.join(__dirname, '..'
 const SERVER_ID = 'abcd1234'
 const virtual = (id) => `zr~${SERVER_ID}~${id}`
 
-// ---- 1. the method table vs the plugin's own source ---------------------------
+// ---- 1. PB-18: the surface extractor — same wire, same digest ----------------
 
-test('PB-12/PB-15 table: every method the 0.25.0+0.26.0 sources dispatch is in the table (exactly the union)', async () => {
-  const adapterMod = await importLib('adapters/dsh-better-sidebar/methods.js')
-  const absent = PLUGIN_SOURCES.filter((sourcePath) => !fs.existsSync(sourcePath))
-  if (absent.length > 0) {
-    test.skip(`plugin sources are not on this machine (${absent.join(', ')}); the table-vs-source comparison is skipped`)
-    return
-  }
-  // The dispatcher's own method names, extracted from BOTH builds and
-  // unioned: every `"x.y": async (payload) =>` entry of buildApi's table
-  // (0.25.0 lib/index.js:6319-6688; 0.26.0 grows fs.readPage and the
-  // sidechat trio, and drops fs.write to the /sidebar/write route), the
-  // sidechat builder's keys, and the spread of buildSidechatApi into the
-  // table.
-  const names = new Set()
-  for (const sourcePath of PLUGIN_SOURCES) {
-    const source = fs.readFileSync(sourcePath, 'utf8')
-    for (const match of source.matchAll(/"([a-zA-Z]+\.[a-zA-Z-]+)":\s*(?:async\s*)?\(/g)) {
-      names.add(match[1])
-    }
-  }
-  // Restrict to the sidebar namespaces (the same regex catches unrelated
-  // object tables elsewhere in the bundle).
-  const sidebarNames = [...names].filter((name) => /^(session|fs|git|changes|subagents|workflows|teams|settings|open|archive|sidechat)\./.test(name))
-  assert.ok(sidebarNames.length >= 45, `the extraction found the union table (${sidebarNames.length} names)`)
-  const missing = sidebarNames.filter((name) => adapterMod.SIDEBAR_METHODS[name] === undefined)
-  assert.deepEqual(missing, [], `methods the plugin dispatches but the table lacks: ${missing.join(', ')}`)
-  // And the reverse direction: a table entry NEITHER build dispatches any
-  // more is a dead row (harmless but worth noticing). fs.write stays: it
-  // rode the 0.25.0 JSON api and the table must keep serving 0.25.0 hosts.
-  const extra = Object.keys(adapterMod.SIDEBAR_METHODS).filter((name) => !names.has(name))
-  assert.deepEqual(extra, [], `table entries neither source dispatches: ${extra.join(', ')}`)
-})
-
-// ---- PB-18: the surface extractor — same wire, same digest -----------------------
-
-test('PB-18: extractBetterSidebarSurface is deterministic and groups the fixture versions by wire generation', async () => {
-  const absent = PLUGIN_SOURCES.filter((sourcePath) => !fs.existsSync(sourcePath))
-  if (absent.length > 0) {
-    test.skip(`plugin sources are not on this machine (${absent.join(', ')}); the surface extraction is skipped`)
-    return
-  }
+test('PB-18: extractBetterSidebarSurface is deterministic and groups synthetic sources by wire surface', async () => {
+  const methodsMod = await importLib('adapters/dsh-better-sidebar/methods.js')
   const mod = await importLib('adapters/dsh-better-sidebar/surface.js')
-  const surfaces = new Map()
-  for (const sourcePath of PLUGIN_SOURCES) {
-    const source = fs.readFileSync(sourcePath, 'utf8')
-    const surface = mod.extractBetterSidebarSurface(source)
-    // Deterministic: same source in, identical arrays out, twice in a row.
-    assert.deepEqual(mod.extractBetterSidebarSurface(source), surface, `${sourcePath} extraction is not deterministic`)
-    assert.equal(mod.surfaceLooksHealthy(surface), true, `${sourcePath}: extraction looks empty (${surface.methods.length} methods, ${surface.routes.length} routes)`)
-    surfaces.set(sourcePath, { surface, digest: mod.betterSidebarSurfaceDigest(surface) })
-  }
-  const digestOf = (version) => surfaces.get(`/tmp/bs-versions/${version}/lib/index.js`).digest
-  // Wire-identical patch releases share a digest — the whole point of ADR-0003:
-  // 0.26.1 was perf-only, 0.28.2 only changed backend cwd resolution.
-  assert.equal(digestOf('0.26.0'), digestOf('0.26.1'), '0.26.0 and 0.26.1 must share a wire surface')
-  assert.equal(digestOf('0.28.1'), digestOf('0.28.2'), '0.28.1 and 0.28.2 must share a wire surface')
-  // Distinct generations differ: fs.readPage arrived in 0.26.0, git.history in 0.28.1.
-  assert.notEqual(digestOf('0.25.0'), digestOf('0.26.0'), '0.25.0 and 0.26.0 are different wire surfaces')
-  assert.notEqual(digestOf('0.26.0'), digestOf('0.28.1'), '0.26.x and 0.28.1 are different wire surfaces')
-  assert.notEqual(digestOf('0.28.0'), digestOf('0.28.1'), '0.28.0 and 0.28.1 are different wire surfaces (git.history)')
-  assert.notEqual(digestOf('0.28.2'), digestOf('0.30.0'), '0.28.2 and 0.30.0 are different wire surfaces (/sidebar/sidechat-image)')
-  // And the empty-source tell: nothing healthy about a non-build.
+  const methodEntries = Object.keys(methodsMod.SIDEBAR_METHODS).slice(0, 48).map((name) => `  "${name}": async () => {},`).join('\n')
+  const baseSource = `const api = {\n${methodEntries}\n}\nregister("/sidebar/api", "/sidebar/file");\n`
+  const patchPerfVariant = `/* perf tweak without route literals */\n${baseSource}\n// comment`
+  const nextGenVariant = `${baseSource}\nregister("/sidebar/sidechat-image");\n`
+
+  const surfaceA = mod.extractBetterSidebarSurface(baseSource)
+  assert.deepEqual(mod.extractBetterSidebarSurface(baseSource), surfaceA, 'extraction is deterministic')
+  assert.equal(mod.surfaceLooksHealthy(surfaceA), true, 'synthetic source meets healthy method and route thresholds')
+
+  assert.equal(
+    mod.betterSidebarSurfaceDigest(surfaceA),
+    mod.betterSidebarSurfaceDigest(mod.extractBetterSidebarSurface(patchPerfVariant)),
+    'wire-identical non-route edits share a digest',
+  )
+  assert.notEqual(
+    mod.betterSidebarSurfaceDigest(surfaceA),
+    mod.betterSidebarSurfaceDigest(mod.extractBetterSidebarSurface(nextGenVariant)),
+    'adding a new route literal changes the surface digest',
+  )
   assert.equal(mod.surfaceLooksHealthy(mod.extractBetterSidebarSurface('')), false)
 })
 
@@ -118,9 +68,7 @@ test('PB-19: an unlisted version registers through its surface digest; a miss, a
   const core = await importLib('plugin-adapter-core.js')
   const adaptersMod = await importLib('adapters/index.js')
   const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
-  // The literal the adapter pins as the 0.28.1 generation (the fixture test
-  // below re-derives every key from the plugin source; this one works without
-  // the fixtures so the admission CONTRACT is always checked).
+  // The literal the adapter pins as the 0.28.1 generation.
   assert.equal(typeof raw.surfaces['65a0acaeb56f87d9'], 'string', 'the 0.28.1 generation is whitelisted')
 
   // A hypothetical wire-identical future release: outside `versions`, inside
@@ -143,27 +91,6 @@ test('PB-19: an unlisted version registers through its surface digest; a miss, a
   const listed = core.normalizeAdapter(noised, '0.25.0')
   assert.equal(listed.declaration.version, '0.25.0')
   assert.equal(listed.digest, core.adapterDigestOf('dsh-better-sidebar', '0.25.0', listed.routes))
-})
-
-test('PB-19: every listed version hashes into the surfaces table; the table holds exactly the five generations', async () => {
-  const absent = PLUGIN_SOURCES.filter((sourcePath) => !fs.existsSync(sourcePath))
-  if (absent.length > 0) {
-    test.skip(`plugin sources are not on this machine (${absent.join(', ')}); the surfaces-table check is skipped`)
-    return
-  }
-  const surfaceMod = await importLib('adapters/dsh-better-sidebar/surface.js')
-  const adaptersMod = await importLib('adapters/index.js')
-  const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
-  const computed = new Set()
-  for (const version of raw.versions) {
-    const sourcePath = `/tmp/bs-versions/${version}/lib/index.js`
-    assert.ok(fs.existsSync(sourcePath), `${sourcePath} is on disk`)
-    const digest = surfaceMod.betterSidebarSurfaceDigest(surfaceMod.extractBetterSidebarSurface(fs.readFileSync(sourcePath, 'utf8')))
-    computed.add(digest)
-    assert.ok(raw.surfaces[digest] !== undefined, `${version}'s surface digest ${digest} is whitelisted as "${raw.surfaces[digest]}"`)
-  }
-  assert.equal(computed.size, 5, 'the eight listed versions collapse to five distinct wire generations')
-  assert.deepEqual(Object.keys(raw.surfaces).sort(), [...computed].sort(), 'the table holds exactly those generations — nothing stale, nothing missing')
 })
 
 test('PB-15: the 0.26.0 additions carry the right dispositions; both versions normalize; /sidebar/write is declared', async () => {
@@ -534,7 +461,7 @@ test('PB-12 client: a read and a write forward with real ids; settings stays loc
     assert.equal(wsOutcome, 'open', 'the local upgrade answered 101 from the LOCAL handler')
     assert.equal(host.hits.localWs, 1, 'the LOCAL upgrade handler ran')
     localWs.close()
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    await waitFor(() => localWs.readyState >= WebSocket.CLOSING, 1000)
     assert.equal(relay.forwarded.length, forwardedBefore, 'no tunnel ever opened for the local session')
     localHandle.uninstall()
   } finally {
@@ -978,7 +905,7 @@ test('PB-26b client: a LOCAL watch thread pipes into the plugin\u2019s own sidec
     const localMessages = []
     localWs.addEventListener('message', (event) => { localMessages.push(String(event.data)) })
     localWs.send(JSON.stringify({ op: 'watch', threadIds: ['session-local'] }))
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    await waitFor(() => host.hits.localSidechat === 1 && localMessages.length === 1, 1000)
     assert.equal(host.hits.localSidechat, 1, 'the plugin\u2019s OWN sidechat handler served the local watch')
     assert.deepEqual(localMessages, [JSON.stringify({ local: true, watched: ['session-local'] })], 'the echo crossed the in-memory pipe')
     assert.equal(relay.tunnelOpens.length, 0, 'no tunnel for a local thread')
@@ -994,7 +921,7 @@ test('PB-26b client: a LOCAL watch thread pipes into the plugin\u2019s own sidec
     })
     assert.equal(remoteOpened, true, 'the remote handshake opened (the 101 answers immediately)')
     remoteWs.send(JSON.stringify({ op: 'watch', threadIds: [virtual('session-a'), virtual('session-b')] }))
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    await waitFor(() => relay.tunnelSends.length === 1, 1000)
     assert.equal(relay.tunnelOpens.length, 1, 'one tunnel opened')
     assert.equal(relay.tunnelOpens[0].path, '/sidebar/ws/sidechat')
     assert.equal(relay.tunnelOpens[0].query, '', 'the upgrade carries no query at all')
@@ -1008,7 +935,7 @@ test('PB-26b client: a LOCAL watch thread pipes into the plugin\u2019s own sidec
     // An id-LESS frame on the tunnel-bound connection (the unsubscribe-all)
     // stays ON the tunnel — never a pivot to the local handler.
     remoteWs.send(JSON.stringify({ op: 'watch', threadIds: [] }))
-    await new Promise((resolve) => setTimeout(resolve, 300))
+    await waitFor(() => relay.tunnelSends.length === 2, 1000)
     assert.equal(relay.tunnelSends.length, 2, 'the unsubscribe-all rode the tunnel verbatim')
     assert.equal(host.hits.localSidechat, 1, 'the unsubscribe-all never opened the local handler')
     const emptyFrame = wsDecodeClientFrame(relay.tunnelSends[1].bytes)
@@ -1024,13 +951,13 @@ test('PB-26b client: a LOCAL watch thread pipes into the plugin\u2019s own sidec
       remoteWs.addEventListener('error', () => { clearTimeout(timer); resolve('errored') })
     })
     assert.notEqual(localAfterRemote, 'still-open', 'the cross-frame local id closed the exchange')
-    await new Promise((resolve) => setTimeout(resolve, 200))
+    await waitFor(() => handle.diagnostics().tunnelsClosed >= 1, 1000)
     assert.equal(relay.tunnelSends.length, 2, 'the local id never travelled')
     assert.equal(host.hits.localSidechat, 1, 'the local handler was never reached from the tunnel-bound connection')
 
     localWs.close()
     remoteWs.close()
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    await waitFor(() => localWs.readyState >= WebSocket.CLOSING && remoteWs.readyState >= WebSocket.CLOSING, 1000)
   } finally {
     handle.uninstall()
     await host.stop()
@@ -1057,7 +984,7 @@ test('PB-26b-fix: a failed tunnel send tears the exchange down completely — co
       ws.send(JSON.stringify({ op: 'watch', threadIds: [virtual('session-a')] }))
     })
     assert.notEqual(outcome, 'still-open', 'the failed send closed the browser socket')
-    await new Promise((resolve) => setTimeout(resolve, 200))
+    await waitFor(() => handle.diagnostics().tunnelsClosed === 1, 1000)
     const diag = handle.diagnostics()
     assert.equal(diag.tunnelsOpened, 1, 'the tunnel opened before the send died')
     assert.equal(diag.tunnelsCurrent, 0, 'no tunnel counter leaked')

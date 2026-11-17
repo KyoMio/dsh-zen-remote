@@ -110,7 +110,9 @@ function freePort() {
 
 function startGateway(port, targetPort, extraEnv) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-mobile-pwa-test-'))
-  return startGatewayAt(home, port, targetPort, extraEnv)
+  const gw = startGatewayAt(home, port, targetPort, extraEnv)
+  gw.child._zrHome = home
+  return gw
 }
 function startGatewayAt(home, port, targetPort, extraEnv) {
   const child = spawn(process.execPath, [GATEWAY], {
@@ -124,13 +126,71 @@ function startGatewayAt(home, port, targetPort, extraEnv) {
     stdio: ['ignore', 'pipe', 'pipe']
   })
   let out = ''
+  const result = { child, ready: null, logs: () => out, home, port: Number(port) || 0 }
   child.stdout.on('data', (d) => { out += d })
   child.stderr.on('data', (d) => { out += d })
-  const ready = new Promise((resolve) => {
-    const t = setInterval(() => { if (out.includes('[lan-gate] listening')) { clearInterval(t); resolve() } }, 25)
-    setTimeout(() => { clearInterval(t); resolve() }, 4000)
+  result.ready = new Promise((resolve, reject) => {
+    let settled = false
+    let timer = null
+    const cleanup = () => {
+      if (timer) { clearTimeout(timer); timer = null }
+      child.stdout.off('data', onData)
+      child.stderr.off('data', onData)
+      child.off('exit', onExit)
+      child.off('error', onError)
+    }
+    const onData = () => {
+      if (settled) return
+      const m = out.match(/\[lan-gate\] listening on \S+:(\d+)/)
+      if (!m) return
+      settled = true
+      cleanup()
+      const boundPort = Number(m[1])
+      result.port = boundPort
+      resolve(boundPort)
+    }
+    const onExit = (code, signal) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(new Error(`gateway exited before listening (code=${code}, signal=${signal}): ${out}`))
+    }
+    const onError = (err) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(err)
+    }
+    timer = setTimeout(() => {
+      if (settled) return
+      settled = true
+      cleanup()
+      reject(new Error(`gateway did not become ready within 4000ms: ${out}`))
+    }, 4000)
+    if (typeof timer.unref === 'function') timer.unref()
+    child.stdout.on('data', onData)
+    child.stderr.on('data', onData)
+    child.once('exit', onExit)
+    child.once('error', onError)
+    onData()
   })
-  return { child, ready, logs: () => out, home }
+  return result
+}
+
+function startResetServer() {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer((s) => s.destroy())
+    server.once('error', reject)
+    server.listen(0, '127.0.0.1', () => {
+      const port = server.address().port
+      resolve({
+        port,
+        close: () => new Promise((done) => {
+          server.close(() => done())
+        }),
+      })
+    })
+  })
 }
 
 function request(port, opts) {
@@ -230,17 +290,23 @@ function rawUpgrade(port, urlPath, headers) {
 }
 
 // Awaits child exit + server close so the next test can rebind the same ports.
-function stopAll(target, child) {
+function stopAll(target, child, opts) {
   return new Promise((resolve) => {
     let n = (target ? 1 : 0) + (child ? 1 : 0)
     if (n === 0) { resolve(); return }
     const done = () => { if (--n === 0) resolve() }
+    const cleanupHome = () => {
+      if (child && child._zrHome && !(opts && opts.keepHome)) {
+        try { fs.rmSync(child._zrHome, { recursive: true, force: true }) } catch (e) {}
+      }
+      done()
+    }
     if (target) target.close(done)
     if (child) {
-      if (child.exitCode !== null) done()
-      else { child.once('exit', done); child.kill('SIGTERM') }
+      if (child.exitCode !== null || child.signalCode !== null) cleanupHome()
+      else { child.once('exit', cleanupHome); child.kill('SIGTERM') }
     }
   })
 }
 
-module.exports = { GATEWAY, REMOTE_HEADERS, startMockTarget, startMockAuthTarget, startGateway, startGatewayAt, request, cookieFrom, pairDevice, pairDesktop, startRecordingTarget, rawUpgrade, stopAll, freePort }
+module.exports = { GATEWAY, REMOTE_HEADERS, startMockTarget, startMockAuthTarget, startGateway, startGatewayAt, startResetServer, request, cookieFrom, pairDevice, pairDesktop, startRecordingTarget, rawUpgrade, stopAll, freePort }

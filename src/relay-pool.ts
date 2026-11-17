@@ -115,6 +115,9 @@ export interface RelayPoolOptions {
   fetchImpl?: typeof fetch
   /** Clock for the clients' reconnect machinery; defaults to the real one. */
   clock?: RelayClock
+  /** Per-request timeout (ms) forwarded to each created {@link RelayClient};
+   * defaults to {@link createRelayClient}'s built-in 15000ms. */
+  requestTimeoutMs?: number
   /** The client factory; injectable so tests run without sockets. */
   createClient?: typeof createRelayClient
   /** Every client state change, with the entry it belongs to. */
@@ -262,6 +265,7 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
         ? { fetchImpl: fetchOverride }
         : options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
       ...(options.clock !== undefined ? { clock: options.clock } : {}),
+      ...(options.requestTimeoutMs !== undefined ? { requestTimeoutMs: options.requestTimeoutMs } : {}),
       ...(uploadRecoveryMarginMs !== undefined ? { uploadRecoveryMarginMs } : {}),
     }
     return createClientImpl(clientOptions)

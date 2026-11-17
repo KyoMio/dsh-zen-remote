@@ -1,18 +1,3 @@
-// dsh-zen-remote · T64 remote group expansion memory (src/client-data/remote-group-expansion.ts
-// + src/client/remote-group-expansion.ts)
-//
-// The server groups' expansion state dies on every page load (the host's
-// retainAccountKeys purges the zr~ keys while the workspace list is still
-// local-only), so the plugin keeps its own record and re-applies it by
-// clicking the group rows. Driven the dynamic .ts way (the same seam
-// current-session-report.test.cjs uses):
-//
-// - the PURE core: the four planning rules (host-recorded → sync, never
-//   click; no record anywhere → default EXPANDED and click when collapsed;
-//   plugin-recorded collapsed → stays collapsed; non-zr~ rows ignored) plus
-//   the record cap's oldest eviction;
-// - the keeper loop: clicks exactly the planned rows, only once per group
-//   per page load, writes the record back, and idles on a non-client role.
 'use strict'
 const test = require('node:test')
 const assert = require('node:assert/strict')
@@ -20,9 +5,9 @@ const assert = require('node:assert/strict')
 const loadPure = () => import('../src/client-data/remote-group-expansion.ts?' + Math.random())
 const loadKeeper = () => import('../src/client/remote-group-expansion.ts?' + Math.random())
 
-const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
-
-// -- the pure planning core -----------------------------------------------------------
+async function flushMicrotasks() {
+  for (let i = 0; i < 6; i += 1) await Promise.resolve()
+}
 
 test('T64 plan: a host-recorded group is never clicked and its value syncs into the plugin record', async () => {
   const { planRemoteGroupExpansion } = await loadPure()
@@ -35,30 +20,22 @@ test('T64 plan: a host-recorded group is never clicked and its value syncs into 
       { key: 'ws-local', expanded: false },
     ],
   })
-  // The host holds records for both zr~ groups — the user's latest choice
-  // lives there: no click, and the plugin record takes the host's values
-  // (the local group never enters the record at all).
   assert.deepEqual(plan.clicks, [])
   assert.deepEqual(plan.record, { 'zr~sid~w1': false, 'zr~sid~w2': true })
 })
 
-test('T64 plan: no record anywhere → default EXPANDED and click; a plugin-recorded collapsed group stays collapsed', async () => {
+test('T64 plan: no record anywhere -> default EXPANDED and click; plugin-recorded collapsed stays collapsed', async () => {
   const { planRemoteGroupExpansion } = await loadPure()
   const plan = planRemoteGroupExpansion({
     hostRecord: {},
     pluginRecord: { 'zr~sid~w2': false, 'zr~sid~w3': true },
     rows: [
-      // Just purged on the host, never recorded by the plugin: the group was
-      // showing its sessions before — restore to expanded.
       { key: 'zr~sid~w1', expanded: false },
-      // The user collapsed it deliberately at some point: keep collapsed.
       { key: 'zr~sid~w2', expanded: false },
-      // Plugin says expanded and the row already is: nothing to do.
       { key: 'zr~sid~w3', expanded: true },
     ],
   })
   assert.deepEqual(plan.clicks, ['zr~sid~w1'])
-  // The untouched groups ride along in the record (value and order kept).
   assert.deepEqual(plan.record, { 'zr~sid~w2': false, 'zr~sid~w3': true })
 })
 
@@ -69,7 +46,7 @@ test('T64 plan: an expanded-by-default group that is already expanded is left al
     pluginRecord: {},
     rows: [{ key: 'zr~sid~w1', expanded: true }],
   })
-  assert.deepEqual(plan.clicks, [], 'already expanded — the wanted state agrees')
+  assert.deepEqual(plan.clicks, [])
   assert.deepEqual(plan.record, {})
 })
 
@@ -77,8 +54,6 @@ test('T64 plan: the record is capped and the oldest entries evict first', async 
   const pure = await loadPure()
   const over = {}
   for (let i = 0; i < pure.REMOTE_GROUP_EXPANSION_LIMIT; i += 1) over[`zr~sid~old${i}`] = true
-  // Touch an OLD key last (sync refreshes recency) and add a NEW key past
-  // the cap: the untouched oldest head must evict, the touched one stays.
   const hostRecord = { 'zr~sid~old3': true }
   over['zr~sid~new'] = false
   const plan = pure.planRemoteGroupExpansion({
@@ -86,13 +61,13 @@ test('T64 plan: the record is capped and the oldest entries evict first', async 
     pluginRecord: over,
     rows: [{ key: 'zr~sid~new', expanded: true }],
   })
-  assert.deepEqual(plan.clicks, ['zr~sid~new'], 'plugin-recorded collapsed, row expanded → click to restore')
+  assert.deepEqual(plan.clicks, ['zr~sid~new'])
   const keys = Object.keys(plan.record)
-  assert.equal(keys.length, pure.REMOTE_GROUP_EXPANSION_LIMIT, 'the cap holds')
-  assert.equal(keys.includes('zr~sid~old0'), false, 'the untouched oldest head evicted')
-  assert.equal(keys.includes('zr~sid~old3'), true, 'the touched key survived')
-  assert.equal(keys[keys.length - 1], 'zr~sid~old3', 'the host-synced key is the freshest (touched last)')
-  assert.equal(keys[keys.length - 2], 'zr~sid~new', 'the newest plugin key sits right before it')
+  assert.equal(keys.length, pure.REMOTE_GROUP_EXPANSION_LIMIT)
+  assert.equal(keys.includes('zr~sid~old0'), false)
+  assert.equal(keys.includes('zr~sid~old3'), true)
+  assert.equal(keys[keys.length - 1], 'zr~sid~old3')
+  assert.equal(keys[keys.length - 2], 'zr~sid~new')
 })
 
 test('T64 parse: malformed values degrade to empty records', async () => {
@@ -110,13 +85,6 @@ test('T64 parse: malformed values degrade to empty records', async () => {
   )
 })
 
-// -- the keeper loop ------------------------------------------------------------------
-
-/** A deterministic environment: fake storage (both keys), fake rows with
- * click recorders, a manual role answer, a fast interval. No DOM. */
-// `roleAnswer` has NO destructuring default on purpose: `undefined` is a
-// real answer here (a failed probe), and a default would turn it into a
-// definite verdict.
 function makeEnv({ hostView = {}, rows = [], roleAnswer, pluginRecord = null } = {}) {
   const backing = new Map()
   if (pluginRecord !== null) backing.set('zr.remoteGroupExpansion.v1', JSON.stringify(pluginRecord))
@@ -125,9 +93,7 @@ function makeEnv({ hostView = {}, rows = [], roleAnswer, pluginRecord = null } =
   const env = {
     clicked,
     backing,
-    /** Rewrite what the host's own record now holds (as a real click would). */
     setHost(groupExpansion) { backing.set('dsh.workspace.view.v5', JSON.stringify({ groupExpansion })) },
-    /** Rewrite the row states the next query sees. */
     setRowStates(states) { env.rowStates = states },
     rowStates: rows,
     stop: undefined,
@@ -145,13 +111,14 @@ function makeEnv({ hostView = {}, rows = [], roleAnswer, pluginRecord = null } =
         expanded,
         click: () => clicked.push(key),
       })),
-      intervalMs: 5,
+      intervalMs: 100,
     })
   }
   return env
 }
 
-test('T64 keeper: collapsed purged groups are restored by one click each; the record is written back', async () => {
+test('T64 keeper: collapsed purged groups are restored by one click each; the record is written back', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   const env = makeEnv({
     hostView: { 'ws-local': true },
     roleAnswer: 'client',
@@ -162,49 +129,44 @@ test('T64 keeper: collapsed purged groups are restored by one click each; the re
   })
   await env.load()
   try {
-    await wait(40)
-    assert.deepEqual(env.clicked, ['zr~sid~w1', 'zr~sid~w2'], 'both just-purged groups restore to expanded')
-    // The record only ever holds keys the HOST once recorded — right after
-    // the restore clicks (nothing recorded yet is zr~) it stays unwritten.
+    await flushMicrotasks()
+    assert.deepEqual(env.clicked, ['zr~sid~w1', 'zr~sid~w2'])
     assert.equal(env.backing.has('zr.remoteGroupExpansion.v1'), false)
 
-    // Simulate the clicks landing: the host records them, the rows show
-    // expanded. The next ticks must not click again (host-recorded anyway)
-    // — and the memory now fills from the host's own record.
     env.setHost({ 'ws-local': true, 'zr~sid~w1': true, 'zr~sid~w2': true })
     env.setRowStates([
       { key: 'zr~sid~w1', expanded: true },
       { key: 'zr~sid~w2', expanded: true },
     ])
-    await wait(40)
-    assert.deepEqual(env.clicked, ['zr~sid~w1', 'zr~sid~w2'], 'no re-click once the host holds the record')
+    t.mock.timers.tick(100)
+    await flushMicrotasks()
+    assert.deepEqual(env.clicked, ['zr~sid~w1', 'zr~sid~w2'])
     assert.deepEqual(JSON.parse(env.backing.get('zr.remoteGroupExpansion.v1')), {
       'zr~sid~w1': true,
       'zr~sid~w2': true,
-    }, 'the host-recorded values synced into the plugin memory')
+    })
   } finally {
     env.stop()
   }
 })
 
-test('T64 keeper: the same group is auto-clicked at most once per page load', async () => {
+test('T64 keeper: the same group is auto-clicked at most once per page load', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   const env = makeEnv({ rows: [{ key: 'zr~sid~w1', expanded: false }], roleAnswer: 'client' })
   await env.load()
   try {
-    await wait(40)
+    await flushMicrotasks()
     assert.deepEqual(env.clicked, ['zr~sid~w1'])
-    // The click did NOT land (the host wrote no record, the row still reads
-    // collapsed): the once-per-load guard must keep the later ticks quiet —
-    // re-clicking would fight the host.
-    await wait(40)
-    await wait(40)
-    assert.deepEqual(env.clicked, ['zr~sid~w1'], 'no re-click even though nothing changed')
+    t.mock.timers.tick(300)
+    await flushMicrotasks()
+    assert.deepEqual(env.clicked, ['zr~sid~w1'])
   } finally {
     env.stop()
   }
 })
 
-test('T64 keeper: a host-recorded group is left alone; a malformed DOM shape is skipped silently', async () => {
+test('T64 keeper: a host-recorded group is left alone; a malformed DOM shape is skipped silently', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   const env = makeEnv({
     hostView: { 'zr~sid~w1': false },
     roleAnswer: 'client',
@@ -215,26 +177,29 @@ test('T64 keeper: a host-recorded group is left alone; a malformed DOM shape is 
   })
   await env.load()
   try {
-    await wait(40)
-    assert.deepEqual(env.clicked, ['zr~sid~w2'], 'only the host-unrecorded group is clicked; the recorded one is the user\'s choice')
+    await flushMicrotasks()
+    assert.deepEqual(env.clicked, ['zr~sid~w2'])
     assert.deepEqual(JSON.parse(env.backing.get('zr.remoteGroupExpansion.v1')), { 'zr~sid~w1': false })
   } finally {
     env.stop()
   }
 })
 
-test('T64 keeper: a non-client role never clicks and never writes', async () => {
+test('T64 keeper: a non-client role never clicks and never writes', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   const env = makeEnv({ rows: [{ key: 'zr~sid~w1', expanded: false }], roleAnswer: 'host' })
   await env.load()
   try {
-    await wait(40)
+    t.mock.timers.tick(200)
+    await flushMicrotasks()
     assert.deepEqual(env.clicked, [])
     assert.equal(env.backing.has('zr.remoteGroupExpansion.v1'), false)
-    // An undecided (failed) probe idles the same way.
+
     const unknown = makeEnv({ rows: [{ key: 'zr~sid~w1', expanded: false }], roleAnswer: undefined })
     await unknown.load()
     try {
-      await wait(40)
+      t.mock.timers.tick(200)
+      await flushMicrotasks()
       assert.deepEqual(unknown.clicked, [])
       assert.equal(unknown.backing.has('zr.remoteGroupExpansion.v1'), false)
     } finally {
@@ -245,10 +210,8 @@ test('T64 keeper: a non-client role never clicks and never writes', async () => 
   }
 })
 
-test('PG-9-fix keeper: a PEER role remembers and restores zr~ groups exactly like a client', async () => {
-  // A peer node mounts the same zr~ server groups as a client — the host's
-  // retainAccountKeys purge kills the expansion record on every load there
-  // too, so the keeper must run (only a HOST has no server groups).
+test('PG-9-fix keeper: a PEER role remembers and restores zr~ groups exactly like a client', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   const env = makeEnv({
     hostView: { 'ws-local': true },
     roleAnswer: 'peer',
@@ -259,26 +222,26 @@ test('PG-9-fix keeper: a PEER role remembers and restores zr~ groups exactly lik
   })
   await env.load()
   try {
-    await wait(40)
-    assert.deepEqual(env.clicked, ['zr~sid~w1', 'zr~sid~w2'], 'purged groups restore on a peer page like on a client page')
+    await flushMicrotasks()
+    assert.deepEqual(env.clicked, ['zr~sid~w1', 'zr~sid~w2'])
     env.setHost({ 'ws-local': true, 'zr~sid~w1': true, 'zr~sid~w2': true })
     env.setRowStates([
       { key: 'zr~sid~w1', expanded: true },
       { key: 'zr~sid~w2', expanded: true },
     ])
-    await wait(40)
+    t.mock.timers.tick(100)
+    await flushMicrotasks()
     assert.deepEqual(JSON.parse(env.backing.get('zr.remoteGroupExpansion.v1')), {
       'zr~sid~w1': true,
       'zr~sid~w2': true,
-    }, 'the host-recorded values sync into the plugin memory on a peer page too')
+    })
   } finally {
     env.stop()
   }
 })
 
-test('T66 keeper: a throwing localStorage neither rejects the tick nor clicks — and recovery works', async () => {
-  // The storage wrapper (a private-mode quota, a poisoned extension) throws
-  // on BOTH methods; the tick must swallow it and keep the loop alive.
+test('T66 keeper: a throwing localStorage neither rejects the tick nor clicks — and recovery works', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   let broken = true
   const backing = new Map()
   const clicked = []
@@ -298,54 +261,46 @@ test('T66 keeper: a throwing localStorage neither rejects the tick nor clicks �
     queryRows: () => [{
       key: 'zr~sid~w1',
       expanded: false,
-      // A real click makes the HOST record the state in its own storage —
-      // mirrored here so the sync half has something to read once healed.
       click: () => {
         clicked.push('zr~sid~w1')
         backing.set('dsh.workspace.view.v5', JSON.stringify({ groupExpansion: { 'zr~sid~w1': true } }))
       },
     }],
-    intervalMs: 5,
+    intervalMs: 100,
   })
   try {
-    // Many ticks against the throwing storage: no rejection escapes (an
-    // escaping one would fail this run as an unhandled rejection), and the
-    // loop stays alive. The clicks keep following the plan computed from
-    // the degraded (empty) record — the failure is swallowed, not the tick.
-    await wait(40)
-    // The storage heals: the next tick works — reads land, and the record
-    // write survives too.
+    await flushMicrotasks()
+    t.mock.timers.tick(200)
+    await flushMicrotasks()
     broken = false
-    await wait(40)
-    assert.deepEqual(clicked, ['zr~sid~w1'], 'recovery needs no reload')
-    assert.deepEqual(JSON.parse(backing.get('zr.remoteGroupExpansion.v1')), { 'zr~sid~w1': true },
-      'the host-recorded value (written by the landing click) synced into the memory')
+    t.mock.timers.tick(100)
+    await flushMicrotasks()
+    assert.deepEqual(clicked, ['zr~sid~w1'])
+    assert.deepEqual(JSON.parse(backing.get('zr.remoteGroupExpansion.v1')), { 'zr~sid~w1': true })
   } finally {
     stop()
   }
 })
 
-test('T66 keeper: a group whose row DISAPPEARS may be restored once more when it comes back', async () => {
+test('T66 keeper: a group whose row DISAPPEARS may be restored once more when it comes back', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   const env = makeEnv({ rows: [{ key: 'zr~sid~w1', expanded: false }], roleAnswer: 'client' })
   await env.load()
   try {
-    await wait(40)
-    assert.deepEqual(env.clicked, ['zr~sid~w1'], 'restored once on first sight')
+    await flushMicrotasks()
+    assert.deepEqual(env.clicked, ['zr~sid~w1'])
 
-    // The row leaves the DOM (a server switch, a workspace refresh): the
-    // once-per-load marker drops with it.
     env.setRowStates([])
-    await wait(40)
+    t.mock.timers.tick(100)
+    await flushMicrotasks()
 
-    // The row comes BACK (still collapsed — a fresh host record again): the
-    // group is restorable once more, like on a fresh load.
     env.setRowStates([{ key: 'zr~sid~w1', expanded: false }])
-    await wait(40)
-    assert.deepEqual(env.clicked, ['zr~sid~w1', 'zr~sid~w1'], 'the returned group was restored a second time')
+    t.mock.timers.tick(100)
+    await flushMicrotasks()
+    assert.deepEqual(env.clicked, ['zr~sid~w1', 'zr~sid~w1'])
 
-    // And the once-per-load rule still holds while the row STAYS: no third
-    // click for an unchanged DOM.
-    await wait(40)
+    t.mock.timers.tick(200)
+    await flushMicrotasks()
     assert.equal(env.clicked.length, 2)
   } finally {
     env.stop()

@@ -136,6 +136,9 @@ export interface ClientHandlerOptions {
     getRowConfig: () => unknown;
     /** Outbound fetch, defaulting to the global one. */
     fetchImpl?: FetchLike;
+    /** Longest wait (ms) for one connection probe or live handshake; defaults to
+     * {@link PROBE_TIMEOUT_MS} (5000). Tests inject a small value. */
+    probeTimeoutMs?: number;
     /** Upload-redirect service probe (RD-6): lazily reflects `connection` /
      * `fileUploads` from a context that already resolved, plus whether the
      * fetch-route inject callback ever fired. Answers WHY the upload
