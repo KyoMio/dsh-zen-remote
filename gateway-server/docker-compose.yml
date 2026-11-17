@@ -1,0 +1,74 @@
+services:
+  zr-gateway:
+    image: kyomio/zen-remote-gateway:latest
+    container_name: zr-gateway
+    restart: unless-stopped
+    # Gateway keeps a 5s shutdown flush budget (+4s error grace) on SIGTERM
+    stop_grace_period: 15s
+
+    ports:
+      - "19393:19393/tcp"   # Web console + WebSocket (supports built-in native HTTPS/WSS)
+      - "19393:19393/udp"   # Primary STUN socket
+      - "19394:19394/udp"   # Secondary STUN socket (NAT classification)
+
+    environment:
+      # External public URL without a trailing slash, used in zr-net:// invite links:
+      # - Built-in single-port native TLS: https://zr.example.com:19393
+      # - Behind external Caddy/Nginx on 443: https://zr.example.com
+      # - Leave unset for local LAN tests or hot-edit later in Gateway Settings
+      # ZR_GATEWAY_PUBLIC_URL: https://zr.example.com:19393
+
+      # --- Optional settings (defaults apply when omitted) ---
+      # ZR_GATEWAY_ADMIN_USER: admin@local
+      # ZR_GATEWAY_ADMIN_PASSWORD: ""        # Generates a 16-char password once in logs if omitted on empty DB
+      # ZR_GATEWAY_ALLOW_SIGNUP: "false"
+      # ZR_GATEWAY_MAX_PEERS: "8"            # Default max peers per new network (2-64)
+      # ZR_GATEWAY_MAX_NETWORKS_PER_USER: "3"
+      # ZR_GATEWAY_RELAY_RATE_KBPS: "4096"   # Per-member relay rate cap (KB/s)
+
+      # --- Optional external PostgreSQL (also uncomment depends_on + postgres service below) ---
+      # ZR_GATEWAY_DATABASE_URL: postgres://zr_gateway:change_me@postgres:5432/zr_gateway
+
+    volumes:
+      # Named volume recommended for /data (holds SQLite DB + 0600 master.key)
+      - zr-gateway-data:/data
+      # Certificate directory for built-in TLS (fullchain.pem / privkey.pem; Linux writable dir needs chown 100:101 ./certs)
+      - ./certs:/certs
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "const s=require('node:net').connect(Number(process.env.ZR_GATEWAY_PORT)||19393,'127.0.0.1',()=>{s.destroy();process.exit(0)});s.on('error',()=>process.exit(1))",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+    # Uncomment when enabling the optional postgres service below:
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
+
+  # --- Optional external PostgreSQL ---
+  # postgres:
+  #   image: postgres:16-alpine
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: zr_gateway
+  #     POSTGRES_PASSWORD: change_me
+  #     POSTGRES_DB: zr_gateway
+  #   volumes:
+  #     - zr-gateway-pg:/var/lib/postgresql/data
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "pg_isready -U zr_gateway -d zr_gateway"]
+  #     interval: 10s
+  #     timeout: 5s
+  #     retries: 5
+
+volumes:
+  zr-gateway-data:
+  # zr-gateway-pg:

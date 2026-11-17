@@ -8,4 +8,5 @@ docs/
 PRODUCT.md
 DESIGN.md
 Dockerfile
+docker-compose.yml
 .dockerignore

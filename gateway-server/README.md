@@ -15,9 +15,24 @@ It performs four core jobs:
 
 ## Quick Deploy (Docker, Recommended)
 
-```sh
-docker build -t zr-gateway ./gateway-server
+### Option A: Docker Compose (Prebuilt Multi-Arch Image, Recommended)
 
+Use [docker-compose.yml](docker-compose.yml) (pulls `kyomio/zen-remote-gateway:latest` for `linux/amd64` and `linux/arm64`, with an optional PostgreSQL service block commented inside):
+
+```sh
+mkdir -p ./certs && sudo chown 100:101 ./certs   # Linux: let non-root user zr write uploaded certs (skip if mounting :ro)
+curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/KyoMio/dsh-zen-remote/main/gateway-server/docker-compose.yml
+# Optional: edit docker-compose.yml to set ZR_GATEWAY_PUBLIC_URL (or configure it later in the Web console)
+docker compose up -d
+docker compose logs -f zr-gateway
+```
+
+To pin a release instead of `latest`, change `image:` to `kyomio/zen-remote-gateway:0.1` or `kyomio/zen-remote-gateway:0.1.0`.
+
+### Option B: `docker run` / Local Image Build
+
+```sh
+# Pull the prebuilt image (or build locally from ./gateway-server: docker build -t kyomio/zen-remote-gateway:latest ./gateway-server)
 docker run -d --name zr-gateway \
   --restart unless-stopped \
   -p 19393:19393/tcp \
@@ -26,7 +41,7 @@ docker run -d --name zr-gateway \
   -e ZR_GATEWAY_PUBLIC_URL=https://zr.example.com \
   -v zr-gateway-data:/data \
   -v $(pwd)/certs:/certs \
-  zr-gateway
+  kyomio/zen-remote-gateway:latest
 ```
 
 - `-e ZR_GATEWAY_PUBLIC_URL`: set this to the external URL peers and browsers will use to reach the gateway (for an external HTTPS reverse proxy on port `443`, use `https://zr.example.com`; for built-in single-port native TLS on `19393`, use `https://zr.example.com:19393`; you can also omit it for local LAN testing or hot-configure it later in the Web console).
