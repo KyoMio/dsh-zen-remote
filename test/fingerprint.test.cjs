@@ -341,8 +341,16 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
     // still r:c3b0734019c7. Other groups are likewise unchanged. npm latest
     // remains 0.2.2-rc.1.
     '0.2.2-rc.3': 'r:c3b0734019c7',
+    // 0.2.2-rc.4: typert.remote-client.js is byte-identical to rc.3 (27
+    // endpoints, same ids and order). The published upgrade is the DeepSeek
+    // streamed-refusal error code (MALFORMED_RESPONSE → CONTENT_REFUSED in
+    // dsh-llm-deepseek); that is not part of the session remote surface.
+    // Live hash against the npm 0.2.2-rc.4 closure is still r:c3b0734019c7.
+    // Other fingerprint groups are likewise unchanged. npm latest remains
+    // 0.2.2-rc.1.
+    '0.2.2-rc.4': 'r:c3b0734019c7',
   }
-  const ENDPOINTS = { '0.2.2-alpha.2': 27, '0.2.2-alpha.3': 27, '0.2.2-rc.1': 27, '0.2.2-rc.2': 27, '0.2.2-rc.3': 27 }
+  const ENDPOINTS = { '0.2.2-alpha.2': 27, '0.2.2-alpha.3': 27, '0.2.2-rc.1': 27, '0.2.2-rc.2': 27, '0.2.2-rc.3': 27, '0.2.2-rc.4': 27 }
   const { version } = require('../node_modules/@deepseek-ai/dsh-api-session-controller/package.json')
   assert.ok(PINS[version], `no session pin for dsh-api-session-controller ${version}: diff its typert.remote-client.js against the last pinned version, then record the new hash`)
   const remote = await import('../node_modules/@deepseek-ai/dsh-api-session-controller/lib/typert.remote-client.js')
