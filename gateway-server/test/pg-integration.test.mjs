@@ -184,8 +184,10 @@ async function countConnections(url, applicationName) {
 /** spawn 隔离子进程跑 runner；deadline 到即 SIGKILL（父侧等待真实有界） */
 function runTestChild(mode, schema, deadlineMs) {
   const runner = path.join(import.meta.dirname, 'pg-batch-child.mjs');
+  const urlSource =
+    typeof urlDirectEnv === 'string' && urlDirectEnv.trim().length > 0 ? '-' : urlFileEnv;
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [runner, mode, urlFileEnv, schema], {
+    const child = spawn(process.execPath, [runner, mode, urlSource, schema], {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';

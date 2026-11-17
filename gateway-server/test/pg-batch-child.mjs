@@ -1,5 +1,5 @@
 // PC-06 fix1 专用隔离子进程 runner（纯测试工具，不参与生产构建）。
-// 用法：node test/pg-batch-child.mjs <batch|hang|init-fail> <urlFile> <schema>
+// 用法：node test/pg-batch-child.mjs <batch|hang|init-fail> <urlFile|-> <schema>
 // - batch：在本轮 schema 上重置配额并跑 50 并发建网 + 12 次健康查询，
 //   stdout 最后一行输出 JSON 摘要（wallMs/fulfilled/quotaRejected/others/maxHealthMs）。
 // - hang：connect 成功后人为永久挂起（测试工具自身的受控挂起，证明父侧 deadline+kill
@@ -23,11 +23,18 @@ const BATCH_DEADLINE_MS = 30_000;
 
 const [mode, urlFile, schema] = process.argv.slice(2);
 if ((mode !== 'batch' && mode !== 'hang' && mode !== 'init-fail') || !urlFile || !schema) {
-  console.error('usage: pg-batch-child.mjs <batch|hang|init-fail> <urlFile> <schema>');
+  console.error('usage: pg-batch-child.mjs <batch|hang|init-fail> <urlFile|-> <schema>');
   process.exit(2);
 }
 
-const raw = readFileSync(urlFile, 'utf8').trim();
+const raw =
+  urlFile === '-'
+    ? (process.env.ZR_TEST_PG_URL ?? '').trim()
+    : readFileSync(urlFile, 'utf8').trim();
+if (!raw) {
+  console.error('missing PG connection string (urlFile or ZR_TEST_PG_URL)');
+  process.exit(2);
+}
 
 if (mode === 'init-fail') {
   const APP_NAME = 'zr_pc07_init_fail';
