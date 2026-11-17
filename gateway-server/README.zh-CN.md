@@ -15,9 +15,24 @@
 
 ## 快速部署（Docker，推荐）
 
-```sh
-docker build -t zr-gateway ./gateway-server
+### 方式一：Docker Compose（直接拉取双架构预构建镜像，推荐）
 
+仓库已提供开箱即用的 [docker-compose.yml](docker-compose.yml)（默认拉取 `kyomio/zen-remote-gateway:latest`，支持 `linux/amd64` 与 `linux/arm64`，文件内附带可选的外置 PostgreSQL 注释配置）：
+
+```sh
+mkdir -p ./certs && sudo chown 100:101 ./certs   # Linux 下如需在控制台保存/上传证书先授权（只读挂载可跳过）
+curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/KyoMio/dsh-zen-remote/main/gateway-server/docker-compose.yml
+# 可按需编辑 docker-compose.yml 中的 ZR_GATEWAY_PUBLIC_URL（也可启动后在控制台「网关设置」热配置）
+docker compose up -d
+docker compose logs -f zr-gateway
+```
+
+如需锁定版本而非 `latest`，可将 `image:` 改为 `kyomio/zen-remote-gateway:0.1` 或 `kyomio/zen-remote-gateway:0.1.0`。
+
+### 方式二：`docker run` / 本地源码构建
+
+```sh
+# 直接拉取官方镜像（如需本地源码构建，可先执行 docker build -t kyomio/zen-remote-gateway:latest ./gateway-server）
 docker run -d --name zr-gateway \
   --restart unless-stopped \
   -p 19393:19393/tcp \
@@ -26,7 +41,7 @@ docker run -d --name zr-gateway \
   -e ZR_GATEWAY_PUBLIC_URL=https://zr.example.com \
   -v zr-gateway-data:/data \
   -v $(pwd)/certs:/certs \
-  zr-gateway
+  kyomio/zen-remote-gateway:latest
 ```
 
 - `-e ZR_GATEWAY_PUBLIC_URL`：按实际对外访问地址填写（走外部 HTTPS 反代 443 时填 `https://zr.example.com`；走网关自带 19393 原生 TLS 时填 `https://zr.example.com:19393`；若先局域网测试或打算之后在控制台热修改，也可省略此变量）。
