@@ -134,7 +134,7 @@ Add the dependency to the profile's `package.json` (`~/.dsh/profiles/desktop` fo
 // ~/.dsh/profiles/desktop/package.json
 {
   "dependencies": {
-    "dsh-zen-remote": "^2.4.4"        // for local development: "link:/path/to/dsh-zen-remote"
+    "dsh-zen-remote": "^2.5.0"        // for local development: "link:/path/to/dsh-zen-remote"
   },
   "dsh": {
     "profile": {
