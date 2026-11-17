@@ -1,7 +1,6 @@
 # 更新日志
 
-只记用户可感知的变化；每个 Release 的正文即本文件对应版本段，其下附逐提交
-完整列表，见
+只记用户可感知的变化；每个 Release 的正文即本文件对应版本段，其下附与上一版本的完整变更对比链接，见
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
