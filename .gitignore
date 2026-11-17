@@ -17,6 +17,7 @@ GLOSSARY.md
 
 # Share-image working tickets (local, not shipped)
 .scratch/
+scripts/cdp-probe.mjs
 
 # Per-order planning notes (super-marshal worktrees; not shipped)
 tasks/
