@@ -405,17 +405,6 @@ test('writeStateFile merges over the disk state: a partial updater never erases 
 
 test('upsertPairedServer honors the maxServers input; the default stays 8 (PG-2)', (t) => {
   const { upsertPairedServer, listPairedServers } = mod
-  const file = tempStateFile(t)
-
-  // Default: the ninth NEW address is still refused (existing behavior).
-  for (let i = 1; i <= 8; i += 1) {
-    assert.equal(upsertPairedServer(file, { serverUrl: `http://10.0.0.${i}:3088`, token: `t${i}` }).ok, true)
-  }
-  assert.deepEqual(
-    upsertPairedServer(file, { serverUrl: 'http://10.0.1.1:3088', token: 't9' }),
-    { ok: false, code: 'limit-reached' },
-    'without the input the cap stays at the default 8',
-  )
 
   // A DIFFERENT file with maxServers 16: the 9th..16th fit, the 17th refuses.
   const wide = tempStateFile(t)

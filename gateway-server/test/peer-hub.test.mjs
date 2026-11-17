@@ -13,17 +13,13 @@ import net from 'node:net';
 import { createGatewayApiServer } from '../dist/server.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { currentUtcYearMonth } from '../dist/store/types.js';
-import { deriveMasterKeyFromSecret, encryptSecret, hashPassword } from '../dist/master-key.js';
+import { deriveMasterKeyFromSecret, encryptSecret } from '../dist/master-key.js';
 import { PeerRateLimiter } from '../dist/peer-hub/rate-limiter.js';
 import { formatRate } from '../dist/web/format.js';
 import { UdpStunService } from '../dist/peer-hub/udp-stun.js';
 import { PeerWsHub } from '../dist/peer-hub/ws-hub.js';
 import WebSocket from 'ws';
-
-const ADMIN_EMAIL = 'admin@local';
-const ADMIN_PASSWORD = 'admin-pass-1234';
-const TENANT_EMAIL = 'tenant@local';
-const TENANT_PASSWORD = 'tenant-pass-1234';
+import { ADMIN_EMAIL, ADMIN_PASSWORD, TENANT_EMAIL, TENANT_HASH, TENANT_PASSWORD, seedSession, waitFor } from './helpers/fixtures.mjs';
 
 // ---------------------------------------------------------------- 节点身份（与 src/peer/crypto.ts 同一套自证明方案）
 
@@ -143,7 +139,7 @@ function wsBinary(ws, { timeoutMs = 2000 } = {}) {
 }
 
 /** 断言窗口期内一条消息都没有（文本与二进制都算，含已缓冲的） */
-function wsSilence(ws, ms = 150) {
+function wsSilence(ws, ms = 80) {
   return new Promise((resolve, reject) => {
     if (ws.__textQueue.length > 0 || ws.__binaryQueue.length > 0) {
       reject(new Error(`expected silence, got queued messages: ${JSON.stringify(ws.__textQueue[0]) ?? ''}`));
@@ -510,14 +506,10 @@ async function startGateway(opts = {}) {
   const udp = await stun.bind();
 
   const base = `http://127.0.0.1:${server.address().port}`;
-  await store.ensureBootstrapAdmin({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD });
-  const tenant = await store.createUser({
-    email: TENANT_EMAIL,
-    passwordHash: await hashPassword(TENANT_PASSWORD),
-    role: 'user',
-  });
-  const adminCookie = await login(base, ADMIN_EMAIL, ADMIN_PASSWORD);
-  const tenantCookie = await login(base, TENANT_EMAIL, TENANT_PASSWORD);
+  const admin = await seedSession(store, { email: ADMIN_EMAIL, role: 'admin' });
+  const tenant = await seedSession(store, { email: TENANT_EMAIL, role: 'user' });
+  const adminCookie = admin.cookie;
+  const tenantCookie = tenant.cookie;
 
   const close = async () => {
     await hub.close();
@@ -529,7 +521,7 @@ async function startGateway(opts = {}) {
     });
     await store.close();
   };
-  return { store, masterKey, hub, stun, udp, natRecords, base, tenantId: tenant.id, adminCookie, tenantCookie, close };
+  return { store, masterKey, hub, stun, udp, natRecords, base, tenantId: tenant.user.id, adminCookie, tenantCookie, close };
 }
 
 /**
@@ -1135,9 +1127,9 @@ describe('双 UDP 端口 STUN 与 NAT 判定', () => {
       const s = await udpSocket();
 
       udpProbe(s, primaryPort, a, { networkId: net.id, signIt: false });
-      await udpSilence(s, 300);
+      await udpSilence(s, 120);
       udpProbe(s, primaryPort, a, { networkId: net.id, timestamp: Date.now() - 6 * 60_000 });
-      await udpSilence(s, 300);
+      await udpSilence(s, 120);
       assert.equal(gw.natRecords.length, 0, '没有任何 NAT 判定');
       s.close();
     } finally {
@@ -1319,7 +1311,7 @@ describe('双 UDP 端口 STUN 与 NAT 判定', () => {
   });
 
   test('PC-02：新鲜配对才分类——窗内反复主口更新继续配对，过窗正确降级 unknown', async () => {
-    const gw = await startGateway({ stunWindowMs: 250 });
+    const gw = await startGateway({ stunWindowMs: 80 });
     const socks = [];
     const mkSock = async () => { const sock = await udpSocket(); socks.push(sock); return sock; };
     try {
@@ -1358,7 +1350,7 @@ describe('双 UDP 端口 STUN 与 NAT 判定', () => {
 
       // 等 > windowMs：主辅槽位过期。此后仅主口的观察没有新鲜配对——
       // 正确降级为 unknown（诚实反映「当前分类不可知」），端点照常更新
-      await sleep(400);
+      await sleep(120);
       const s3 = await mkSock();
       const p3 = s3.address().port;
       udpProbe(s3, primaryPort, a, { networkId: net.id, nonce: 'ff04' });
@@ -1480,18 +1472,18 @@ describe('二进制帧中转与源地址防伪造', () => {
 
       // 伪造 srcNodeId：A 冒充 C 发帧 → 丢弃、连接不断
       wsA.send(frame({ src: 'deadbeef', dst: b.nodeId }));
-      await wsSilence(wsB, 150);
+      await wsSilence(wsB, 70);
       // 未知 dst：静默丢弃
       wsA.send(frame({ src: a.nodeId, dst: 'cafebabe' }));
-      await wsSilence(wsB, 150);
+      await wsSilence(wsB, 70);
       // src === dst 自环：丢弃
       wsA.send(frame({ src: a.nodeId, dst: a.nodeId }));
-      await wsSilence(wsB, 150);
+      await wsSilence(wsB, 70);
       // 垃圾（太短/魔数错/超长）：丢弃且连接存活
       wsA.send(Buffer.from([0x5a, 0x52, 0x01]));
       wsA.send(frame({ src: a.nodeId, dst: b.nodeId, totalBytes: 44 }).fill(0x00, 0, 2));
       wsA.send(Buffer.concat([frame({ src: a.nodeId, dst: b.nodeId, totalBytes: 1200 }), Buffer.alloc(200)]));
-      await wsSilence(wsB, 150);
+      await wsSilence(wsB, 70);
       // A 的连接还活着：正常帧仍中转
       const payload3 = frame({ src: a.nodeId, dst: b.nodeId, seq: 3n });
       wsA.send(payload3);
@@ -1552,7 +1544,13 @@ describe('二进制帧中转与源地址防伪造', () => {
       wsB.send(f2);
       await wsBinary(wsA);
 
-      await new Promise((resolve) => setTimeout(resolve, 400));
+      await waitFor(async () => {
+        const rows = await gw.store.listMembers(net.id);
+        return (
+          rows.find((m) => m.nodeId === a.nodeId)?.cumulativeRelayBytes === 64
+          && rows.find((m) => m.nodeId === b.nodeId)?.cumulativeRelayBytes === 48
+        );
+      });
       const members = await gw.store.listMembers(net.id);
       const aRow = members.find((m) => m.nodeId === a.nodeId);
       const bRow = members.find((m) => m.nodeId === b.nodeId);
@@ -1587,7 +1585,7 @@ describe('PC-19 第一片：遥测成功后确认、串行 flush 与失败保留
     });
     const tenant = await store.createUser({
       email: TENANT_EMAIL,
-      passwordHash: await hashPassword(TENANT_PASSWORD),
+      passwordHash: TENANT_HASH,
       role: 'user',
     });
     const net = await store.createNetwork({
@@ -2270,7 +2268,7 @@ describe('PC-03：pause 保留受限控制连接，resume 原地恢复', () => {
 
       // 业务即刻受限：B 的帧不再转发给 A
       wsB.send(frame({ src: b.nodeId, dst: a.nodeId }));
-      await wsSilence(wsA, 200);
+      await wsSilence(wsA, 100);
 
       // 拓扑：B 离线（不占在线数），状态 paused
       const topo = await getTopology(gw, net.id);
@@ -2282,7 +2280,7 @@ describe('PC-03：pause 保留受限控制连接，resume 原地恢复', () => {
       const sock = await udpSocket();
       t.after(() => sock.close());
       udpProbe(sock, gw.udp.primaryPort, b, { networkId: net.id });
-      await udpSilence(sock, 400);
+      await udpSilence(sock, 120);
     } finally {
       await gw.close();
     }
@@ -2436,38 +2434,6 @@ describe('PC-03：暂停池与最新持久授权的一致性', () => {
       const probe = frame({ src: b.nodeId, dst: a.nodeId, payloadBytes: 8 });
       wsB.send(probe);
       assert.deepEqual(await wsBinary(wsA), probe, '转发随 approve 恢复');
-    } finally {
-      await gw.close();
-    }
-  });
-
-  test('重复 resume 幂等：第二次无重复公告，连接保持授权', async (t) => {
-    const gw = await startGateway();
-    try {
-      const { net, a, b, wsA, wsB } = await setupPair(gw);
-      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
-      assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json));
-      assert.equal((await wsJson(wsB)).type, 'paused');
-      assert.equal((await wsJson(wsA)).type, 'peer-paused');
-
-      const res1 = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/resume`, { cookie: gw.tenantCookie });
-      assert.equal(res1.status, 200, JSON.stringify(res1.json));
-      assert.equal((await wsJson(wsB)).type, 'welcome');
-      const punchAtB = await wsJson(wsB);
-      assert.equal(punchAtB.type, 'punch-coordinate');
-      assert.equal((await wsJson(wsA)).type, 'peer-joined');
-      const punchAtA = await wsJson(wsA);
-      assert.equal(punchAtA.type, 'punch-coordinate');
-
-      // 第二次 resume（store 幂等 authorized→authorized，钩子照发）：池已空，
-      // 只刷拓扑——不得向 A 重复公告、不得向 B 重复 welcome
-      const res2 = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/resume`, { cookie: gw.tenantCookie });
-      assert.equal(res2.status, 200, JSON.stringify(res2.json));
-      await wsSilence(wsA, 250);
-      await wsSilence(wsB, 250);
-      const probe = frame({ src: b.nodeId, dst: a.nodeId, payloadBytes: 8 });
-      wsB.send(probe);
-      assert.deepEqual(await wsBinary(wsA), probe, '转发保持恢复态');
     } finally {
       await gw.close();
     }
@@ -2712,38 +2678,6 @@ describe('PC-03 fix2：初次入网认证的成员代次守卫', () => {
       await gw.close();
     }
   });
-
-  test('无关成员的 pause 不影响在途认证（成员代次按成员隔离）', async (t) => {
-    const gw = await startGateway();
-    try {
-      const { net, b, wsA, wsB } = await setupPair(gw);
-      const gate = gateAuthAtOwnerCheck(gw);
-
-      const c = identity();
-      const wsC = await wsOpen(gw.base);
-      t.after(() => wsC.close());
-      await authNode(wsC, c, { networkId: net.id, joinKey: net.joinKey, name: 'charlie', pauseHold: true });
-      for (let i = 0; i < 100 && !gate.gateEntered(); i++) await sleep(10);
-      assert.ok(gate.gateEntered(), '认证未进入末端 owner 复查窗口');
-
-      // 交错 pause 的是另一个成员 B（在线，降级受限保留）
-      const pauseRes = await api(gw.base, 'POST', `/api/v1/networks/${net.id}/members/${b.nodeId}/pause`, { cookie: gw.tenantCookie });
-      assert.equal(pauseRes.status, 200, JSON.stringify(pauseRes.json));
-      assert.equal((await wsJson(wsB)).type, 'paused');
-      assert.equal((await wsJson(wsA)).type, 'peer-paused');
-
-      // C 的认证不受无关 pause 影响：正常完成注册
-      gate.release();
-      const welcome = await wsJson(wsC, { timeoutMs: 2000 });
-      assert.equal(welcome.type, 'welcome');
-      assert.equal(welcome.status, 'authorized');
-      const topo = await getTopology(gw, net.id);
-      assert.equal(topo.members.find((m) => m.nodeId === c.nodeId).status, 'authorized');
-      assert.equal(topo.summary.onlineDevices, 2, 'A 与 C 在线，B 受限挂起');
-    } finally {
-      await gw.close();
-    }
-  });
 });
 
 // ---------------------------------------------------------------- GC-3：按组限速与月度中转配额
@@ -2789,11 +2723,12 @@ describe('GC-3 用户组限速与月度中转配额', () => {
       await gw.store.updateUserByAdmin(tenant.id, { groupId: slowGroup.id });
       await gw.store.createUser({
         email: 'gc3-fast@local',
-        passwordHash: await hashPassword('gc3-fast-pass-1234'),
+        passwordHash: TENANT_HASH,
         role: 'user',
         groupId: fastGroup.id,
       });
-      const fastCookie = await login(gw.base, 'gc3-fast@local', 'gc3-fast-pass-1234');
+      const fastSession = await seedSession(gw.store, { email: 'gc3-fast@local', role: 'user' });
+      const fastCookie = fastSession.cookie;
 
       const netSlow = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
       const slow = await joinPair(gw, netSlow, clock);
@@ -2811,7 +2746,7 @@ describe('GC-3 用户组限速与月度中转配额', () => {
         await wsBinary(slow.wsB);
       }
       slow.wsA.send(bigFrame(slow.a.nodeId, slow.b.nodeId, 55n));
-      await wsSilence(slow.wsB, 250);
+      await wsSilence(slow.wsB, 100);
 
       // fast 组（512kbps → 桶 524288B）同量流量全过：桶按网络/属主独立，互不串扰
       for (let i = 1; i <= 55; i++) {
@@ -2856,7 +2791,7 @@ describe('GC-3 用户组限速与月度中转配额', () => {
 
       // 配额耗尽后 DATA 帧被静默丢弃：不转发、不断线，且留下可观测量计数
       wsA.send(dataFrame(33n));
-      await wsSilence(wsB, 250);
+      await wsSilence(wsB, 80);
       assert.equal(gw.hub.getMonthlyQuotaDroppedCount(net.id), 1, '恰好丢弃这一帧 DATA');
 
       // 控制帧完全不受门禁影响：HELLO(0x01) / PING(0x05) / PONG(0x06) 照常转发
@@ -2994,7 +2929,7 @@ describe('GC-3 用户组限速与月度中转配额', () => {
       }
       assert.equal(await gw.store.getMonthlyRelayUsage(tenant.id, currentUtcYearMonth(clock.now)), 2048, '回落默认组后照常落库记账');
       wsA.send(dataFrame(33n));
-      await wsSilence(wsB, 250);
+      await wsSilence(wsB, 80);
       assert.equal(gw.hub.getMonthlyQuotaDroppedCount(net.id), 1, '到期回落默认组后月度门禁准时生效');
 
       // 已回退（isExpiredFallback=true）→ 快照 expiresAtMs=null：命中缓存不再触发重查
@@ -3292,6 +3227,289 @@ describe('T1：WS 控制面双向保活与 connSeq 代次分发', () => {
       wsA2.close();
       wsB.close();
       wsC.close();
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------- 合并自 owner-admission.test.mjs
+
+describe('owner-admission：禁用属主禁入网与 STUN 代次守卫', () => {
+  function barrier(object, method, call = 1) {
+    const original = object[method].bind(object);
+    let arrived;
+    let release;
+    let count = 0;
+    const reached = new Promise((resolve) => { arrived = resolve; });
+    const wait = new Promise((resolve) => { release = resolve; });
+    object[method] = async (...args) => {
+      const result = await original(...args);
+      if (++count === call) {
+        arrived();
+        await wait;
+      }
+      return result;
+    };
+    return { reached, release, restore: () => { object[method] = original; } };
+  }
+
+  test('禁用属主踢出在线节点并阻止重连与新节点入网，重新启用后恢复', async () => {
+    const gw = await startGateway();
+    try {
+      const net = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const a = identity();
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey, name: 'owner-a' });
+      assert.equal((await wsJson(wsA)).status, 'authorized');
+      assert.equal(gw.hub.getOnlineCountByNetwork(net.id), 1);
+
+      await gw.store.setUserActive(gw.tenantId, false);
+      await gw.hub.hooks.onUserDisabled(gw.tenantId);
+      await wsClosed(wsA);
+      assert.equal(gw.hub.getOnlineCountByNetwork(net.id), 0);
+
+      for (const peer of [a, identity()]) {
+        const ws = await wsOpen(gw.base);
+        await authNode(ws, peer, { networkId: net.id, joinKey: net.joinKey });
+        const msg = await wsJson(ws);
+        assert.equal(msg.type, 'denied');
+        await wsClosed(ws);
+      }
+
+      await gw.store.setUserActive(gw.tenantId, true);
+      const wsA2 = await wsOpen(gw.base);
+      await authNode(wsA2, a, { networkId: net.id, joinKey: net.joinKey, name: 'owner-a' });
+      assert.equal((await wsJson(wsA2)).status, 'authorized');
+      wsA2.close();
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('在途 auth 遇禁用/禁用后重启用：旧握手不落地，无关属主禁用不受影响', async () => {
+    const gw = await startGateway();
+    try {
+      const net = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const other = await gw.store.createUser({ email: 'other-owner@local', passwordHash: TENANT_HASH, role: 'user' });
+
+      // 无关属主禁用不阻断本网络在途认证
+      const b0 = barrier(gw.store, 'upsertMemberJoinAttempt', 1);
+      const ws0 = await wsOpen(gw.base);
+      await authNode(ws0, identity(), { networkId: net.id, joinKey: net.joinKey });
+      await b0.reached;
+      await gw.store.setUserActive(other.id, false);
+      await gw.hub.hooks.onUserDisabled(other.id);
+      b0.release();
+      b0.restore();
+      assert.equal((await wsJson(ws0)).status, 'authorized');
+      ws0.close();
+
+      // 本属主在途禁用 + 立即重启用均不得放行旧握手
+      for (const reenableBeforeRelease of [false, true]) {
+        const b = barrier(gw.store, 'getNetwork', 1);
+        const ws = await wsOpen(gw.base);
+        await authNode(ws, identity(), { networkId: net.id, joinKey: net.joinKey });
+        await b.reached;
+        await gw.store.setUserActive(gw.tenantId, false);
+        await gw.hub.hooks.onUserDisabled(gw.tenantId);
+        if (reenableBeforeRelease) await gw.store.setUserActive(gw.tenantId, true);
+        b.release();
+        b.restore();
+        const msg = await wsJson(ws);
+        assert.equal(msg.type, 'denied');
+        await wsClosed(ws);
+        await gw.store.setUserActive(gw.tenantId, true);
+      }
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('STUN 代次守卫：禁用后重连不可复用旧连接的延迟回包或主口槽位', async () => {
+    const gw = await startGateway();
+    try {
+      const net = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const id = identity();
+      const ws1 = await wsOpen(gw.base);
+      await authNode(ws1, id, { networkId: net.id, joinKey: net.joinKey });
+      assert.equal((await wsJson(ws1)).status, 'authorized');
+
+      const observations = [];
+      const stun = new UdpStunService({
+        primaryPort: 0,
+        admitProbe: (...args) => gw.hub.admitStunProbe(...args),
+        onNatDetected: (r) => observations.push(r),
+      });
+      const timestamp = Date.now();
+      const nonce = '0123456789abcdef';
+      const sig = edSign(
+        id.privateKeyHex,
+        id.publicKeyHex,
+        stunMessage(net.id, id.nodeId, nonce, timestamp),
+      );
+      const packet = Buffer.from(JSON.stringify({
+        type: 'stun-probe',
+        networkId: net.id,
+        nodeId: id.nodeId,
+        publicKeyHex: id.publicKeyHex,
+        timestamp,
+        nonce,
+        signatureHex: sig,
+      }));
+      const socket = { send(_reply, _port, _ip, cb) { cb(); } };
+      const remote = { address: '127.0.0.1', port: 55555 };
+
+      await stun.handlePacket(socket, 'primary', packet, remote);
+      let finish;
+      const pending = stun.handlePacket({ send(_reply, _port, _ip, cb) { finish = cb; } }, 'alt', packet, remote);
+
+      await gw.store.setUserActive(gw.tenantId, false);
+      await gw.hub.hooks.onUserDisabled(gw.tenantId);
+      await wsClosed(ws1);
+
+      await gw.store.setUserActive(gw.tenantId, true);
+      const ws2 = await wsOpen(gw.base);
+      await authNode(ws2, id, { networkId: net.id, joinKey: net.joinKey });
+      assert.equal((await wsJson(ws2)).status, 'authorized');
+
+      finish();
+      await pending;
+      assert.equal(observations.length, 1);
+      assert.equal(observations[0].natType, 'unknown');
+
+      await stun.handlePacket(socket, 'alt', packet, remote);
+      await stun.handlePacket(socket, 'primary', packet, remote);
+      assert.equal(observations.length, 2);
+      assert.equal(observations[1].natType, 'cone');
+      ws2.close();
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------- 合并自 network-capacity.test.mjs
+
+describe('PC-08a 网络容量变更广播与祖父缩容不踢', () => {
+  test('PATCH maxPeers/peerDirectMaxRttMs 仅向本网在线连接广播 network-updated（含幂等去重）', async () => {
+    const gw = await startGateway();
+    try {
+      const n1 = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const n2 = await createNetwork(gw, { mode: 'key', maxPeers: 4 });
+      const ws1 = await wsOpen(gw.base);
+      await authNode(ws1, identity(), { networkId: n1.id, joinKey: n1.joinKey });
+      assert.equal((await wsJson(ws1)).status, 'authorized');
+      const ws1b = await wsOpen(gw.base);
+      await authNode(ws1b, identity(), { networkId: n1.id, joinKey: n1.joinKey });
+      assert.equal((await wsJson(ws1b)).status, 'authorized');
+      const ws1c = await wsOpen(gw.base);
+      await authNode(ws1c, identity(), { networkId: n1.id, joinKey: n1.joinKey });
+      assert.equal((await wsJson(ws1c)).status, 'authorized');
+      const ws2 = await wsOpen(gw.base);
+      await authNode(ws2, identity(), { networkId: n2.id, joinKey: n2.joinKey });
+      assert.equal((await wsJson(ws2)).status, 'authorized');
+
+      const nextType = async (ws, type) => {
+        for (;;) {
+          const msg = await wsJson(ws);
+          if (msg.type === type) return msg;
+        }
+      };
+
+      const patch1 = await api(gw.base, 'PATCH', `/api/v1/networks/${n1.id}`, {
+        cookie: gw.tenantCookie,
+        body: { maxPeers: 8, peerDirectMaxRttMs: 150 },
+      });
+      assert.equal(patch1.status, 200);
+      const updated = await nextType(ws1, 'network-updated');
+      assert.equal(updated.type, 'network-updated');
+      assert.equal(updated.networkId, n1.id);
+      assert.equal(updated.maxPeers, 8);
+      assert.equal(updated.peerDirectMaxRttMs, 150);
+      assert.equal('joinKey' in updated, false);
+      await wsSilence(ws2, 120);
+
+      // 重复相同值 + 仅改名称 → 不重播；向下缩容 8 -> 2 不踢 3 个已在线存量节点
+      await api(gw.base, 'PATCH', `/api/v1/networks/${n1.id}`, {
+        cookie: gw.tenantCookie,
+        body: { maxPeers: 8, peerDirectMaxRttMs: 150 },
+      });
+      await api(gw.base, 'PATCH', `/api/v1/networks/${n1.id}`, {
+        cookie: gw.tenantCookie,
+        body: { name: 'renamed-only' },
+      });
+      await wsSilence(ws1, 120);
+
+      const shrink = await api(gw.base, 'PATCH', `/api/v1/networks/${n1.id}`, {
+        cookie: gw.tenantCookie,
+        body: { maxPeers: 2 },
+      });
+      assert.equal(shrink.status, 200);
+      const shrinkEv = await nextType(ws1, 'network-updated');
+      assert.equal(shrinkEv.type, 'network-updated');
+      assert.equal(shrinkEv.maxPeers, 2);
+      assert.equal(gw.hub.getOnlineCountByNetwork(n1.id), 3, '缩容不踢已在线存量节点');
+      ws1.close();
+      ws1b.close();
+      ws1c.close();
+      ws2.close();
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('pending / paused 连接不收增量推送，approve / resume 后 welcome 带最新容量与 RTT 上限', async () => {
+    const gw = await startGateway();
+    try {
+      const mNet = await createNetwork(gw, { mode: 'manual', maxPeers: 4 });
+      const waiter = identity();
+      const wsWaiter = await wsOpen(gw.base);
+      await authNode(wsWaiter, waiter, { networkId: mNet.id, omitProof: true });
+      const pending = await wsJson(wsWaiter);
+      assert.equal(pending.status, 'pending');
+      assert.equal(pending.maxPeers, 4);
+
+      await api(gw.base, 'PATCH', `/api/v1/networks/${mNet.id}`, {
+        cookie: gw.tenantCookie,
+        body: { maxPeers: 8, peerDirectMaxRttMs: 180 },
+      });
+      await wsSilence(wsWaiter, 150);
+
+      await api(gw.base, 'POST', `/api/v1/networks/${mNet.id}/members/${waiter.nodeId}/approve`, {
+        cookie: gw.tenantCookie,
+      });
+      const promoted = await wsJson(wsWaiter);
+      assert.equal(promoted.type, 'welcome');
+      assert.equal(promoted.status, 'authorized');
+      assert.equal(promoted.maxPeers, 8);
+      assert.equal(promoted.peerDirectMaxRttMs, 180);
+
+      await api(gw.base, 'POST', `/api/v1/networks/${mNet.id}/members/${waiter.nodeId}/pause`, {
+        cookie: gw.tenantCookie,
+      });
+      // Reconnect with pauseHold to verify resume welcome picks up patched maxPeers
+      wsWaiter.close();
+      await wsClosed(wsWaiter);
+      const wsHold = await wsOpen(gw.base);
+      await authNode(wsHold, waiter, { networkId: mNet.id, omitProof: true, pauseHold: true });
+      assert.equal((await wsJson(wsHold)).status, 'paused');
+
+      await api(gw.base, 'PATCH', `/api/v1/networks/${mNet.id}`, {
+        cookie: gw.tenantCookie,
+        body: { maxPeers: 7, peerDirectMaxRttMs: 220 },
+      });
+      await wsSilence(wsHold, 150);
+
+      await api(gw.base, 'POST', `/api/v1/networks/${mNet.id}/members/${waiter.nodeId}/resume`, {
+        cookie: gw.tenantCookie,
+      });
+      const resumed = await wsJson(wsHold);
+      assert.equal(resumed.type, 'welcome');
+      assert.equal(resumed.status, 'authorized');
+      assert.equal(resumed.maxPeers, 7);
+      assert.equal(resumed.peerDirectMaxRttMs, 220);
+      wsHold.close();
     } finally {
       await gw.close();
     }

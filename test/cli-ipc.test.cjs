@@ -80,7 +80,7 @@ async function waitFor(fn, timeoutMs, message) {
     } catch (error) {
       lastError = error
     }
-    await sleep(40)
+    await sleep(15)
   }
   assert.ok(await fn().catch(() => false), `${message}${lastError === undefined ? '' : ` (last error: ${lastError})`}`)
 }

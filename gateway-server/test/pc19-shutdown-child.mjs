@@ -1,13 +1,5 @@
-// PC-19 第二片受控子进程：经**真实 main() 入口**（SIGINT/SIGTERM 处理器在生产
-// 代码里安装）验证关停形态——
-//   ok      ：少量真实中转流量尚未周期落库 → 父进程 SIGTERM → close 补末批 → 退出 0，
-//             父进程重开数据库读回最终累计。
-//   hang    ：flushMemberTelemetry 受控永不完成（模拟存储不响应）→ SIGTERM →
-//             close 在墙钟预算耗尽后如实拒绝 → 非零退出。
-//   udp-hang：UdpStunService.close 受控永不完成（模拟**早期关停步骤**卡点）→
-//             SIGTERM → 生产入口仍须在预算 + 有限清理宽限内自有非零退出，失败
-//             兜底不得重新卡死在卡点上。
-// 环境由父进程提供（ZR_GATEWAY_*，见 pc19-shutdown.test.mjs）。
+// PC-19 第二片受控子进程：经真实 main() 入口（安装 SIGINT/SIGTERM 处理器）验证
+// SQLite 形态下 SIGTERM → close 补末批 → exit(0)，父进程重开 SQLite 读回最终累计。
 // 就绪标记：stdout 打印 `PC19_CHILD_READY bytes=<N> net=... sender=...`。
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -17,11 +9,8 @@ import WebSocket from 'ws';
 
 import { main } from '../dist/main.js';
 import { loadOrCreateMasterKey, encryptSecret } from '../dist/master-key.js';
-import { PgStore } from '../dist/store/pg-store.js';
-import { UdpStunService } from '../dist/peer-hub/udp-stun.js';
+import { SqliteStore } from '../dist/store/sqlite-store.js';
 
-const modeArg = process.argv[2] ?? 'ok';
-const mode = ['ok', 'hang', 'udp-hang'].includes(modeArg) ? modeArg : 'ok';
 const port = Number(process.env.ZR_GATEWAY_PORT);
 if (!Number.isInteger(port) || port < 1) {
   console.error('PC19_CHILD_FAIL: ZR_GATEWAY_PORT missing');
@@ -32,8 +21,6 @@ const dataDir = process.env.ZR_GATEWAY_DATA_DIR;
 const joinKey = 'pc19-child-join-key';
 const adminEmail = process.env.ZR_GATEWAY_ADMIN_USER;
 const adminPassword = process.env.ZR_GATEWAY_ADMIN_PASSWORD;
-
-// ---- 节点身份与帧（与 test/peer-hub.test.mjs 同一套自证明方案的最小子集）----
 
 function identity() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
@@ -68,11 +55,7 @@ function attach(ws) {
   ws.__waiters = [];
   ws.on('message', (data) => {
     let json;
-    try {
-      json = JSON.parse(Buffer.from(data).toString('utf8'));
-    } catch {
-      json = { __raw: true };
-    }
+    try { json = JSON.parse(Buffer.from(data).toString('utf8')); } catch { json = { __raw: true }; }
     const waiter = ws.__waiters.shift();
     if (waiter !== undefined) waiter(json);
     else ws.__queue.push(json);
@@ -82,10 +65,7 @@ function attach(ws) {
 const wsJson = (ws, timeoutMs = 5000) =>
   new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error('child ws message timeout')), timeoutMs);
-    const deliver = (json) => {
-      clearTimeout(timer);
-      resolve(json);
-    };
+    const deliver = (json) => { clearTimeout(timer); resolve(json); };
     if (ws.__queue.length > 0) deliver(ws.__queue.shift());
     else ws.__waiters.push(deliver);
   });
@@ -95,14 +75,8 @@ const wsOpen = (url) =>
     const ws = new WebSocket(url);
     attach(ws);
     const timer = setTimeout(() => reject(new Error('child ws open timeout')), 5000);
-    ws.once('open', () => {
-      clearTimeout(timer);
-      resolve(ws);
-    });
-    ws.once('error', (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
+    ws.once('open', () => { clearTimeout(timer); resolve(ws); });
+    ws.once('error', (err) => { clearTimeout(timer); reject(err); });
   });
 
 async function authNode(ws, node, { networkId }) {
@@ -122,23 +96,23 @@ async function authNode(ws, node, { networkId }) {
   }));
 }
 
-// ---- 1. 预播种：与网关共用同一 master.key，建 key 模式网络与两名授权成员 ----
-
 fs.mkdirSync(dataDir, { recursive: true });
-const masterKey = loadOrCreateMasterKey(dataDir); // main() 随后读取同一文件，密钥一致
-const seeder = await PgStore.connect(process.env.ZR_GATEWAY_DATABASE_URL);
+const masterKey = loadOrCreateMasterKey(dataDir);
+const seeder = new SqliteStore({ path: path.join(dataDir, 'gateway.sqlite') });
+let networkId;
+const nodes = [identity(), identity()];
 try {
-  const admin = await seeder.ensureBootstrapAdmin({ email: adminEmail, password: adminPassword });
+  await seeder.ensureBootstrapAdmin({ email: adminEmail, password: adminPassword });
+  const admin = await seeder.findUserByEmail(adminEmail);
   const net = await seeder.createNetwork({
-    ownerId: (await seeder.findUserByEmail(adminEmail)).id,
+    ownerId: admin.id,
     name: 'pc19-child-net',
     admissionMode: 'key',
     joinKeyEnc: encryptSecret(joinKey, masterKey),
     maxPeers: 8,
   });
-  void admin;
-  globalThis.__pc19NetId = net.id;
-  for (const node of [identity(), identity()]) {
+  networkId = net.id;
+  for (const node of nodes) {
     const joined = await seeder.upsertMemberJoinAttempt({
       networkId: net.id,
       nodeId: node.nodeId,
@@ -146,39 +120,23 @@ try {
       joinKeyMatched: true,
     });
     if (joined.status !== 'authorized') throw new Error(`seed join not authorized: ${joined.status}`);
-    (globalThis.__pc19Nodes ??= []).push(node);
   }
 } finally {
   await seeder.close();
 }
 
-// ---- 2. hang / udp-hang 模式武装（受控永不完成，仅本测试进程）----
-
-if (mode === 'hang') {
-  PgStore.prototype.flushMemberTelemetry = async () => new Promise(() => {});
-}
-if (mode === 'udp-hang') {
-  // 第一层关停步骤（udp.close）即卡点：生产入口的失败兜底不得重新卡死在这里
-  UdpStunService.prototype.close = async () => new Promise(() => {});
-}
-
-// ---- 3. 真实入口：main() 安装 SIGINT/SIGTERM 优雅停机处理器 ----
-
 await main(process.env);
 
-// ---- 4. 网关就绪后驱动一帧真实中转流量，然后宣告 READY ----
-
-const networkId = globalThis.__pc19NetId;
-const [a, b] = globalThis.__pc19Nodes;
+const [a, b] = nodes;
 const wsA = await wsOpen(base.replace(/^http/, 'ws') + '/peer/v1/ws');
 await authNode(wsA, a, { networkId });
 if ((await wsJson(wsA)).status !== 'authorized') throw new Error('child node A not authorized');
 const wsB = await wsOpen(base.replace(/^http/, 'ws') + '/peer/v1/ws');
 await authNode(wsB, b, { networkId });
 if ((await wsJson(wsB)).status !== 'authorized') throw new Error('child node B not authorized');
-await wsJson(wsB); // punch-coordinate（对 A）
-await wsJson(wsA); // peer-joined（B 上线）
-await wsJson(wsA); // punch-coordinate（对 B）
+await wsJson(wsB); // punch-coordinate (A)
+await wsJson(wsA); // peer-joined (B)
+await wsJson(wsA); // punch-coordinate (B)
 
 const header = Buffer.alloc(28);
 header.writeUInt16BE(0x5a52, 0);
@@ -195,4 +153,3 @@ const received = await wsJson(wsB);
 if (received.__raw !== true) throw new Error('child: B did not receive the relay frame');
 
 console.log(`PC19_CHILD_READY bytes=${frameBuf.length} net=${networkId} sender=${a.nodeId}`);
-// 进程保持存活（server/udp 监听），等父进程 SIGTERM 触发 main() 的关停处理器

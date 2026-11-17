@@ -18,7 +18,10 @@ const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 
 const CONFIG_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'config.js')).href
+const WRITER_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'cli', 'config-writer.js')).href
+const RESTART_FIELDS_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'restart-fields.js')).href
 const load = () => import(CONFIG_URL)
+const loadWriter = () => import(WRITER_URL)
 
 // T12-fix test isolation: any LAN_GATE_* / DSH_PUSH_* variable exported in
 // the developer's shell would leak into every resolveConfig call that reads
@@ -516,4 +519,92 @@ test('a fully populated Config row resolves with EVERY source = row (T17)', asyn
   assert.equal(resolved.values.trustedProxies, '10.0.0.1')
   assert.equal(resolved.values.pushSummary, true)
   assert.equal(resolved.values.serverName, 'phone')
+})
+
+// --- PG-2: maxServers (merged from config.test.cjs) -------------------------
+
+test('maxServers: default 8, sources tracked through all four layers', async () => {
+  const { resolveConfig, DEFAULTS } = await load()
+  assert.equal(DEFAULTS.maxServers, 8, 'the default cap is 8')
+  assert.equal(resolveConfig({}, {}, {}).values.maxServers, 8)
+  assert.equal(resolveConfig({}, {}, {}).sources.maxServers, 'default')
+
+  assert.equal(resolveConfig({ maxServers: 16 }, {}, {}).values.maxServers, 16)
+  assert.equal(resolveConfig({ maxServers: 16 }, {}, {}).sources.maxServers, 'row')
+  assert.equal(resolveConfig({}, { maxServers: 12 }, {}).values.maxServers, 12)
+  assert.equal(resolveConfig({}, { maxServers: 12 }, {}).sources.maxServers, 'file')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_MAX_SERVERS: '16' }).values.maxServers, 16)
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_MAX_SERVERS: '16' }).sources.maxServers, 'env')
+
+  const all = resolveConfig({ maxServers: 4 }, { maxServers: 12 }, { LAN_GATE_MAX_SERVERS: '16' })
+  assert.equal(all.values.maxServers, 16)
+  assert.equal(resolveConfig({ maxServers: 4 }, { maxServers: 12 }, {}).values.maxServers, 4, 'row beats file')
+})
+
+test('maxServers: the legal band is integer 1..64 inclusive; anything else is transparent', async () => {
+  const { resolveConfig } = await load()
+  assert.equal(resolveConfig({ maxServers: 1 }, {}, {}).values.maxServers, 1, 'the lower bound is inclusive')
+  assert.equal(resolveConfig({ maxServers: 64 }, {}, {}).values.maxServers, 64, 'the upper bound is inclusive')
+
+  for (const bad of [0, -1, 65, 8.5, Number.NaN, Number.POSITIVE_INFINITY, '16', true, null]) {
+    assert.equal(
+      resolveConfig({ maxServers: bad }, {}, {}).values.maxServers,
+      8,
+      `row maxServers ${String(bad)} must fall to the default`,
+    )
+  }
+  const rescued = resolveConfig({ maxServers: 0 }, { maxServers: 12 }, {})
+  assert.equal(rescued.values.maxServers, 12)
+  assert.equal(rescued.sources.maxServers, 'file')
+
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_MAX_SERVERS: '0' }).values.maxServers, 8, 'env 0 is illegal')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_MAX_SERVERS: '65' }).values.maxServers, 8, 'env 65 is illegal')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_MAX_SERVERS: 'abc' }).values.maxServers, 8, 'env garbage is illegal')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_MAX_SERVERS: '' }).values.maxServers, 8, 'an empty env var is unset')
+  assert.equal(resolveConfig({}, {}, { LAN_GATE_MAX_SERVERS: '64' }).values.maxServers, 64, 'env 64 is legal')
+})
+
+test('maxServers: the file layer keeps the digit-string leniency, the row layer stays strict', async () => {
+  const { resolveConfig } = await load()
+  const lenient = resolveConfig({}, { maxServers: '16' }, {})
+  assert.equal(lenient.values.maxServers, 16, 'a hand-edited "16" string keeps working at the file layer')
+  assert.equal(lenient.sources.maxServers, 'file')
+  assert.equal(resolveConfig({}, { maxServers: '0' }, {}).values.maxServers, 8, 'an out-of-band digit string is still illegal')
+  assert.equal(resolveConfig({}, { maxServers: '-5' }, {}).values.maxServers, 8, 'a sign is not a digit string')
+  assert.equal(resolveConfig({ maxServers: '16' }, {}, {}).values.maxServers, 8, 'the row layer gets NO such leniency')
+})
+
+test('maxServers is NOT a restart field (PG-2): the pool reads it live', async () => {
+  const { RESTART_FIELDS } = await import(RESTART_FIELDS_URL)
+  assert.ok(!RESTART_FIELDS.includes('maxServers'), 'maxServers must not reload the row')
+})
+
+test('Config carries maxServers as a volatile field', async () => {
+  const { Config } = await load()
+  assert.ok('maxServers' in Config.dict, 'the schema declares the field (the settings form renders it)')
+  assert.equal(Config.dict.maxServers.meta?.volatile, true, 'maxServers must be volatile like every field')
+  const empty = Config({})
+  assert.equal(empty.maxServers.get(), undefined, 'no schema default leaks into an empty row')
+})
+
+test('ENV_VAR_BY_FIELD registers maxServers: LAN_GATE_MAX_SERVERS', async () => {
+  const { ENV_VAR_BY_FIELD } = await loadWriter()
+  assert.equal(ENV_VAR_BY_FIELD.maxServers, 'LAN_GATE_MAX_SERVERS')
+})
+
+test('writeCliConfig writes maxServers to the file layer and refuses under the env variable', async () => {
+  const { writeCliConfig } = await loadWriter()
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-config-maxservers-'))
+  try {
+    const written = writeCliConfig({ dshHome: home, env: {}, set: { maxServers: 12 } })
+    assert.equal(written.ok, true)
+    assert.equal(written.values.maxServers, 12)
+    assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'lan-gate.config.json'), 'utf8')).maxServers, 12)
+
+    const refused = writeCliConfig({ dshHome: home, env: { LAN_GATE_MAX_SERVERS: '16' }, set: { maxServers: 20 } })
+    assert.deepEqual(refused, { ok: false, code: 'env-shadowed', field: 'maxServers', envVar: 'LAN_GATE_MAX_SERVERS' })
+    assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'lan-gate.config.json'), 'utf8')).maxServers, 12, 'the refusal wrote nothing')
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true })
+  }
 })

@@ -820,18 +820,6 @@ export function canSubmitClientPairing(input: {
   return { allowed, isOverwrite, blockedByLimit }
 }
 
-/**
- * Whether the settings page may follow the SERVER's record of this device's
- * name into the row (T59): the body carried a name, it differs from the row
- * (nothing to do otherwise — and this equality is the anti-bounce half: the
- * page's own write echoes back through client/status with both sides equal),
- * and the user has no staged draft in the field (their edit wins until they
- * save — a follow mid-typing would clobber it).
- */
-export function shouldFollowServerDeviceName(deviceName: string, rowName: string, hasDraft: boolean): boolean {
-  return deviceName !== '' && deviceName !== rowName && !hasDraft
-}
-
 // --- UX-1: reload after the FIRST client activation ---------------------------
 
 /**
@@ -1682,18 +1670,6 @@ export class ZenRemoteSettingsForm {
    */
   hasDraft(field: string): boolean {
     return this.staged.has(field)
-  }
-
-  /**
-   * One direct write for the T59 name follow: the SERVER's record of this
-   * device's name landing in the row's `serverName` (the role card's 设备
-   * 名称 field). The page only calls it when the user is not mid-edit —
-   * see {@link shouldFollowServerDeviceName} — and the write's own volatile
-   * update echoes back to the backend with both sides now equal, so the
-   * push path stays silent (no overwrite loop).
-   */
-  async writeDeviceName(name: string): Promise<boolean> {
-    return this.directWrite([{ op: 'set', path: ['serverName'], value: name }])
   }
 
   /**

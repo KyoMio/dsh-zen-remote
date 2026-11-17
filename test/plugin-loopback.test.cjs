@@ -16,6 +16,7 @@ const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
 const { createPluginLoopback, LoopbackAuthError } = require('../lib/plugin-loopback.js')
+const { waitFor } = require('./helpers/plugin-bridge-harness.cjs')
 
 /**
  * The fake DSH. `validCookie` is READ LIVE per request, so a test can
@@ -210,11 +211,11 @@ test('a caller abort tears the loopback request down — the fake server sees th
       response.stream.on('close', resolve)
       response.stream.on('end', resolve)
     })
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    await new Promise((resolve) => setImmediate(resolve))
     controller.abort()
     await streamDone
     // The abort must cross the socket: the fake's request 'close' fires.
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    await waitFor(() => dsh.state.aborted === true)
     assert.equal(dsh.state.aborted, true, 'the fake server saw its connection close')
     dsh.finish() // release the held response so server.close() can complete
   } finally {

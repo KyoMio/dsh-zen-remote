@@ -6,7 +6,18 @@ const assert = require('node:assert/strict')
 const test = require('node:test')
 
 /** Minimal history + popstate wiring, faithful to the ordering that matters. */
-function harness() {
+function harness(t) {
+  const prevWindow = Object.getOwnPropertyDescriptor(global, 'window')
+  const prevLocation = Object.getOwnPropertyDescriptor(global, 'location')
+  const prevHistory = Object.getOwnPropertyDescriptor(global, 'history')
+  t.after(() => {
+    if (prevWindow === undefined) delete global.window
+    else Object.defineProperty(global, 'window', prevWindow)
+    if (prevLocation === undefined) delete global.location
+    else Object.defineProperty(global, 'location', prevLocation)
+    if (prevHistory === undefined) delete global.history
+    else Object.defineProperty(global, 'history', prevHistory)
+  })
   const entries = [{ state: null }]
   let index = 0
   let onPop = null
@@ -35,8 +46,8 @@ async function load() {
   return mod
 }
 
-test('a layer gives the back gesture something to close instead of exiting', async () => {
-  const h = harness()
+test('a layer gives the back gesture something to close instead of exiting', async (t) => {
+  const h = harness(t)
   const { pushLayer, hasLayer, layerDepth } = await load()
   let closed = false
   pushLayer({ id: 'session', close: () => { closed = true } })
@@ -47,8 +58,8 @@ test('a layer gives the back gesture something to close instead of exiting', asy
   assert.equal(layerDepth(), 0)
 })
 
-test('nested layers close top-down, one gesture each', async () => {
-  harness()
+test('nested layers close top-down, one gesture each', async (t) => {
+  harness(t)
   const { pushLayer, layerDepth } = await load()
   const order = []
   pushLayer({ id: 'session', close: () => order.push('session') })
@@ -60,8 +71,8 @@ test('nested layers close top-down, one gesture each', async () => {
   assert.deepEqual(order, ['info', 'session'])
 })
 
-test('popLayer rewinds instead of flipping state, so the two never drift', async () => {
-  harness()
+test('popLayer rewinds instead of flipping state, so the two never drift', async (t) => {
+  harness(t)
   const { pushLayer, popLayer, layerDepth } = await load()
   let closed = 0
   pushLayer({ id: 'info', close: () => { closed += 1 } })
@@ -70,8 +81,8 @@ test('popLayer rewinds instead of flipping state, so the two never drift', async
   assert.equal(layerDepth(), 0, 'history and the stack agree')
 })
 
-test('closing out of order does not take the layer above with it', async () => {
-  harness()
+test('closing out of order does not take the layer above with it', async (t) => {
+  harness(t)
   const { pushLayer, popLayer, hasLayer } = await load()
   const order = []
   pushLayer({ id: 'session', close: () => order.push('session') })
@@ -81,8 +92,8 @@ test('closing out of order does not take the layer above with it', async () => {
   assert.equal(hasLayer('modal-1'), true, 'the deeper layer is still open')
 })
 
-test('one gesture crossing several entries closes every layer above the target', async () => {
-  const h = harness()
+test('one gesture crossing several entries closes every layer above the target', async (t) => {
+  const h = harness(t)
   const { pushLayer, layerDepth } = await load()
   const order = []
   pushLayer({ id: 'a', close: () => order.push('a') })
@@ -96,8 +107,8 @@ test('one gesture crossing several entries closes every layer above the target',
   assert.equal(h.depth(), 1)
 })
 
-test('a throwing layer does not strand the ones underneath it', async () => {
-  harness()
+test('a throwing layer does not strand the ones underneath it', async (t) => {
+  harness(t)
   const { pushLayer, layerDepth } = await load()
   let bottom = false
   pushLayer({ id: 'bottom', close: () => { bottom = true } })
@@ -108,8 +119,8 @@ test('a throwing layer does not strand the ones underneath it', async () => {
   assert.equal(layerDepth(), 0)
 })
 
-test('the same id is never stacked twice', async () => {
-  harness()
+test('the same id is never stacked twice', async (t) => {
+  harness(t)
   const { pushLayer, layerDepth } = await load()
   pushLayer({ id: 'info', close: () => {} })
   pushLayer({ id: 'info', close: () => {} })

@@ -107,7 +107,7 @@ export type { BridgeDeclaration, ZenRemoteService } from './plugin-bridge.js'
 // src/config.ts next to the resolution they describe; re-exported so the
 // plugin row's public surface stays on the main entry. The same-origin gate
 // moved to src/http.ts next to the response envelope (T14) but its export
-// stays here for scripts/check-upload-endpoint.mjs.
+// stays here for test/upload-endpoint.test.mjs.
 export { Config, resolveRole, servesRole, connectsRole } from './config.js'
 export { sameOriginPost } from './http.js'
 
@@ -277,7 +277,7 @@ export interface MobileNavConfig {
  * Absent from the result when the row left it unset or wrote something that
  * is not a finite number, which leaves the client on its shipped default.
  *
- * Exported for scripts/check-keyboard-avoid.mjs — this is the trust boundary
+ * Exported for test/mobile-viewport-compat.test.mjs — this is the trust boundary
  * between a hand-edited YAML row and the browser, so it is asserted directly.
  */
 export function clamped(key: string, value: number | undefined, min: number, max: number): Record<string, number> {
@@ -289,7 +289,7 @@ export function clamped(key: string, value: number | undefined, min: number, max
  * One rejection carrying the status the client should see.
  *
  * Fields are assigned in the body rather than declared as constructor
- * parameter properties: `scripts/check-upload-endpoint.mjs` imports this
+ * parameter properties: `test/upload-endpoint.test.mjs` imports this
  * module through Node's strip-only type stripping, which rejects that syntax.
  */
 class UploadError extends Error {

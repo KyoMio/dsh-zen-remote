@@ -48,11 +48,15 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const http = require('node:http')
 const net = require('node:net')
 const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
 const { createBridgeRegistry, normalizeDeclaration } = require('../lib/plugin-bridge.js')
 const { toVirtual } = require('../lib/virtual-id.js')
+const {
+  startFakeHost: createFakeHost,
+  startFakeRelay,
+  fakeRelayClient,
+} = require('./helpers/plugin-bridge-harness.cjs')
 
 const DECLARED_V2 = {
   plugin: 'v2-panel',
@@ -100,214 +104,40 @@ const SERVER_ID = 'abcd1234'
 const VA = toVirtual(SERVER_ID, 'session-a')
 const VB = toVirtual(SERVER_ID, 'session-b')
 
-/**
- * The fake host webServer — the same shape plugin-route-intercept.test.cjs
- * drives: real http server, host-shaped handle (raw undecoded pathname,
- * `this.match(rawPath)`, route.handler, else fallback), exact + prefix
- * tables, hit counters as the security observable.
- */
 function startFakeHost() {
-  const hits = { localCommand: 0, localMedia: 0, localOld: 0, localAmb: 0, localAmbSub: 0, localDenyQuery: 0, localDenyBody: 0 }
-  let fallback = undefined
-  const raw = {
-    exact: new Map(),
-    prefixes: new Map(),
-    upgrades: new Map(),
-    match(pathname) {
-      const exact = this.exact.get(pathname)
-      if (exact !== undefined) return exact
-      let best
-      for (const [prefix, route] of this.prefixes) {
-        if (pathname !== prefix && !pathname.startsWith(`${prefix}/`)) continue
-        if (best === undefined || prefix.length > best.path.length) best = route
+  return createFakeHost(
+    { localCommand: 0, localMedia: 0, localOld: 0, localAmb: 0, localAmbSub: 0, localDenyQuery: 0, localDenyBody: 0 },
+    (raw, hits) => {
+      const bodyEcho = (key) => async (req, res) => {
+        hits[key] += 1
+        const chunks = []
+        req.on('data', (c) => chunks.push(c))
+        req.on('end', () => {
+          res.writeHead(200, { 'content-type': 'application/json' })
+          res.end(JSON.stringify({ local: true, body: Buffer.concat(chunks).toString('utf8') }))
+        })
       }
-      return best
-    },
-    register(route) {
-      const table = route.kind === 'exact' ? this.exact : this.prefixes
-      table.set(route.path, route)
-      return () => table.delete(route.path)
-    },
-    registerFallback(handler) {
-      fallback = handler
-      return () => { fallback = undefined }
-    },
-  }
-  const server = http.createServer((req, res) => {
-    const rawPath = new URL(req.url ?? '/', 'http://x').pathname
-    Promise.resolve(raw.match(rawPath)).then(async (route) => {
-      if (route !== undefined) {
-        await route.handler(req, res)
-        return
-      }
-      if (fallback !== undefined) {
-        await fallback(req, res)
-        return
-      }
-      res.writeHead(404)
-      res.end()
-    }).catch(() => { try { res.destroy() } catch { /* gone */ } })
-  })
-  // The upgrade face (PB-10): the host hands the looked-up handler the raw
-  // socket; an undeclared upgrade path is destroyed.
-  server.on('upgrade', (req, socket, head) => {
-    const rawPath = new URL(req.url ?? '/', 'http://x').pathname
-    const entry = raw.upgrades.get(rawPath)
-    if (entry !== undefined && typeof entry.handler === 'function') {
-      entry.handler(req, socket, head)
-      return
-    }
-    socket.destroy()
-  })
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const port = server.address().port
-      resolve({
-        raw,
-        hits,
-        port,
-        stop: () => new Promise((done) => { server.closeAllConnections(); server.close(done) }),
-        /** The LOCAL plugin routes the bridge must guard. The json-body ones
-         * echo the request body back, so a test can prove the replay handed
-         * the handler the exact original bytes. */
-        registerLocalPlugin() {
-          const bodyEcho = (key) => async (req, res) => {
-            hits[key] += 1
-            const chunks = []
-            req.on('data', (c) => chunks.push(c))
-            req.on('end', () => {
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ local: true, body: Buffer.concat(chunks).toString('utf8') }))
-            })
-          }
-          raw.register({ kind: 'exact', path: '/v2/command', handler: bodyEcho('localCommand') })
-          raw.register({ kind: 'exact', path: '/v2/amb/sub', handler: bodyEcho('localAmbSub') })
-          raw.register({ kind: 'exact', path: '/v2/deny-body', handler: bodyEcho('localDenyBody') })
-          const urlEcho = (key) => async (req, res) => {
-            hits[key] += 1
-            res.writeHead(200, { 'content-type': 'application/json' })
-            res.end(JSON.stringify({ local: true, url: req.url }))
-          }
-          raw.register({ kind: 'prefix', path: '/v2/media', handler: urlEcho('localMedia') })
-          raw.register({ kind: 'prefix', path: '/v2/old', handler: urlEcho('localOld') })
-          raw.register({ kind: 'prefix', path: '/v2/amb', handler: urlEcho('localAmb') })
-          raw.register({ kind: 'exact', path: '/v2/deny-query', handler: urlEcho('localDenyQuery') })
-          // The deny upgrade route's LOCAL handler: answers a plain 101 so a
-          // passthrough is distinguishable from a refusal or a dead socket.
-          raw.upgrades.set('/v2/deny-ws', {
-            path: '/v2/deny-ws',
-            handler: (req, socket) => {
-              socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
-              socket.end()
-            },
-          })
-        },
-        get: (pathWithQuery, { headers = {}, signal, method, body } = {}) =>
-          fetch(`http://127.0.0.1:${port}${pathWithQuery}`, {
-            method: method ?? 'GET',
-            headers,
-            ...(body !== undefined ? { body, ...(body instanceof ReadableStream ? { duplex: 'half' } : {}) } : {}),
-            signal,
-          }),
-      })
-    })
-  })
-}
-
-/**
- * The fake relay: records every arrival (forwarded coordinates + the body),
- * echoes a json-body forward verbatim so the test can prove the exact
- * rewritten bytes crossed the boundary. `state.reply` (PB-22 tests) replaces
- * the echo with a programmable answer: (req, res, body) => void owns the
- * response entirely; unset, the built-in echo answers.
- */
-function startFakeRelay() {
-  const state = { hits: [], reply: undefined }
-  const server = http.createServer((req, res) => {
-    const url = new URL(req.url ?? '/', 'http://relay.internal')
-    const chunks = []
-    req.on('data', (c) => chunks.push(c))
-    req.on('end', () => {
-      const body = Buffer.concat(chunks).toString('utf8')
-      state.hits.push({
-        method: req.method,
-        plugin: req.headers['x-zr-plugin'],
-        version: req.headers['x-zr-plugin-version'],
-        digest: req.headers['x-zr-plugin-digest'],
-        zrPath: req.headers['x-zr-path'],
-        zrQuery: req.headers['x-zr-query'],
-        ct: req.headers['content-type'],
-        body,
-      })
-      if (state.reply !== undefined) {
-        state.reply(req, res, body)
-        return
-      }
-      if (url.pathname === '/_dsh/zen-remote/relay/v1/plugin' && req.headers['x-zr-path'] === '/v2/command') {
+      raw.register({ kind: 'exact', path: '/v2/command', handler: bodyEcho('localCommand') })
+      raw.register({ kind: 'exact', path: '/v2/amb/sub', handler: bodyEcho('localAmbSub') })
+      raw.register({ kind: 'exact', path: '/v2/deny-body', handler: bodyEcho('localDenyBody') })
+      const urlEcho = (key) => async (req, res) => {
+        hits[key] += 1
         res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ echoed: body, ct: req.headers['content-type'] }))
-        return
+        res.end(JSON.stringify({ local: true, url: req.url }))
       }
-      res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' })
-      res.end(JSON.stringify({ remote: true }))
-    })
-  })
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const port = server.address().port
-      resolve({
-        __port: port,
-        state,
-        stop: () => new Promise((done) => { server.closeAllConnections(); server.close(done) }),
-      })
-    })
-  })
-}
-
-/** The relay client stub — the same contract mirror
- * plugin-route-intercept.test.cjs uses: every call recorded, a caller abort
- * is a caller verdict (never offline). */
-function fakeRelayClient(relayPort) {
-  const forwarded = []
-  const offlineVerdicts = []
-  const client = {
-    forwarded,
-    offlineVerdicts,
-    pluginRequest: async (request, signal) => {
-      const hasBody = request.body !== undefined && request.body !== null
-      forwarded.push({
-        method: request.method ?? 'GET',
-        contentType: request.contentType,
-        contentLength: request.contentLength,
-        path: request.path,
-        query: request.query,
-      })
-      const init = {
-        method: request.method ?? 'POST',
-        headers: {
-          accept: request.accept ?? 'application/json',
-          ...(hasBody && request.contentType !== undefined ? { 'content-type': request.contentType } : {}),
-          'x-zr-plugin': request.plugin,
-          'x-zr-plugin-version': request.version,
-          'x-zr-plugin-digest': request.digest,
-          'x-zr-path': request.path,
-          'x-zr-query': request.query,
+      raw.register({ kind: 'prefix', path: '/v2/media', handler: urlEcho('localMedia') })
+      raw.register({ kind: 'prefix', path: '/v2/old', handler: urlEcho('localOld') })
+      raw.register({ kind: 'prefix', path: '/v2/amb', handler: urlEcho('localAmb') })
+      raw.register({ kind: 'exact', path: '/v2/deny-query', handler: urlEcho('localDenyQuery') })
+      raw.upgrades.set('/v2/deny-ws', {
+        path: '/v2/deny-ws',
+        handler: (req, socket) => {
+          socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
+          socket.end()
         },
-        ...(hasBody ? { body: request.body, duplex: 'half' } : {}),
-        signal,
-      }
-      try {
-        return await fetch(`http://127.0.0.1:${relayPort}/_dsh/zen-remote/relay/v1/plugin`, init)
-      } catch (error) {
-        if (signal?.aborted) {
-          throw Object.assign(new Error('aborted'), { code: 'aborted' })
-        }
-        offlineVerdicts.push({ code: 'offline', message: String((error && error.message) ?? error) })
-        throw Object.assign(new Error('offline'), { code: 'offline' })
-      }
+      })
     },
-  }
-  return client
+  )
 }
 
 /** Host + relay + registry + install, wired for the v2 declaration. The

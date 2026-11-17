@@ -172,6 +172,10 @@ export interface RelayHandlerOptions {
      * destroyed (the {@link DRAIN_DEADLINE_MS} bound); defaults to 10000.
      * Tests inject a small value so the deadline path stays cheap to drive. */
     drainDeadlineMs?: number;
+    /** How many extra bytes past `fromBytes` an upload refusal's tail drain
+     * swallows before destroying the socket (the {@link DRAIN_SLACK_BYTES}
+     * bound); defaults to 8 MiB. Tests inject a small value. */
+    drainSlackBytes?: number;
     /** The plugin bridge's server half (PB-3). Absent — a wiring that never
      * mounted it, old tests — and `POST relay/v1/plugin` answers 501
      * `unsupported`, exactly like the `/api` passthrough without a dispatcher. */

@@ -162,6 +162,9 @@ export interface PeerPunchOptions {
     /** Silent reprobe interval from the 3rd retry on (the first two fire
      *  at 5s/15s so a dead endpoint is abandoned quickly). */
     reprobeIntervalMs?: number;
+    /** Initial delays (ms) for the first two silent reprobe attempts; defaults
+     *  to [5000, 15000]. Tests inject smaller values. */
+    reprobeInitialDelaysMs?: readonly [number, number];
     /** Encrypted PING cadence once direct (spec: 5s). */
     keepAliveMs?: number;
     /** Silent keepalive cycles that declare the direct path lost (spec: 3). */

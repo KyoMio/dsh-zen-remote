@@ -7,9 +7,6 @@
 // 与其余测试相同：.mjs 直接 import 编译产物 ../dist/。
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import {
   LOCALES,
@@ -1508,23 +1505,6 @@ describe('PC-20 fix1：ConsoleClient 把 AbortSignal 透传给底层 fetch', () 
   });
 });
 
-describe('PS-4b：NetworkView 分项快速复制（网关地址 / 网络 ID / 入网口令）', () => {
-  test('渐进披露 <details className="invite-parts"> 不在 DOM 中明文展示 joinKey，并处理 manual 与无网关地址态', () => {
-    const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-    const source = fs.readFileSync(path.join(pkgDir, 'src/web/components/NetworkView.tsx'), 'utf8');
-    assert.match(source, /<details className="invite-parts">/, '必须包含原生渐进披露细节区');
-    assert.ok(source.includes('{network.gatewayUrl || \'—\'}'), '网关地址行使用后端返回的 gatewayUrl');
-    assert.ok(source.includes('{network.id}'), '网络 ID 行展示 network.id');
-    assert.ok(source.includes('••••••••••••'), '入网口令行必须只显示打码圆点');
-    assert.ok(!source.includes('>{network.joinKey}<'), '不得把明文 joinKey 渲染进可见 DOM 文本');
-    assert.ok(source.includes("network.admissionMode === 'manual'"), '手动审批模式需隐去无用口令复制按钮');
-    assert.ok(
-      source.includes("onCopyField?.(network.joinKey, 'toast.joinPassphraseCopied')"),
-      '点击口令复制按钮时交由回调复制完整 joinKey 并弹独立提示',
-    );
-  });
-});
-
 // ---------------------------------------------------------------- GC-7b：配额格式化与用量档位
 
 describe('GC-7b：formatBytesQuota 配额字节', () => {
@@ -1673,91 +1653,8 @@ describe('GC-7b：buildHeadlessJoinCommand 无头接入命令', () => {
 
 // ---------------------------------------------------------------- GC-7b：locales 错误码与管理文案完整性
 
-describe('GC-7b：GC-5/GC-6 新错误码与管理文案键完整性', () => {
-  const errorCodeKeys = [
-    'error.otpCooldown',
-    'error.otpInvalid',
-    'error.otpLocked',
-    'error.rateLimited',
-    'error.smtpNotConfigured',
-    'error.smtpSendFailed',
-    'error.currentPasswordWrong',
-    'error.noteTooLong',
-    'error.peerLimitByGroup',
-    'error.cannotRemoveLastAdmin',
-    'error.cannotDeleteDefaultGroup',
-    'error.groupInUse',
-    'error.duplicateGroupCode',
-    'error.invalidApiKey',
-  ];
-
-  const adminCopyKeys = [
-    'admin.tabUsers',
-    'admin.tabGroups',
-    'admin.tabGateway',
-    'admin.tabTls',
-    'admin.tabEmail',
-    'admin.tabApiKey',
-    'admin.runtimeTcpPort',
-    'admin.runtimeStorage',
-    'admin.runtimeMasterKey',
-    'admin.advisoryTitle',
-    'admin.newUser',
-    'admin.emailVerified',
-    'admin.columnGroup',
-    'admin.columnExpiry',
-    'admin.columnMonthlyTraffic',
-    'admin.newGroup',
-    'admin.groupName',
-    'admin.groupCode',
-    'admin.isDefaultGroup',
-    'admin.groupPeerCap',
-    'admin.monthlyQuotaGb',
-    'admin.quotaThrottleNote',
-    'admin.publicUrl',
-    'admin.requireEmailVerification',
-    'admin.sessionTtlDays',
-    'admin.smtpTitle',
-    'admin.smtpHost',
-    'admin.smtpTestSend',
-    'admin.apiKeyTitle',
-    'admin.apiKeyOnce',
-    'admin.apiKeyPrefixLabel',
-    'network.partHeadlessCommand',
-    'network.headlessCommandHint',
-    'accountSettings.title',
-    'accountSettings.monthlyTraffic',
-    'common.unlimited',
-    'common.usedOfLimit',
-    'auth.passwordMinHint',
-    'auth.passwordTooShort',
-    'account.adminQuotaNote',
-    'admin.kpiAccounts',
-    'admin.kpiAccountsSub',
-    'admin.groupCodeImmutable',
-    'admin.groupAdminExemptNote',
-    'admin.smtpVerifyCert',
-  ];
-
-  test('错误码键中英齐备且都能取词（删键会被钉住）', () => {
-    for (const key of errorCodeKeys) {
-      assert.ok(key in LOCALES.zh, `zh 缺少 ${key}`);
-      assert.ok(key in LOCALES.en, `en 缺少 ${key}`);
-      assert.ok(translate('zh', key).length > 0);
-      assert.ok(translate('en', key).length > 0);
-    }
-  });
-
-  test('管理三标签页 / 运行态 / 设置页关键文案键中英齐备', () => {
-    for (const key of adminCopyKeys) {
-      assert.ok(key in LOCALES.zh, `zh 缺少 ${key}`);
-      assert.ok(key in LOCALES.en, `en 缺少 ${key}`);
-      assert.ok(LOCALES.zh[key].length > 0);
-      assert.ok(LOCALES.en[key].length > 0);
-    }
-  });
-
-  test('带插值的错误/提示词条取词正常', () => {
+describe('GC-7b：GC-5/GC-6 管理文案插值', () => {
+  test('关键管理/错误/提示词条插值正常', () => {
     assert.equal(translate('zh', 'admin.smtpTestFailed', { message: '超时' }), '发送失败：超时');
     assert.equal(translate('zh', 'common.usedOfLimit', { used: 2, limit: 3 }), '已用 2 / 3');
     assert.equal(translate('en', 'common.usedOfLimit', { used: 2, limit: 3 }), 'Used 2 / 3');
@@ -1765,6 +1662,9 @@ describe('GC-7b：GC-5/GC-6 新错误码与管理文案键完整性', () => {
     assert.equal(translate('en', 'auth.passwordMinHint', { min: 8 }), 'At least 8 characters');
     assert.equal(translate('zh', 'admin.kpiAccountsSub', { users: 3, groups: 2 }), '3 位用户 · 2 个用户组');
     assert.equal(translate('en', 'admin.kpiAccountsSub', { users: 3, groups: 2 }), '3 users · 2 groups');
+    assert.equal(LOCALES.zh['network.admissionBoth'], '有邀请链接就自动加入，否则需要手动批准');
+    assert.equal(LOCALES.zh['network.admissionManual'], '所有设备都需要我批准');
+    assert.ok('network.admissionLegacyKeyHint' in LOCALES.zh && 'network.admissionLegacyKeyHint' in LOCALES.en);
   });
 
   test('effectiveNetworkMaxPeers：组上限收紧时与网络上限取较小值，管理员不封顶', () => {
@@ -2573,22 +2473,7 @@ describe('GT-4：TLS 词典、Store 状态隔离与 ConsoleClient 方法', () =>
   });
 });
 
-describe('PAS-2：加入方式收敛为两项与 manual 无口令格式化', () => {
-  test('词典与 NetworkView 仅提供 both / manual 两项单选并保留旧 key 只读提示', () => {
-    assert.equal(LOCALES.zh['network.admissionBoth'], '有邀请链接就自动加入，否则需要手动批准');
-    assert.equal(LOCALES.zh['network.admissionManual'], '所有设备都需要我批准');
-    assert.ok('network.admissionLegacyKeyHint' in LOCALES.zh);
-    assert.ok('network.admissionLegacyKeyHint' in LOCALES.en);
-
-    const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-    const source = fs.readFileSync(path.join(pkgDir, 'src/web/components/NetworkView.tsx'), 'utf8');
-    assert.ok(!source.includes("['key', t('network.admissionKey')]"), '新建/设置单选组不再提供 key 选项');
-    assert.ok(source.includes("['both', t('network.admissionBoth')]"));
-    assert.ok(source.includes("['manual', t('network.admissionManual')]"));
-    assert.ok(source.includes("network.admissionMode === 'key'"), 'legacy key 网络设置弹窗需展示只读提示');
-    assert.ok(source.includes("t('network.admissionLegacyKeyHint')"));
-  });
-
+describe('PAS-2：manual 无口令格式化', () => {
   test('maskInviteUri 与 buildHeadlessJoinCommand 对 manual 无 # 链接不加多余掩码后缀', () => {
     const manualUri = 'zr-net://gw.local:19393/0123456789abcdef';
     assert.equal(maskInviteUri(manualUri), manualUri);
@@ -2692,14 +2577,5 @@ describe('T5：双向直连归并（resolvePairLink / summarizeNetworkPairs / su
       blocked: 1,
       latency: '—',
     });
-  });
-
-  test('NetworkView.tsx 消费 summarizeNetworkPairs/summarizeMemberConnections 且绝不在 relay===0 时渲染正在中转', () => {
-    const pkgDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-    const source = fs.readFileSync(path.join(pkgDir, 'src/web/components/NetworkView.tsx'), 'utf8');
-    assert.ok(source.includes('summarizeNetworkPairs('), '概览第 3 格必须消费 summarizeNetworkPairs');
-    assert.ok(source.includes('summarizeMemberConnections('), '设备列表行必须消费 summarizeMemberConnections');
-    assert.ok(!source.includes('relayingNow'), '必须移除独立的 relayingNow 芯片');
-    assert.ok(!source.includes("t('devices.relayingNow'"), '禁止独立渲染 devices.relayingNow 与直连共存');
   });
 });

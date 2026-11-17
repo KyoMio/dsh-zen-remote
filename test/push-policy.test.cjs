@@ -21,8 +21,8 @@ const path = require('node:path')
 const { pathToFileURL } = require('node:url')
 
 const MODULE_URL = pathToFileURL(path.join(__dirname, '..', 'dsh-push.mjs')).href
-let seq = 0
-const freshImport = () => import(`${MODULE_URL}?policy=${++seq}`)
+let pushPromise
+const freshImport = () => (pushPromise ??= import(MODULE_URL))
 
 const CFG = { turnEndEnabled: false, debounceMs: 15000, includeSummary: false }
 const cfg = (over) => ({ ...CFG, ...over })
@@ -238,7 +238,8 @@ test('apply registers the standing prompt section, and survives a host without o
 
 // --- wiring: the event leg reaches the pure layer with the right kinds -----
 
-test('session/event wiring: a decided approval is not pushed, an undecided one is', async () => {
+test('session/event wiring: a decided approval is not pushed, an undecided one is', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   // Shrink the grace so the test stays fast; the wiring under test is the same.
   process.env.DSH_PUSH_APPROVAL_GRACE_MS = '200'
   const mod = await freshImport()
@@ -267,7 +268,8 @@ test('session/event wiring: a decided approval is not pushed, an undecided one i
     onSessionEvent({}, { type: 'tool/call', data: { turn: 1, name: 'ask_user_question', arguments: '{"questions":[{"id":"q","question":"ok?"}]}' } })
     onSessionEvent({}, { type: 'tool/call', data: { turn: 1, name: 'bash', arguments: '{}' } })
 
-    await new Promise((r) => setTimeout(r, 500))
+    t.mock.timers.tick(200)
+    await Promise.resolve()
     const titles = sent.map((s) => s.title)
     const titleOf = (kind) => mod.decideNotification({ kind, now: 0, lastSent: 0 }, cfg()).title
     assert.deepStrictEqual(titles, [titleOf('question'), titleOf('approval')], 'question fires immediately, the still-pending approval after its grace period')
@@ -275,11 +277,8 @@ test('session/event wiring: a decided approval is not pushed, an undecided one i
   } finally { global.fetch = original; delete process.env.DSH_PUSH_APPROVAL_GRACE_MS }
 })
 
-test('a machine answerer that takes seconds must not trigger a notification', async () => {
-  // The 1500ms window assumed every answerer settles in the same tick. A
-  // model-backed one (dsh-auto-approve) takes 2-3s: at 1500ms the timer won
-  // the race and pushed "waiting for your approval" for a request that was
-  // auto-approved a second later — notification arrived, prompt never did.
+test('a machine answerer that takes seconds must not trigger a notification', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   process.env.DSH_PUSH_APPROVAL_GRACE_MS = '400'
   const mod = await freshImport()
   const listeners = new Map()
@@ -292,14 +291,16 @@ test('a machine answerer that takes seconds must not trigger a notification', as
   try {
     onSessionEvent({}, { type: 'approval/asked', data: { id: 'slow', toolName: 'bash' } })
     // Answerer takes a while, but still lands inside the grace window.
-    await new Promise((r) => setTimeout(r, 250))
+    t.mock.timers.tick(250)
     onSessionEvent({}, { type: 'approval/decided', data: { id: 'slow', outcome: 'allowed-once' } })
-    await new Promise((r) => setTimeout(r, 400))
+    t.mock.timers.tick(400)
+    await Promise.resolve()
     assert.deepStrictEqual(sent, [], 'an approval answered inside the grace window must stay silent')
   } finally { global.fetch = original; delete process.env.DSH_PUSH_APPROVAL_GRACE_MS }
 })
 
-test('an answerer slower than the grace still notifies — the window is a bet, not a guarantee', async () => {
+test('an answerer slower than the grace still notifies — the window is a bet, not a guarantee', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   process.env.DSH_PUSH_APPROVAL_GRACE_MS = '150'
   const mod = await freshImport()
   const listeners = new Map()
@@ -310,7 +311,8 @@ test('an answerer slower than the grace still notifies — the window is a bet, 
   global.fetch = async (url, opts) => { sent.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({ ok: true, sent: 1 }) } }
   try {
     onSessionEvent({}, { type: 'approval/asked', data: { id: 'tooslow', toolName: 'bash' } })
-    await new Promise((r) => setTimeout(r, 350))
+    t.mock.timers.tick(150)
+    await Promise.resolve()
     assert.strictEqual(sent.length, 1, 'past the window it notifies — raising the window is the only lever')
   } finally { global.fetch = original; delete process.env.DSH_PUSH_APPROVAL_GRACE_MS }
 })
@@ -336,7 +338,7 @@ test('apply(ctx, {}) re-resolves config: DSH_PUSH_TURN_END=1 still lands', async
   global.fetch = async (url, opts) => { sent.push(JSON.parse(opts.body)); return { ok: true, status: 200, json: async () => ({ ok: true, sent: 1 }) } }
   try {
     onTurnEnd({ agent: { session: { header: {} } } })
-    await new Promise((r) => setTimeout(r, 100))
+    await Promise.resolve()
     assert.strictEqual(sent.length, 1, 'the env layer must survive an empty config object')
   } finally { global.fetch = original; delete process.env.DSH_PUSH_TURN_END }
 })
@@ -476,7 +478,8 @@ test('sessionName: English copy reads "Session: <name>", a blank or non-string n
   } finally { delete process.env.DSH_PUSH_LANG }
 })
 
-test('wiring: sessionName rides fire() into the body, resolved from the session event log', async () => {
+test('wiring: sessionName rides fire() into the body, resolved from the session event log', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
   process.env.DSH_PUSH_APPROVAL_GRACE_MS = '60'
   const mod = await freshImport()
   const listeners = new Map()
@@ -497,9 +500,43 @@ test('wiring: sessionName rides fire() into the body, resolved from the session 
     onSessionEvent(session, { type: 'tool/call', data: { name: 'ask_user_question', arguments: '{"questions":[{"question":"继续吗？"}]}' } })
     // Approval leg fires after the (shrunk) grace period.
     onSessionEvent(session, { type: 'approval/asked', data: { id: 'w-named', toolName: 'bash' } })
-    await new Promise((r) => setTimeout(r, 300))
+    t.mock.timers.tick(60)
+    await Promise.resolve()
     assert.strictEqual(sent.length, 2, 'both legs fired')
     assert.strictEqual(sent[0].body, '来源会话：排查 推送\n智能体提了一个问题，正在等你回答')
     assert.strictEqual(sent[1].body, '来源会话：排查 推送\nbash 需要授权才能继续')
   } finally { global.fetch = original; delete process.env.DSH_PUSH_APPROVAL_GRACE_MS }
+})
+
+// ---- sessionEvents: the turn-summary event log read, both DSH versions (merged from push.test.cjs) ----
+
+test('sessionEvents: 0.1.1 array form feeds turnSummary identically to a bare array', async () => {
+  const { sessionEvents, turnSummary } = await freshImport()
+  const events = [
+    { type: 'tool/call', data: { turn: 7, step: 0, name: 'bash', arguments: '{}' } },
+    { type: 'assistant/message', data: { turn: 7, step: 1, message: { content: [{ type: 'text', text: '改完收工' }] } } }
+  ]
+  const direct = turnSummary(events, 7)
+  const viaGetter = turnSummary(sessionEvents({ events }), 7)
+  assert.strictEqual(viaGetter, direct)
+  assert.match(viaGetter, /改完收工/)
+})
+
+test('sessionEvents: 0.1.2 method form produces the exact same summary as the array form', async () => {
+  const { sessionEvents, turnSummary } = await freshImport()
+  const events = [
+    { type: 'tool/call', data: { turn: 7, step: 0, name: 'bash', arguments: '{}' } },
+    { type: 'assistant/message', data: { turn: 7, step: 1, message: { content: [{ type: 'text', text: '改完收工' }] } } }
+  ]
+  const direct = turnSummary(events, 7)
+  const viaMethod = turnSummary(sessionEvents({ snapshotEvents: () => events }), 7)
+  assert.strictEqual(viaMethod, direct, 'both DSH readers must yield byte-identical summaries')
+})
+
+test('sessionEvents: no reader available ({} or undefined) yields [] → empty summary', async () => {
+  const { sessionEvents, turnSummary } = await freshImport()
+  assert.deepStrictEqual(sessionEvents({}), [])
+  assert.deepStrictEqual(sessionEvents(undefined), [])
+  assert.strictEqual(turnSummary(sessionEvents({}), 7), '')
+  assert.strictEqual(turnSummary(sessionEvents(undefined), 7), '')
 })

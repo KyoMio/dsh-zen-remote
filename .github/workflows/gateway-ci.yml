@@ -1,0 +1,58 @@
+name: gateway-ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    paths:
+      - 'gateway-server/**'
+      - 'src/**'
+      - 'lib/**'
+      - '.github/workflows/gateway-ci.yml'
+  workflow_dispatch:
+
+jobs:
+  gateway-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: zr_test
+          POSTGRES_PASSWORD: zr_test_password
+          POSTGRES_DB: zr_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U zr_test -d zr_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install and verify root build artifacts
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          git diff --exit-code -- lib
+
+      - name: Install, verify, build, and test gateway-server
+        env:
+          ZR_TEST_PG_URL: postgres://zr_test:zr_test_password@127.0.0.1:5432/zr_test
+        run: |
+          pnpm --dir gateway-server install --frozen-lockfile
+          pnpm --dir gateway-server verify
+          pnpm --dir gateway-server build
+          pnpm --dir gateway-server test

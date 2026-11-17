@@ -1264,3 +1264,30 @@ test('PS-4a assembleInviteUri: lone UTF-16 surrogate in joinKey fails cleanly wi
   const emoji = assembleInviteUri({ gatewayAddress: '10.0.0.1:4088', networkId: '0123456789abcdef', joinKey: 'pass 🔑 word' })
   assert.equal(parseInviteUri(emoji.inviteUri)?.joinKey, 'pass 🔑 word')
 })
+
+test('security boundaries: low-order X25519 keys and non-self-certifying handshake nodeIds are rejected', () => {
+  const aEph = generateEphemeralX25519()
+  for (const lowOrder of ['00'.repeat(32), '01' + '00'.repeat(31)]) {
+    assert.throws(() => derivePeerSessionCiphers({
+      networkId: ENV.networkId,
+      myNodeId: ENV.A.nodeId,
+      peerNodeId: ENV.B.nodeId,
+      myEphPrivateKeyHex: aEph.privateKeyHex,
+      myEphPublicKeyHex: aEph.publicKeyHex,
+      peerEphPublicKeyHex: lowOrder,
+    }))
+  }
+  const helloBytes = buildPeerHandshakeEnvelope({
+    kind: 'hello',
+    networkId: ENV.networkId,
+    identity: ENV.A,
+    selfEphPubHex: ENV.aEph.publicKeyHex,
+    peerNodeId: ENV.B.nodeId,
+    peerEphPubHex: null,
+    nonce: ENV.nonce,
+    timestamp: ENV.timestamp,
+  })
+  const forged = JSON.parse(helloBytes.toString('utf8'))
+  forged.nodeId = 'deadbeef'
+  assert.equal(parseAs(Buffer.from(JSON.stringify(forged), 'utf8'), ENV.B.nodeId), null, 'forged nodeId binding rejected')
+})

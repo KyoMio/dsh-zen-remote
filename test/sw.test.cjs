@@ -212,10 +212,11 @@ test('sw: a hanging cache write does not hold the response (no await on the writ
   const sw = loadSw(async () => typed('file-v1', 'application/octet-stream'), { putHangs: true })
   const req = { method: 'GET', url: ORIGIN + '/api/download', mode: 'cors' }
 
+  let timer
   const res = await Promise.race([
     dispatchFetch(sw, req),
-    new Promise((resolve) => setTimeout(() => resolve({ marker: 'timed-out' }), 1000))
-  ])
+    new Promise((resolve) => { timer = setTimeout(() => resolve({ marker: 'timed-out' }), 1000) })
+  ]).finally(() => clearTimeout(timer))
   assert.strictEqual(res.marker, 'file-v1', 'respondWith settles without waiting for cache.put')
   assert.strictEqual(sw.putCalls.length, 1)
 })

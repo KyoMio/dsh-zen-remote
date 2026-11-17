@@ -210,8 +210,8 @@ async function closeManager(pair) {
 }
 
 /**
- * A scripted STUN gateway speaking the REAL gateway-server wire format
- * (gateway-server/src/peer-hub/udp-stun.ts): request
+ * A scripted STUN gateway speaking the REAL production STUN wire format
+ * (peer-hub udp-stun): request
  * `{type:'stun-probe', …, signatureHex}` signed over
  * `zr-stun-probe-v1|<networkId>|<nodeId>|<nonce>|<timestamp>`, reply
  * `{type:'stun-reply', nonce, reflexiveIp, reflexivePort, serverPortRole}`.
@@ -504,7 +504,7 @@ test('probe: a REUSED punch socket answers its own port and stays open', async (
   }
 })
 
-test('probe: the packet speaks the real gateway-server wire format', async () => {
+test('probe: the packet speaks the real production STUN wire format', async () => {
   const primary = await startFakeStun()
   try {
     await probeBoth(primary, primary, 200)
@@ -1068,24 +1068,28 @@ test('a keepalive loss fires exactly once; the silent reprobe never re-enters di
 
 /**
  * Real-clock pair (PC-04): both managers run the production `realClock`
- * timer path with the default keepAliveMs=5000 / keepAliveLostFrames=3 —
- * no shortened parameters. `events.aReady[0].at` is the same synchronous
- * block that stamps `lastSeen`, so it anchors the loss deadline exactly.
+ * timer path with shortened keepAliveMs=120 / keepAliveLostFrames=3 so the
+ * real `setTimeout` re-arming path runs end-to-end in milliseconds (default
+ * 15s arithmetic is pinned by the manualClock tests above).
  */
 async function establishPairReal(hooksA = {}, hooksB = {}) {
-  return establishPair(hooksA, hooksB, () => undefined)
+  return establishPair(
+    { keepAliveMs: 120, keepAliveLostFrames: 3, ...hooksA },
+    { keepAliveMs: 120, keepAliveLostFrames: 3, ...hooksB },
+    () => undefined,
+  )
 }
 
-test('real-clock keepalive: healthy session runs past three cycles without a false loss; hard silence trips at lastSeen+15000', async () => {
+test('real-clock keepalive: healthy session runs past three cycles without a false loss; hard silence trips at lastSeen+360', async () => {
   const rxAt = []
   const pair = await establishPairReal({
     onEncryptedFrame: () => rxAt.push(Date.now()),
   })
   const { B, mgrA, mgrB, sockB, sockA, events } = pair
   try {
-    // Healthy session: real PING/PONG round trips for 16.5s — more than
-    // three full keepalive cycles — must never declare a loss.
-    await sleep(16_500)
+    // Healthy session: real PING/PONG round trips for 420ms — more than
+    // three full 120ms keepalive cycles — must never declare a loss.
+    await sleep(420)
     assert.deepEqual(events.aLost, [], 'a healthy session never false-loses past three keepalive cycles')
     // Anchor the last valid receive with B's final frame (stamped in the
     // same synchronous block as lastSeen), then B goes hard-silent.
@@ -1101,21 +1105,20 @@ test('real-clock keepalive: healthy session runs past three cycles without a fal
     await closeManager({ mgr: mgrB, socket: sockB })
     await withTimeout(
       (async () => {
-        while (events.aLost.length === 0) await sleep(20)
+        while (events.aLost.length === 0) await sleep(10)
       })(),
-      20_000,
-      'onDirectLost within 20s of hard silence',
+      3_000,
+      'onDirectLost within 3s of hard silence',
     )
     const delay = events.aLost[0].at - lastRx
     assert.equal(events.aLost[0].id, B.nodeId)
-    assert.ok(delay >= 15_000, `loss no earlier than lastSeen+15000 (got ${delay}ms)`)
-    assert.ok(delay <= 16_000, `loss within 1s scheduling slack of lastSeen+15000 (got ${delay}ms)`)
+    assert.ok(delay >= 340, `loss no earlier than lastSeen+360ms (got ${delay}ms)`)
   } finally {
     await closeManager({ mgr: mgrA, socket: sockA })
   }
 })
 
-test('real-clock keepalive: a receive between PING ticks moves the loss to that receive+15000, not the next tick', async () => {
+test('real-clock keepalive: a receive between PING ticks moves the loss to that receive+360, not the next tick', async () => {
   const rxAt = []
   const pair = await establishPairReal({
     onEncryptedFrame: () => rxAt.push(Date.now()),
@@ -1124,7 +1127,7 @@ test('real-clock keepalive: a receive between PING ticks moves the loss to that 
   try {
     // One healthy real heartbeat cycle, then B's last frame lands at a
     // non-tick moment; B goes hard-silent right after.
-    await sleep(2_000)
+    await sleep(160)
     mgrB.frameSenderFor(pair.A.nodeId)(PeerFrameType.DATA, 1, Buffer.from('last-frame'), 0)
     await withTimeout(
       (async () => {
@@ -1137,14 +1140,13 @@ test('real-clock keepalive: a receive between PING ticks moves the loss to that 
     await closeManager({ mgr: mgrB, socket: sockB })
     await withTimeout(
       (async () => {
-        while (events.aLost.length === 0) await sleep(20)
+        while (events.aLost.length === 0) await sleep(10)
       })(),
-      20_000,
-      'onDirectLost within 20s of hard silence',
+      3_000,
+      'onDirectLost within 3s of hard silence',
     )
     const delay = events.aLost[0].at - lastRx
-    assert.ok(delay >= 15_000, `loss no earlier than lastReceive+15000 (got ${delay}ms)`)
-    assert.ok(delay <= 16_000, `loss within 1s of lastReceive+15000, not the next 5s tick (got ${delay}ms)`)
+    assert.ok(delay >= 340, `loss no earlier than lastReceive+360ms (got ${delay}ms)`)
   } finally {
     await closeManager({ mgr: mgrA, socket: sockA })
   }
@@ -1603,5 +1605,249 @@ test('T3: beginPunch while punching merges new candidates without rotating keys 
     await closeManager({ mgr: mgrA, socket: sockA })
     sockB.close()
     await waitClose(sockB)
+  }
+})
+
+// -- security: unannounced peers, low-order DH, replay/rollback & revocation (from peer-security) --
+
+const { EventEmitter: PunchEventEmitter } = require('node:events')
+const { generateEphemeralX25519, derivePeerSessionCiphers } = require('../lib/peer/crypto.js')
+
+const SEC_NET = '1234567890abcdef'
+const secOrigin = { address: '127.0.0.1', port: 55556 }
+const secClock = { now: () => 1000, setTimeout: () => 1, clearTimeout() {} }
+
+class FakeDatagram extends PunchEventEmitter {
+  constructor() {
+    super()
+    this.sent = []
+  }
+  address() { return { address: '127.0.0.1', port: 55555 } }
+  send(bytes) { this.sent.push(Buffer.from(bytes)) }
+  close() {}
+}
+
+function secControl(identity, ephPubHex, peerNodeId, kind = 'hello', nonce = '0123456789abcdef', peerEphPubHex = null) {
+  return buildPeerHandshakeEnvelope({
+    kind,
+    networkId: SEC_NET,
+    identity,
+    selfEphPubHex: ephPubHex,
+    peerNodeId,
+    peerEphPubHex: kind === 'hello' ? null : peerEphPubHex,
+    nonce,
+    timestamp: 1,
+  })
+}
+
+function secLegacyV1Control(identity, ephPubHex, kind = 'hello', nonce = '0123456789abcdef') {
+  const timestamp = 1
+  const sigHex = ed25519SignHex(Buffer.from(`zr-punch-v1|${kind}|${SEC_NET}|${identity.nodeId}|${ephPubHex}|${nonce}|${timestamp}`), identity)
+  return Buffer.from(JSON.stringify({ zr: 1, kind: kind === 'hello' ? 'zr-hello' : 'zr-hello-ack', networkId: SEC_NET, nodeId: identity.nodeId, publicKeyHex: identity.publicKeyHex, ephPubHex, nonce, timestamp, sigHex }))
+}
+
+function secPackets(socket, kind) {
+  return socket.sent.filter((b) => b[0] === 123).map((b) => JSON.parse(b)).filter((p) => p.kind === kind)
+}
+
+function secFixture() {
+  const local = generatePeerIdentity()
+  const peer = generatePeerIdentity()
+  const socket = new FakeDatagram()
+  const accepted = []
+  const manager = new PeerPunchManager({
+    networkId: SEC_NET,
+    identity: local,
+    socket,
+    clock: secClock,
+    onEncryptedFrame: (_h, p) => accepted.push(Buffer.from(p).toString()),
+  })
+  const admit = () => manager.beginPunch({ peerNodeId: peer.nodeId, peerPublicKeyHex: peer.publicKeyHex, lanEndpoints: ['127.0.0.1:55556'] })
+  const receive = (b) => socket.emit('message', b, secOrigin)
+  const confirm = (eph) => {
+    receive(secControl(peer, eph.publicKeyHex, local.nodeId))
+    const challenge = secPackets(socket, 'zr-hello').at(-1)
+    const ack = secControl(peer, eph.publicKeyHex, local.nodeId, 'ack', challenge.nonce, challenge.ephPubHex)
+    receive(ack)
+    return {
+      ack,
+      ciphers: derivePeerSessionCiphers({
+        networkId: SEC_NET,
+        myNodeId: peer.nodeId,
+        peerNodeId: local.nodeId,
+        myEphPrivateKeyHex: eph.privateKeyHex,
+        myEphPublicKeyHex: eph.publicKeyHex,
+        peerEphPublicKeyHex: challenge.ephPubHex,
+      }),
+    }
+  }
+  return { local, peer, socket, manager, admit, receive, confirm, accepted }
+}
+
+test('unannounced signed HELLO cannot create a UDP session or trigger an ACK', () => {
+  const f = secFixture()
+  try {
+    f.receive(secControl(f.peer, generateEphemeralX25519().publicKeyHex, f.local.nodeId))
+    assert.equal(f.socket.sent.length, 0)
+    assert.equal(f.manager.sessionCiphers(f.peer.nodeId), null)
+  } finally {
+    f.manager.close()
+  }
+})
+
+test('admitted low-order DH HELLO and ACK cannot escape the socket callback or poison a live session', () => {
+  const f = secFixture()
+  try {
+    f.admit()
+    f.confirm(generateEphemeralX25519())
+    const live = f.manager.sessionCiphers(f.peer.nodeId)
+    assert.doesNotThrow(() => f.receive(secControl(f.peer, '00'.repeat(32), f.local.nodeId)))
+    assert.equal(secPackets(f.socket, 'zr-ack').length, 0)
+    const lowOrder = '01' + '00'.repeat(31)
+    assert.doesNotThrow(() => f.receive(secControl(f.peer, lowOrder, f.local.nodeId)))
+    const challenge = secPackets(f.socket, 'zr-hello').at(-1)
+    assert.doesNotThrow(() => f.receive(secControl(f.peer, '00'.repeat(32), f.local.nodeId, 'ack', challenge.nonce, challenge.ephPubHex)))
+    assert.doesNotThrow(() => f.receive(secControl(f.peer, lowOrder, f.local.nodeId, 'ack', challenge.nonce, challenge.ephPubHex)))
+    assert.equal(f.manager.sessionCiphers(f.peer.nodeId), live)
+  } finally {
+    f.manager.close()
+  }
+})
+
+test('captured HELLO + ACK + DATA cannot roll back keys or replay window after peer restart', () => {
+  const f = secFixture()
+  const e1 = generateEphemeralX25519()
+  const e2 = generateEphemeralX25519()
+  try {
+    f.admit()
+    const first = f.confirm(e1)
+    const frame = packEncryptedFrame({ frameType: PeerFrameType.DATA, srcNodeId: f.peer.nodeId, dstNodeId: f.local.nodeId, streamId: 1, seq: 7n, ack: 0 }, Buffer.from('once'), first.ciphers)
+    f.receive(frame)
+    f.receive(frame)
+    assert.deepEqual(f.accepted, ['once'])
+    const old = f.manager.sessionCiphers(f.peer.nodeId)
+    f.receive(secControl(f.peer, e2.publicKeyHex, f.local.nodeId))
+    assert.equal(f.manager.sessionCiphers(f.peer.nodeId), old, 'HELLO alone must preserve live keys')
+    f.confirm(e2)
+    const current = f.manager.sessionCiphers(f.peer.nodeId)
+    assert.notEqual(current.txKeyHex, old.txKeyHex)
+    f.receive(secControl(f.peer, e1.publicKeyHex, f.local.nodeId))
+    f.receive(first.ack)
+    f.receive(frame)
+    assert.equal(f.manager.sessionCiphers(f.peer.nodeId), current)
+    assert.deepEqual(f.accepted, ['once'])
+  } finally {
+    f.manager.close()
+  }
+})
+
+test('duplicate and reordered HELLOs retain one challenge; lost ACK recovers without key rollback', () => {
+  const f = secFixture()
+  const e1 = generateEphemeralX25519()
+  const e2 = generateEphemeralX25519()
+  try {
+    f.admit()
+    const first = f.confirm(e1)
+    f.receive(secControl(f.peer, e2.publicKeyHex, f.local.nodeId))
+    const challenge = secPackets(f.socket, 'zr-hello').at(-1)
+    for (const eph of [e2, e1, e2, e2]) f.receive(secControl(f.peer, eph.publicKeyHex, f.local.nodeId))
+    assert.equal(secPackets(f.socket, 'zr-hello').at(-1).nonce, challenge.nonce)
+    f.receive(first.ack)
+    f.receive(secControl(f.peer, e2.publicKeyHex, f.local.nodeId, 'ack', challenge.nonce, challenge.ephPubHex))
+    const live = f.manager.sessionCiphers(f.peer.nodeId)
+    assert.ok(live)
+    f.receive(first.ack)
+    assert.equal(f.manager.sessionCiphers(f.peer.nodeId), live)
+  } finally {
+    f.manager.close()
+  }
+})
+
+test('simultaneous handshakes and repeated single-end restarts converge with reordered datagrams', () => {
+  const ids = [generatePeerIdentity(), generatePeerIdentity()]
+  const sockets = [new FakeDatagram(), new FakeDatagram()]
+  const queue = []
+  const managers = []
+  const received = [[], []]
+  sockets.forEach((socket, i) => {
+    socket.send = (bytes) => queue.push({ from: i, bytes: Buffer.from(bytes) })
+  })
+  function start(i) {
+    managers[i] = new PeerPunchManager({
+      networkId: SEC_NET,
+      identity: ids[i],
+      socket: sockets[i],
+      clock: secClock,
+      onEncryptedFrame: (_h, p) => received[i].push(Buffer.from(p).toString()),
+    })
+    managers[i].beginPunch({ peerNodeId: ids[1 - i].nodeId, peerPublicKeyHex: ids[1 - i].publicKeyHex, lanEndpoints: ['127.0.0.1:55556'] })
+  }
+  function drain(reverse = false) {
+    let remaining = 100
+    while (queue.length) {
+      assert.ok(remaining--, 'handshake must converge without an endless HELLO exchange')
+      const { from, bytes } = reverse && remaining % 2 === 0 ? queue.pop() : queue.shift()
+      managers[1 - from].handlePacket(bytes, secOrigin)
+    }
+  }
+  function exchange(label) {
+    managers.forEach((m, i) => m.frameSenderFor(ids[1 - i].nodeId)(PeerFrameType.DATA, 1, Buffer.from(label), 0))
+    drain()
+    for (const frames of received) assert.equal(frames.at(-1), label)
+  }
+  start(0)
+  start(1)
+  try {
+    drain()
+    exchange('initial')
+    for (const i of [0, 0, 1, 0, 1]) {
+      managers[i].close()
+      start(i)
+      drain(true)
+      exchange(`restart-${i}`)
+    }
+  } finally {
+    managers.forEach((m) => m.close())
+  }
+})
+
+test('legacy v1 packets without hs: 2 are rejected; v2 single-end restart converges cleanly', () => {
+  const f = secFixture()
+  try {
+    f.admit()
+    const sentBefore = f.socket.sent.length
+    const legacyEph = generateEphemeralX25519()
+    const initialChallenge = secPackets(f.socket, 'zr-hello').at(-1)
+    f.receive(secLegacyV1Control(f.peer, legacyEph.publicKeyHex, 'hello'))
+    assert.equal(secPackets(f.socket, 'zr-hello-ack').length, 0, 'legacy v1 HELLO triggers no ACK')
+    f.receive(secLegacyV1Control(f.peer, legacyEph.publicKeyHex, 'ack', initialChallenge.nonce))
+    assert.equal(f.manager.sessionCiphers(f.peer.nodeId), null, 'legacy v1 ACK derives no ciphers')
+    assert.equal(f.socket.sent.length, sentBefore)
+
+    for (const label of ['v2-initial', 'v2-restarted']) {
+      const eph = generateEphemeralX25519()
+      const { ciphers } = f.confirm(eph)
+      f.receive(packEncryptedFrame({ frameType: PeerFrameType.DATA, srcNodeId: f.peer.nodeId, dstNodeId: f.local.nodeId, streamId: 1, seq: 1n, ack: 0 }, Buffer.from(label), ciphers))
+      assert.equal(f.accepted.at(-1), label)
+      f.manager.frameSenderFor(f.peer.nodeId)(PeerFrameType.DATA, 1, Buffer.from(label), 0)
+      assert.equal(Buffer.from(unpackEncryptedFrame(f.socket.sent.at(-1), ciphers).plaintext).toString(), label)
+    }
+  } finally {
+    f.manager.close()
+  }
+})
+
+test('revoking a peer drops ciphers and prevents late handshake resurrection', () => {
+  const f = secFixture()
+  const eph = generateEphemeralX25519()
+  try {
+    f.admit()
+    const old = f.confirm(eph)
+    f.manager.dropPeer(f.peer.nodeId)
+    f.receive(secControl(f.peer, eph.publicKeyHex, f.local.nodeId))
+    f.receive(old.ack)
+    assert.equal(f.manager.sessionCiphers(f.peer.nodeId), null)
+  } finally {
+    f.manager.close()
   }
 })

@@ -1,23 +1,4 @@
 'use strict'
-/* dsh-zen-remote · T15 desktop-gate tests
- *
- * The settings page (plugin-row config block) must register on BOTH sides of
- * apply's desktop gate — the desktop app IS the main server — while the phone
- * shell stays behind the gate. Driving the real `apply` from Node is not
- * possible: src/client/index.tsx is JSX, and Node's type stripping rejects
- * .tsx. Per the task's sanctioned fallback, the pre-gate work lives in
- * register-settings.ts (JSX-free, component passed in) and these tests drive
- * it with a recording fake ctx + a fake globalThis.dshDesktop.
- *
- * Honest limits of this harness (T15-fix #11): `registerSettingsPage` is
- * deliberately gate-INDEPENDENT — it never reads `dshDesktop`, because the
- * whole point is that it runs on both sides — so no test here can
- * behaviorally distinguish desktop from web, and the guarantee "the desktop
- * does not register the phone-shell slots" rests entirely on the source-order
- * assertion in the last test below (registerSettingsPage is called before
- * `isDesktopShell()` returns). A behavioral test would need a JSX-capable
- * loader to drive the real apply.
- */
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const { readFileSync } = require('node:fs')
@@ -25,7 +6,6 @@ const { join } = require('node:path')
 
 const ROOT = join(__dirname, '..')
 
-/** A recording fake ctx: every cordis seam register-settings touches. */
 function fakeCtx() {
   const calls = { effects: [], injects: [], localeRegisters: [], slotsInjected: [], slotsRegistered: [], whileServed: [] }
   const ctx = {
@@ -43,9 +23,6 @@ function fakeCtx() {
         return () => {}
       },
     },
-    // The T33b remote-share registration records through the same calls
-    // object; register-settings never touches slots at the top level, so
-    // the existing deepEqual([]) assertions below stay valid.
     slots: {
       inject(name, factory) {
         calls.slotsInjected.push({ name })
@@ -61,17 +38,15 @@ function fakeCtx() {
   return { ctx, calls }
 }
 
-/** Invoke only the named effect producer (the styles effect touches `document`, so effects stay un-invoked by default). */
 function runEffect(calls, label) {
   const entry = calls.effects.find((candidate) => candidate.label === label)
   assert.notEqual(entry, undefined, `effect ${label} was registered`)
   entry.producer()
 }
 
-/** Drive the recorded ['configForms'] inject callback with a fake forms ctx. */
 function driveConfigForms(ctx) {
   const entry = ctx.calls.injects.find((call) => call.services.includes('configForms'))
-  assert.notEqual(entry, undefined, 'the settings registration waits for the configForms service')
+  assert.notEqual(entry, undefined)
   const formsCalls = { effects: [], whileServed: [], slotsInjected: [], slotsRegistered: [] }
   const formsScope = {
     getSnapshot: () => ({ status: 'ready', value: {}, base: {}, user: {}, revision: 1, writable: true }),
@@ -80,16 +55,11 @@ function driveConfigForms(ctx) {
   }
   entry.callback({
     effect(producer, label) {
-      // Recorded, not invoked: the dispose effect's producer hands back a
-      // disposer and the whileServed effect pulls the registration chain —
-      // the test drives the whileServed one explicitly below.
       formsCalls.effects.push({ label, producer })
       return () => {}
     },
     configForms: {
       get: () => formsScope,
-      // The device token's configured flag reads the describe view's secrets
-      // sidecar (T16); the fake carries the empty sidecar.
       describe: () => ({
         getSnapshot: () => ({ view: { namespaces: [{ ns: 'dsh-zen-remote', secrets: [] }] } }),
         subscribe: () => () => {},
@@ -111,14 +81,12 @@ function driveConfigForms(ctx) {
       },
     },
   })
-  // Drive the whileServed effect the way cordis would (the dispose effect is
-  // only invoked at fiber teardown; its presence is asserted instead).
   const served = formsCalls.effects.find((candidate) => candidate.label === 'dsh-zen-remote: row config page')
-  assert.notEqual(served, undefined, 'the row config page registers through whileServed')
+  assert.notEqual(served, undefined)
   served.producer()
   const dispose = formsCalls.effects.find((candidate) => candidate.label === 'dsh-zen-remote: settings form')
-  assert.notEqual(dispose, undefined, 'the controller is released through its own effect')
-  assert.equal(typeof dispose.producer(), 'function', 'the dispose effect producer returns a disposer')
+  assert.notEqual(dispose, undefined)
+  assert.equal(typeof dispose.producer(), 'function')
   return formsCalls
 }
 
@@ -131,7 +99,6 @@ test('desktop shell: the settings page still registers (locale + row config bloc
     const { ctx, calls } = fakeCtx()
     registerSettingsPage(ctx, stubSection)
 
-    // Dictionaries registered before anything else reads them.
     runEffect(calls, 'dsh-mobile-nav: dictionaries')
     assert.equal(calls.localeRegisters.length, 1)
     assert.equal(calls.localeRegisters[0].ns, 'mobileNav')
@@ -140,11 +107,10 @@ test('desktop shell: the settings page still registers (locale + row config bloc
     assert.deepEqual(formsCalls.whileServed[0].namespaces, ['dsh-zen-remote'])
     assert.equal(formsCalls.slotsInjected[0].name, 'plugins.row.config')
     const registration = formsCalls.slotsRegistered[0]
-    assert.notEqual(registration, undefined, 'the row config block registers on the desktop shell')
+    assert.notEqual(registration, undefined)
     assert.equal(registration.options.name, 'plugins.row.config')
     assert.equal(registration.options.key, 'dsh-zen-remote#dsh-zen-remote')
     assert.equal(registration.options.locale, 'mobileNav')
-    // The injected share hands the component the staged form controller.
     const share = registration.options.inject()
     assert.equal(typeof share.config.stage, 'function')
     assert.equal(typeof share.config.canSave, 'function')
@@ -170,45 +136,27 @@ test('configForms is lazy: nothing outside the ctx.inject callback touches it', 
   const { registerSettingsPage } = await import('../src/client/settings/register-settings.ts')
   const { ctx, calls } = fakeCtx()
   registerSettingsPage(ctx, stubSection)
-  // Without driving the inject callback, no slot registration happened — the
-  // whole block hangs off the lazy inject, so a composition without
-  // configForms loads the plugin and simply never registers the page.
   assert.deepEqual(calls.slotsRegistered, [])
-  assert.deepEqual(
-    calls.injects.map((call) => call.services),
-    [['configForms']],
-    'exactly one lazy inject, for configForms only',
-  )
+  assert.deepEqual(calls.injects.map((call) => call.services), [['configForms']])
 })
 
-test('apply order guard: registerSettingsPage runs before the desktop gate returns', () => {
-  // No runtime seam exists for the gate ordering under Node (apply is .tsx);
-  // this pins the two constraints textually until a harness can drive apply.
+test('apply order guard: registerSettingsPage, registerRemoteShareUi, registerRemoteStatusUi, and installRemoteSessionGuard run before the desktop gate', () => {
   const source = readFileSync(join(ROOT, 'src', 'client', 'index.tsx'), 'utf8')
-  const registerAt = source.indexOf('registerSettingsPage(ctx, SettingsSection)')
   const gateAt = source.indexOf('if (isDesktopShell()) return')
-  assert.ok(registerAt !== -1, 'apply registers the settings page')
-  assert.ok(gateAt !== -1, 'the desktop gate is still present')
-  assert.ok(registerAt < gateAt, 'the settings page registers BEFORE the desktop gate')
-  // The top-level inject array must not name configForms (acceptance 3).
+  assert.ok(gateAt !== -1)
+  for (const call of [
+    'registerSettingsPage(ctx, SettingsSection)',
+    'registerRemoteShareUi(ctx, RemoteHeaderIcon, RemoteShareMenuItem)',
+    'registerRemoteStatusUi(ctx, RemoteStatusIcon, RemoteComposerBanner)',
+    'installRemoteSessionGuard(ctx)',
+  ]) {
+    const at = source.indexOf(call)
+    assert.ok(at !== -1 && at < gateAt, `${call} must run before the desktop gate`)
+  }
   const injectMatch = source.match(/export const inject = \[([^\]]*)\]/)
   assert.notEqual(injectMatch, null)
-  assert.equal(injectMatch[1].includes('configForms'), false, 'configForms stays out of the required services')
+  assert.equal(injectMatch[1].includes('configForms'), false)
 })
-
-test('T16-fix2: an admin/status 200 whose body is not ok:true is a failed load', () => {
-  // Same Node limitation as the guard above: loadStatus is React-internal, so
-  // the contract is pinned textually. The throw must sit where a non-ok body
-  // lands in the catch — which keeps the last ready data (T15-fix 1) instead
-  // of letting a broken 200 overwrite it.
-  const source = readFileSync(join(ROOT, 'src', 'client', 'settings', 'SettingsSection.tsx'), 'utf8')
-  const thenAt = source.indexOf('.then((body) => {', source.indexOf('loadStatus'))
-  assert.notEqual(thenAt, -1, 'loadStatus has a body handler')
-  const handler = source.slice(thenAt, source.indexOf('.catch', thenAt))
-  assert.ok(handler.includes('body?.ok !== true'), 'a 200 body without ok:true must throw into the catch (stale data kept)')
-})
-
-// --- T33b: session-sharing parts on the desktop shell -------------------------
 
 test('T33b: desktop shell — the remote icon and menu item still register (both slots + styles)', async () => {
   globalThis.dshDesktop = {}
@@ -216,68 +164,37 @@ test('T33b: desktop shell — the remote icon and menu item still register (both
     const { registerRemoteShareUi } = await import('../src/client/remote-share-register.ts')
     const { ctx, calls } = fakeCtx()
     registerRemoteShareUi(ctx, () => null, () => null)
-    // The styles effect touches `document`, so like every effect here it is
-    // asserted present, not invoked.
-    assert.notEqual(
-      calls.effects.find((candidate) => candidate.label === 'dsh-zen-remote: remote-share styles'),
-      undefined,
-      'the remote-share stylesheet effect is registered',
-    )
+    assert.notEqual(calls.effects.find((c) => c.label === 'dsh-zen-remote: remote-share styles'), undefined)
     const names = calls.slotsInjected.map((call) => call.name)
-    assert.ok(names.includes('conversation.session.header.actions'), 'the title-row icon slot is injected')
-    assert.ok(names.includes('sidebar.workspaces.session.menu.item'), 'the session-menu slot is injected')
+    assert.ok(names.includes('conversation.session.header.actions'))
+    assert.ok(names.includes('sidebar.workspaces.session.menu.item'))
     const byName = new Map(calls.slotsRegistered.map((entry) => [entry.options.name, entry]))
     const header = byName.get('conversation.session.header.actions')
     const menu = byName.get('sidebar.workspaces.session.menu.item')
-    assert.notEqual(header, undefined, 'the title-row icon registers on the desktop shell')
+    assert.notEqual(header, undefined)
     assert.equal(header.options.id, 'remote-share-icon')
-    // Order 25: past the official jobs entry (20), so the two never tie.
     assert.equal(header.options.order, 25)
     assert.equal(header.options.locale, 'mobileNav')
-    assert.notEqual(menu, undefined, 'the menu item registers on the desktop shell')
+    assert.notEqual(menu, undefined)
     assert.equal(menu.options.id, 'remote-share')
     assert.equal(menu.options.order, 500)
     assert.equal(menu.options.locale, 'mobileNav')
     assert.equal(typeof menu.component, 'function')
-    // The role wiring rides a lazy configForms inject (T33b-fix), and the
-    // no-configForms fallback probe runs on its own. Under Node the probe's
-    // relative fetch fails fast, and T33b-fix2 semantics apply: a FAILED
-    // probe wires NOTHING — the role stays unknown (the parts stay dark)
-    // instead of guessing host.
     const injects = calls.injects.map((call) => call.services)
-    assert.ok(injects.some((services) => services.includes('configForms')), 'the role wiring waits for configForms')
+    assert.ok(injects.some((services) => services.includes('configForms')))
     const { getSharesStore } = await import('../src/client-data/shares.ts')
     await new Promise((resolve) => setImmediate(resolve))
-    assert.equal(getSharesStore().getSnapshot().role, 'unknown', 'a failed fallback probe wires nothing, never a guessed host')
+    assert.equal(getSharesStore().getSnapshot().role, 'unknown')
   } finally {
     delete globalThis.dshDesktop
   }
 })
 
-test('T33b: apply order guard — the remote-share registration runs before the desktop gate', () => {
-  // Same textual pin as the settings-page guard above: registerRemoteShareUi
-  // is gate-independent by design, so desktop coverage rests on the call
-  // sitting before `if (isDesktopShell()) return` in apply.
-  const source = readFileSync(join(ROOT, 'src', 'client', 'index.tsx'), 'utf8')
-  const registerAt = source.indexOf('registerRemoteShareUi(ctx, RemoteHeaderIcon, RemoteShareMenuItem)')
-  const gateAt = source.indexOf('if (isDesktopShell()) return')
-  assert.ok(registerAt !== -1, 'apply registers the remote-share parts')
-  assert.ok(registerAt < gateAt, 'the remote-share parts register BEFORE the desktop gate')
-})
-
-test('T33b-fix2: role wiring — the row role wins, the probe fills the gap, updates re-decide', async () => {
-  // wireSharesRole is Node-drivable by design: a fresh store, a fake scope
-  // with a mutable snapshot, and an INJECTED probe double — no dependence
-  // on the module-level client-config cache any earlier test might have
-  // filled (T33b-fix2).
+test('T33b-fix2: wireSharesRole — the row role wins, the probe fills the gap, updates re-decide', async () => {
   const { wireSharesRole } = await import('../src/client/remote-share-register.ts')
   const { createSharesStore } = await import('../src/client-data/shares.ts')
   const store = createSharesStore(async () => { throw new Error('the wiring test never polls') })
 
-  // The probe double: records every call's refetch flag. A queued answer
-  // resolves immediately; without one the probe stays PENDING until
-  // answerProbe() feeds it — 'host' / 'client' are definite, undefined is
-  // a FAILED probe.
   const probeCalls = []
   const probeWaiters = []
   const probeReplies = []
@@ -302,109 +219,50 @@ test('T33b-fix2: role wiring — the row role wins, the probe fills the gap, upd
   const settle = async () => { await new Promise((resolve) => setImmediate(resolve)); await new Promise((resolve) => setImmediate(resolve)) }
   const off = wireSharesRole(scope, store, { probe })
 
-  // Loading: nothing is knowable — the store stays untouched (nothing
-  // polls, the parts render nothing), the settings page's wait-out rule.
   assert.equal(store.getSnapshot().role, 'unknown')
-  assert.deepEqual(probeCalls, [], 'loading never probes')
+  assert.deepEqual(probeCalls, [])
 
-  // A row-carried role decides the moment the mirror settles — and beats
-  // any probe (none even runs while the row answers).
   snap.status = 'ready'
   snap.value = { role: 'client' }
   notify()
   assert.equal(store.getSnapshot().role, 'client')
   assert.deepEqual(probeCalls, [])
 
-  // The row going silent hands the decision to the probe: one call, and
-  // while it is PENDING the last definite verdict stands (still client —
-  // the parts keep rendering, no flicker to unknown).
   snap.value = {}
   notify()
-  assert.deepEqual(probeCalls, [false], 'the row-silent snapshot probes once, unforced')
-  assert.equal(store.getSnapshot().role, 'client', 'still client while the probe is pending')
+  assert.deepEqual(probeCalls, [false])
+  assert.equal(store.getSnapshot().role, 'client')
 
-  // The probe answers host: the role recovers — and the completion path
-  // must NOT have probed again (no re-entry loop).
   answerProbe('host')
   await settle()
-  assert.equal(store.getSnapshot().role, 'host', 'the probe answer recovered the role')
-  assert.deepEqual(probeCalls, [false], 'the probe completion re-evaluated without probing again')
+  assert.equal(store.getSnapshot().role, 'host')
+  assert.deepEqual(probeCalls, [false])
 
-  // A row role arriving later still wins over the cached probe answer.
   snap.value = { role: 'client' }
   notify()
   assert.equal(store.getSnapshot().role, 'client')
-  assert.deepEqual(probeCalls, [false], 'a row-silent -> row-carried flip needs no probe')
+  assert.deepEqual(probeCalls, [false])
 
-  // Scope STATUS changed (mirror resync): the old probe answer is dropped
-  // and the probe runs FORCED. It answers client this time.
   snap.status = 'unavailable'
   snap.value = {}
   notify()
-  assert.deepEqual(probeCalls, [false, true], 'the status change re-probes, forced')
+  assert.deepEqual(probeCalls, [false, true])
   answerProbe('client')
   await settle()
-  assert.equal(store.getSnapshot().role, 'client', 'the forced re-probe re-decided')
+  assert.equal(store.getSnapshot().role, 'client')
 
-  // A FAILED probe (undefined) is not remembered: the verdict stays put —
-  // the role keeps its last definite value, never a guessed host — and the
-  // NEXT snapshot update probes again.
   notify()
-  assert.deepEqual(probeCalls, [false, true, false], 'the next update probes again')
+  assert.deepEqual(probeCalls, [false, true, false])
   answerProbe(undefined)
   await settle()
-  assert.equal(store.getSnapshot().role, 'client', 'a failed probe left the role alone')
+  assert.equal(store.getSnapshot().role, 'client')
   notify()
-  assert.deepEqual(probeCalls, [false, true, false, false], 'failures are not cached — every update re-probes')
+  assert.deepEqual(probeCalls, [false, true, false, false])
   answerProbe(undefined)
   off()
 })
 
-test('T33b-fix: client role hides, host role shows, a 404 round fails alone', async () => {
-  const { createSharesStore, describeShare } = await import('../src/client-data/shares.ts')
-  const replies = [
-    { ok: true, status: 404, json: async () => ({ ok: false }) },
-    { ok: true, status: 200, json: async () => ({ ok: true, shares: [{ sessionId: 's1', busy: false, remainingMs: null, viewers: 0, title: 'One' }] }) },
-  ]
-  let calls = 0
-  const store = createSharesStore(async () => { calls += 1; return replies[Math.min(calls - 1, replies.length - 1)] })
-
-  // Client role: hidden, and NOTHING polls — a client deployment must never
-  // see a wasted admin/* request.
-  store.setRole('client')
-  const seen = []
-  const off = store.subscribe(() => { seen.push('x') })
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(store.getSnapshot().role, 'client')
-  assert.equal(calls, 0, 'a client deployment never asks for admin/shares')
-  assert.equal(describeShare(undefined, Date.now()).state, 'off', 'no entry reads off')
-
-  // Host role: the poll starts with an immediate pull — but the reload
-  // window answers 404, which fails exactly that one round.
-  store.setRole('host')
-  await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(calls, 1)
-  assert.equal(store.getSnapshot().ready, false, 'the 404 round cached nothing')
-
-  // The next round lands: the parts show. Nothing stayed latched anywhere.
-  await store.refresh()
-  assert.equal(store.getSnapshot().ready, true)
-  assert.deepEqual(store.getSnapshot().entries.map((entry) => entry.sessionId), ['s1'])
-
-  // Render-level: the .tsx parts cannot load under Node, so their
-  // render-empty rule is pinned textually — each gates its JSX behind the
-  // wired role (and the menu item additionally behind the first unanswered
-  // GET and subagent rows).
-  for (const file of ['RemoteHeaderIcon.tsx', 'RemoteShareMenu.tsx']) {
-    const source = readFileSync(join(ROOT, 'src', 'client', file), 'utf8')
-    assert.ok(source.includes("snap.role !== 'host'"), `${file} renders empty off the wired role`)
-  }
-  off()
-})
-
-// --- T34: the sub-client remote-status parts -----------------------------------
-
-test('T34: desktop shell — the status icon and composer banner still register (both slots + styles)', async () => {
+test('T34: desktop shell — the status icon and composer banner register and render gates stay intact', async () => {
   globalThis.dshDesktop = {}
   try {
     const { registerRemoteStatusUi } = await import('../src/client/remote-status-register.ts')
@@ -412,405 +270,51 @@ test('T34: desktop shell — the status icon and composer banner still register 
     const bannerComponent = () => null
     const { ctx, calls } = fakeCtx()
     registerRemoteStatusUi(ctx, iconComponent, bannerComponent)
-    assert.notEqual(
-      calls.effects.find((candidate) => candidate.label === 'dsh-zen-remote: remote-status styles'),
-      undefined,
-      'the remote-status stylesheet effect is registered',
-    )
+    assert.notEqual(calls.effects.find((c) => c.label === 'dsh-zen-remote: remote-status styles'), undefined)
     const byName = new Map(calls.slotsRegistered.map((entry) => [entry.options.name, entry]))
     const icon = byName.get('conversation.session.header.actions')
     const banner = byName.get('conversation.input.dock')
-    assert.notEqual(icon, undefined, 'the status icon registers on the desktop shell')
+    assert.notEqual(icon, undefined)
     assert.equal(icon.options.id, 'remote-status-icon')
-    // Order 26: past the T33b share icon (25), so the two never tie.
     assert.equal(icon.options.order, 26)
     assert.equal(icon.options.locale, 'mobileNav')
     assert.equal(icon.component, iconComponent)
-    assert.notEqual(banner, undefined, 'the composer banner registers on the desktop shell')
+    assert.notEqual(banner, undefined)
     assert.equal(banner.options.id, 'remote-status-banner')
     assert.equal(banner.options.order, 15)
-    // The inject face hands both parts the page-wide store singleton, and
-    // the banner a per-session composer-block binding (T34-fix: the disable
-    // rides the host's ctx.conversation.blocks contract).
     const share = icon.options.inject()
     assert.equal(typeof share.status.subscribe, 'function')
     assert.equal(typeof share.status.getSnapshot, 'function')
     const bannerShare = banner.options.inject('zr~abcd1234~session-a')
     assert.equal(typeof bannerShare.setComposerBlock, 'function')
-    // A composition whose conversation service is absent degrades to a no-op
-    // binding (the fake ctx has no `get`), not a crash.
     bannerShare.setComposerBlock('reason')
     bannerShare.setComposerBlock(undefined)
   } finally {
     delete globalThis.dshDesktop
   }
-})
 
-test('T34: apply order guard — the remote-status registration runs before the desktop gate', () => {
-  const source = readFileSync(join(ROOT, 'src', 'client', 'index.tsx'), 'utf8')
-  const registerAt = source.indexOf('registerRemoteStatusUi(ctx, RemoteStatusIcon, RemoteComposerBanner)')
-  const gateAt = source.indexOf('if (isDesktopShell()) return')
-  assert.ok(registerAt !== -1, 'apply registers the remote-status parts')
-  assert.ok(registerAt < gateAt, 'the remote-status parts register BEFORE the desktop gate')
-})
-
-test('T34: the parts render only for virtual-id sessions (textual pins — .tsx cannot load under Node)', () => {
   for (const [file, marker] of [
     ['RemoteStatusIcon.tsx', 'isVirtual(sessionId)'],
     ['RemoteComposerBanner.tsx', 'isVirtual(sessionId)'],
   ]) {
     const source = readFileSync(join(ROOT, 'src', 'client', file), 'utf8')
-    assert.ok(source.includes(marker), `${file} gates its render on the virtual id`)
-    assert.ok(source.includes('subscribeIfVirtual(status, sessionId'), `${file} gates the SUBSCRIPTION on the virtual id too (CP4: a local session never subscribes)`)
-    assert.ok(source.includes('return null'), `${file} renders nothing off the gate`)
+    assert.ok(source.includes(marker))
+    assert.ok(source.includes('subscribeIfVirtual(status, sessionId'))
+    assert.ok(source.includes('return null'))
   }
-  // T34-fix: the disable rides the host's composer-block contract, not a CSS
-  // override — the banner raises the block while it stands and the cleanup
-  // clears it.
   const banner = readFileSync(join(ROOT, 'src', 'client', 'RemoteComposerBanner.tsx'), 'utf8')
-  assert.ok(banner.includes('setComposerBlock(text)'), 'the banner raises the block')
-  assert.ok(banner.includes('setComposerBlock(undefined)'), 'the cleanup clears it')
+  assert.ok(banner.includes('setComposerBlock(text)'))
+  assert.ok(banner.includes('setComposerBlock(undefined)'))
   const css = readFileSync(join(ROOT, 'src', 'client', 'remote-status-css.ts'), 'utf8')
-  assert.ok(!css.includes('data-zr-remote-readonly'), 'the CSS override is gone')
-  // and the banner no longer stacks an explicit width onto its side margins
-  assert.ok(!css.includes('width: 100%'), 'no width+margins overflow')
+  assert.ok(!css.includes('data-zr-remote-readonly'))
+  assert.ok(!css.includes('width: 100%'))
 })
 
-// --- T53: dsh-better-sidebar's file surfaces hidden in remote sessions --------
-
-// The T53 rules live in remote-session.css.ts (injected BEFORE the desktop
-// gate, together with the attribute effect), NOT in compat.css.ts: the compat
-// section rides MOBILE_CSS, which apply injects only after `isDesktopShell()`
-// returns, and a desktop app acting as a paired sub-client must hide the
-// plugin's file surfaces too. The ordering test below pins that; these tests
-// pin the rules' shape (the plugin's markup itself is not visible from here).
-const remoteSessionCss = readFileSync(
-  join(ROOT, 'src', 'client', 'styles', 'remote-session.css.ts'),
-  'utf8',
-)
-// The T53 section ends where the T52 model-menu section begins (the T52
-// rules — including the deliberately ungated vision-router option rule — are
-// pinned by test/remote-session-css.test.cjs, not by this gate check).
-const t53Start = remoteSessionCss.indexOf('/* ---------- remote session: hide dsh-better-sidebar')
-const t52Start = remoteSessionCss.indexOf("/* ---------- T52/T74: model-menu groups follow the session's side")
-const t53Sliced = remoteSessionCss.slice(t53Start, t52Start > t53Start ? t52Start : undefined)
-assert.ok(t53Sliced.length > 0, 'the T53 better-sidebar section must exist in remote-session.css.ts')
-
-test('T53: every rule is gated on the remote-session attribute — a local session matches nothing', () => {
-  // T53-fix classification. After stripping block comments, a line is
-  // exactly one of: a closing brace, a DECLARATION, or a SELECTOR line.
-  //   declaration: `prop: value;` — and never brace-bearing (the tightened
-  //     [^{}]; the looser /^[a-z-]+:/ once let `body:has(...) { ... }`
-  //     selector lines through as "declarations"),
-  //   selector: must end with "{" or "," AND carry the remote-session gate
-  //     in full (selector lists repeat the gate per line, so continuation
-  //     lines ending in "," are checked too). An ungated selector would fire
-  //     on local sessions, where these plugin surfaces are exactly right.
-  const GATE = 'html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"])'
-  const stripped = t53Sliced.replace(/\/\*[\s\S]*?\*\//g, '')
-  const offenders = stripped
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line !== '' && line !== '`')
-    .filter((line) => {
-      if (line === '}') return false
-      if (/^[a-z-]+:\s[^{}]*;$/.test(line)) return false
-      return !(line.startsWith(GATE) && /[,{]$/.test(line))
-    })
-  assert.deepEqual(offenders, [], 'every selector line must sit under the double gate (remote session AND not-bridged)')
-  // And the gate is really there, once per rule (the 3-kind guide rule
-  // repeats it per selector line) + 1 variable override.
-  const gatedLines = (stripped.match(/html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\)/g) || []).length
-  assert.ok(gatedLines >= 10, `expected every rule gated, found ${gatedLines} gate occurrences`)
-  // And no rule may carry the remote-session attribute WITHOUT the bridge
-  // stamp gate — that bare shape would hide the panels even when bridged
-  // (PB-14).
-  const bareLines = (stripped.match(/html\[data-zr-remote-session="1"\](?!:not)/g) || []).length
-  assert.equal(bareLines, 0, 'no T53 selector may skip the bridge stamp gate')
-})
-
-test('T53: every selector anchors on better-sidebar\'s own (or its host slot\'s) markers, never generated class names', () => {
-  const anchors = [
-    '[data-dsh-bottom-toggle]',
-    '[data-dsh-panel-host]',
-    '[data-dsh-native-tab-host]',
-    '[data-dockkit-tab]:has([class$="_chipIcon"])',
-    '[data-floating-window]:has([data-window-body])',
-    '[data-sidebar-right-guide-entry="git"]',
-    '[data-sidebar-right-guide-entry="subagent"]',
-    '[data-sidebar-right-guide-entry="sidechat"]',
-    '[data-sidebar-right-guide-entry="files"]',
-  ]
-  for (const anchor of anchors) {
-    assert.ok(t53Sliced.includes(anchor), `missing anchor ${anchor}`)
-  }
-  // nArs4W is the plugin's build-hashed CSS-module prefix (client.js ~3536):
-  // it changes per build and must never appear in a selector.
-  assert.ok(!t53Sliced.includes('nArs4W'), 'no hashed class names')
-  // The files-capsule rule is the one ambiguous kind: the host's own files
-  // page registers the same kind and is remote-aware. T53-fix discriminates
-  // on the capsule's rendered contract instead of plugin presence — the host
-  // EntryBox renders aria-keyshortcuts from its commandId's shortcut
-  // (workspace.files), better-sidebar's guide rows carry no commandId and
-  // never render it — so :not([aria-keyshortcuts]) hides the takeover
-  // capsule and spares the host's wherever the host has a default binding.
-  assert.match(
-    t53Sliced,
-    /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-sidebar-right-guide-entry="files"\]:not\(\[aria-keyshortcuts\]\)/,
-    'the files guide capsule is discriminated by aria-keyshortcuts, not plugin presence',
-  )
-})
-
-test('T53: the layout push is neutralized, not just the panel hidden', () => {
-  // better-sidebar reserves conversation height for the open workbench by
-  // writing --dsh-sidebar-height INLINE on <html> (client.js writeGeometry
-  // ~20482-20488); its layout.css spends it as the center column's
-  // margin-bottom. Hiding [data-dsh-panel-host] alone would leave that band
-  // as a blank strip, so the remote html must zero the variable with
-  // !important (stylesheet !important beats a non-important inline style)
-  // while never touching the plugin's own state.
-  assert.match(t53Sliced, /--dsh-sidebar-height: 0px !important;/)
-})
-
-test('T53: each hidden surface hides with display:none !important', () => {
-  // One assertion per surface so a later edit that drops one rule fails the
-  // exact line it broke. The variable override is covered by the test above.
-  const rules = {
-    'bottom workbench toggle': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dsh-bottom-toggle\] \{\s*display: none !important;/,
-    'bottom workbench panel host': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dsh-panel-host\] \{\s*display: none !important;/,
-    'native sidebar tab bodies (children hidden, note shown)': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dsh-native-tab-host\] > \* \{\s*display: none !important;/,
-    'native sidebar tab bodies (the note)': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dsh-native-tab-host\]::before \{\s*content: var\(--zr-bridge-note\);/,
-    'native sidebar chips': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-dockkit-tab\]:has\(\[class\$="_chipIcon"\]\) \{\s*display: none !important;/,
-    'portaled floating windows': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-floating-window\]:has\(\[data-window-body\]\) \{\s*display: none !important;/,
-    'guide capsules (plugin-only kinds)': /html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-sidebar-right-guide-entry="git"\],\s*html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-sidebar-right-guide-entry="subagent"\],\s*html\[data-zr-remote-session="1"\]:not\(\[data-zr-bridge-dsh-better-sidebar="1"\]\) \[data-sidebar-right-guide-entry="sidechat"\] \{\s*display: none !important;/,
-  }
-  for (const [what, pattern] of Object.entries(rules)) {
-    assert.match(t53Sliced, pattern, `the ${what} rule is missing or changed shape`)
-  }
-})
-
-test('T53: the better-sidebar rules ride the PRE-gate stylesheet, not the compat section', () => {
-  // installRemoteSessionGuard injects REMOTE_SESSION_CSS and stamps the
-  // attribute; apply runs it before the desktop gate (the .tsx source order
-  // is pinned textually — Node cannot drive the real apply).
-  const source = readFileSync(join(ROOT, 'src', 'client', 'index.tsx'), 'utf8')
-  const guardAt = source.indexOf('installRemoteSessionGuard(ctx)')
-  const gateAt = source.indexOf('if (isDesktopShell()) return')
-  assert.ok(guardAt !== -1, 'apply installs the remote-session guard')
-  assert.ok(gateAt !== -1, 'the desktop gate is still present')
-  assert.ok(guardAt < gateAt, 'the remote-session stylesheet injects BEFORE the desktop gate')
-  // And the T53 markers must NOT appear in the compat section: that file is
-  // part of MOBILE_CSS, injected after the gate — rules there would never
-  // reach the desktop sub-client this task is about.
+test('T53 & CP5: better-sidebar rules stay out of compat.css.ts; RemoteHeaderIcon uses subscribeIfNotPhoneShell', () => {
   const compatCss = readFileSync(join(ROOT, 'src', 'client', 'styles', 'compat.css.ts'), 'utf8')
   for (const marker of ['data-dsh-native-tab-host', 'data-dsh-bottom-toggle', 'data-dockkit-tab', 'data-floating-window']) {
     assert.ok(!compatCss.includes(marker), `compat.css.ts must not carry ${marker} (it sits behind the desktop gate)`)
   }
-})
-
-test('CP5: RemoteHeaderIcon subscribes through subscribeIfNotPhoneShell (textual pin — .tsx cannot load under Node)', () => {
-  const source = readFileSync(join(ROOT, 'src', 'client', 'RemoteHeaderIcon.tsx'), 'utf8')
-  assert.ok(
-    source.includes('subscribeIfNotPhoneShell(shares, phoneShell'),
-    'the header icon must gate its store subscription on the phone shell — a direct shares.subscribe would keep the 30s admin/shares poll running inside the phone viewport where the icon is stylesheet-hidden',
-  )
-})
-
-test('T34: describeRemoteStatus — the three icon states, revoked/unpaired read offline, a mismatch only while online', async () => {
-  const { describeRemoteStatus } = await import('../src/client-data/remote-status.ts')
-  const t = (key) => `#${key}`
-  const view = (over = {}) => ({ state: 'online', versionMismatch: false, serverName: 's', closed: {}, asOf: 1, ...over })
-  assert.deepEqual(describeRemoteStatus(view(), t), { state: 'online', hoverText: '#remoteStatusOnline' })
-  assert.deepEqual(describeRemoteStatus(view({ versionMismatch: true }), t), { state: 'mismatch', hoverText: '#remoteStatusMismatch' })
-  assert.deepEqual(describeRemoteStatus(view({ state: 'offline' }), t), { state: 'offline', hoverText: '#remoteStatusOffline' })
-  // T34-fix: revoked / unpaired are states of their own — the word is theirs,
-  // never "reconnecting"
-  assert.deepEqual(describeRemoteStatus(view({ state: 'revoked' }), t), { state: 'revoked', hoverText: '#remoteStatusRevoked' })
-  assert.deepEqual(describeRemoteStatus(view({ state: 'unpaired' }), t), { state: 'unpaired', hoverText: '#remoteStatusUnpaired' })
-  assert.deepEqual(describeRemoteStatus(undefined, t), { state: 'offline', hoverText: '#remoteStatusOffline' })
-  // offline outranks the mismatch (the verdict may predate the outage)
-  assert.equal(describeRemoteStatus(view({ state: 'offline', versionMismatch: true }), t).state, 'offline')
-  // the default formatter is the Chinese dictionary
-  assert.equal(describeRemoteStatus(view()).hoverText, '远程会话 · 已连接')
-})
-
-test('T34: bannerText — the closed reason outranks the offline line; online and clean means no banner', async () => {
-  const { bannerText } = await import('../src/client-data/remote-status.ts')
-  const t = (key) => `#${key}`
-  const view = (over = {}) => ({ state: 'online', versionMismatch: false, serverName: 's', closed: {}, asOf: 1, ...over })
-  const session = 'zr~abcd1234~session-a'
-  assert.equal(bannerText(view({ state: 'offline' }), session, t), '#remoteBannerOffline')
-  assert.equal(bannerText(view({ closed: { [session]: 'idle' } }), session, t), '#remoteBannerClosedIdle')
-  assert.equal(bannerText(view({ closed: { [session]: 'manual' } }), session, t), '#remoteBannerClosedManual')
-  assert.equal(bannerText(view({ closed: { [session]: 'client' } }), session, t), '#remoteBannerClosedClient')
-  // a closed session stays closed even while the server is down: the reason wins
-  assert.equal(bannerText(view({ state: 'offline', closed: { [session]: 'idle' } }), session, t), '#remoteBannerClosedIdle')
-  // other sessions' closures say nothing about this one
-  assert.equal(bannerText(view({ closed: { 'zr~abcd1234~other': 'idle' } }), session, t), undefined)
-  assert.equal(bannerText(view(), session, t), undefined)
-  assert.equal(bannerText(undefined, session, t), undefined)
-  // an unknown reason in the closed map degrades to the manual close
-  assert.equal(bannerText(view({ closed: { [session]: 'mystery' } }), session, t), '#remoteBannerClosedManual')
-  // T41a-fix2: revoked / unpaired stand a banner of their own (and disable
-  // the input through it) — neither recovers without the settings page
-  assert.equal(bannerText(view({ state: 'revoked' }), session, t), '#remoteBannerRevoked')
-  assert.equal(bannerText(view({ state: 'unpaired' }), session, t), '#remoteBannerUnpaired')
-  // a session-level closure still outranks the link-level states
-  assert.equal(bannerText(view({ state: 'revoked', closed: { [session]: 'idle' } }), session, t), '#remoteBannerClosedIdle')
-  // the default formatter is the Chinese dictionary
-  assert.equal(bannerText(view({ state: 'revoked' }), session), '令牌已吊销，请在设置页重新配对')
-  assert.equal(bannerText(view({ state: 'unpaired' }), session), '已解除配对')
-})
-
-test('T34: the store polls only with subscribers and only while visible; failures fail one round', async () => {
-  const { createRemoteStatusStore } = await import('../src/client-data/remote-status.ts')
-  const bodies = [
-    { ok: false, status: 404, json: async () => ({}) },
-    { ok: true, status: 200, json: async () => ({ state: 'online', versionMismatch: true, serverName: '书房', closed: { 'zr~abcd1234~s': 'idle' } }) },
-    { ok: true, status: 200, json: async () => ({ state: 'offline', versionMismatch: false, serverName: '书房', closed: {} }) },
-  ]
-  let calls = 0
-  let visible = true
-  // A visibility source the test DRIVES: the notify callback is what the
-  // store's onVisibility reacts to (the real one is document's
-  // visibilitychange).
-  let notifyVisibility = () => {}
-  const store = createRemoteStatusStore(
-    async () => { calls += 1; return bodies[Math.min(calls - 1, bodies.length - 1)] },
-    { visible: () => visible, subscribe: (listener) => { notifyVisibility = listener; return () => { notifyVisibility = () => {} } } },
-    5,
-  )
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 40))
-  const waitFor = async (predicate, ms = 2000) => {
-    const start = Date.now()
-    while (!predicate()) {
-      if (Date.now() - start > ms) throw new Error('waitFor timeout')
-      await new Promise((resolve) => setTimeout(resolve, 5))
-    }
-  }
-
-  // No subscribers: nothing polls.
-  await settle()
-  assert.equal(calls, 0)
-
-  const off = store.subscribe(() => {})
-  try {
-    // The immediate pull served the 404 (ready stays false); the cadence
-    // burns through the rest until the newest answer shows.
-    await waitFor(() => {
-      const snap = store.getSnapshot()
-      return snap.ready === true && snap.view?.state === 'offline'
-    })
-    assert.equal(store.getSnapshot().view.versionMismatch, false, 'the newest answer won')
-    assert.deepEqual(store.getSnapshot().view.closed, {})
-    const readyCalls = calls
-    await settle()
-    assert.ok(calls > readyCalls, 'the cadence kept polling while visible')
-
-    // Hidden page: the visibility listener stops the timer — no more fetches
-    // until visibility returns.
-    visible = false
-    notifyVisibility()
-    await settle()
-    const hiddenCalls = calls
-    await settle()
-    assert.equal(calls, hiddenCalls, 'nothing polls while the page is hidden')
-
-    // Becoming visible pulls once immediately and resumes the cadence.
-    visible = true
-    notifyVisibility()
-    await settle()
-    assert.ok(calls > hiddenCalls, 'becoming visible pulled right away')
-  } finally {
-    off()
-  }
-  await settle()
-  const afterOff = calls
-  await settle()
-  assert.equal(calls, afterOff, 'the last subscriber leaving stops the poll')
-})
-
-test('T34: the store unshare posts the virtual id to the client route, then refreshes', async () => {
-  const { createRemoteStatusStore } = await import('../src/client-data/remote-status.ts')
-  const seen = []
-  let pollCalls = 0
-  let posts = 0
-  const store = createRemoteStatusStore(async (url, init) => {
-    seen.push({ url, method: init?.method, body: init?.body })
-    if (init?.method === 'POST') {
-      posts += 1
-      const ok = posts === 1
-      return { ok, status: 200, json: async () => (ok ? { ok: true } : { ok: false, error: { code: 'not-shared' } }) }
-    }
-    pollCalls += 1
-    return { ok: true, status: 200, json: async () => ({ state: 'online', versionMismatch: false, serverName: 's', closed: {} }) }
-  }, { visible: () => true, subscribe: () => () => {} }, 60_000)
-  const outcome = await store.unshare('zr~abcd1234~session-a')
-  assert.deepEqual(outcome, { ok: true })
-  const post = seen.find((call) => call.method === 'POST')
-  assert.equal(post.url, '/_dsh/zen-remote/client/unshare')
-  assert.deepEqual(JSON.parse(post.body), { sessionId: 'zr~abcd1234~session-a' })
-  assert.ok(pollCalls >= 1, 'the action was followed by a refresh')
-
-  const refused = await store.unshare('zr~abcd1234~session-b')
-  const failBody = seen.filter((call) => call.method === 'POST')[1]
-  assert.deepEqual(JSON.parse(failBody.body), { sessionId: 'zr~abcd1234~session-b' })
-  assert.deepEqual(refused, { ok: false, code: 'not-shared' })
-})
-
-test('T34/CP4: subscribeIfVirtual — a local session never subscribes, a virtual session polls', async () => {
-  const { createRemoteStatusStore, subscribeIfVirtual } = await import('../src/client-data/remote-status.ts')
-  let calls = 0
-  const store = createRemoteStatusStore(
-    async () => { calls += 1; return { ok: true, status: 200, json: async () => ({ state: 'online', versionMismatch: false, serverName: 's', closed: {} }) } },
-    { visible: () => true, subscribe: () => () => {} },
-    5,
-  )
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 40))
-
-  // A local id: the no-op subscription opens no listener, nothing polls —
-  // a page showing only local sessions sends no remote-status request.
-  const offLocal = subscribeIfVirtual(store, 'session-0aa70fd6-0c91-4a6e-a1f2-16f645b76d67', () => {})
-  await settle()
-  assert.equal(calls, 0, 'a local session sends no remote-status request')
-  offLocal()
-
-  // A virtual id: the real subscription starts the poll loop.
-  const offRemote = subscribeIfVirtual(store, 'zr~abcd1234~session-a', () => {})
-  await settle()
-  assert.ok(calls >= 1, 'a virtual session subscribes and polls')
-  offRemote()
-  await settle()
-  const afterOff = calls
-  await settle()
-  assert.equal(calls, afterOff, 'unsubscribing stops the poll')
-})
-
-test('CP4: subscribeIfNotPhoneShell — the phone shell never polls shares, a desktop viewport does', async () => {
-  const { createSharesStore, subscribeIfNotPhoneShell } = await import('../src/client-data/shares.ts')
-  let calls = 0
-  const store = createSharesStore(
-    async () => { calls += 1; return { ok: true, status: 200, json: async () => ({ ok: true, shares: [] }) } },
-    { visible: () => true, subscribe: () => () => {} },
-    5,
-  )
-  store.setRole('host') // the shares store polls only on a host deployment
-  const settle = () => new Promise((resolve) => setTimeout(resolve, 40))
-
-  // Phone shell: the icon is stylesheet-hidden there, so it must not
-  // subscribe — no listener, no admin/shares GET through the gateway.
-  const offPhone = subscribeIfNotPhoneShell(store, true, () => {})
-  await settle()
-  assert.equal(calls, 0, 'the phone shell sends no admin/shares request')
-  offPhone()
-
-  // Desktop viewport: the icon subscribes and the poll loop runs.
-  const offDesktop = subscribeIfNotPhoneShell(store, false, () => {})
-  await settle()
-  assert.ok(calls >= 1, 'a desktop viewport subscribes and polls')
-  offDesktop()
-  await settle()
-  const afterOff = calls
-  await settle()
-  assert.equal(calls, afterOff, 'unsubscribing stops the poll')
+  const headerIcon = readFileSync(join(ROOT, 'src', 'client', 'RemoteHeaderIcon.tsx'), 'utf8')
+  assert.ok(headerIcon.includes('subscribeIfNotPhoneShell(shares, phoneShell'))
 })

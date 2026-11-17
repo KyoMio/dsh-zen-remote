@@ -34,7 +34,6 @@ const { pathToFileURL } = require('node:url')
 // wiring test imports the BUILT lib/index.js (the same committed artifact
 // check-client-externals.mjs reads).
 const SHARE_URL = pathToFileURL(path.join(__dirname, '..', 'src', 'share-export.ts')).href
-const INDEX_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'index.js')).href
 
 const T = 1757500000000
 const CREATED_AT = 1757000000000
@@ -322,11 +321,10 @@ function makeSessionQuery(sessions) {
   return { query, state }
 }
 
-let share, index, server, base, queryState, warned
+let share, server, base, queryState, warned
 
 before(async () => {
   share = await import(SHARE_URL)
-  index = await import(INDEX_URL)
   const { query, state } = makeSessionQuery({
     'sess-live': { session: { version: 3, id: 'sess-live', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: fixtureEvents() },
     'sess-empty': { session: { version: 3, id: 'sess-empty', createdAt: CREATED_AT, isSeeded: false }, events: [] },
@@ -536,24 +534,45 @@ test('only GET is allowed', async () => {
 })
 
 test('every export reads the log through readSession exactly once', async () => {
-  // Twenty-one reads so far: twenty 200s (live ×5, empty, steer ×4,
-  // replace ×4, fork ×3, gappy ×3) plus the 404 (the fake records the id,
-  // then throws); the 16 validation 400s short-circuit before readSession.
-  assert.deepEqual(queryState.read, [
-    'sess-live', 'sess-live', 'sess-empty', 'sess-gone',
-    'sess-live', 'sess-live',
-    'sess-steer', 'sess-steer', 'sess-steer', 'sess-steer',
-    'sess-replace', 'sess-replace', 'sess-replace', 'sess-replace',
-    'sess-live',
-    'sess-fork', 'sess-fork', 'sess-fork',
-    'sess-gappy', 'sess-gappy', 'sess-gappy',
-  ])
+  const { query, state } = makeSessionQuery({
+    'sess-live': { session: { version: 3, id: 'sess-live', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: fixtureEvents() },
+    'sess-empty': { session: { version: 3, id: 'sess-empty', createdAt: CREATED_AT, isSeeded: false }, events: [] },
+    'sess-steer': { session: { version: 3, id: 'sess-steer', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: steeringEvents() },
+  })
+  const ctx = { sessionQuery: query, logger: { warn: () => {} } }
+  const srv = createServer((req, res) => { void share.handleShareExport(ctx, req, res) })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  const srvBase = `http://127.0.0.1:${srv.address().port}`
+  try {
+    assert.equal((await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-live&range=all`)).status, 200)
+    assert.equal((await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-empty`)).status, 200)
+    assert.equal((await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-steer&range=all`)).status, 200)
+    assert.equal((await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-gone`)).status, 404)
+    assert.equal((await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-live&range=bad`)).status, 400)
+    assert.deepEqual(state.read, ['sess-live', 'sess-empty', 'sess-steer', 'sess-gone'])
+  } finally {
+    await new Promise((resolve) => srv.close(resolve))
+  }
 })
 
 test('rejections are logged once each, the method guard is not', async () => {
-  // 1×404 + 16×400 reached the try block and logged; the 405 answers before
-  // it and the 200s (replace's included) never log.
-  assert.equal(warned, 17)
+  let localWarned = 0
+  const { query } = makeSessionQuery({
+    'sess-live': { session: { version: 3, id: 'sess-live', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: fixtureEvents() },
+  })
+  const ctx = { sessionQuery: query, logger: { warn: () => { localWarned += 1 } } }
+  const srv = createServer((req, res) => { void share.handleShareExport(ctx, req, res) })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  const srvBase = `http://127.0.0.1:${srv.address().port}`
+  try {
+    assert.equal((await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-live`)).status, 200)
+    assert.equal((await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-live`, { method: 'POST' })).status, 405)
+    assert.equal((await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-gone`)).status, 404)
+    assert.equal((await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-live&range=bad`)).status, 400)
+    assert.equal(localWarned, 2, 'only 404 and 400 reach the logged block; 200 and 405 stay quiet')
+  } finally {
+    await new Promise((resolve) => srv.close(resolve))
+  }
 })
 
 test('a fold-stage throw after a successful readSession is a clean 500', async () => {
@@ -569,101 +588,4 @@ test('a fold-stage throw after a successful readSession is a clean 500', async (
   assert.match(body.error.message, /fold stage exploded/)
   assert.equal(queryState.read[queryState.read.length - 1], 'sess-boom')
   assert.equal(warned, warnedBefore + 1, 'the failure was logged')
-})
-
-/** Fake Cordis context for apply(): inject runs its callback only when every
- * requested service exists (that IS the no-mount path), effect runs eagerly.
- * A `connection` service is present by default (T17: the upload and
- * share-export routes mount only where it exists); pass one explicitly to
- * override its admit. Pass webServer:false to simulate a composition with no
- * web server at all. */
-function makeApplyCtx({ webServer = true, ...services } = {}) {
-  const routes = []
-  const all = {
-    logger: { warn: () => {} },
-    effect: (fn) => fn(),
-    // T12: apply() calls ctx.plugin unconditionally on the default host role
-    // (loading the gateway/push halves). The namespace objects are never
-    // executed here, so a no-op sink is all the fake context needs.
-    plugin: () => {},
-    connection: { admit: () => ({ peer: {} }) },
-    // GW-13a: the wizard registration reads `subprocess` through the
-    // reflection layer (production cordis always carries it; this fake
-    // answers undefined = a composition without it, so the wizard routes
-    // simply do not wire).
-    reflect: { get: () => undefined },
-    ...(webServer ? { webServer: { register: (route) => { routes.push(route); return () => {} } } } : {}),
-    ...services,
-  }
-  const ctx = { ...all, inject: (deps, cb) => { if (deps.every((d) => all[d] !== undefined)) cb(Object.assign(Object.create(ctx), all)) } }
-  return { ctx, routes }
-}
-
-test('apply mounts the share route only where sessionQuery exists', async () => {
-  const sessions = { get: () => undefined }
-  const sessionQuery = makeSessionQuery({}).query
-
-  const full = makeApplyCtx({ sessions, sessionQuery })
-  index.apply(full.ctx)
-  const fullPaths = full.routes.map((r) => r.path)
-  assert.ok(fullPaths.includes(share.SHARE_EXPORT_ROUTE))
-  assert.ok(fullPaths.includes(index.UPLOAD_ROUTE), 'upload route unaffected')
-  assert.ok(fullPaths.includes(index.CLIENT_CONFIG_ROUTE), 'client-config route unaffected')
-  const shareRoute = full.routes.find((r) => r.path === share.SHARE_EXPORT_ROUTE)
-  assert.equal(shareRoute.kind, 'exact')
-  assert.equal(typeof shareRoute.handler, 'function')
-
-  // A composition without sessionQuery (Electron carries neither it nor a
-  // webServer): the route never mounts and the other two still do.
-  const noQuery = makeApplyCtx({ sessions })
-  index.apply(noQuery.ctx)
-  assert.ok(!noQuery.routes.some((r) => r.path === share.SHARE_EXPORT_ROUTE))
-  assert.ok(noQuery.routes.some((r) => r.path === index.UPLOAD_ROUTE))
-
-  const noWeb = makeApplyCtx({ webServer: false, sessions, sessionQuery })
-  index.apply(noWeb.ctx)
-  assert.equal(noWeb.routes.length, 0)
-})
-
-test('T17: the registered share route admits through the connection service', async () => {
-  const { query } = makeSessionQuery({
-    'sess-live': { session: { version: 3, id: 'sess-live', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: fixtureEvents() },
-  })
-
-  // A refusing connection service: the wall answers before anything else —
-  // even a wrong method gets the refusal, not the method check.
-  for (const [admission, method] of [[{ rejection: 401 }, 'GET'], [{ rejection: 403 }, 'GET'], [{ rejection: 401 }, 'POST']]) {
-    const denying = makeApplyCtx({ sessionQuery: query, connection: { admit: () => admission } })
-    index.apply(denying.ctx)
-    const route = denying.routes.find((r) => r.path === share.SHARE_EXPORT_ROUTE)
-    assert.ok(route, 'the route mounts where a connection service exists')
-    const server = createServer((req, res) => { void route.handler(req, res) })
-    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-    try {
-      const base = `http://127.0.0.1:${server.address().port}`
-      const response = await fetch(`${base}/_dsh/mobile-nav/share-export?session=sess-live`, { method })
-      assert.equal(response.status, admission.rejection)
-      const body = await response.json()
-      assert.equal(body.ok, false)
-      assert.equal(body.error.code, admission.rejection === 401 ? 'unauthorized' : 'forbidden')
-    } finally {
-      await new Promise((resolve) => server.close(resolve))
-    }
-  }
-
-  // An admitting service changes nothing else: the exact same envelope the
-  // direct-drive tests assert above.
-  const allowing = makeApplyCtx({ sessionQuery: query })
-  index.apply(allowing.ctx)
-  const allowRoute = allowing.routes.find((r) => r.path === share.SHARE_EXPORT_ROUTE)
-  const server = createServer((req, res) => { void allowRoute.handler(req, res) })
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
-  try {
-    const base = `http://127.0.0.1:${server.address().port}`
-    const ok = await fetch(`${base}/_dsh/mobile-nav/share-export?session=sess-live&range=all`)
-    assert.equal(ok.status, 200)
-    assert.deepEqual(await ok.json(), { ok: true, createdAt: CREATED_AT, turns: EXPECTED_TURNS, truncated: false })
-  } finally {
-    await new Promise((resolve) => server.close(resolve))
-  }
 })

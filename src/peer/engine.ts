@@ -105,6 +105,7 @@ export interface PeerEnginePunchTimings {
   punchRounds?: number
   punchWindowMs?: number
   reprobeIntervalMs?: number
+  reprobeInitialDelaysMs?: readonly [number, number]
   keepAliveMs?: number
   keepAliveLostFrames?: number
 }
@@ -133,6 +134,10 @@ export interface PeerEngineOptions {
   punch?: PeerEnginePunchTimings
   /** path-report 周期（缺省 15000ms）。 */
   pathReportMs?: number
+  /** STUN NAT 探测超时（缺省 2000ms）。 */
+  stunProbeTimeoutMs?: number
+  /** leaveNetwork HTTP 超时（缺省 3000ms）。 */
+  leaveTimeoutMs?: number
   /** WS 重连退避（缺省 1000ms 起、30000ms 封顶）。 */
   wsReconnectBaseMs?: number
   wsReconnectMaxMs?: number
@@ -1028,7 +1033,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       // reflexiveEndpoint 必须是 peers 真能打到的那个端口。临时探测 socket
       // 一关，反射端口就成了黑洞，同机回环与真实 cone NAT 都打不通。
       ...(punchSocket !== undefined ? { socket: punchSocket } : {}),
-      timeoutMs: 2000,
+      timeoutMs: options.stunProbeTimeoutMs ?? 2000,
     })
       .then((result) => {
         // 过期防护：stop、连接断开（换代）或换网/leave 之后的迟到结果一律
@@ -1488,7 +1493,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
               timestamp,
               signatureHex,
             }),
-            signal: AbortSignal.timeout(3000),
+            signal: AbortSignal.timeout(options.leaveTimeoutMs ?? 3000),
           })
           return { ok: true, gatewaySynced: res.ok }
         } catch {

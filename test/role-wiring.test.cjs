@@ -22,7 +22,7 @@ const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const { pathToFileURL } = require('node:url')
-const { request } = require('./util.cjs')
+const { request, startResetServer } = require('./util.cjs')
 
 const INDEX_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'index.js')).href
 const SHARE_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'share-export.js')).href
@@ -60,6 +60,19 @@ test.after(() => {
  * wiring test asserts on; `warns` captures logger.warn calls (the T33a-fix
  * listener-swallow test reads them); `provides` is what the PB-1 zenRemote
  * test reads. */
+const activeDisposers = []
+function trackEffect(fn) {
+  const stop = fn()
+  if (typeof stop === 'function') activeDisposers.push(stop)
+  return stop
+}
+test.afterEach(() => {
+  while (activeDisposers.length > 0) {
+    const stop = activeDisposers.pop()
+    try { stop() } catch { /* ignore */ }
+  }
+})
+
 function makeCtx() {
   const calls = []
   const listeners = []
@@ -73,7 +86,7 @@ function makeCtx() {
     // it (the T43 credentials watcher's disposer calls it on teardown).
     on(event, listener) { listeners.push({ event, listener }); return () => {} },
     inject() {},
-    effect(fn) { effects.push(fn()) },
+    effect(fn) { effects.push(trackEffect(fn)) },
     logger: { warn: (...args) => warns.push(args) },
   }
   return { ctx, calls, listeners, effects, warns, provides }
@@ -95,7 +108,7 @@ function tightInject(services) {
       get: (name) => services[name],
       reflect: { get: (name) => services[name] },
       effect: (fn) => {
-        const out = fn()
+        const out = trackEffect(fn)
         // When the fake provides an `effectReturns` array, disposer returns
         // land there — the T33a2 test drives the relay teardown from it.
         if (Array.isArray(services.effectReturns)) services.effectReturns.push(out)
@@ -203,7 +216,7 @@ test("role 'client' mounts all three routes through a real inject and never call
   const ctx = {
     plugin: (module, config) => { pluginCalls.push({ module, config }) },
     on() {},
-    effect(fn) { fn() },
+    effect: trackEffect,
     inject: tightInject(services),
   }
   index.apply(ctx, { role: 'client' })
@@ -225,7 +238,7 @@ test("role 'client' mounts all three routes through a real inject and never call
   const hostCtx = {
     plugin: (module, config) => { pluginCalls.push({ module, config }) },
     on() {},
-    effect(fn) { fn() },
+    effect: trackEffect,
     inject: tightInject(hostServices),
   }
   index.apply(hostCtx, {})
@@ -258,7 +271,7 @@ test('admin routes register on the host role only', async () => {
     const ctx = {
       plugin() {},
       on() {},
-      effect(fn) { fn() },
+      effect: trackEffect,
       inject: tightInject(services),
     }
     return ctx
@@ -300,7 +313,7 @@ test('T16: client routes register on the client role (the host mounts the prefix
       // through ctx.logger if that fails; both must exist on this fake.
       on() { return () => {} },
       logger: { warn() {} },
-      effect(fn) { fn() },
+      effect: trackEffect,
       reflect: { get: () => undefined },
       inject(deps, cb) { if (deps.every((d) => services[d] !== undefined)) cb(Object.assign(Object.create(ctx), services)) },
     }
@@ -346,17 +359,11 @@ test('T16: client routes register on the client role (the host mounts the prefix
 
 test('the admin handler resolves config per request, volatile fields included', async () => {
   const index = await import(INDEX_URL)
-  // A port that is closed NOW, so the handler's status call refuses instantly
-  // and this test only watches config.values — it must never reach a real
-  // gateway on 3088.
-  const dead = http.createServer()
-  await new Promise((resolve) => dead.listen(0, '127.0.0.1', resolve))
-  const deadPort = dead.address().port
-  await new Promise((resolve) => dead.close(resolve))
+  const reset = await startResetServer()
 
   let serverName = 'Name-Before'
   const row = {
-    port: deadPort,
+    port: reset.port,
     // The loader wraps volatile fields in { get() } references before apply()
     // ever sees the row (src/config.ts unwrapVolatile) — this is that shape,
     // with the returned value mutable so the test can age it mid-stream.
@@ -373,7 +380,7 @@ test('the admin handler resolves config per request, volatile fields included', 
   const ctx = {
     plugin() {},
     on() {},
-    effect(fn) { fn() },
+    effect: trackEffect,
     inject: tightInject(services),
   }
   index.apply(ctx, row)
@@ -396,6 +403,7 @@ test('the admin handler resolves config per request, volatile fields included', 
     assert.equal(second.config.sources.serverName, 'row')
   } finally {
     await new Promise((resolve) => server.close(resolve))
+    await reset.close()
   }
 })
 
@@ -419,7 +427,7 @@ function makeWiringCtx(record) {
   const ctx = {
     plugin: (module, config) => { record.plugins.push({ module, config }) },
     on() {},
-    effect(fn) { fn() },
+    effect: trackEffect,
     inject: tightInject(services),
   }
   return ctx
@@ -844,7 +852,7 @@ test('T33a: the host role restores busy on startup, auto-shares fresh top-level 
     const ctx = {
       plugin() {},
       on(event, listener) { listeners.push({ event, listener }) },
-      effect(fn) { fn() },
+      effect: trackEffect,
       inject: tightInject(services),
     }
     return { ctx, listeners, effectReturns }
@@ -1232,7 +1240,7 @@ function ctxExecuting(services) {
     logger: { warn() {} },
     plugin() {},
     on() {},
-    effect(fn) { fn() },
+    effect: trackEffect,
     reflect: { get: () => undefined },
     webServer: { register: (route) => { routes.push(route); return () => {} } },
     ...services,
@@ -1357,7 +1365,8 @@ test('T17: the upload route refuses an unadmitted request and passes an admitted
   }
 })
 
-test('T17: a restart-required row change reloads the row exactly once; a live-read change never does', async () => {
+test('T17: a restart-required row change reloads the row exactly once; a live-read change never does', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   const index = await import(INDEX_URL)
   const restarts = []
   const { ctx } = makeCtx()
@@ -1370,19 +1379,21 @@ test('T17: a restart-required row change reloads the row exactly once; a live-re
 
   // A live-read field alone never triggers, even across a full poll window.
   row.serverName = 'after'
-  await sleep(2300)
+  t.mock.timers.tick(2300)
   assert.equal(restarts.length, 0, 'a serverName change never reloads the row')
 
   // A restart-required field triggers exactly one reload; the watcher is
   // then disarmed (the reload's fresh apply() starts a new one).
   row.port = 4001
-  await waitFor(() => restarts.length === 1, 5000, 'the port change reloads the row')
+  t.mock.timers.tick(2000)
+  assert.equal(restarts.length, 1, 'the port change reloads the row')
   row.port = 4002
-  await sleep(2300)
+  t.mock.timers.tick(2300)
   assert.equal(restarts.length, 1, 'the watcher stopped after firing')
 })
 
-test('T17b: a loader/volatile-update dispatch reloads the row immediately, without waiting for the poll', async () => {
+test('T17b: a loader/volatile-update dispatch reloads the row immediately, without waiting for the poll', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
   const index = await import(INDEX_URL)
   const restarts = []
   const { ctx, listeners } = makeCtx()
@@ -1401,7 +1412,7 @@ test('T17b: a loader/volatile-update dispatch reloads the row immediately, witho
   // Exactly once: later dispatches and the (already stopped) poll stay quiet.
   row.port = 4002
   update.listener()
-  await sleep(2300)
+  t.mock.timers.tick(2300)
   assert.equal(restarts.length, 1, 'the watcher is disarmed after the event fired')
 })
 

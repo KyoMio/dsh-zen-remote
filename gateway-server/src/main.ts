@@ -53,6 +53,10 @@ export interface StartGatewayOptions {
    * 绝不假称成功——生产信号入口把它映射为非零退出码。
    */
   closeBudgetMs?: number;
+  /**
+   * 失败兜底路径上每一步资源停止的独立短预算（毫秒，默认 1000）。
+   */
+  abortStepBudgetMs?: number;
 }
 
 /** 关停墙钟预算缺省值：末批一小批 + 逐层关闭的正常量级，余量给慢盘 */
@@ -181,6 +185,7 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
     const port = address !== null && typeof address === 'object' ? address.port : config.port;
     const base = `${tlsManager.isEnabled() ? 'https' : 'http'}://127.0.0.1:${port}`;
     const closeBudgetMs = options.closeBudgetMs ?? DEFAULT_CLOSE_BUDGET_MS;
+    const abortStepBudgetMs = options.abortStepBudgetMs ?? ABORT_STEP_BUDGET_MS;
     let closePromise: Promise<void> | null = null;
 
     // PC-19 第二片：逐层关停（PC-19 第二片顺序）——先停 UDP 摄入与证书 watch，
@@ -237,7 +242,7 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
           await Promise.race([
             op(),
             new Promise<never>((_, reject) => {
-              timer = setTimeout(() => reject(new Error(`${label} exceeded ${ABORT_STEP_BUDGET_MS}ms cleanup cap`)), ABORT_STEP_BUDGET_MS);
+              timer = setTimeout(() => reject(new Error(`${label} exceeded ${abortStepBudgetMs}ms cleanup cap`)), abortStepBudgetMs);
             }),
           ]);
         } finally {
@@ -255,7 +260,7 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
         await bounded('store close', () => store.close());
         closedStore = true;
       } catch (error) {
-        const cleanupGraceMs = ABORT_STEP_BUDGET_MS * 4;
+        const cleanupGraceMs = abortStepBudgetMs * 4;
         await abortStep('abort: udp shutdown', () => udp.close()).catch(() => {});
         // hub.close 的拆除（闸门/定时器/socket terminate）在调用时同步完成，
         // 即使末批刷盘超预算被放弃，WS 也已全部摘除

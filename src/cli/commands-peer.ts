@@ -274,7 +274,7 @@ export async function switchToPeerRole(ctx: CliExecutionContext): Promise<boolea
     }
     return false
   }
-  const waitSeconds = Math.max(1, ctx.args.options.wait)
+  const waitSeconds = Math.max(0.05, ctx.args.options.wait)
   const interval = ctx.pollIntervalMs ?? ROLE_POLL_INTERVAL_DEFAULT_MS
   const deadline = Date.now() + waitSeconds * 1000
   while (true) {
@@ -386,7 +386,7 @@ export async function runPeerJoinCommand(ctx: CliExecutionContext): Promise<numb
         return 1
       }
       if (!(await switchToPeerRole(ctx))) {
-        human.write(`${t('setup.roleSwitchTimeout', { seconds: Math.max(1, args.options.wait) })}\n`)
+        human.write(`${t('setup.roleSwitchTimeout', { seconds: Math.max(0.05, args.options.wait) })}\n`)
         return 1
       }
     }
@@ -498,7 +498,7 @@ export async function runPeerJoinCommand(ctx: CliExecutionContext): Promise<numb
     // verdict at every loop top). Transport failures are "no new
     // information" — the last OBSERVED snapshot stays the report.
     const interval = ctx.pollIntervalMs ?? PEER_POLL_INTERVAL_DEFAULT_MS
-    const waitSeconds = Math.max(1, args.options.wait)
+    const waitSeconds = Math.max(0.05, args.options.wait)
     const deadline = Date.now() + waitSeconds * 1000
     const remainingMs = (): number => Math.max(1, deadline - Date.now())
     const cutter = new AbortController()

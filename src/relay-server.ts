@@ -294,6 +294,10 @@ export interface RelayHandlerOptions {
    * destroyed (the {@link DRAIN_DEADLINE_MS} bound); defaults to 10000.
    * Tests inject a small value so the deadline path stays cheap to drive. */
   drainDeadlineMs?: number
+  /** How many extra bytes past `fromBytes` an upload refusal's tail drain
+   * swallows before destroying the socket (the {@link DRAIN_SLACK_BYTES}
+   * bound); defaults to 8 MiB. Tests inject a small value. */
+  drainSlackBytes?: number
   /** The plugin bridge's server half (PB-3). Absent — a wiring that never
    * mounted it, old tests — and `POST relay/v1/plugin` answers 501
    * `unsupported`, exactly like the `/api` passthrough without a dispatcher. */
@@ -776,7 +780,7 @@ const DRAIN_DEADLINE_MS = 10_000
  * it before answering, so a client still mid-send reads the status code
  * rather than a reset.
  */
-function drainUpload(req: IncomingMessage, fromBytes: number, deadlineMs: number): Promise<void> {
+function drainUpload(req: IncomingMessage, fromBytes: number, deadlineMs: number, slackBytes = DRAIN_SLACK_BYTES): Promise<void> {
   return new Promise((resolve) => {
     let size = fromBytes
     let settled = false
@@ -787,7 +791,7 @@ function drainUpload(req: IncomingMessage, fromBytes: number, deadlineMs: number
     if (typeof timer.unref === 'function') timer.unref()
     const onData = (chunk: Buffer): void => {
       size += chunk.byteLength
-      if (size - fromBytes > DRAIN_SLACK_BYTES) {
+      if (size - fromBytes > slackBytes) {
         req.destroy()
         finish()
       }
@@ -1019,6 +1023,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
   const endDrainTimeoutMs = options.endDrainTimeoutMs ?? DEFAULT_END_DRAIN_TIMEOUT_MS
   const uploadCapBytes = options.uploadCapBytes ?? DEFAULT_UPLOAD_CAP_BYTES
   const drainDeadlineMs = options.drainDeadlineMs ?? DRAIN_DEADLINE_MS
+  const drainSlackBytes = options.drainSlackBytes ?? DRAIN_SLACK_BYTES
   const parentOf = options.parentOf ?? (() => undefined)
   const isAccessible = (sessionId: string): boolean => store.isAccessible(sessionId, parentOf)
 
@@ -1804,7 +1809,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         }
         if (bodyBytes > 0) {
           relayPluginError(res, 400, 'bad-request')
-          await drainUpload(req, 0, drainDeadlineMs)
+          await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
           return
         }
       }
@@ -1912,7 +1917,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               }
               if (over) {
                 relayPluginError(res, 413, 'body-too-large')
-                void drainUpload(req, 0, drainDeadlineMs)
+                void drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
                 return
               }
               bufferedBody = Buffer.concat(chunks)
@@ -2033,7 +2038,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             )
             if (adapterBodyGateError !== undefined && !res.headersSent) {
               relayPluginError(res, 413, 'body-too-large')
-              void drainUpload(req, 0, drainDeadlineMs)
+              void drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
               return
             }
             // The adapter header allowlist (PB-12): the HTML preview's CSP
@@ -2153,7 +2158,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // The reader's over-limit stop leaves the request half-read — the
         // tail drains after the answer (the T51 discipline; only the reader
         // can produce this code on this path).
-        if (validation.code === 'body-too-large') void drainUpload(req, 0, drainDeadlineMs)
+        if (validation.code === 'body-too-large') void drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
         return
       }
       const route = validation.route
@@ -2175,7 +2180,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       const declaredLength = Number(headerValue(req, 'content-length'))
       if (!bodylessMethod && validation.bufferedBody === undefined && Number.isFinite(declaredLength) && declaredLength > maxBody) {
         relayPluginError(res, 413, 'body-too-large')
-        await drainUpload(req, 0, drainDeadlineMs)
+        await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
         return
       }
       const params = validation.params
@@ -2330,7 +2335,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           // drained after the answer, bounded and timed like every
           // oversized read here.
           relayPluginError(res, 413, 'body-too-large')
-          void drainUpload(req, 0, drainDeadlineMs)
+          void drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
         } else if (hangUp.signal.aborted) {
           // The sub-client is gone mid-stream: its socket is dead, and the
           // abort already tore the loopback request down.
@@ -2420,7 +2425,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       if (Number(req.headers['content-length']) > uploadCapBytes) {
         res.setHeader('Connection', 'close')
         responseJson(res, 413, PAYLOAD_TOO_LARGE)
-        await drainUpload(req, 0, drainDeadlineMs)
+        await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
         return
       }
       // The query is parsed ONCE (decideUploadQuery, the T41b-fix
@@ -2430,13 +2435,13 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       // re-enter between the check and the dispatch.
       const decision = decideUploadQuery(new URL(req.url ?? '/', 'http://dsh.internal').search, isAccessible)
       if (!decision.allow) {
-        await drainUpload(req, 0, drainDeadlineMs)
+        await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
         responseJson(res, decision.reason === 'not-shared' ? 403 : 400, { ok: false, error: { code: decision.reason } })
         return
       }
       const dispatch = options.getApiFetch?.()
       if (dispatch === undefined) {
-        await drainUpload(req, 0, drainDeadlineMs)
+        await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
         responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
         return
       }
@@ -2450,7 +2455,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       // then-abandoned slot would quietly shrink this device's budget.
       const device = headerValue(req, 'x-zen-remote-device') ?? ''
       if ((uploadsByDevice.get(device) ?? 0) >= MAX_UPLOADS_PER_DEVICE) {
-        await drainUpload(req, 0, drainDeadlineMs)
+        await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
         responseJson(res, 429, { ok: false, error: { code: 'too-many-uploads' } })
         return
       }
@@ -2498,7 +2503,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         if (pump.tooLarge()) {
           res.setHeader('Connection', 'close')
           responseJson(res, 413, PAYLOAD_TOO_LARGE)
-          await drainUpload(req, pump.received(), drainDeadlineMs)
+          await drainUpload(req, pump.received(), drainDeadlineMs, drainSlackBytes)
           return
         }
         const contentType = upstream.headers.get('content-type') ?? undefined
@@ -2515,7 +2520,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         if (pump.tooLarge()) {
           res.setHeader('Connection', 'close')
           responseJson(res, 413, PAYLOAD_TOO_LARGE)
-          await drainUpload(req, pump.received(), drainDeadlineMs)
+          await drainUpload(req, pump.received(), drainDeadlineMs, drainSlackBytes)
           return
         }
         responseJson(res, 502, { ok: false, error: { code: 'internal' } })

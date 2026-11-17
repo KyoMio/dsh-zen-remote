@@ -23,6 +23,7 @@ const { createShareStore } = require('../lib/share-store.js')
 const { createBridgeRegistry, normalizeDeclaration } = require('../lib/plugin-bridge.js')
 const { createPluginLoopback } = require('../lib/plugin-loopback.js')
 const { createPluginTunnel } = require('../lib/plugin-tunnel.js')
+const { waitFor } = require('./helpers/plugin-bridge-harness.cjs')
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-plugin-relay-'))
 process.on('exit', () => { try { fs.rmSync(ROOT, { recursive: true, force: true }) } catch { /* best effort */ } })
@@ -694,7 +695,7 @@ test('PB-3: the per-device budget holds 8, refuses the 9th with busy, and recove
     for (let i = 0; i < 8; i += 1) {
       held.push(wiring.pluginFetch(ROUTE, { zrPath: '/panel/hold', query: `sessionId=session-shared&i=${i}` }))
     }
-    await new Promise((resolve) => setTimeout(resolve, 150))
+    await waitFor(() => wiring.pluginServer.state.requests.length - hitsBefore === 8)
     assert.equal(wiring.pluginServer.state.requests.length - hitsBefore, 8, 'eight requests reached the plugin')
     const ninth = await wiring.pluginFetch(ROUTE, { zrPath: '/panel/hold', query: 'sessionId=session-shared&i=9' })
     assert.equal(ninth.status, 429)
@@ -772,7 +773,7 @@ test('PB-3: a streamed plugin answer crosses in order with its headers; a mid-st
     assert.equal(held.status, 200)
     controller.abort()
     await held.text().catch(() => 'aborted')
-    await new Promise((resolve) => setTimeout(resolve, 120))
+    await waitFor(() => wiring.pluginServer.state.aborted.includes('/panel/hold'))
     assert.ok(wiring.pluginServer.state.aborted.includes('/panel/hold'), 'the hang-up reached the plugin as a closed connection')
   } finally {
     wiring.pluginServer.releaseAll()

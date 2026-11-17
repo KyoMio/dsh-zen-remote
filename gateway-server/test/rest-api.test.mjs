@@ -21,14 +21,20 @@ import { ZR_NATIVE_TLS_SYMBOL } from '../dist/tls/dual-protocol-server.js';
 import { decodeSmtpConfig, encodeSmtpConfig, hashToken } from '../dist/http/auth.js';
 import { gatewayLeaveMessage } from '../dist/peer-hub/peer-crypto.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
-import { deriveMasterKeyFromSecret, hashPassword, decryptSecret } from '../dist/master-key.js';
+import { deriveMasterKeyFromSecret, decryptSecret, encryptSecret } from '../dist/master-key.js';
 import { maskInviteUri } from '../dist/web/format.js';
+import {
+  ADMIN_EMAIL,
+  ADMIN_HASH,
+  ADMIN_PASSWORD,
+  TENANT_EMAIL,
+  TENANT_HASH,
+  TENANT_PASSWORD,
+  getTestTlsPair,
+  seedSession,
+} from './helpers/fixtures.mjs';
 
 const MASTER_KEY = deriveMasterKeyFromSecret('rest-api-test');
-const ADMIN_EMAIL = 'admin@local';
-const ADMIN_PASSWORD = 'admin-pass-1234';
-const TENANT_EMAIL = 'tenant@local';
-const TENANT_PASSWORD = 'tenant-pass-1234';
 const SESSION_COOKIE_RE = /^zr_gw_session=[0-9a-f]{64}$/; // 32B 随机令牌 hex
 
 function seedSettings(overrides = {}) {
@@ -108,13 +114,17 @@ function assertEnvelopeError(json, code) {
 }
 
 async function seedUsers(store) {
-  await store.ensureBootstrapAdmin({ email: ADMIN_EMAIL, password: ADMIN_PASSWORD });
+  const admin = await store.createUser({
+    email: ADMIN_EMAIL,
+    passwordHash: ADMIN_HASH,
+    role: 'admin',
+    emailVerified: true,
+  });
   const tenant = await store.createUser({
     email: TENANT_EMAIL,
-    passwordHash: await hashPassword(TENANT_PASSWORD),
+    passwordHash: TENANT_HASH,
     role: 'user',
   });
-  const admin = await store.findUserByEmail(ADMIN_EMAIL);
   return { tenantId: tenant.id, adminId: admin.id };
 }
 
@@ -1163,8 +1173,7 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
   test('公网 IP 跑明文 http:// 时 joinUri 附 ?tls=0 纠偏，避免节点端误连 wss://', async () => {
     const h = await startServer({ publicUrl: 'http://203.0.113.10:19393' });
     try {
-      await seedUsers(h.store);
-      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const { cookie } = await seedSession(h.store, { email: ADMIN_EMAIL, role: 'admin' });
       const res = await api(h.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'http-public' } });
       assert.equal(res.status, 200);
       assert.equal(
@@ -1180,8 +1189,7 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
   test('https:// 反代未显式带端口时自动补 :443，防止节点端回落默认 19393', async () => {
     const h = await startServer({ publicUrl: 'https://zr.example.com' });
     try {
-      await seedUsers(h.store);
-      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const { cookie } = await seedSession(h.store, { email: ADMIN_EMAIL, role: 'admin' });
       const res = await api(h.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'https-proxy' } });
       assert.equal(res.status, 200);
       assert.equal(
@@ -1197,8 +1205,7 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
   test('https:// 指向私网 IP 时自动补 :443 并附 ?tls=1 纠偏（私网默认推断是明文）', async () => {
     const h = await startServer({ publicUrl: 'https://192.168.1.10' });
     try {
-      await seedUsers(h.store);
-      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const { cookie } = await seedSession(h.store, { email: ADMIN_EMAIL, role: 'admin' });
       const res = await api(h.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'https-private' } });
       assert.equal(res.status, 200);
       assert.equal(
@@ -1214,8 +1221,7 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
   test('http:// 指向私网 IP 时自动补 :80 且不带 query（与私网默认明文一致）', async () => {
     const h = await startServer({ publicUrl: 'http://192.168.1.10' });
     try {
-      await seedUsers(h.store);
-      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const { cookie } = await seedSession(h.store, { email: ADMIN_EMAIL, role: 'admin' });
       const res = await api(h.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'http-private' } });
       assert.equal(res.status, 200);
       assert.equal(
@@ -1231,8 +1237,7 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
   test('https:// 指向 .local 域名时附 ?tls=1（.local/.lan 与客户端同样视为内网默认明文）', async () => {
     const h = await startServer({ publicUrl: 'https://nas.local:8443' });
     try {
-      await seedUsers(h.store);
-      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const { cookie } = await seedSession(h.store, { email: ADMIN_EMAIL, role: 'admin' });
       const res = await api(h.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'https-mdns' } });
       assert.equal(res.status, 200);
       assert.equal(
@@ -1248,8 +1253,7 @@ describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口�
   test('缺省 publicUrl 但带 X-Forwarded-Proto: https 时 gatewayUrl 返回 https://origin', async () => {
     const h = await startServer();
     try {
-      await seedUsers(h.store);
-      const cookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const { cookie } = await seedSession(h.store, { email: ADMIN_EMAIL, role: 'admin' });
       const res = await api(h.base, 'POST', '/api/v1/networks', {
         cookie,
         headers: { 'x-forwarded-proto': 'https' },
@@ -2149,59 +2153,59 @@ describe('GC-6a 用户管理 /admin/users CRUD 与密码重置', () => {
   });
 });
 
-describe('GC-6a publicUrl 热更新（settings 优先级最高，立即生效）', () => {
-  test('settings 更新后 joinUri 与 /admin/runtime 立即反映新地址，无需重启', async () => {
-    const h = await startServer({ publicUrl: 'https://old.example.com' });
-    try {
-      await seedUsers(h.store);
-      const adminCookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
-      const tenantCookie = await login(h.base, TENANT_EMAIL, TENANT_PASSWORD);
-
-      const before = await api(h.base, 'POST', '/api/v1/networks', {
-        cookie: tenantCookie,
-        body: { name: 'pre-hot' },
-      });
-      assert.equal(before.status, 200);
-      assert.ok(before.json.data.joinUri.startsWith('zr-net://old.example.com:443/'));
-      const rtBefore = await api(h.base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
-      assert.equal(rtBefore.json.data.publicUrlSource, 'settings');
-      assert.equal(rtBefore.json.data.publicUrlEffective, 'https://old.example.com');
-
-      // 管理后台热更新的持久化路径：直接写 extendedSettings
-      await h.store.updateExtendedSettings({ publicUrl: 'https://gw.new.example.com' });
-
-      const after = await api(h.base, 'POST', '/api/v1/networks', {
-        cookie: tenantCookie,
-        body: { name: 'post-hot' },
-      });
-      assert.equal(after.status, 200);
-      assert.ok(after.json.data.joinUri.startsWith('zr-net://gw.new.example.com:443/'));
-      const rtAfter = await api(h.base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
-      assert.equal(rtAfter.json.data.publicUrlSource, 'settings');
-      assert.equal(rtAfter.json.data.publicUrlEffective, 'https://gw.new.example.com');
-    } finally {
-      await stopServer(h);
-    }
-  });
-});
-
-describe('GC-fix-batch1 R1：POST /approve 遵守用户组每网设备上限', () => {
-  test('普通用户网络 maxPeers=4 但组上限 2：第 3 台 approve → 409 LIMIT_REACHED；admin 网络豁免', async () => {
-    const h = await startServer();
+describe('GC-3 & GC-fix-batch1 R1：建网与 approve 遵守用户组每网设备上限（含祖父缩容）', () => {
+  test('建网省略 maxPeers 取组上限、超组 400 PEER_LIMIT_EXCEEDED_BY_GROUP、祖父缩容合法且 approve 按 min(net, group) 拦截', async () => {
+    const h = await startServer({ seed: seedSettings({ defaultMaxPeers: 8 }) });
     try {
       const { tenantId, adminId } = await seedUsers(h.store);
+      const { cookie: tenantCookie } = await seedSession(h.store, { email: TENANT_EMAIL, role: 'user' });
+      const { cookie: adminCookie } = await seedSession(h.store, { email: ADMIN_EMAIL, role: 'admin' });
+
+      const omitted = await api(h.base, 'POST', '/api/v1/networks', {
+        cookie: tenantCookie,
+        body: { name: 'grouped-net', admissionMode: 'key' },
+      });
+      assert.equal(omitted.status, 200);
+      assert.equal(omitted.json.data.maxPeers, 8);
+
+      const over = await api(h.base, 'POST', '/api/v1/networks', {
+        cookie: tenantCookie,
+        body: { name: 'over-group', admissionMode: 'key', maxPeers: 9 },
+      });
+      assert.equal(over.status, 400);
+      assertEnvelopeError(over.json, 'PEER_LIMIT_EXCEEDED_BY_GROUP');
+
+      const adminTop = await api(h.base, 'POST', '/api/v1/networks', {
+        cookie: adminCookie,
+        body: { name: 'admin-net-top', admissionMode: 'key', maxPeers: 64 },
+      });
+      assert.equal(adminTop.status, 200);
+      assert.equal(adminTop.json.data.maxPeers, 64);
+
       const tiny = await h.store.createUserGroup({
         code: 'r1tiny', name: 'Tiny', maxNetworks: 4, maxPeersPerNetwork: 2, relayRateKbps: 2048,
       });
       await h.store.updateUserByAdmin(tenantId, { groupId: tiny.id });
-      // 祖父存量形态：网络容量 4 大于组上限 2（绕过 REST 建网校验，直经 store 造）
       const net = await h.store.createNetwork({
-        ownerId: tenantId, name: 'r1-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 4,
+        ownerId: tenantId, name: 'r1-net', admissionMode: 'both', joinKeyEnc: encryptSecret('r1-join-key', MASTER_KEY), maxPeers: 4,
       });
+      const raise = await api(h.base, 'PATCH', `/api/v1/networks/${net.id}`, {
+        cookie: tenantCookie,
+        body: { maxPeers: 5 },
+      });
+      assert.equal(raise.status, 400);
+      assertEnvelopeError(raise.json, 'PEER_LIMIT_EXCEEDED_BY_GROUP');
+
+      const shrink = await api(h.base, 'PATCH', `/api/v1/networks/${net.id}`, {
+        cookie: tenantCookie,
+        body: { maxPeers: 3 },
+      });
+      assert.equal(shrink.status, 200);
+      assert.equal(shrink.json.data.maxPeers, 3);
+
       await seedMember(h.store, net.id, 'd1aaaaaa', 'authorized');
       await seedMember(h.store, net.id, 'd2aaaaaa', 'authorized');
       await seedMember(h.store, net.id, 'd3aaaaaa', 'pending');
-      const tenantCookie = await login(h.base, TENANT_EMAIL, TENANT_PASSWORD);
       const res = await api(h.base, 'POST', `/api/v1/networks/${net.id}/members/d3aaaaaa/approve`, {
         cookie: tenantCookie,
         body: {},
@@ -2211,13 +2215,11 @@ describe('GC-fix-batch1 R1：POST /approve 遵守用户组每网设备上限', (
       const still = (await h.store.listMembers(net.id)).find((m) => m.nodeId === 'd3aaaaaa');
       assert.equal(still.status, 'pending', '被拒的 approve 不得改变成员状态');
 
-      // admin 属主的网络无组上限约束：2 席内正常批准
       const adminNet = await h.store.createNetwork({
         ownerId: adminId, name: 'r1-admin-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 2,
       });
       await seedMember(h.store, adminNet.id, 'd4aaaaaa', 'authorized');
       await seedMember(h.store, adminNet.id, 'd5aaaaaa', 'pending');
-      const adminCookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
       const ok = await api(h.base, 'POST', `/api/v1/networks/${adminNet.id}/members/d5aaaaaa/approve`, {
         cookie: adminCookie,
         body: {},
@@ -2711,10 +2713,10 @@ describe('GT-3: 原生 TLS 管理接口（/api/v1/admin/tls*）与 HTTPS 请求�
       assert.equal((await api(base, 'GET', '/api/v1/admin/tls', { cookie: adminCookie })).json.data.enabled, false);
 
       // 4. 校验错误码：不匹配私钥 / 加密私钥 / 路径穿越文件名 / 空 PATCH 体
-      const otherPair = generateTlsTestCert({ cn: 'other.unit.test', days: 30 });
+      const { cert: otherCert, key: otherKey } = getTestTlsPair();
       const mismatchRes = await api(base, 'PUT', '/api/v1/admin/tls/certificate', {
         cookie: adminCookie,
-        body: { certPem: pair1.certPem, keyPem: otherPair.keyPem },
+        body: { certPem: pair1.certPem, keyPem: otherKey.toString('utf8') },
       });
       assert.equal(mismatchRes.status, 400);
       assert.equal(mismatchRes.json.error.code, 'TLS_CERT_KEY_MISMATCH');

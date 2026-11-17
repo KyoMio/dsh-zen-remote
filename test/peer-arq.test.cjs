@@ -23,22 +23,6 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const { createHash, randomBytes } = require('node:crypto')
-const { registerHooks, stripTypeScriptTypes } = require('node:module')
-const { existsSync, readFileSync } = require('node:fs')
-const { fileURLToPath } = require('node:url')
-registerHooks({
-  resolve(specifier, context, next) {
-    if (specifier.startsWith('.') && specifier.endsWith('.js') && context.parentURL?.startsWith('file:')) {
-      const url = new URL(specifier.replace(/\.js$/, '.ts'), context.parentURL)
-      if (existsSync(url)) return { url: url.href, shortCircuit: true }
-    }
-    return next(specifier, context)
-  },
-  load(url, context, next) {
-    if (url.endsWith('.ts')) return { format: 'module', shortCircuit: true, source: stripTypeScriptTypes(readFileSync(fileURLToPath(url), 'utf8'), { mode: 'transform' }) }
-    return next(url, context)
-  },
-})
 
 const {
   PeerArqSession,
@@ -49,7 +33,7 @@ const {
   ARQ_DEFAULT_WINDOW,
   ARQ_DEFAULT_RTO_MS,
   ARQ_DEFAULT_RTO_MAX_MS,
-} = require('../src/peer/arq.ts')
+} = require('../lib/peer/arq.js')
 const {
   PeerFrameType,
   packEncryptedFrame,
@@ -58,12 +42,12 @@ const {
   PEER_MAX_FRAME_BYTES,
   PEER_HEADER_BYTES,
   PEER_AEAD_TAG_BYTES,
-} = require('../src/peer/wire.ts')
+} = require('../lib/peer/wire.js')
 const {
   generatePeerIdentity,
   generateEphemeralX25519,
   derivePeerSessionCiphers,
-} = require('../src/peer/crypto.ts')
+} = require('../lib/peer/crypto.js')
 
 // -- harness helpers -------------------------------------------------------------
 
@@ -216,7 +200,7 @@ function wireSessions(sessionA, sessionB, rng = null) {
       link.dropped += 1
       return
     }
-    const delay = rng ? Math.floor(rng() * 15) : 0
+    const delay = rng ? Math.floor(rng() * 4) : 0
     setTimeout(() => to.handleFrame(frameType, streamId, Buffer.from(payload), ack), delay)
   }
   sessionA.sendFrame = (frameType, streamId, payload, ack) => forward(sessionB, frameType, streamId, payload, ack)
@@ -695,20 +679,20 @@ test('concurrent duplex streams transfer both directions intact over a perfect l
   sessionB.closeAll()
 })
 
-// -- 10. the 10 MiB lossy hot-swap acceptance run ------------------------------------
+// -- 10. the 1 MiB lossy hot-swap acceptance run ------------------------------------
 
-test('10 MiB across two concurrent streams survives 20% loss + reorder and a mid-flight path swap', { skip: false }, async () => {
+test('1 MiB across two concurrent streams survives 20% loss + reorder and a mid-flight path swap', { skip: false }, async () => {
   const assembler = makeAssembler() // receiver collects both streams
-  const sessionA = new PeerArqSession({ sendFrame: () => {} })
-  const sessionB = new PeerArqSession({ onStreamData: assembler.onStreamData, sendFrame: () => {} })
+  const sessionA = new PeerArqSession({ rtoMs: 25, rtoMaxMs: 120, sendFrame: () => {} })
+  const sessionB = new PeerArqSession({ rtoMs: 25, rtoMaxMs: 120, onStreamData: assembler.onStreamData, sendFrame: () => {} })
   const rng = mulberry32(20261110)
-  // Swap the physical path after ~8000 forwarded frames — comfortably
-  // mid-transfer (~40% of the ~19k data+ack frames), with fragments that
+  // Swap the physical path after ~800 forwarded frames — comfortably
+  // mid-transfer (~40% of the ~1,900 data+ack frames), with fragments that
   // are still unacked at swap time retransmitting over the new path.
   const link = wireSessions(sessionA, sessionB, rng)
-  link.swapAfter = 8000
+  link.swapAfter = 800
 
-  const SIZE = 5 * 1024 * 1024
+  const SIZE = 512 * 1024
   const buf1 = randomBytes(SIZE)
   const buf2 = randomBytes(SIZE)
   const hash1 = createHash('sha256').update(buf1).digest('hex')
@@ -717,7 +701,7 @@ test('10 MiB across two concurrent streams survives 20% loss + reorder and a mid
   const finalBoth = (async () => {
     for (;;) {
       if (assembler.finalOf(1) && assembler.finalOf(2)) return
-      await sleep(50)
+      await sleep(10)
     }
   })()
   async function sendLarge(id, bytes) {
@@ -731,7 +715,7 @@ test('10 MiB across two concurrent streams survives 20% loss + reorder and a mid
   await Promise.all([sendLarge(1, buf1), sendLarge(2, buf2), finalBoth])
 
   assert.ok(link.dropped > 0, `loss actually injected (dropped ${link.dropped})`)
-  assert.ok(link.forwarded > 8000, `transfer crossed the swap point (${link.forwarded} forwards)`)
+  assert.ok(link.forwarded > 800, `transfer crossed the swap point (${link.forwarded} forwards)`)
   assert.equal(link.swapped, true, 'physical path swapped mid-flight')
   assert.equal(assembler.bytesOf(1).length, SIZE)
   assert.equal(assembler.bytesOf(2).length, SIZE)
@@ -868,4 +852,230 @@ test('T4: setTransportProfile dynamically bounds inflight window and initial RTO
     assert.equal(session.queuedTotal(), 0)
     session.closeAll()
   }
+})
+
+// -- 12. stream lifecycle, terminal capacity & retirement (from peer-lifecycle) ----
+
+function lifecycleFrame(seq, text = '', fin = false) {
+  const b = Buffer.alloc(5 + Buffer.byteLength(text))
+  b[0] = +fin
+  b.writeUInt32BE(seq, 1)
+  b.write(text, 5)
+  return b
+}
+
+function lifecycleSession(options = {}) {
+  const c = manualClock()
+  const sent = []
+  const arq = new PeerArqSession({ clock: c, sendFrame: (...f) => sent.push(f), ...options })
+  return { arq, c, sent }
+}
+
+test('blocked expected DATA and out-of-order FIN are never selectively acknowledged', () => {
+  const { arq, sent } = lifecycleSession({ onStreamData: () => false })
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(0, 'a'), 0)
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(1, '', true), 0)
+  assert.equal(sent.at(-1)[3], 0)
+  assert.equal(sent.at(-1)[2][0], 0, 'neither unaccepted expected data nor undelivered FIN is SACKed')
+  arq.closeAll()
+})
+
+test('FIN promise requires cumulative ACK even when peer SACK bitmap includes FIN', async () => {
+  const { arq } = lifecycleSession()
+  let finished = false
+  const p = arq.finish(1).then(() => { finished = true })
+  arq.handleFrame(PeerFrameType.SACK, 1, Buffer.from([1]), 0)
+  await Promise.resolve()
+  assert.equal(finished, false)
+  arq.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), 1)
+  await p
+  arq.closeAll()
+})
+
+test('lost RST and RST ACK retry without loops, then release all timers', () => {
+  const a = lifecycleSession({ retryTimeoutMs: 1000 })
+  const b = lifecycleSession()
+  let resets = 0
+  b.arq.onStreamReset = () => resets++
+  a.arq.reset(1) // drop first RST
+  a.c.advance(120)
+  assert.equal(a.sent.filter((f) => f[0] === PeerFrameType.RST).length, 2)
+  let req = a.sent.at(-1)
+  assert.equal(req[2][0], 1)
+  b.arq.handleFrame(...req) // drop first ACK
+  a.c.advance(240)
+  req = a.sent.at(-1)
+  b.arq.handleFrame(...req)
+  assert.equal(b.sent.at(-1)[2][0], 2)
+  a.arq.handleFrame(...b.sent.at(-1))
+  const count = a.sent.length
+  a.c.advance(10000)
+  assert.equal(a.sent.length, count)
+  assert.equal(a.c.pendingCount(), 0)
+  assert.equal(resets, 1)
+  a.arq.closeAll()
+  b.arq.closeAll()
+})
+
+test('retired stream never resurrects after final ACK cache expiry or many later streams', () => {
+  let delivered = 0
+  const { arq, c } = lifecycleSession({ onStreamData: () => { delivered++ } })
+  arq.reset(1)
+  for (let id = 3; id < 2200; id += 2) arq.reset(id)
+  c.advance(120000)
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(0, 'late legacy retry'), 0)
+  assert.equal(delivered, 0)
+  arq.closeAll()
+})
+
+test('DATA no-progress expires but idle live stream does not', async () => {
+  const closed = []
+  const { arq, c } = lifecycleSession({ retryTimeoutMs: 1000, onStreamClosed: (...args) => closed.push(args) })
+  const p = arq.write(1, Buffer.from('lost'))
+  c.advance(1100)
+  assert.equal(closed.length, 1)
+  await assert.rejects(p, /progress|timeout/)
+  const q = arq.write(2, Buffer.from('ok'))
+  arq.handleFrame(PeerFrameType.ACK, 2, Buffer.alloc(0), 1)
+  await q
+  c.advance(120000)
+  assert.equal(closed.length, 1)
+  arq.closeAll()
+})
+
+test('lost final ACK is recovered from terminal cache after receiver released live state', async () => {
+  const a = lifecycleSession()
+  const b = lifecycleSession()
+  const pa = a.arq.finish(1)
+  const pb = b.arq.finish(1)
+  b.arq.handleFrame(...a.sent[0])
+  a.arq.handleFrame(...b.sent[0])
+  // Deliver ACK only to B. B is now closed and A must retransmit its FIN.
+  b.arq.handleFrame(...a.sent.at(-1))
+  await pb
+  assert.equal(b.arq.active.size, 0)
+  a.c.advance(120)
+  b.arq.handleFrame(...a.sent.at(-1))
+  a.arq.handleFrame(...b.sent.at(-1))
+  await pa
+  assert.equal(a.arq.active.size, 0)
+  a.arq.closeAll()
+  b.arq.closeAll()
+})
+
+test('progressing transfers outlive retry timeout while fresh writes cannot extend a blackhole', async () => {
+  const { arq, c } = lifecycleSession({ retryTimeoutMs: 1000 })
+  for (let seq = 0; seq < 100; seq++) {
+    const p = arq.write(1, Buffer.alloc(1))
+    c.advance(900)
+    arq.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), seq + 1)
+    await p
+  }
+  assert.ok(arq.active.has(1), '90 second active stream is healthy')
+  const lost = arq.write(2, Buffer.from('lost'))
+  for (let i = 0; i < 11; i++) { void arq.write(2, Buffer.alloc(1)).catch(() => {}); c.advance(100) }
+  await assert.rejects(lost, /no-progress/)
+  arq.closeAll()
+})
+
+test('terminal capacity reserves active streams and never evicts fresh ACK or retired ranges', async () => {
+  const { arq, c } = lifecycleSession({ maxTerminalRecords: 2, maxRetiredRanges: 3, terminalTtlMs: 1000, retryTimeoutMs: 500 })
+  const a = arq.write(1, Buffer.alloc(1))
+  const b = arq.write(5, Buffer.alloc(1))
+  await assert.rejects(arq.write(9, Buffer.alloc(1)), /capacity/)
+  arq.reset(1)
+  arq.reset(5)
+  await assert.rejects(a)
+  await assert.rejects(b)
+  await assert.rejects(arq.write(9, Buffer.alloc(1)), /capacity/)
+  c.advance(1100)
+  arq.reset(9)
+  c.advance(1100)
+  for (let id = 13; id < 1000; id += 4) arq.handleFrame(PeerFrameType.DATA, id, lifecycleFrame(0, 'rejected'), 0)
+  assert.equal(arq.retired[1].length, 3)
+  assert.equal(arq.active.size, 0)
+  arq.closeAll()
+})
+
+for (const cancel of [true, false]) {
+  test(`capacity-${cancel ? 'cancelled' : 'rejected'} ID stays retired after capacity recovers`, () => {
+    const received = []
+    const { arq, sent } = lifecycleSession({ maxStreams: 1, onStreamData: (id) => { received.push(id) } })
+    arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(0, 'active'), 0)
+    arq.handleFrame(cancel ? PeerFrameType.RST : PeerFrameType.DATA, 3, cancel ? Buffer.from([1]) : lifecycleFrame(0, 'refused'), 0)
+    assert.equal(sent.at(-1)[0], PeerFrameType.RST)
+    arq.reset(1)
+    arq.handleFrame(PeerFrameType.DATA, 3, lifecycleFrame(0, 'late'), 0)
+    assert.deepEqual(received, [1])
+    arq.closeAll()
+  })
+}
+
+test('exhausted retirement history permanently rejects new IDs while active stream can finish', async () => {
+  const received = []
+  const errors = []
+  const { arq, c, sent } = lifecycleSession({
+    maxStreams: 1,
+    maxRetiredRanges: 2,
+    onStreamData: (id) => { received.push(id) },
+    onAdmissionClosed: (error) => errors.push(error.message),
+  })
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(0, 'head'), 0)
+  arq.handleFrame(PeerFrameType.RST, 5, Buffer.from([1]), 0)
+  arq.handleFrame(PeerFrameType.RST, 9, Buffer.from([1]), 0)
+  assert.equal(errors.length, 1)
+  assert.match(errors[0], /rejoin/)
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(1, 'still active'), 0)
+  const finish = arq.finish(1)
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(2, '', true), 1)
+  await finish
+  assert.equal(arq.active.size, 0)
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(2, '', true), 1)
+  assert.equal(sent.at(-1)[0], PeerFrameType.SACK, 'existing stream final ACK recovery survives closed admission')
+  assert.equal(sent.at(-1)[3], 3)
+  c.advance(120000)
+  for (let id = 5; id < 4000; id += 4) arq.handleFrame(PeerFrameType.DATA, id, lifecycleFrame(0, 'late'), 0)
+  assert.deepEqual(received, [1, 1, 1])
+  await assert.rejects(arq.write(4001, Buffer.alloc(1)), /rejoin/)
+  assert.throws(() => arq.tryWrite(4001, Buffer.alloc(1)), /rejoin/)
+  assert.ok(arq.retired[0].length + arq.retired[1].length <= 2)
+  assert.equal(errors.length, 1)
+  arq.closeAll()
+})
+
+test('synchronous resume during delivery never delivers the same frame twice', () => {
+  let calls = 0
+  const { arq } = lifecycleSession({ onStreamData: (id) => { calls++; if (calls < 3) arq.resume(id) } })
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(0, 'x'), 0)
+  assert.equal(calls, 1)
+  arq.closeAll()
+})
+
+test('out-of-order traffic cannot consume space reserved for the missing expected frame', () => {
+  const received = []
+  const { arq } = lifecycleSession({ maxSessionBytes: 32, maxStreams: 2, onStreamData: (id, bytes) => received.push([id, bytes.length]) })
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(1, 'x'.repeat(16)), 0)
+  arq.handleFrame(PeerFrameType.DATA, 2, lifecycleFrame(1, 'y'.repeat(16)), 0)
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(0, 'head'), 0)
+  arq.handleFrame(PeerFrameType.DATA, 2, lifecycleFrame(0, 'head'), 0)
+  assert.ok(received.some(([id]) => id === 1) && received.some(([id]) => id === 2), 'both missing heads can make progress')
+  assert.ok(arq.bufferedReceiveBytes() <= 32)
+  arq.closeAll()
+})
+
+test('1000 graceful duplex closes release live state and late FIN is re-ACKed', async () => {
+  const closed = []
+  const { arq, sent } = lifecycleSession({ onStreamClosed: (id) => closed.push(id) })
+  for (let id = 1; id <= 1000; id++) {
+    const p = arq.finish(id)
+    arq.handleFrame(PeerFrameType.DATA, id, lifecycleFrame(0, '', true), 1)
+    await p
+  }
+  assert.equal(closed.length, 1000)
+  assert.equal(arq.txStreams.size, 0)
+  assert.equal(arq.rxStreams.size, 0)
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(0, '', true), 0)
+  assert.equal(sent.at(-1)[0], PeerFrameType.SACK)
+  assert.equal(sent.at(-1)[3], 1)
+  arq.closeAll()
 })

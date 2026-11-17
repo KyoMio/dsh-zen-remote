@@ -15,9 +15,15 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const http = require('node:http')
 const { checkWebServerShape, installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
 const { createBridgeRegistry, normalizeDeclaration } = require('../lib/plugin-bridge.js')
+const {
+  waitFor,
+  startResetServer,
+  startFakeHost: createFakeHost,
+  startFakeRelay,
+  fakeRelayClient,
+} = require('./helpers/plugin-bridge-harness.cjs')
 
 const DECLARED = {
   plugin: 'test-panel',
@@ -32,219 +38,36 @@ const DECLARED = {
 }
 const DIGEST = normalizeDeclaration(DECLARED).digest
 
-/**
- * The fake host webServer: real http server, host-shaped handle, an exact
- * table the local plugin registers into. `hitCounts` is the security
- * observable. Returns the raw instance (what symbols.original would hand
- * over) plus the register/registerFallback faces the tests need.
- */
 function startFakeHost() {
-  const hits = { localPanel: 0, other: 0 }
-  let fallback = undefined
-  const raw = {
-    exact: new Map(),
-    prefixes: new Map(),
-    upgrades: new Map(),
-    match(pathname) {
-      const exact = this.exact.get(pathname)
-      if (exact !== undefined) return exact
-      let best
-      for (const [prefix, route] of this.prefixes) {
-        if (pathname !== prefix && !pathname.startsWith(`${prefix}/`)) continue
-        if (best === undefined || prefix.length > best.path.length) best = route
-      }
-      return best
-    },
-    register(route) {
-      const table = route.kind === 'exact' ? this.exact : this.prefixes
-      table.set(route.path, route)
-      return () => table.delete(route.path)
-    },
-    registerFallback(handler) {
-      fallback = handler
-      return () => { fallback = undefined }
-    },
-  }
-  const server = http.createServer((req, res) => {
-    const rawPath = new URL(req.url ?? '/', 'http://x').pathname
-    Promise.resolve(raw.match(rawPath)).then(async (route) => {
-      if (route !== undefined) {
-        await route.handler(req, res)
-        return
-      }
-      if (fallback !== undefined) {
-        await fallback(req, res)
-        return
-      }
-      res.writeHead(404)
-      res.end()
-    }).catch(() => { try { res.destroy() } catch { /* gone */ } })
-  })
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const port = server.address().port
-      resolve({
-        raw,
-        hits,
-        port,
-        stop: () => new Promise((done) => { server.closeAllConnections(); server.close(done) }),
-        /** Register the LOCAL plugin routes (the ones the bridge must guard). */
-        registerLocalPlugin() {
-          raw.register({
-            kind: 'exact',
-            path: '/panel/data',
-            handler: async (req, res) => {
-              hits.localPanel += 1
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ local: true, query: new URL(req.url ?? '/', 'http://x').search }))
-            },
-          })
-          raw.register({
-            kind: 'exact',
-            path: '/panel/all',
-            handler: async (req, res) => {
-              hits.localPanel += 1
-              res.writeHead(200, { 'content-type': 'application/json' })
-              res.end(JSON.stringify({ local: true, whole: 'machine' }))
-            },
-          })
-          raw.register({
-            kind: 'exact',
-            path: '/panel/stream',
-            handler: async (req, res) => {
-              hits.localPanel += 1
-              res.writeHead(200, { 'content-type': 'application/x-ndjson' })
-              res.end('local\n')
-            },
-          })
-        },
-        get: (pathWithQuery, { headers = {}, signal, method, body } = {}) =>
-          fetch(`http://127.0.0.1:${port}${pathWithQuery}`, {
-            method: method ?? 'GET',
-            headers,
-            ...(body !== undefined ? { body, ...(body instanceof ReadableStream ? { duplex: 'half' } : {}) } : {}),
-            signal,
-          }),
-      })
-    })
-  })
-}
-
-/**
- * The fake relay: PB-3's relay/v1/plugin shape. Refuses with the marker
- * header when `refuse` says so, streams NDJSON when the path says stream,
- * and records every arrival (plus the aborts).
- */
-function startFakeRelay({ refuse } = {}) {
-  const state = { hits: [], aborted: 0 }
-  let hold
-  const server = http.createServer((req, res) => {
-    const url = new URL(req.url ?? '/', 'http://relay.internal')
-    state.hits.push({
-      method: req.method,
-      path: url.pathname,
-      plugin: req.headers['x-zr-plugin'],
-      version: req.headers['x-zr-plugin-version'],
-      digest: req.headers['x-zr-plugin-digest'],
-      zrPath: req.headers['x-zr-path'],
-      zrQuery: req.headers['x-zr-query'],
-      accept: req.headers.accept,
-    })
-    req.on('close', () => { if (!res.writableEnded) state.aborted += 1 })
-    if (refuse !== undefined) {
-      res.writeHead(refuse.status ?? 403, { 'x-zen-remote-error': refuse.code, 'content-type': 'application/json' })
-      res.end(JSON.stringify({ ok: false, error: { code: refuse.code } }))
-      return
-    }
-    if (url.pathname === '/_dsh/zen-remote/relay/v1/plugin' && req.headers['x-zr-path'] === '/panel/stream') {
-      res.writeHead(200, { 'content-type': 'application/x-ndjson' })
-      res.write('frame-1\n')
-      setTimeout(() => { res.write('frame-2\n'); res.end() }, 15)
-      return
-    }
-    if (url.pathname === '/_dsh/zen-remote/relay/v1/plugin' && req.headers['x-zr-path'] === '/panel/write') {
-      // PB-9: echo the forwarded body verbatim so the test can prove the
-      // exact bytes and content type crossed the sub-client boundary.
-      const chunks = []
-      req.on('data', (c) => chunks.push(c))
-      req.on('end', () => {
+  return createFakeHost({ localPanel: 0, other: 0 }, (raw, hits) => {
+    raw.register({
+      kind: 'exact',
+      path: '/panel/data',
+      handler: async (req, res) => {
+        hits.localPanel += 1
         res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ echoed: Buffer.concat(chunks).toString('utf8'), ct: req.headers['content-type'] }))
-      })
-      return
-    }
-    if (url.pathname === '/_dsh/zen-remote/relay/v1/plugin' && req.headers['x-zr-path'] === '/panel/hold') {
-      res.writeHead(200, { 'content-type': 'text/plain' })
-      res.write('held')
-      hold = () => res.end()
-      return
-    }
-    res.writeHead(200, { 'content-type': 'application/json', 'content-length': '18', 'cache-control': 'no-store' })
-    res.end(JSON.stringify({ remote: true }))
-  })
-  return new Promise((resolve) => {
-    server.listen(0, '127.0.0.1', () => {
-      const port = server.address().port
-      resolve({
-        __port: port,
-        state,
-        releaseHold: () => { const done = hold; hold = undefined; if (done !== undefined) done() },
-        stop: () => new Promise((done) => { server.closeAllConnections(); server.close(done) }),
-      })
+        res.end(JSON.stringify({ local: true, query: new URL(req.url ?? '/', 'http://x').search }))
+      },
+    })
+    raw.register({
+      kind: 'exact',
+      path: '/panel/all',
+      handler: async (req, res) => {
+        hits.localPanel += 1
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ local: true, whole: 'machine' }))
+      },
+    })
+    raw.register({
+      kind: 'exact',
+      path: '/panel/stream',
+      handler: async (req, res) => {
+        hits.localPanel += 1
+        res.writeHead(200, { 'content-type': 'application/x-ndjson' })
+        res.end('local\n')
+      },
     })
   })
-}
-
-/** The relay client stub: only `pluginRequest` and the state the wrap reads.
- * PB-9: the method, body stream and content type forward too, and EVERY
- * call is recorded (method, content type, declared length) so the test can
- * assert what the wrap actually handed the relay client — the body BYTES
- * themselves are proven by the fake relay's echo. PB-9-fix: the stub mirrors
- * the fixed relay-client contract — a caller abort is a caller verdict, NOT
- * a transport death — and every offline verdict it WOULD have made is
- * recorded for the tests to refute. */
-function fakeRelayClient(relayPort) {
-  const forwarded = []
-  const offlineVerdicts = []
-  const client = {
-    forwarded,
-    offlineVerdicts,
-    pluginRequest: async (request, signal) => {
-      const hasBody = request.body !== undefined && request.body !== null
-      forwarded.push({
-        method: request.method ?? 'GET',
-        contentType: request.contentType,
-        contentLength: request.contentLength,
-        path: request.path,
-        query: request.query,
-      })
-      const init = {
-        method: request.method ?? 'POST',
-        headers: {
-          accept: request.accept ?? 'application/json',
-          ...(request.range !== undefined ? { range: request.range } : {}),
-          ...(hasBody && request.contentType !== undefined ? { 'content-type': request.contentType } : {}),
-          'x-zr-plugin': request.plugin,
-          'x-zr-plugin-version': request.version,
-          'x-zr-plugin-digest': request.digest,
-          'x-zr-path': request.path,
-          'x-zr-query': request.query,
-        },
-        ...(hasBody ? { body: request.body, duplex: 'half' } : {}),
-        signal,
-      }
-      try {
-        return await fetch(`http://127.0.0.1:${relayPort}/_dsh/zen-remote/relay/v1/plugin`, init)
-      } catch (error) {
-        if (signal?.aborted) {
-          throw Object.assign(new Error('aborted'), { code: 'aborted' })
-        }
-        offlineVerdicts.push({ code: 'offline', message: String((error && error.message) ?? error) })
-        throw Object.assign(new Error('offline'), { code: 'offline' })
-      }
-    },
-  }
-  return client
 }
 
 const VIRTUAL = 'zr~abcd1234~session-a'
@@ -595,14 +418,11 @@ test('PB-5-fix: a relay TRANSPORT failure answers the uniform 503 offline, and t
   const registry = createBridgeRegistry()
   registry.register(DECLARED)
   // A relay client pointed at a port nothing listens on: the transport dies.
-  const dead = http.createServer()
-  await new Promise((resolve) => dead.listen(0, '127.0.0.1', resolve))
-  const deadPort = dead.address().port
-  await new Promise((resolve) => dead.close(resolve))
+  const reset = await startResetServer()
   const handle = installPluginRouteIntercept({
     webServer: host.raw,
     registry,
-    relay: fakeRelayClient(deadPort),
+    relay: fakeRelayClient(reset.port),
     getServerId: () => SERVER_ID,
     getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
     log: () => {},
@@ -619,11 +439,13 @@ test('PB-5-fix: a relay TRANSPORT failure answers the uniform 503 offline, and t
     assert.equal(diag.refusalsByReason.offline, 1)
   } finally {
     handle.uninstall()
+    await reset.close()
     await host.stop()
   }
 })
 
-test('PB-4: the browser hang-up aborts the relay round-trip', async () => {  const host = await startFakeHost()
+test('PB-4: the browser hang-up aborts the relay round-trip', async () => {
+  const host = await startFakeHost()
   host.registerLocalPlugin()
   const relay = await startFakeRelay()
   const registry = createBridgeRegistry()
@@ -639,11 +461,11 @@ test('PB-4: the browser hang-up aborts the relay round-trip', async () => {  con
   try {
     const controller = new AbortController()
     const pending = host.get(`/panel/hold?sessionId=${encodeURIComponent(VIRTUAL)}`, { signal: controller.signal })
-    await new Promise((resolve) => setTimeout(resolve, 120))
+    await waitFor(() => relay.state.hits.length === 1)
     assert.equal(relay.state.hits.length, 1, 'the forward reached the relay')
     controller.abort()
     await pending.catch(() => 'aborted')
-    await new Promise((resolve) => setTimeout(resolve, 100))
+    await waitFor(() => relay.state.aborted === 1)
     assert.equal(relay.state.aborted, 1, 'the relay saw its connection close')
   } finally {
     await relay.releaseHold()

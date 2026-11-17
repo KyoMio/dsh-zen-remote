@@ -95,7 +95,7 @@ export interface MobileNavConfig {
  * Absent from the result when the row left it unset or wrote something that
  * is not a finite number, which leaves the client on its shipped default.
  *
- * Exported for scripts/check-keyboard-avoid.mjs — this is the trust boundary
+ * Exported for test/mobile-viewport-compat.test.mjs — this is the trust boundary
  * between a hand-edited YAML row and the browser, so it is asserted directly.
  */
 export declare function clamped(key: string, value: number | undefined, min: number, max: number): Record<string, number>;

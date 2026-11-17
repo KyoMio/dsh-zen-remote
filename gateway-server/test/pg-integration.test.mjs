@@ -26,6 +26,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 
@@ -35,8 +36,10 @@ import { encryptSecret, hashPassword } from '../dist/master-key.js';
 import { resolveGatewayConfig } from '../dist/config.js';
 import { startGateway } from '../dist/main.js';
 
+const urlDirectEnv = process.env.ZR_TEST_PG_URL;
 const urlFileEnv = process.env.ZR_TEST_PG_URL_FILE;
-const hasPg = typeof urlFileEnv === 'string' && urlFileEnv.trim().length > 0;
+const hasPg = (typeof urlDirectEnv === 'string' && urlDirectEnv.trim().length > 0)
+  || (typeof urlFileEnv === 'string' && urlFileEnv.trim().length > 0);
 
 /** 服务端 statement_timeout 兜底：超时查询报 57014，测试一律视为失败（而非正常拒绝） */
 const STATEMENT_TIMEOUT_MS = 5000;
@@ -52,6 +55,9 @@ const SCHEMA_PREFIX = 'zr_pc06_test_';
 const ROOT_STEP_MS = 5_000;
 
 function readRawDatabaseUrl() {
+  if (typeof urlDirectEnv === 'string' && urlDirectEnv.trim().length > 0) {
+    return urlDirectEnv.trim();
+  }
   const p = path.isAbsolute(urlFileEnv) ? urlFileEnv : path.resolve(process.cwd(), urlFileEnv);
   return fs.readFileSync(p, 'utf8').trim();
 }
@@ -553,19 +559,19 @@ function runTestChild(mode, schema, deadlineMs) {
 // openStore 播种进了真实 PG——而不是只有测试直接给 store 传 seed 才生效。
 (hasPg ? describe : describe.skip)('PC-07 生产接线：resolveGatewayConfig → startGateway 进真实 PG', () => {
   /** 本轮网关数据目录（master.key）：mkdtemp 独占创建，返回值即拥有权事实；清理只认本轮变量 */
-  const DATA_DIR_PREFIX = '.pc07-gw-';
+  const DATA_DIR_PREFIX = 'zr-pc07-gw-';
   let dataDir = null; // 本轮 mkdtemp 返回的独占目录路径；不删除任何固定旧目录
   let masterKeySnapshot = null; // 首次启动后的 master.key 内容，供重开用例钉住主密钥稳定
 
-  /** 删除守卫：只允许删本轮 mkdtemp 创建、前缀匹配且解析后位于本测试根内的目录 */
+  /** 删除守卫：只允许删本轮 mkdtemp 创建、前缀匹配且解析后位于 os.tmpdir() 内的目录 */
   function removeOwnedDataDir(dir) {
     if (typeof dir !== 'string' || !path.basename(dir).startsWith(DATA_DIR_PREFIX)) {
       throw new Error(`refusing to remove data dir not owned by this round: ${String(dir)}`);
     }
     const resolved = path.resolve(dir);
-    const testRoot = path.resolve(import.meta.dirname);
-    if (!resolved.startsWith(testRoot + path.sep)) {
-      throw new Error(`refusing to remove data dir outside test root: ${resolved}`);
+    const tmpRoot = path.resolve(os.tmpdir());
+    if (!resolved.startsWith(tmpRoot + path.sep)) {
+      throw new Error(`refusing to remove data dir outside tmpdir: ${resolved}`);
     }
     fs.rmSync(resolved, { recursive: true, force: true });
   }
@@ -657,7 +663,7 @@ function runTestChild(mode, schema, deadlineMs) {
   before(async () => {
     rawUrl = readRawDatabaseUrl();
     ownedSchema = await createOwnedSchema(rawUrl);
-    dataDir = fs.mkdtempSync(path.join(import.meta.dirname, DATA_DIR_PREFIX)); // 独占目录，开始不删任何既有目录
+    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), DATA_DIR_PREFIX));
   });
 
   after(async () => {

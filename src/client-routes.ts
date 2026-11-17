@@ -193,6 +193,9 @@ export interface ClientHandlerOptions {
   getRowConfig: () => unknown
   /** Outbound fetch, defaulting to the global one. */
   fetchImpl?: FetchLike
+  /** Longest wait (ms) for one connection probe or live handshake; defaults to
+   * {@link PROBE_TIMEOUT_MS} (5000). Tests inject a small value. */
+  probeTimeoutMs?: number
   /** Upload-redirect service probe (RD-6): lazily reflects `connection` /
    * `fileUploads` from a context that already resolved, plus whether the
    * fetch-route inject callback ever fired. Answers WHY the upload
@@ -400,7 +403,7 @@ function respondRelayFailure(res: ServerResponse, error: unknown): void {
 
 /** One probe of the server's relay ping with the row's token. Only the
  * Authorization header ever sees the token. */
-async function probe(fetchImpl: FetchLike, serverUrl: string, token: string): Promise<ProbeState> {
+async function probe(fetchImpl: FetchLike, serverUrl: string, token: string, timeoutMs = PROBE_TIMEOUT_MS): Promise<ProbeState> {
   let response: Response
   try {
     response = await fetchImpl(serverUrl.replace(/\/+$/u, '') + RELAY_PING_PATH, {
@@ -408,7 +411,7 @@ async function probe(fetchImpl: FetchLike, serverUrl: string, token: string): Pr
       headers: { authorization: `Bearer ${token}` },
       // A wrong server must not walk the probe through a redirect chain.
       redirect: 'manual',
-      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      signal: AbortSignal.timeout(timeoutMs),
     })
   } catch {
     return classifyProbe({ kind: 'error' })
@@ -481,13 +484,13 @@ function deviceStatusBody(state: string, info: { serverName: string, deviceName?
  * state and digest either way — but the status answer never waits longer
  * than a probe would have.
  */
-async function withProbeTimeout<T>(promise: Promise<T>): Promise<T> {
+async function withProbeTimeout<T>(promise: Promise<T>, timeoutMs = PROBE_TIMEOUT_MS): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new RelayError('offline', `no handshake within ${PROBE_TIMEOUT_MS} ms`)), PROBE_TIMEOUT_MS)
+        timer = setTimeout(() => reject(new RelayError('offline', `no handshake within ${timeoutMs} ms`)), timeoutMs)
         if (typeof timer.unref === 'function') timer.unref()
       }),
     ])
@@ -773,7 +776,7 @@ async function statusBodyOf(options: ClientHandlerOptions): Promise<Record<strin
   const relay = options.getRelayClient?.()
   if (relay === undefined) {
     // T16 shape: no relay client wired — the ping probe is the answer.
-    const state = await probe(fetchImpl, normalized.url, token)
+    const state = await probe(fetchImpl, normalized.url, token, options.probeTimeoutMs)
     return withDiagnostics({ state, serverUrl: normalized.url })
   }
   // The cached verdict is trusted only over the EXACT credentials the
@@ -798,7 +801,7 @@ async function statusBodyOf(options: ClientHandlerOptions): Promise<Record<strin
   // automatic retry fires and which code failed last — both free of
   // credential material by contract.
   try {
-    const info = await withProbeTimeout(relay.connect())
+    const info = await withProbeTimeout(relay.connect(), options.probeTimeoutMs)
     return withDiagnostics(deviceStatusBody('online', info, normalized.url, relay.deviceNameSyncing))
   } catch (error) {
     const body: Record<string, unknown> = { state: probeStateOfRelayError(error), serverUrl: normalized.url }

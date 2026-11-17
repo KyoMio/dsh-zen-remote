@@ -51,40 +51,24 @@ async function waitFor(fn, timeoutMs, message) {
   while (Date.now() < deadline) {
     const v = fn()
     if (v) return v
-    await new Promise((r) => setTimeout(r, 25))
+    await new Promise((r) => setTimeout(r, 15))
   }
   assert.ok(fn(), message)
 }
 
-// Boot the gateway behind a freshly-allocated pair; opts may carry the
-// token-URL mode the rebind tests need.
-//
-// Readiness is the gateway's own `listening on 127.0.0.1:<port>` line, and the
-// port it names must be the one we handed over: gw.ready's 4s cap would
-// otherwise paper over a lost rebind race (busy port → silent fallback) and
-// leave every later request pointing at a dead port. Cleanup is registered
-// with t.after BEFORE anything can throw, so a failed or timed-out test body
-// still tears the child down; stopAll is idempotent, so the tests' own finally
-// is just the early path of the same teardown.
 async function bootGateway(t, opts) {
   const target = await startMockAuthTarget(0)
   TARGET_PORT = target.server.address().port
-  PORT = await freePort()
   const env = opts && opts.tokenUrl ? { LAN_GATE_UPSTREAM_TOKEN_URL: 'http://127.0.0.1:' + TARGET_PORT + '/?token=SECRET' } : undefined
-  const gw = startGateway(PORT, TARGET_PORT, env)
+  const gw = startGateway(0, TARGET_PORT, env)
   t.after(() => stopAll(target.server, gw.child))
   try {
-    const listened = await waitFor(
-      () => (gw.logs().match(/listening on 127\.0\.0\.1:(\d+)/) || [])[1],
-      8000,
-      'the gateway never announced a listening port, logs: ' + gw.logs(),
-    )
-    assert.strictEqual(Number(listened), PORT, 'the gateway must listen on the handed-over port, logs: ' + gw.logs())
+    PORT = await gw.ready
   } catch (e) {
     await stopAll(target.server, gw.child)
     throw e
   }
-  return { target, gw, stop: () => stopAll(target.server, gw.child) }
+  return { target, gw, port: PORT, stop: () => stopAll(target.server, gw.child) }
 }
 
 // ---- 1. DNS rebinding --------------------------------------------------------
@@ -196,13 +180,13 @@ test('csrf: the plugin backend’s exact call shape still passes (json body, no 
 // ---- 3. revocation cuts device HTTP streams -----------------------------------
 
 // The probe-shaped upstream: /api/fast answers at once, anything else streams
-// NDJSON forever at ~10 lines/s. Listens on 0 and reports the kernel's pick.
+// NDJSON forever at ~50 lines/s. Listens on 0 and reports the kernel's pick.
 function startFastAndStreamTarget() {
   const up = http.createServer((req, res) => {
     if (String(req.url || '').indexOf('/api/fast') === 0) { res.end('ok'); return }
     res.writeHead(200, { 'content-type': 'application/x-ndjson' })
     res.flushHeaders()
-    const t = setInterval(() => res.write('x\n'), 100)
+    const t = setInterval(() => res.write('x\n'), 20)
     res.on('close', () => clearInterval(t))
   })
   return new Promise((resolve, reject) => {
@@ -212,14 +196,11 @@ function startFastAndStreamTarget() {
 }
 
 test('revoke tears down an open device HTTP stream (forwards register their socket now)', { timeout: 20000 }, async (t) => {
-  // Upstream: an NDJSON stream that emits a line every 100ms forever — the
-  // relay-shaped long response the desktop client parks on.
   const up = await startFastAndStreamTarget()
   STREAM_TARGET_PORT = up.address().port
-  PORT = await freePort()
-  const gw = startGateway(PORT, STREAM_TARGET_PORT, { LAN_GATE_RELAY_SECRET: 's' })
+  const gw = startGateway(0, STREAM_TARGET_PORT, { LAN_GATE_RELAY_SECRET: 's' })
   t.after(() => stopAll(up, gw.child))
-  await gw.ready
+  PORT = await gw.ready
   try {
     const d = await pairDesktop(PORT)
     let lines = 0
@@ -232,16 +213,13 @@ test('revoke tears down an open device HTTP stream (forwards register their sock
       res.on('close', () => { closed = true })
     })
     req.end('{}')
-    await new Promise((r) => setTimeout(r, 800))
-    const before = lines
-    assert.ok(before > 0, 'the stream is flowing before the revoke')
+    await waitFor(() => lines > 0, 3000, 'the stream is flowing before the revoke')
 
     const rv = await request(PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: d.id } })
     assert.strictEqual(rv.status, 200)
-    await new Promise((r) => setTimeout(r, 600))
-    assert.strictEqual(closed, true, 'the stream socket was destroyed by the revoke')
+    await waitFor(() => closed === true, 3000, 'the stream socket was destroyed by the revoke')
     const atClose = lines
-    await new Promise((r) => setTimeout(r, 400))
+    await new Promise((r) => setTimeout(r, 80))
     assert.strictEqual(lines, atClose, 'no lines flow after the revoke (was: kept pushing forever)')
   } finally {
     await stopAll(up, gw.child)
@@ -284,25 +262,21 @@ async function openTwoDeviceSocket(port, cookieA, cookieB) {
 test('pipeline: A\'s response ends, B still streams — revoking A must not close the socket', { timeout: 20000 }, async (t) => {
   const up = await startFastAndStreamTarget()
   STREAM_TARGET_PORT = up.address().port
-  PORT = await freePort()
-  const gw = startGateway(PORT, STREAM_TARGET_PORT, { LAN_GATE_RELAY_SECRET: 's' })
+  const gw = startGateway(0, STREAM_TARGET_PORT, { LAN_GATE_RELAY_SECRET: 's' })
   t.after(() => stopAll(up, gw.child))
-  await gw.ready
+  PORT = await gw.ready
   try {
     const a = await pairDevice(PORT, 'pipe-a')
     const b = await pairDevice(PORT, 'pipe-b')
     const c = await openTwoDeviceSocket(PORT, a.cookie, b.cookie)
     c.socket.write(c.reqA + c.reqB) // both requests in one write: true pipelining
-    await new Promise((r) => setTimeout(r, 700))
-    assert.ok(c.data().indexOf('ok') >= 0, 'A\'s short response has fully arrived')
-    assert.ok(c.data().length > 2, 'B\'s stream is flowing on the same socket')
+    await waitFor(() => c.data().indexOf('ok') >= 0 && c.data().includes('x\n'), 3000, 'A answered and B is flowing on the same socket')
 
     const atRevoke = c.data().length
     const rv = await request(PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: a.id } })
     assert.strictEqual(rv.status, 200)
-    await new Promise((r) => setTimeout(r, 600))
+    await waitFor(() => c.data().length > atRevoke, 3000, 'B\'s stream keeps flowing past the revoke of A')
     assert.strictEqual(c.closed(), false, 'revoking A must not kill the socket B is still streaming on')
-    assert.ok(c.data().length > atRevoke, 'B\'s stream keeps flowing past the revoke of A')
     c.socket.destroy()
   } finally {
     await stopAll(up, gw.child)
@@ -312,24 +286,22 @@ test('pipeline: A\'s response ends, B still streams — revoking A must not clos
 test('sequential: A finishes, B streams on the same socket — revoking B disconnects it', { timeout: 20000 }, async (t) => {
   const up = await startFastAndStreamTarget()
   STREAM_TARGET_PORT = up.address().port
-  PORT = await freePort()
-  const gw = startGateway(PORT, STREAM_TARGET_PORT, { LAN_GATE_RELAY_SECRET: 's' })
+  const gw = startGateway(0, STREAM_TARGET_PORT, { LAN_GATE_RELAY_SECRET: 's' })
   t.after(() => stopAll(up, gw.child))
-  await gw.ready
+  PORT = await gw.ready
   try {
     const a = await pairDevice(PORT, 'seq-a')
     const b = await pairDevice(PORT, 'seq-b')
     const c = await openTwoDeviceSocket(PORT, a.cookie, b.cookie)
     c.socket.write(c.reqA)
-    await new Promise((r) => setTimeout(r, 300))
+    await waitFor(() => c.data().indexOf('ok') >= 0, 3000, 'A\'s response arrived')
     c.socket.write(c.reqB)
-    await new Promise((r) => setTimeout(r, 700))
-    assert.ok(c.data().indexOf('ok') >= 0 && c.closed() === false, 'A\'s response is done and B is streaming, socket alive')
+    await waitFor(() => c.data().includes('x\n'), 3000, 'B is streaming on the alive socket')
+    assert.strictEqual(c.closed(), false)
 
     const rv = await request(PORT, { method: 'POST', path: '/lan-gate/action', body: { action: 'revoke', id: b.id } })
     assert.strictEqual(rv.status, 200)
-    await new Promise((r) => setTimeout(r, 600))
-    assert.strictEqual(c.closed(), true, 'revoking B destroys the socket it is streaming on')
+    await waitFor(() => c.closed() === true, 3000, 'revoking B destroys the socket it is streaming on')
     c.socket.destroy()
   } finally {
     await stopAll(up, gw.child)
@@ -344,13 +316,19 @@ test('sequential: A finishes, B streams on the same socket — revoking B discon
 // SIGKILLs the intermediary, and the gateway has to take the port down.
 test('orphan guard: a gateway whose parent died exits within a few seconds', { timeout: 30000 }, async (t) => {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-orphan-'))
-  const ORPHAN_PORT = await freePort()
   const SPAWNER = 'const { spawn } = require("node:child_process");' +
     'const c = spawn(process.execPath, [process.env.GW], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });' +
     'c.stdout.on("data", (d) => process.stdout.write(d)); c.stderr.on("data", (d) => process.stderr.write(d));' +
     'c.on("exit", () => process.exit(0))'
   const parent = spawn(process.execPath, ['-e', SPAWNER], {
-    env: { ...process.env, GW: GATEWAY, DSH_HOME: home, LAN_GATE_PORT: String(ORPHAN_PORT), LAN_GATE_TARGET_PORT: String(await freePort()) },
+    env: {
+      ...process.env,
+      GW: GATEWAY,
+      DSH_HOME: home,
+      LAN_GATE_PORT: '0',
+      LAN_GATE_TARGET_PORT: String(await freePort()),
+      LAN_GATE_ORPHAN_CHECK_MS: '80',
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   })
   t.after(() => { try { parent.kill('SIGKILL') } catch (e) {} })
@@ -358,23 +336,34 @@ test('orphan guard: a gateway whose parent died exits within a few seconds', { t
   parent.stdout.on('data', (d) => { out += d })
   parent.stderr.on('data', (d) => { out += d })
   try {
+    let timer
     await new Promise((resolve, reject) => {
-      const t = setInterval(() => { if (out.includes('[lan-gate] listening')) { clearInterval(t); resolve() } }, 25)
-      setTimeout(() => { clearInterval(t); reject(new Error('gateway never came up: ' + out)) }, 5000)
+      const check = () => {
+        if (out.includes('[lan-gate] listening')) {
+          clearTimeout(timer)
+          parent.stdout.off('data', check)
+          parent.stderr.off('data', check)
+          resolve()
+        }
+      }
+      timer = setTimeout(() => {
+        parent.stdout.off('data', check)
+        parent.stderr.off('data', check)
+        reject(new Error('gateway never came up: ' + out))
+      }, 5000)
+      if (typeof timer.unref === 'function') timer.unref()
+      parent.stdout.on('data', check)
+      parent.stderr.on('data', check)
+      check()
     })
-    // The gateway may have had to fall back from the requested port (a
-    // leftover listener from an earlier run, say) — probe whichever port the
-    // listening line names, not the one we asked for.
-    const listened = out.match(/listening on 127\.0\.0\.1:(\d+)/)
+    const listened = out.match(/listening on \S+:(\d+)/)
     assert.ok(listened, 'the listening line names the port: ' + out)
     const livePort = Number(listened[1])
     parent.kill('SIGKILL') // the crash: no SIGTERM reaches the gateway
-    // The port must free itself: poll until connect fails, well past the 5s
-    // check interval.
-    const deadline = Date.now() + 12000
+    const deadline = Date.now() + 5000
     let freed = false
     while (Date.now() < deadline && !freed) {
-      await new Promise((r) => setTimeout(r, 250))
+      await new Promise((r) => setTimeout(r, 40))
       freed = await new Promise((resolve) => {
         const probe = http.get({ host: '127.0.0.1', port: livePort, path: '/lan-gate/status', timeout: 500 }, (res) => {
           res.resume()
