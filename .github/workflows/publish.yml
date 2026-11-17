@@ -75,9 +75,9 @@ jobs:
       # 就不该留下 Release，顺序反过来会得到一个指向不存在版本的发布页。
       #
       # 正文 = CHANGELOG.md 里本版本的那一段（人工摘要，与守卫同一条 awk 提取），
-      # 附录 = 自上一 tag 以来的全部提交（git log 现算，替代 --generate-notes——
-      # 它无法与 --notes-file 共存，且正文来源要可预测：CHANGELOG 是什么，Release
-      # 就是什么）。标题下的版本日期与 npm 包版本以 CHANGELOG 段首行为准。
+      # 附录 = 到上一 tag 的 GitHub compare 对比链接 + 提交计数（不再把上百行
+      # git log 全部铺开，保持 Release 页面简洁，替代 --generate-notes）。
+      # 标题下的版本日期与 npm 包版本以 CHANGELOG 段首行为准。
       # --verify-tag 拒绝给不存在的 tag 建 Release（手滑删过 tag 又重跑时会挡住）。
       #
       # 先 view 再 create：重跑一次失败的 workflow 是常事，而 create 撞上已存在的
@@ -100,12 +100,11 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            echo "#### 自上一版本以来的全部提交"
-            echo ""
             if [ -n "$prev" ]; then
-              git log --oneline --no-decorate "$prev..$GITHUB_REF_NAME"
+              count=$(git rev-list --count "$prev..$GITHUB_REF_NAME")
+              echo "**完整变更对比**：[$prev...$GITHUB_REF_NAME](https://github.com/${{ github.repository }}/compare/$prev...$GITHUB_REF_NAME)（共 ${count} 个提交）"
             else
-              git log --oneline --no-decorate "$GITHUB_REF_NAME" | head -50
+              echo "**发布提交**：[$GITHUB_REF_NAME](https://github.com/${{ github.repository }}/commits/$GITHUB_REF_NAME)"
             fi
           } >> release-body.md
           gh release create "$GITHUB_REF_NAME" \
