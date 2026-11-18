@@ -31,6 +31,8 @@ export interface GatewayConfig {
   maxNetworksPerUser: number;
   /** 单成员中继限速（KB/s），env `ZR_GATEWAY_RELAY_RATE_KBPS`，默认 4096，范围 64..1048576 */
   relayRateKbps: number;
+  /** 容器内自动更新初始开关，env `ZR_GATEWAY_AUTO_UPDATE`（仅 'false'/'0' 为 false），默认 true */
+  autoUpdateEnabled?: boolean;
 }
 
 type Env = Record<string, string | undefined>;
@@ -65,6 +67,7 @@ export function resolveGatewayConfig(env: Env = process.env, cwd: string = proce
   const publicUrlRaw = optionalNonEmpty(env, 'ZR_GATEWAY_PUBLIC_URL');
   const certDirRaw = optionalNonEmpty(env, 'ZR_GATEWAY_CERT_DIR');
   const allowSignupRaw = env['ZR_GATEWAY_ALLOW_SIGNUP'];
+  const autoUpdateRaw = env['ZR_GATEWAY_AUTO_UPDATE'];
 
   return {
     port,
@@ -79,5 +82,6 @@ export function resolveGatewayConfig(env: Env = process.env, cwd: string = proce
     defaultMaxPeers: intInRange(env, 'ZR_GATEWAY_MAX_PEERS', 8, 2, 64),
     maxNetworksPerUser: intInRange(env, 'ZR_GATEWAY_MAX_NETWORKS_PER_USER', 3, 1, 50),
     relayRateKbps: intInRange(env, 'ZR_GATEWAY_RELAY_RATE_KBPS', 4096, 64, 1048576),
+    autoUpdateEnabled: autoUpdateRaw !== 'false' && autoUpdateRaw !== '0',
   };
 }

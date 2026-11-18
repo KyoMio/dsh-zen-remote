@@ -79,6 +79,8 @@ export interface ExtendedSystemSettings extends SystemSettings {
   tlsCertFile: string;
   /** 证书目录内激活的私钥文件名（单段安全文件名，默认 `privkey.pem`） */
   tlsKeyFile: string;
+  /** 容器内自动热更新总开关（默认 true；首配支持 ZR_GATEWAY_AUTO_UPDATE=false|0） */
+  autoUpdateEnabled: boolean;
 }
 
 export type ExtendedSettingsPatch = Partial<ExtendedSystemSettings>;
@@ -96,6 +98,7 @@ export const DEFAULT_EXTENDED_SETTINGS: ExtendedSystemSettings = {
   tlsEnabled: null,
   tlsCertFile: 'fullchain.pem',
   tlsKeyFile: 'privkey.pem',
+  autoUpdateEnabled: true,
 };
 
 /** 三项配额键：settings ↔ 默认组双向同步只同步这三个键 */
@@ -126,6 +129,7 @@ export const SETTINGS_KEYS: Readonly<Record<keyof ExtendedSystemSettings, string
   tlsEnabled: 'tls_enabled',
   tlsCertFile: 'tls_cert_file',
   tlsKeyFile: 'tls_key_file',
+  autoUpdateEnabled: 'auto_update_enabled',
 };
 
 /** settings 值统一以字符串存 key-value 表（null 存空串，读取时空串解析回 null） */
@@ -187,6 +191,7 @@ export function parseExtendedSettingsRows(rows: ReadonlyArray<Record<string, unk
     tlsEnabled: triBool('tlsEnabled'),
     tlsCertFile: text('tlsCertFile') ?? DEFAULT_EXTENDED_SETTINGS.tlsCertFile,
     tlsKeyFile: text('tlsKeyFile') ?? DEFAULT_EXTENDED_SETTINGS.tlsKeyFile,
+    autoUpdateEnabled: map.get(SETTINGS_KEYS.autoUpdateEnabled) !== 'false',
   };
 }
 

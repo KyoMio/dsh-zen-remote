@@ -10,9 +10,10 @@
 //
 // 安全红线：安全告警只有非阻塞的 warn-tint 提示横幅，绝不提供
 // 「允许不安全连接」开关；运行态展示全部来自 /admin/runtime 的脱敏视图。
-import { useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 
+import { copyTextToClipboard } from '../clipboard';
 import { formatBytes, formatRate } from '../format';
 import { LOCALE_STORAGE_KEY, resolveLocale } from '../i18n/locales';
 import type { Locale, LocaleKey, TranslateFn } from '../i18n/locales';
@@ -21,6 +22,7 @@ import type {
   AdminSettingsData,
   AdminSliceKey,
   AdminTlsView,
+  AdminUpdateView,
   AdminUserRow,
   GatewayRuntimeStatus,
   SecurityWarning,
@@ -29,7 +31,13 @@ import type {
   UiLocalState,
   UserGroup,
 } from '../store/console-store';
-import { ApiKeySection, HotConfigForm, SmtpSettingsSection, TlsCertSection } from './AdminGatewaySettings';
+import {
+  ApiKeySection,
+  HotConfigForm,
+  SmtpSettingsSection,
+  TlsCertSection,
+  UpdateSettingsSection,
+} from './AdminGatewaySettings';
 import { AdminUsersGroups } from './AdminUsersGroups';
 import { AlertIcon } from './Icons';
 
@@ -349,6 +357,119 @@ export function AdminView(props: AdminViewProps) {
 
   const [tab, setTab] = useState<AdminTab>('users');
   const tabRefs = useRef<Partial<Record<AdminTab, HTMLButtonElement | null>>>({});
+  const [updateView, setUpdateView] = useState<AdminUpdateView | null>(null);
+  const [applyingUpdate, setApplyingUpdate] = useState(false);
+  const [restartingVersion, setRestartingVersion] = useState<string | null>(null);
+  const [restartTimedOut, setRestartTimedOut] = useState(false);
+  const [updateActionError, setUpdateActionError] = useState<string | null>(null);
+  const [copiedUpgradeCmd, setCopiedUpgradeCmd] = useState(false);
+  const restartPollTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void client
+      .getAdminUpdate(controller.signal)
+      .then((view) => {
+        if (!controller.signal.aborted) setUpdateView(view);
+      })
+      .catch(() => {
+        /* non-blocking: banner falls back to runtime.update */
+      });
+    return () => {
+      controller.abort();
+    };
+  }, [client]);
+
+  useEffect(() => {
+    return () => {
+      if (restartPollTimerRef.current !== null) {
+        clearInterval(restartPollTimerRef.current);
+        restartPollTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  const stopRestartPolling = useCallback((): void => {
+    if (restartPollTimerRef.current !== null) {
+      clearInterval(restartPollTimerRef.current);
+      restartPollTimerRef.current = null;
+    }
+  }, []);
+
+  const startRestartPolling = useCallback(
+    (targetVersion: string | null): void => {
+      stopRestartPolling();
+      setRestartingVersion(targetVersion ?? '');
+      setRestartTimedOut(false);
+      let attempts = 0;
+      restartPollTimerRef.current = setInterval(() => {
+        attempts += 1;
+        void client
+          .getAdminRuntime()
+          .then(async (rt) => {
+            const onlineVersion = rt.update?.currentVersion ?? null;
+            if (targetVersion === null || onlineVersion === targetVersion) {
+              stopRestartPolling();
+              setRestartingVersion(null);
+              setRestartTimedOut(false);
+              await onRefreshRuntime();
+              const fresh = await client.getAdminUpdate().catch(() => null);
+              if (fresh !== null) setUpdateView(fresh);
+              if (typeof window !== 'undefined' && typeof window.location?.reload === 'function') {
+                window.location.reload();
+              }
+            }
+          })
+          .catch(() => {
+            /* 1-3s restart window: tolerate transient 502/network errors */
+          });
+        if (attempts >= 25) {
+          stopRestartPolling();
+          setRestartTimedOut(true);
+        }
+      }, 1000);
+    },
+    [client, onRefreshRuntime, stopRestartPolling],
+  );
+
+  const handleApplyUpdate = useCallback(async (): Promise<void> => {
+    if (applyingUpdate || restartingVersion !== null) return;
+    setApplyingUpdate(true);
+    setUpdateActionError(null);
+    try {
+      const outcome = await client.applyAdminUpdate();
+      if (outcome.status === 'restarting') {
+        startRestartPolling(outcome.version);
+      } else {
+        const fresh = await client.getAdminUpdate().catch(() => null);
+        if (fresh !== null) setUpdateView(fresh);
+        await onRefreshRuntime();
+      }
+    } catch (err) {
+      setUpdateActionError(err instanceof ConsoleApiError ? err.message : t('error.network'));
+      const fresh = await client.getAdminUpdate().catch(() => null);
+      if (fresh !== null) setUpdateView(fresh);
+    } finally {
+      setApplyingUpdate(false);
+    }
+  }, [applyingUpdate, client, onRefreshRuntime, restartingVersion, startRestartPolling, t]);
+
+  const handleDismissRollback = useCallback(async (): Promise<void> => {
+    try {
+      const fresh = await client.dismissUpdateRollback();
+      setUpdateView(fresh);
+      await onRefreshRuntime();
+    } catch {
+      /* ignore */
+    }
+  }, [client, onRefreshRuntime]);
+
+  const handleCopyBannerCommand = useCallback(async (cmd: string): Promise<void> => {
+    if (await copyTextToClipboard(cmd)) {
+      setCopiedUpgradeCmd(true);
+      setTimeout(() => setCopiedUpgradeCmd(false), 1800);
+    }
+  }, []);
 
   // 任一管理切片末次刷新失败时给一条非阻塞提示：面板显示的是旧数据兜底，
   // 不阻塞标签页（成功补拍后 adminError 归 null，提示自动消失）
@@ -394,6 +515,9 @@ export function AdminView(props: AdminViewProps) {
     { id: 'apiKey', label: t('admin.tabApiKey') },
   ];
 
+  const updateSummary = updateView ?? runtime?.update ?? null;
+  const upgradeCmd = updateView?.upgradeCommand ?? 'docker compose pull && docker compose up -d';
+
   return (
     <section className="admin-view">
       <RuntimeStrip
@@ -406,6 +530,87 @@ export function AdminView(props: AdminViewProps) {
         smtpConfigured={settings?.smtp.configured ?? runtime?.smtpConfigured}
       />
       {runtime !== null && <SecurityAdvisories t={t} warnings={runtime.securityWarnings} />}
+
+      {restartingVersion !== null && (
+        <div className="warn-banner tint-warn update-banner" role="status">
+          <AlertIcon size={16} />
+          <p>
+            {restartTimedOut
+              ? t('admin.updateBannerRestartTimeout')
+              : t('admin.updateBannerRestarting', {
+                  version: restartingVersion ? `v${restartingVersion}` : '',
+                })}
+          </p>
+        </div>
+      )}
+
+      {restartingVersion === null && updateView?.lastRollback && (
+        <div className="warn-banner tint-warn update-banner" role="status">
+          <AlertIcon size={16} />
+          <p>
+            {t('admin.updateRollbackBanner', {
+              failed: `v${updateView.lastRollback.failedVersion}`,
+              target: `v${updateView.lastRollback.rolledBackTo}`,
+              reason: updateView.lastRollback.reason,
+            })}
+          </p>
+          <button
+            type="button"
+            className="btn ghost"
+            onClick={() => {
+              void handleDismissRollback();
+            }}
+          >
+            {t('admin.updateDismissRollback')}
+          </button>
+        </div>
+      )}
+
+      {restartingVersion === null && updateSummary?.updateAvailable && updateSummary.latestVersion && (
+        <div className="warn-banner tint-warn update-banner" role="status">
+          <AlertIcon size={16} />
+          {updateSummary.compatibility === 'compatible' && updateSummary.supervisorManaged ? (
+            <>
+              <p>
+                {t('admin.updateBannerAvailable', {
+                  version: `v${updateSummary.latestVersion}`,
+                  current: updateSummary.currentVersion ? `v${updateSummary.currentVersion}` : '—',
+                })}
+              </p>
+              <button
+                type="button"
+                className="btn primary"
+                disabled={applyingUpdate}
+                onClick={() => {
+                  void handleApplyUpdate();
+                }}
+              >
+                {applyingUpdate ? t('admin.updateApplying') : t('admin.updateNowButton')}
+              </button>
+            </>
+          ) : (
+            <div className="update-banner-pull">
+              <p>
+                {t('admin.updateBannerPullRequired', { version: `v${updateSummary.latestVersion}` })}
+              </p>
+              <div className="update-banner-cmd">
+                <code className="mono">{upgradeCmd}</code>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => {
+                    void handleCopyBannerCommand(upgradeCmd);
+                  }}
+                >
+                  {copiedUpgradeCmd ? t('admin.updateCommandCopied') : t('admin.updateCopyCommand')}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {updateActionError !== null && <p className="form-error">{updateActionError}</p>}
       {anySliceError && <p className="field-hint">{t('admin.sliceError')}</p>}
 
       <div className="admin-tabs" role="tablist" aria-label={t('view.admin')} onKeyDown={handleTablistKeyDown}>
@@ -474,6 +679,20 @@ export function AdminView(props: AdminViewProps) {
                 onSettingsChanged={onSettingsChanged}
                 onRefreshGroups={onRefreshGroups}
                 onRefreshRuntime={onRefreshRuntime}
+              />
+            </section>
+            <section className="settings-section">
+              <UpdateSettingsSection
+                t={t}
+                client={client}
+                settings={settings}
+                runtime={runtime}
+                updateView={updateView}
+                applyingUpdate={applyingUpdate}
+                restartingVersion={restartingVersion}
+                onUpdateViewChanged={setUpdateView}
+                onSettingsChanged={onSettingsChanged}
+                onApplyUpdate={handleApplyUpdate}
               />
             </section>
           </div>

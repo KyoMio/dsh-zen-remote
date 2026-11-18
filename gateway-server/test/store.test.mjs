@@ -56,6 +56,7 @@ describe('resolveGatewayConfig', () => {
       defaultMaxPeers: 8,
       maxNetworksPerUser: 3,
       relayRateKbps: 4096,
+      autoUpdateEnabled: true,
     });
   });
 
@@ -928,6 +929,7 @@ describe('SqliteStore GC-2 扩展', () => {
         tlsEnabled: null,
         tlsCertFile: 'fullchain.pem',
         tlsKeyFile: 'privkey.pem',
+        autoUpdateEnabled: true,
       });
       // 扩展键部分更新（含可空字符串、时间戳与 TLS 三态字段往返）；未在 patch 里的键不受影响
       const updated = await store.updateExtendedSettings({
@@ -1641,5 +1643,40 @@ describe('PAS-1a：decideJoinAttempt 重连防复活、manual 强审批与 verif
       verifyGatewayLeaveSignature({ networkId, nodeId, publicKeyHex: pub1, timestamp, signatureHex: '00' }),
       false,
     );
+  });
+});
+
+describe('T3 autoUpdateEnabled config & store persistence', () => {
+  test('resolveGatewayConfig 解析 ZR_GATEWAY_AUTO_UPDATE（缺省 true，仅 false/0 关闭）', () => {
+    assert.equal(resolveGatewayConfig({}).autoUpdateEnabled, true);
+    assert.equal(resolveGatewayConfig({ ZR_GATEWAY_AUTO_UPDATE: 'true' }).autoUpdateEnabled, true);
+    assert.equal(resolveGatewayConfig({ ZR_GATEWAY_AUTO_UPDATE: 'false' }).autoUpdateEnabled, false);
+    assert.equal(resolveGatewayConfig({ ZR_GATEWAY_AUTO_UPDATE: '0' }).autoUpdateEnabled, false);
+  });
+
+  test('SqliteStore autoUpdateEnabled 默认 true、seed=false 覆写及热更新持久化', async () => {
+    const dir = tmpDir('auto-update-store');
+    const dbPath = path.join(dir, 'gw.sqlite');
+    const s1 = new SqliteStore({ path: dbPath, seed: { autoUpdateEnabled: false } });
+    try {
+      const ext1 = await s1.getExtendedSettings();
+      assert.equal(ext1.autoUpdateEnabled, false);
+      const updated = await s1.updateExtendedSettings({ autoUpdateEnabled: true });
+      assert.equal(updated.autoUpdateEnabled, true);
+    } finally {
+      await s1.close();
+    }
+
+    // Reopen with conflicting seed=false -> persisted true wins
+    const s2 = new SqliteStore({ path: dbPath, seed: { autoUpdateEnabled: false } });
+    try {
+      const ext2 = await s2.getExtendedSettings();
+      assert.equal(ext2.autoUpdateEnabled, true);
+      await s2.updateExtendedSettings({ autoUpdateEnabled: false });
+      assert.equal((await s2.getExtendedSettings()).autoUpdateEnabled, false);
+    } finally {
+      await s2.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

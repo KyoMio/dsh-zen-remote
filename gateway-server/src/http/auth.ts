@@ -23,6 +23,7 @@ import type { MailLocale } from '../mail/templates.js';
 import { StoreError, constantTimeEqualText, DEFAULT_GROUP_ID } from '../store/types.js';
 import type { GatewayTlsBridge } from '../tls/dual-protocol-server.js';
 import { ZR_NATIVE_TLS_SYMBOL } from '../tls/dual-protocol-server.js';
+import type { GatewayUpdateBridge } from '../update/update-manager.js';
 import type {
   AdmissionMode,
   EmailOtpPurpose,
@@ -138,6 +139,8 @@ export interface TopologyMemberRow {
   cumulativeRelayBytes: number;
   /** 最后一次遥测/入网落库时间；从未上报过为 null（控制台显示「刚刚」） */
   lastSeenAt: string | null;
+  /** 在线节点上报的插件语义版本号；离线或旧客户端为 null */
+  pluginVersion: string | null;
 }
 
 /** GET /networks/:id/topology 与 SSE 共用的完整快照 */
@@ -168,6 +171,8 @@ export interface RouteContext {
   topology?: TopologyProvider;
   /** GT-3 原生单端口 TLS 控制器；未装配时 /api/v1/admin/tls* 按未配置降级 */
   tls?: GatewayTlsBridge;
+  /** T5 容器内热更新控制器；未装配时 /api/v1/admin/update* 与 /admin/runtime 回落只读摘要 */
+  update?: GatewayUpdateBridge;
 }
 
 export type RouteHandler = (ctx: RouteContext, params: Record<string, string>) => Promise<void>;
@@ -181,9 +186,9 @@ export interface RouteDef {
 
 // ---------------------------------------------------------------- 信封
 
-export function sendOk(res: ServerResponse, data: unknown): void {
+export function sendOk(res: ServerResponse, data: unknown, status = 200): void {
   if (res.headersSent) return;
-  res.writeHead(200, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
   res.end(JSON.stringify({ ok: true, data }));
 }
 

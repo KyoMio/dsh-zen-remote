@@ -169,7 +169,7 @@ function wsSendJson(ws, obj) {
  * 走完挑战应答：读 challenge、（可选）算 join key 证明、签名 auth 上送。
  * 返回收到的 challenge 消息；后续 welcome 由调用方读。
  */
-async function authNode(ws, node, { networkId, joinKey, name, lanEndpoints = [], timestamp = Date.now(), omitProof = false, badSignature = false, badIdentity = false, pauseHold = false, reconnect = false } = {}) {
+async function authNode(ws, node, { networkId, joinKey, name, lanEndpoints = [], timestamp = Date.now(), omitProof = false, badSignature = false, badIdentity = false, pauseHold = false, reconnect = false, pluginVersion, recommendedGatewayVersion, wireCompatLevel, minRequiredWireCompatLevel } = {}) {
   const challenge = await wsJson(ws);
   assert.equal(challenge.type, 'challenge');
   assert.match(challenge.challengeHex, /^[0-9a-f]{64}$/);
@@ -192,6 +192,10 @@ async function authNode(ws, node, { networkId, joinKey, name, lanEndpoints = [],
   }
   if (pauseHold) auth.pauseHold = true;
   if (reconnect) auth.reconnect = true;
+  if (pluginVersion !== undefined) auth.pluginVersion = pluginVersion;
+  if (recommendedGatewayVersion !== undefined) auth.recommendedGatewayVersion = recommendedGatewayVersion;
+  if (wireCompatLevel !== undefined) auth.wireCompatLevel = wireCompatLevel;
+  if (minRequiredWireCompatLevel !== undefined) auth.minRequiredWireCompatLevel = minRequiredWireCompatLevel;
   wsSendJson(ws, auth);
   return challenge;
 }
@@ -483,6 +487,9 @@ async function startGateway(opts = {}) {
     ...(opts.pingIntervalMs !== undefined ? { pingIntervalMs: opts.pingIntervalMs } : {}),
     ...(opts.pongTimeoutMs !== undefined ? { pongTimeoutMs: opts.pongTimeoutMs } : {}),
     ...(opts.maxTargetBufferedBytes !== undefined ? { maxTargetBufferedBytes: opts.maxTargetBufferedBytes } : {}),
+    ...(opts.gatewayVersion !== undefined ? { gatewayVersion: opts.gatewayVersion } : {}),
+    ...(opts.getLatestKnownPluginVersion !== undefined ? { getLatestKnownPluginVersion: opts.getLatestKnownPluginVersion } : {}),
+    ...(opts.wireCompatRange !== undefined ? { wireCompatRange: opts.wireCompatRange } : {}),
   });
   const server = createGatewayApiServer({ store, masterKey, runtime: hub, hooks: hub.hooks, topology: hub });
   await new Promise((resolve, reject) => {
@@ -3701,6 +3708,116 @@ describe('T8：gateway-relay-backpressure-perf（控制帧免限速、背压、�
       await waitFor(() => gw.hub.getOnlineCountByNetwork(net.id) === 1);
       assert.equal(gw.hub.limiter.hasNodeBucket(net.id, a.nodeId), false, 'offline node bucket must be released');
       wsB.close();
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+describe('T2 /peer/v1/ws 双向版本握手与拓扑 pluginVersion', () => {
+  test('welcome / peer-joined / TopologyMemberRow 携带动态版本，推荐插件版由注入源或同网高版节点推导且兼容无版本旧客户端', async () => {
+    let knownLatestPlugin = null;
+    const gw = await startGateway({
+      getLatestKnownPluginVersion: () => knownLatestPlugin,
+    });
+    try {
+      const net = await createNetwork(gw, { mode: 'key' });
+      const a = identity();
+      const b = identity();
+      const c = identity();
+
+      // 1. Legacy client A omits all version fields -> accepted, recommendedPluginVersion = null
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey, name: 'legacy-a' });
+      const welcomeA = await wsJson(wsA);
+      assert.equal(welcomeA.status, 'authorized');
+      assert.equal(welcomeA.gatewayVersion, '0.2.0', 'gatewayVersion must come dynamically from gateway-server/package.json');
+      assert.equal(welcomeA.wireCompatLevel, 1);
+      assert.equal(welcomeA.recommendedPluginVersion, null);
+
+      // 2. Client B joins with pluginVersion 2.6.0 & recommendedGatewayVersion 0.2.1
+      const wsB = await wsOpen(gw.base);
+      await authNode(wsB, b, {
+        networkId: net.id,
+        joinKey: net.joinKey,
+        name: 'newer-b',
+        pluginVersion: '2.6.0',
+        recommendedGatewayVersion: '0.2.1',
+        wireCompatLevel: 1,
+      });
+      const welcomeB = await wsJson(wsB);
+      assert.equal(welcomeB.status, 'authorized');
+      assert.equal(welcomeB.gatewayVersion, '0.2.0');
+      assert.equal(welcomeB.recommendedPluginVersion, '2.6.0');
+      assert.equal(welcomeB.peers.length, 1);
+      assert.equal(welcomeB.peers[0].pluginVersion, null);
+
+      const joinedOnA = await wsJson(wsA);
+      assert.equal(joinedOnA.type, 'peer-joined');
+      assert.equal(joinedOnA.pluginVersion, '2.6.0');
+      assert.equal(gw.hub.getObservedRecommendedGatewayVersion(), '0.2.1');
+
+      // 3. TopologyMemberRow exposes pluginVersion for online peers and null for offline peers
+      const topo = await getTopology(gw, net.id);
+      const rowA = topo.members.find((m) => m.nodeId === a.nodeId);
+      const rowB = topo.members.find((m) => m.nodeId === b.nodeId);
+      assert.equal(rowA.pluginVersion, null);
+      assert.equal(rowB.pluginVersion, '2.6.0');
+
+      // 4. External knownLatestPlugin 2.7.0 overrides lower peer version when C joins
+      knownLatestPlugin = '2.7.0';
+      const wsC = await wsOpen(gw.base);
+      await authNode(wsC, c, {
+        networkId: net.id,
+        joinKey: net.joinKey,
+        name: 'mid-c',
+        pluginVersion: '2.5.1',
+        wireCompatLevel: 1,
+      });
+      const welcomeC = await wsJson(wsC);
+      assert.equal(welcomeC.recommendedPluginVersion, '2.7.0');
+      const peerBInC = welcomeC.peers.find((p) => p.nodeId === b.nodeId);
+      assert.equal(peerBInC.pluginVersion, '2.6.0');
+
+      // Offline peer B drops pluginVersion to null in topology
+      wsB.close();
+      await waitFor(() => gw.hub.getOnlineCountByNetwork(net.id) === 2);
+      const topoAfter = await getTopology(gw, net.id);
+      assert.equal(topoAfter.members.find((m) => m.nodeId === b.nodeId).pluginVersion, null);
+
+      wsA.close();
+      wsC.close();
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('不兼容的 wireCompatLevel 或 minRequiredWireCompatLevel 拒绝入网并返回 version-incompatible:*', async () => {
+    const gw = await startGateway({
+      gatewayVersion: '0.2.0',
+      wireCompatRange: { level: 2, minClientLevel: 2, maxClientLevel: 2 },
+    });
+    try {
+      const net = await createNetwork(gw, { mode: 'key' });
+      const a = identity();
+      const b = identity();
+
+      // Client wireCompatLevel=1 < minClientLevel=2 -> plugin-too-old
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey, wireCompatLevel: 1 });
+      const deniedA = await wsJson(wsA);
+      assert.equal(deniedA.type, 'denied');
+      assert.equal(deniedA.reason, 'version-incompatible:plugin-too-old');
+      assert.equal(deniedA.gatewayVersion, '0.2.0');
+      await wsClosed(wsA);
+
+      // Client minRequiredWireCompatLevel=3 > hub level=2 -> gateway-too-old
+      const wsB = await wsOpen(gw.base);
+      await authNode(wsB, b, { networkId: net.id, joinKey: net.joinKey, wireCompatLevel: 2, minRequiredWireCompatLevel: 3 });
+      const deniedB = await wsJson(wsB);
+      assert.equal(deniedB.type, 'denied');
+      assert.equal(deniedB.reason, 'version-incompatible:gateway-too-old');
+      await wsClosed(wsB);
     } finally {
       await gw.close();
     }

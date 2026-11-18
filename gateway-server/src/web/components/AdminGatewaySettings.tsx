@@ -12,12 +12,14 @@
 import { useEffect, useState } from 'react';
 import type { ChangeEvent, FormEvent } from 'react';
 
+import { copyTextToClipboard } from '../clipboard';
 import { ConsoleApiError } from '../store/console-store';
 import type {
   AdminSettingsData,
   AdminSettingsPatch,
   AdminSmtpDraft,
   AdminTlsView,
+  AdminUpdateView,
   ConsoleClient,
   GatewayRuntimeStatus,
   SmtpSecurity,
@@ -1194,6 +1196,215 @@ export function SmtpSettingsSection(props: {
       <SmtpForm t={t} client={client} settings={settings} onSettingsChanged={onSettingsChanged} />
       <div className="menu-sep" style={{ margin: '16px 0 14px' }} aria-hidden="true" />
       <SmtpTestForm t={t} client={client} settings={settings} />
+    </div>
+  );
+}
+
+export function UpdateSettingsSection(props: {
+  t: TranslateFn;
+  client: ConsoleClient;
+  settings: AdminSettingsData;
+  runtime: GatewayRuntimeStatus | null;
+  updateView: AdminUpdateView | null;
+  applyingUpdate: boolean;
+  restartingVersion: string | null;
+  onUpdateViewChanged: (next: AdminUpdateView) => void;
+  onSettingsChanged: AdminGatewaySettingsProps['onSettingsChanged'];
+  onApplyUpdate: () => Promise<void>;
+}) {
+  const {
+    t,
+    client,
+    settings,
+    runtime,
+    updateView,
+    applyingUpdate,
+    restartingVersion,
+    onUpdateViewChanged,
+    onSettingsChanged,
+    onApplyUpdate,
+  } = props;
+  const [checking, setChecking] = useState(false);
+  const [toggleBusy, setToggleBusy] = useState(false);
+  const [copiedCommand, setCopiedCommand] = useState(false);
+  const [errorText, setErrorText] = useState<string | null>(null);
+
+  const summary = updateView ?? runtime?.update ?? null;
+  const upgradeCommand = updateView?.upgradeCommand ?? 'docker compose pull && docker compose up -d';
+
+  const handleToggleAutoUpdate = async (): Promise<void> => {
+    if (toggleBusy) return;
+    setToggleBusy(true);
+    setErrorText(null);
+    try {
+      const nextSettings = await client.updateAdminSettings({
+        autoUpdateEnabled: !settings.autoUpdateEnabled,
+      });
+      onSettingsChanged(nextSettings);
+      const refreshed = await client.getAdminUpdate().catch(() => null);
+      if (refreshed !== null) onUpdateViewChanged(refreshed);
+    } catch (err) {
+      setErrorText(t(adminErrorToKey(err)));
+    } finally {
+      setToggleBusy(false);
+    }
+  };
+
+  const handleCheckNow = async (): Promise<void> => {
+    if (checking) return;
+    setChecking(true);
+    setErrorText(null);
+    try {
+      const nextView = await client.checkAdminUpdate();
+      onUpdateViewChanged(nextView);
+    } catch (err) {
+      setErrorText(err instanceof ConsoleApiError ? err.message : t('error.network'));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const handleCopyCommand = async (): Promise<void> => {
+    if (await copyTextToClipboard(upgradeCommand)) {
+      setCopiedCommand(true);
+      setTimeout(() => setCopiedCommand(false), 1800);
+    }
+  };
+
+  const currentVersionLabel = summary?.currentVersion ? `v${summary.currentVersion}` : '—';
+  const baseVersionLabel = summary?.baseVersion ? `v${summary.baseVersion}` : '—';
+  const sourceLabel =
+    summary?.activeSource === 'hot-update' ? t('admin.updateSourceHot') : t('admin.updateSourceBase');
+  const canHotApply =
+    summary !== null &&
+    summary.updateAvailable &&
+    summary.compatibility === 'compatible' &&
+    summary.supervisorManaged;
+  const needsPull =
+    summary !== null &&
+    summary.updateAvailable &&
+    (summary.compatibility !== 'compatible' || !summary.supervisorManaged);
+
+  return (
+    <div>
+      <p className="section-title" style={{ margin: '0 0 10px' }}>
+        {t('admin.updateSectionTitle')}
+      </p>
+      <div className="setting-form">
+        <dl className="meta-grid update-meta-grid">
+          <div className="meta-item">
+            <dt>{t('admin.updateCurrentVersion')}</dt>
+            <dd className="mono">{currentVersionLabel}</dd>
+          </div>
+          <div className="meta-item">
+            <dt>{t('admin.updateBaseVersion')}</dt>
+            <dd className="mono">{baseVersionLabel}</dd>
+          </div>
+          <div className="meta-item">
+            <dt>{t('admin.updateSourceLabel')}</dt>
+            <dd>{sourceLabel}</dd>
+          </div>
+          <div className="meta-item">
+            <dt>{t('admin.updateSupervisorLabel')}</dt>
+            <dd>{summary?.supervisorManaged ? t('admin.updateSupervisorOn') : t('admin.updateSupervisorOff')}</dd>
+          </div>
+        </dl>
+
+        <div className="setting-row">
+          <div>
+            <span id="admin-auto-update-label">{t('admin.updateAutoToggle')}</span>
+            <p className="field-hint">{t('admin.updateAutoToggleHint')}</p>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={settings.autoUpdateEnabled}
+            aria-labelledby="admin-auto-update-label"
+            className={settings.autoUpdateEnabled ? 'switch on' : 'switch'}
+            disabled={toggleBusy}
+            onClick={() => {
+              void handleToggleAutoUpdate();
+            }}
+          >
+            <span className="switch-knob" aria-hidden="true" />
+          </button>
+        </div>
+
+        <div className="update-actions-row">
+          <button
+            type="button"
+            className="btn"
+            disabled={checking || applyingUpdate || restartingVersion !== null}
+            onClick={() => {
+              void handleCheckNow();
+            }}
+          >
+            {checking ? t('admin.updateChecking') : t('admin.updateCheckNowButton')}
+          </button>
+          {canHotApply && (
+            <button
+              type="button"
+              className="btn primary"
+              disabled={applyingUpdate || restartingVersion !== null}
+              onClick={() => {
+                void onApplyUpdate();
+              }}
+            >
+              {applyingUpdate ? t('admin.updateApplying') : t('admin.updateNowButton')}
+            </button>
+          )}
+          <span className="field-hint">
+            {t('admin.updateLastChecked')}:{' '}
+            {updateView?.lastCheckedAt ? new Date(updateView.lastCheckedAt).toLocaleString() : t('admin.updateNeverChecked')}
+          </span>
+        </div>
+
+        {updateView?.lastCheckError && (
+          <p className="form-error">{t('admin.updateCheckFailed', { reason: updateView.lastCheckError })}</p>
+        )}
+        {errorText !== null && <p className="form-error">{errorText}</p>}
+
+        {summary !== null && !summary.updateAvailable && updateView?.lastCheckedAt && !updateView.lastCheckError && (
+          <p className="form-status-ok" role="status">
+            {t('admin.updateUpToDate')}
+          </p>
+        )}
+
+        {summary?.offlinePeerRecommendedVersion && (
+          <p className="field-hint">
+            {t('admin.updateOfflinePeerHint', { version: `v${summary.offlinePeerRecommendedVersion}` })}
+          </p>
+        )}
+
+        {updateView?.notesSummary && (
+          <div className="update-notes-box">
+            <span className="field-label">{t('admin.updateNotesLabel')}</span>
+            <p className="field-hint" style={{ whiteSpace: 'pre-line' }}>
+              {updateView.notesSummary}
+            </p>
+          </div>
+        )}
+
+        {needsPull && (
+          <div className="update-command-box">
+            <p className="field-hint">
+              {t('admin.updateBannerPullRequired', { version: `v${summary.latestVersion ?? ''}` })}
+            </p>
+            <div className="invite-box">
+              <code className="invite-key mono">{upgradeCommand}</code>
+              <button
+                type="button"
+                className="btn"
+                onClick={() => {
+                  void handleCopyCommand();
+                }}
+              >
+                {copiedCommand ? t('admin.updateCommandCopied') : t('admin.updateCopyCommand')}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

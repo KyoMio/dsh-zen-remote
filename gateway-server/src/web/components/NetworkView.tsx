@@ -31,6 +31,8 @@ import {
   filterJoinedMembers,
   formatBytesQuota,
   formatRate,
+  highestPluginVersion,
+  isMemberPluginOutdated,
   isQuotaExceeded,
   maskInviteUri,
   memberStatusView,
@@ -78,6 +80,8 @@ export interface NetworkViewProps {
   quota?: UserQuotaSummary | null;
   /** formatBytesQuota 的语言实参（GC-10b 起 App 接线真实界面语言）；未传回落 readUiLocale() */
   locale?: Locale;
+  /** 已知最新插件版本（来自管理员运行态或 Releases）；缺省仅按同网络节点最高版本号比对 */
+  latestPluginVersion?: string | null;
   onPatchNetwork: (patch: NetworkPatchInput) => void;
   onDeleteNetwork: () => void;
   onRotateInviteKey: () => void;
@@ -486,6 +490,7 @@ export function NetworkView(props: NetworkViewProps) {
     onCopyField,
     quota,
     locale,
+    latestPluginVersion,
     onPatchNetwork,
     onDeleteNetwork,
     onRotateInviteKey,
@@ -558,6 +563,7 @@ export function NetworkView(props: NetworkViewProps) {
 
   // 连接对统计（cell 3）：严格按双向直连归并口径
   const pairSummary = summarizeNetworkPairs(joinedMembers, links);
+  const maxPluginVer = highestPluginVersion(joinedMembers, latestPluginVersion);
 
   const detailMember = detailNodeId !== null ? (members.find((m) => m.nodeId === detailNodeId) ?? null) : null;
   if (detailMember !== null && topology !== null) {
@@ -566,6 +572,7 @@ export function NetworkView(props: NetworkViewProps) {
         t={t}
         topology={topology}
         member={detailMember}
+        latestPluginVersion={maxPluginVer}
         ui={ui}
         onUi={onUi}
         busy={busy}
@@ -888,7 +895,15 @@ export function NetworkView(props: NetworkViewProps) {
                     }}
                   >
                     <td className="device-cell-name">
-                      <div className="device-name">{displayName(member, t)}</div>
+                      <div className="device-name-line">
+                        <span className="device-name">{displayName(member, t)}</span>
+                        {member.pluginVersion && (
+                          <span className="device-version mono">v{member.pluginVersion}</span>
+                        )}
+                        {isMemberPluginOutdated(member.pluginVersion, maxPluginVer) && (
+                          <span className="badge badge-warn">{t('devices.pluginOutdatedBadge')}</span>
+                        )}
+                      </div>
                       {member.note !== null && <div className="device-note">{member.note}</div>}
                     </td>
                     <td className="device-cell-status">

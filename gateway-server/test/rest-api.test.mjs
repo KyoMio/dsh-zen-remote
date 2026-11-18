@@ -50,6 +50,7 @@ async function startServer(opts = {}) {
     publicUrl: opts.publicUrl,
     runtimeMeta: opts.runtimeMeta,
     runtime: opts.runtime,
+    update: opts.update,
     hooks: {
       onMemberChanged: (event) => hooks.memberChanged.push(event),
       onNetworkDeleted: (networkId) => hooks.networkDeleted.push(networkId),
@@ -754,6 +755,7 @@ describe('REST API /api/v1（主服务器）', () => {
         relayRateKbps: 2048,
         publicUrl: null,
         sessionTtlDays: 7,
+        autoUpdateEnabled: true,
         defaultGroupId: 'grp_default',
         smtp: {
           configured: false,
@@ -1470,6 +1472,7 @@ describe('GC-6a GET /admin/runtime：运行态聚合与安全告警', () => {
       'totalLiveRelayKbps',
       'udpAltPort',
       'udpPort',
+      'update',
     ]);
     assert.equal(data.listenPort, 19393);
     assert.equal(data.udpPort, 19393);
@@ -2887,6 +2890,121 @@ describe('T8：server.ts getExtendedSettings() 短效缓存与写操作失效', 
       assert.equal(after.status, 200);
       assert.equal(after.json.data.allowSignup, true);
       assert.ok(dbReadCount >= 2 && dbReadCount <= 3, `PATCH invalidates cache cleanly without repeated reads (got ${dbReadCount})`);
+
+      const badAuto = await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { autoUpdateEnabled: 'no' },
+      });
+      assert.equal(badAuto.status, 400);
+
+      const patchAuto = await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { autoUpdateEnabled: false },
+      });
+      assert.equal(patchAuto.status, 200);
+      assert.equal(patchAuto.json.data.autoUpdateEnabled, false);
+      assert.equal((await h.store.getExtendedSettings()).autoUpdateEnabled, false);
+    } finally {
+      await stopServer(h);
+    }
+  });
+});
+
+describe('T5 /api/v1/admin/update* 与 /admin/runtime update 摘要', () => {
+  test('非管理员 403、匿名 401，管理员可查/检/应用(202)/忽略回滚且响应严格脱敏', async () => {
+    let restartScheduled = 0;
+    let dismissed = false;
+    let checked = false;
+    const fakeUpdateBridge = {
+      getRuntimeSummary(autoUpdateEnabled) {
+        return {
+          currentVersion: '0.2.0',
+          baseVersion: '0.2.0',
+          activeSource: 'base',
+          supervisorManaged: true,
+          autoUpdateEnabled,
+          updateAvailable: checked,
+          latestVersion: checked ? '0.3.0' : null,
+          latestPluginVersion: checked ? '2.6.0' : null,
+          compatibility: 'compatible',
+          offlinePeerRecommendedVersion: '0.2.5',
+          rollbackReason: dismissed ? null : 'startup health check timed out',
+        };
+      },
+      getStatusView(autoUpdateEnabled) {
+        return {
+          ...this.getRuntimeSummary(autoUpdateEnabled),
+          lastCheckedAt: checked ? '2026-11-18T00:00:00.000Z' : null,
+          lastCheckError: null,
+          incompatibilityReason: null,
+          notesSummary: checked ? 'Release notes' : null,
+          hasOfficialDigest: checked,
+          lastRollback: dismissed
+            ? null
+            : {
+                failedVersion: '0.2.9',
+                rolledBackTo: '0.2.0',
+                reason: 'startup health check timed out',
+                at: '2026-11-18T00:00:00.000Z',
+              },
+          upgradeCommand: 'docker compose pull && docker compose up -d',
+        };
+      },
+      async checkNow(autoUpdateEnabled) {
+        checked = true;
+        return this.getStatusView(autoUpdateEnabled);
+      },
+      async applyNow() {
+        restartScheduled += 1;
+        return { accepted: true, status: 'restarting', version: '0.3.0' };
+      },
+      dismissRollback(autoUpdateEnabled) {
+        dismissed = true;
+        return this.getStatusView(autoUpdateEnabled);
+      },
+    };
+
+    const h = await startServer({ update: fakeUpdateBridge });
+    try {
+      await seedUsers(h.store);
+      const adminCookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const tenantCookie = await login(h.base, TENANT_EMAIL, TENANT_PASSWORD);
+
+      // Anonymous -> 401; non-admin -> 403
+      for (const [method, p] of [
+        ['GET', '/api/v1/admin/update'],
+        ['POST', '/api/v1/admin/update/check'],
+        ['POST', '/api/v1/admin/update/apply'],
+        ['POST', '/api/v1/admin/update/dismiss-rollback'],
+      ]) {
+        const anon = await api(h.base, method, p);
+        assert.equal(anon.status, 401, `${method} ${p} anonymous must be 401`);
+        const forbidden = await api(h.base, method, p, { cookie: tenantCookie });
+        assert.equal(forbidden.status, 403, `${method} ${p} tenant must be 403`);
+      }
+
+      const rt = await api(h.base, 'GET', '/api/v1/admin/runtime', { cookie: adminCookie });
+      assert.equal(rt.status, 200);
+      assert.equal(rt.json.data.update.currentVersion, '0.2.0');
+      assert.equal(rt.json.data.update.supervisorManaged, true);
+      assert.equal(rt.json.data.update.offlinePeerRecommendedVersion, '0.2.5');
+      assert.equal(rt.json.data.update.rollbackReason, 'startup health check timed out');
+
+      const checkRes = await api(h.base, 'POST', '/api/v1/admin/update/check', { cookie: adminCookie });
+      assert.equal(checkRes.status, 200);
+      assert.equal(checkRes.json.data.updateAvailable, true);
+      assert.equal(checkRes.json.data.latestVersion, '0.3.0');
+
+      const applyRes = await api(h.base, 'POST', '/api/v1/admin/update/apply', { cookie: adminCookie });
+      assert.equal(applyRes.status, 202);
+      assert.equal(applyRes.json.data.status, 'restarting');
+      assert.equal(applyRes.json.data.version, '0.3.0');
+      assert.equal(restartScheduled, 1);
+
+      const dismissRes = await api(h.base, 'POST', '/api/v1/admin/update/dismiss-rollback', { cookie: adminCookie });
+      assert.equal(dismissRes.status, 200);
+      assert.equal(dismissRes.json.data.lastRollback, null);
+      assert.equal(dismissRes.json.data.rollbackReason, null);
     } finally {
       await stopServer(h);
     }

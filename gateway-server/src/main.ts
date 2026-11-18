@@ -7,6 +7,7 @@
 // 决定；管理员账号经 store.ensureBootstrapAdmin 引导——空库且未给
 // ZR_GATEWAY_ADMIN_PASSWORD 时生成 16 位随机密码，仅在创建成功的输出里
 // 打印一次（result.generatedPassword），已建库重启绝不重复创建或改密。
+import fs from 'node:fs';
 import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
@@ -19,11 +20,21 @@ import { createApiRequestHandler } from './server.js';
 import type { GatewayTlsBridge } from './server.js';
 import { PgStore } from './store/pg-store.js';
 import { SqliteStore } from './store/sqlite-store.js';
-import type { BootstrapAdminResult, GatewayStore, SystemSettings } from './store/types.js';
+import type { BootstrapAdminResult, ExtendedSystemSettings, GatewayStore, SystemSettings } from './store/types.js';
 import { PeerWsHub } from './peer-hub/ws-hub.js';
 import { UdpStunService } from './peer-hub/udp-stun.js';
 import { createDualProtocolServer } from './tls/dual-protocol-server.js';
 import { TlsManager } from './tls/tls-manager.js';
+import {
+  IdleAutoUpdateScheduler,
+  UpdateManager,
+  createGatewayUpdateBridge,
+  type UpdateManagerOptions,
+} from './update/update-manager.js';
+import { readPackageVersion, resolveAppRootPackagePath } from './update/version.js';
+
+/** Convention exit code consumed by `bootstrap.ts` to hot-swap without exiting PID 1. */
+export const UPDATE_RESTART_EXIT_CODE = 75;
 
 export interface GatewayInstance {
   readonly config: GatewayConfig;
@@ -32,6 +43,7 @@ export interface GatewayInstance {
   readonly hub: PeerWsHub;
   readonly udp: UdpStunService;
   readonly server: http.Server;
+  readonly updateManager: UpdateManager;
   /** 引导管理员的结果：created=false 表示复用已有账号（数据库已初始化过） */
   readonly admin: BootstrapAdminResult;
   /** HTTP/TLS 实际监听端口（config.port=0 时为内核分配值） */
@@ -40,6 +52,8 @@ export interface GatewayInstance {
   readonly udpPorts: { primaryPort: number; altPort: number | null };
   /** 本机回环访问入口（打印与测试用，随初始 TLS 状态为 http:// 或 https://） */
   readonly base: string;
+  /** 注册由管理台触发热更新重启时的回调（主要由 main() 挂接 exit 75 停机链） */
+  setOnUpdateRestart(fn: (() => void) | null): void;
   /** 逐层关停（PC-19 第二片）：UDP → WS（末批遥测刷盘确认后才过）→ HTTP/TLS → 数据库；共享墙钟预算与同一真实结果 */
   close(): Promise<void>;
 }
@@ -57,6 +71,14 @@ export interface StartGatewayOptions {
    * 失败兜底路径上每一步资源停止的独立短预算（毫秒，默认 1000）。
    */
   abortStepBudgetMs?: number;
+  /** 覆盖 UpdateManager 构造参数（测试注入 releasesApiUrl / fetchImpl / selfCheckRunner 等） */
+  updateManagerOptions?: Partial<UpdateManagerOptions>;
+  /** 覆盖是否处于 bootstrap.ts 守护态（缺省读 ZR_GATEWAY_SUPERVISED === '1'） */
+  supervisorManaged?: boolean;
+  /** 覆盖激活来源（缺省读 ZR_GATEWAY_ACTIVE_SOURCE === 'hot-update' ? 'hot-update' : 'base'） */
+  activeSource?: 'hot-update' | 'base';
+  /** 触发更新重启回调 */
+  onUpdateRestart?: () => void;
 }
 
 /** 关停墙钟预算缺省值：末批一小批 + 逐层关闭的正常量级，余量给慢盘 */
@@ -81,11 +103,12 @@ function listen(server: net.Server, port: number): Promise<void> {
 async function openStore(config: GatewayConfig): Promise<GatewayStore> {
   // 部署配置作为播种初始值进两种存储：空库按本轮配置播种、已有键不被覆盖、
   // 缺键逐键补齐（两种 store 同一语义），重启绝不推翻控制台改过的持久化设置。
-  const seed: SystemSettings = {
+  const seed: Partial<ExtendedSystemSettings> = {
     allowSignup: config.allowSignup,
     maxNetworksPerUser: config.maxNetworksPerUser,
     defaultMaxPeers: config.defaultMaxPeers,
     relayRateKbps: config.relayRateKbps,
+    ...(config.autoUpdateEnabled !== undefined ? { autoUpdateEnabled: config.autoUpdateEnabled } : {}),
   };
   if (config.databaseUrl !== undefined) {
     return PgStore.connect(config.databaseUrl, seed);
@@ -116,7 +139,23 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
     // 查询为空、通知无业务状态；真实绑定端口在 bind 完成后经供给器供给
     // welcome（PC-01a），不把配置值或 HTTP 端口当 UDP 端口。
     let udpPorts: { primaryPort: number; altPort: number | null } | null = null;
-    const hub = new PeerWsHub({ store, masterKey, stunPorts: () => udpPorts });
+    const supervisorManaged =
+      options.supervisorManaged ?? process.env['ZR_GATEWAY_SUPERVISED'] === '1';
+    const activeSource: 'hot-update' | 'base' =
+      options.activeSource ??
+      (process.env['ZR_GATEWAY_ACTIVE_SOURCE'] === 'hot-update' ? 'hot-update' : 'base');
+    const updateManager = new UpdateManager({
+      dataDir: config.dataDir,
+      ...options.updateManagerOptions,
+    });
+    let onUpdateRestart: (() => void) | null = options.onUpdateRestart ?? null;
+
+    const hub = new PeerWsHub({
+      store,
+      masterKey,
+      stunPorts: () => udpPorts,
+      getLatestKnownPluginVersion: () => updateManager.getLatestPluginVersion(),
+    });
     const udp = new UdpStunService({
       primaryPort: config.port,
       // 配置层 `udpAltPort=0 表示关闭辅助口` → 映射成 udp-stun 的 null
@@ -135,6 +174,16 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
       updateSettings: (input) => tlsManager.applySettings(store, input),
       reload: () => tlsManager.reloadFromDisk(),
     };
+    const updateBridge = createGatewayUpdateBridge({
+      updateManager,
+      supervisorManaged,
+      activeSource,
+      getOfflinePeerRecommendedVersion: () => hub.getObservedRecommendedGatewayVersion(),
+      getHighestObservedPluginVersion: () => hub.getRecommendedPluginVersion(),
+      onScheduleRestart: () => {
+        onUpdateRestart?.();
+      },
+    });
     const requestHandler = createApiRequestHandler({
       store,
       masterKey,
@@ -165,6 +214,7 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
       topology: hub,
       staticRoot,
       tls: tlsBridge,
+      update: updateBridge,
     });
     const dualServer = createDualProtocolServer({
       requestHandler,
@@ -285,10 +335,14 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
       hub,
       udp,
       server,
+      updateManager,
       admin,
       port,
       udpPorts,
       base,
+      setOnUpdateRestart: (fn: (() => void) | null): void => {
+        onUpdateRestart = fn;
+      },
       close: (): Promise<void> => {
         if (closePromise === null) closePromise = closeGateway();
         return closePromise;
@@ -303,25 +357,66 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
 }
 
 /** CLI 入口：读 env、启动、打印入口地址与一次性初始密码，SIGINT/SIGTERM 优雅停机 */
-export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+export async function main(env: NodeJS.ProcessEnv = process.env, argv: readonly string[] = process.argv): Promise<void> {
+  if (argv.includes('--self-check')) {
+    const publicIndex = fileURLToPath(new URL('./public/index.html', import.meta.url));
+    if (!fs.existsSync(publicIndex) || !fs.statSync(publicIndex).isFile()) {
+      console.error(`[gateway] self-check failed: missing ${publicIndex}`);
+      process.exit(1);
+    }
+    if (
+      typeof startGateway !== 'function' ||
+      typeof createApiRequestHandler !== 'function' ||
+      typeof PeerWsHub !== 'function'
+    ) {
+      console.error('[gateway] self-check failed: core exports missing');
+      process.exit(1);
+    }
+    process.exit(0);
+  }
+
   const config = resolveGatewayConfig(env);
-  const gw = await startGateway(config);
+  const supervisorManaged = env['ZR_GATEWAY_SUPERVISED'] === '1';
+  const activeSource: 'hot-update' | 'base' =
+    env['ZR_GATEWAY_ACTIVE_SOURCE'] === 'hot-update' ? 'hot-update' : 'base';
+  const gw = await startGateway(config, { supervisorManaged, activeSource });
 
   let shuttingDown = false;
-  const shutdown = (signal: string): void => {
+  let scheduler: IdleAutoUpdateScheduler | null = null;
+  const shutdown = (signal: string, exitCode = 0): void => {
     if (shuttingDown) return;
     shuttingDown = true;
+    scheduler?.stop();
     console.log(`[gateway] received ${signal}, shutting down`);
     void gw
       .close()
-      .then(() => process.exit(0))
+      .then(() => process.exit(exitCode))
       .catch((err: unknown) => {
         console.error('[gateway] shutdown failed:', err);
         process.exit(1);
       });
   };
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  gw.setOnUpdateRestart(() => shutdown('update-apply', UPDATE_RESTART_EXIT_CODE));
+  scheduler = new IdleAutoUpdateScheduler({
+    updateManager: gw.updateManager,
+    supervisorManaged,
+    isAutoUpdateEnabled: async () => (await gw.store.getExtendedSettings()).autoUpdateEnabled,
+    getTotalLiveRelayKbps: () => gw.hub.getTotalLiveRelayKbps(),
+    onRestart: () => shutdown('auto-update', UPDATE_RESTART_EXIT_CODE),
+  });
+  scheduler.start();
+  process.on('SIGINT', () => shutdown('SIGINT', 0));
+  process.on('SIGTERM', () => shutdown('SIGTERM', 0));
+  process.on('message', (msg: unknown) => {
+    if (typeof msg === 'object' && msg !== null && (msg as { type?: unknown }).type === 'zr-shutdown') {
+      shutdown('IPC:zr-shutdown', 0);
+    }
+  });
+
+  const currentVersion = readPackageVersion(resolveAppRootPackagePath(import.meta.url));
+  if (typeof process.send === 'function') {
+    process.send({ type: 'zr-gateway-ready', version: currentVersion });
+  }
 
   console.log('Zen Remote gateway ready');
   console.log(`  console  ${gw.base}/`);

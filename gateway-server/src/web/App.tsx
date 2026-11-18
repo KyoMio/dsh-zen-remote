@@ -884,6 +884,7 @@ export function App() {
             onCopyField={handleCopyField}
             quota={state.quota}
             locale={locale}
+            latestPluginVersion={state.adminRuntime?.update?.latestPluginVersion ?? null}
             onPatchNetwork={(patch) => void handlePatchNetwork(selected.id, patch)}
             onDeleteNetwork={() => void handleDeleteNetwork(selected.id)}
             onRotateInviteKey={() => void handleRotateInviteKey(selected.id)}

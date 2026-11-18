@@ -88,6 +88,8 @@ export interface TopologyMemberRow {
   cumulativeRelayBytes: number;
   /** 最后一次遥测/入网落库时间；从未上报过为 null（界面显示「刚刚」） */
   lastSeenAt: string | null;
+  /** 对端在 WS hello 中自报的插件版本号（老节点可能省略或为 null） */
+  pluginVersion?: string | null;
 }
 
 export interface TopologyLink {
@@ -221,6 +223,47 @@ export type SecurityWarning =
   | 'TLS_CERT_EXPIRED'
   | 'TLS_RELOAD_FAILED';
 
+export type AdminUpdateCompatibility = 'compatible' | 'image-pull-required';
+
+export interface ReleaseRollbackRecord {
+  failedVersion: string;
+  rolledBackTo: string;
+  reason: string;
+  at: string;
+}
+
+export interface AdminUpdateRuntimeSummary {
+  currentVersion: string | null;
+  baseVersion: string | null;
+  activeSource: 'hot-update' | 'base';
+  supervisorManaged: boolean;
+  autoUpdateEnabled: boolean;
+  updateAvailable: boolean;
+  latestVersion: string | null;
+  latestPluginVersion: string | null;
+  compatibility: AdminUpdateCompatibility;
+  offlinePeerRecommendedVersion: string | null;
+  rollbackReason: string | null;
+}
+
+export interface AdminUpdateView extends AdminUpdateRuntimeSummary {
+  lastCheckedAt: string | null;
+  lastCheckError: string | null;
+  incompatibilityReason: string | null;
+  notesSummary: string | null;
+  hasOfficialDigest: boolean;
+  lastRollback: ReleaseRollbackRecord | null;
+  upgradeCommand: string;
+}
+
+export interface ApplyUpdateOutcome {
+  accepted: boolean;
+  status: 'restarting' | 'up-to-date' | 'image-pull-required';
+  version: string | null;
+  reason?: string;
+  upgradeCommand?: string;
+}
+
 /** GET /api/v1/admin/runtime 的只读运行态（脱敏红线：绝无数据库串/密钥/绝对路径） */
 export interface GatewayRuntimeStatus {
   listenPort: number;
@@ -237,6 +280,7 @@ export interface GatewayRuntimeStatus {
   totalLiveRelayKbps: number;
   cumulativeRelayBytes: number;
   securityWarnings: SecurityWarning[];
+  update?: AdminUpdateRuntimeSummary;
 }
 
 export interface TlsCertSummary {
@@ -331,6 +375,7 @@ export interface AdminSettingsData {
   /** 登录态有效期（天），后端约束 1..90 */
   sessionTtlDays: number;
   defaultGroupId: string;
+  autoUpdateEnabled: boolean;
   smtp: AdminSmtpView;
   adminApiKey: AdminApiKeyView;
 }
@@ -358,6 +403,7 @@ export interface AdminSettingsPatch {
   publicUrl?: string | null;
   sessionTtlDays?: number;
   defaultGroupId?: string;
+  autoUpdateEnabled?: boolean;
   smtp?: AdminSmtpDraft | null;
 }
 
@@ -1262,6 +1308,26 @@ export class ConsoleClient {
   /** 立即从磁盘重载激活证书并刷新运行期 TLS 上下文 */
   async reloadAdminTls(): Promise<AdminTlsView> {
     return this.request('POST', '/api/v1/admin/tls/reload');
+  }
+
+  /** 读取网关自更新状态、可用版本与回滚记录（脱敏） */
+  async getAdminUpdate(signal?: AbortSignal): Promise<AdminUpdateView> {
+    return this.request('GET', '/api/v1/admin/update', undefined, signal);
+  }
+
+  /** 立即向 GitHub Releases 检查一次新版本（无状态、不重启） */
+  async checkAdminUpdate(): Promise<AdminUpdateView> {
+    return this.request('POST', '/api/v1/admin/update/check');
+  }
+
+  /** 下载验证并准备热更新（成功则返回 202 restarting，或 image-pull-required 指引升级镜像） */
+  async applyAdminUpdate(): Promise<ApplyUpdateOutcome> {
+    return this.request('POST', '/api/v1/admin/update/apply');
+  }
+
+  /** 确认并关闭最近一次自动回滚告警 */
+  async dismissUpdateRollback(): Promise<AdminUpdateView> {
+    return this.request('POST', '/api/v1/admin/update/dismiss-rollback');
   }
 
   // ---- SSE

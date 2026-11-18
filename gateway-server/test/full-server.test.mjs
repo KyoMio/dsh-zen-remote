@@ -1127,6 +1127,7 @@ describe('PC-07 部署配置播种：resolveGatewayConfig → startGateway 生�
     requireEmailVerification: false,
     publicUrl: null,
     sessionTtlDays: 7,
+    autoUpdateEnabled: true,
     defaultGroupId: 'grp_default',
     smtp: {
       configured: false,

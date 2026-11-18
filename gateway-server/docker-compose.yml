@@ -30,7 +30,9 @@ services:
       # ZR_GATEWAY_DATABASE_URL: postgres://zr_gateway:change_me@postgres:5432/zr_gateway
 
     volumes:
-      # Named volume recommended for /data (holds SQLite DB + 0600 master.key)
+      # Named volume recommended for /data (holds SQLite DB + 0600 master.key,
+      # and in-container hot-update releases stored under /data/releases when
+      # built-in auto-update is enabled — no external sidecar container needed)
       - zr-gateway-data:/data
       # Certificate directory for built-in TLS (fullchain.pem / privkey.pem; Linux writable dir needs chown 100:101 ./certs)
       - ./certs:/certs

@@ -621,6 +621,7 @@ function runTestChild(mode, schema, deadlineMs) {
     requireEmailVerification: false,
     publicUrl: null,
     sessionTtlDays: 7,
+    autoUpdateEnabled: true,
     defaultGroupId: 'grp_default',
     smtp: {
       configured: false,
@@ -1086,5 +1087,15 @@ function runTestChild(mode, schema, deadlineMs) {
     const afterRetry = await store.listMembers(net.id);
     assert.equal(afterRetry.find((m) => m.nodeId === '51aaaaaa').cumulativeRelayBytes, a0 + 50);
     assert.equal(afterRetry.find((m) => m.nodeId === '52aaaaaa').cumulativeRelayBytes, b0 + 7);
+  });
+
+  test('T3 PgStore autoUpdateEnabled 默认值与读写持久化', { timeout: 30_000 }, async () => {
+    const ext = await store.getExtendedSettings();
+    assert.equal(ext.autoUpdateEnabled, true);
+    const updated = await store.updateExtendedSettings({ autoUpdateEnabled: false });
+    assert.equal(updated.autoUpdateEnabled, false);
+    assert.equal((await store.getExtendedSettings()).autoUpdateEnabled, false);
+    await store.updateExtendedSettings({ autoUpdateEnabled: true });
+    assert.equal((await store.getExtendedSettings()).autoUpdateEnabled, true);
   });
 });

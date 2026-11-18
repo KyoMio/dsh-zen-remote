@@ -26,6 +26,8 @@ import {
   formatLatencyRange,
   formatQuotaExpiry,
   formatRate,
+  highestPluginVersion,
+  isMemberPluginOutdated,
   isQuotaExceeded,
   maskInviteUri,
   memberStatusView,
@@ -150,6 +152,19 @@ function makeRuntimeStatus(overrides = {}) {
     totalLiveRelayKbps: 12.5,
     cumulativeRelayBytes: 1048576,
     securityWarnings: [],
+    update: {
+      currentVersion: '0.2.0',
+      baseVersion: '0.2.0',
+      activeSource: 'base',
+      supervisorManaged: false,
+      autoUpdateEnabled: true,
+      updateAvailable: false,
+      latestVersion: null,
+      latestPluginVersion: null,
+      compatibility: 'compatible',
+      offlinePeerRecommendedVersion: null,
+      rollbackReason: null,
+    },
     ...overrides,
   };
 }
@@ -164,6 +179,7 @@ function makeAdminSettings(overrides = {}) {
     relayRateKbps: 512,
     publicUrl: null,
     sessionTtlDays: 7,
+    autoUpdateEnabled: true,
     defaultGroupId: 'grp_default',
     smtp: {
       configured: false,
@@ -679,6 +695,7 @@ function makeMember(nodeId, status, overrides = {}) {
     liveRelayKbps: 0,
     cumulativeRelayBytes: 0,
     lastSeenAt: null,
+    pluginVersion: null,
     ...overrides,
   };
 }
@@ -2577,5 +2594,63 @@ describe('T5：双向直连归并（resolvePairLink / summarizeNetworkPairs / su
       blocked: 1,
       latency: '—',
     });
+  });
+});
+
+describe('T5 ConsoleClient 更新接口与插件版本提示判定', () => {
+  test('ConsoleClient getAdminUpdate / checkAdminUpdate / applyAdminUpdate / dismissUpdateRollback', async () => {
+    const view = {
+      currentVersion: '0.2.0',
+      baseVersion: '0.2.0',
+      activeSource: 'base',
+      supervisorManaged: true,
+      autoUpdateEnabled: true,
+      updateAvailable: true,
+      latestVersion: '0.3.0',
+      latestPluginVersion: '2.6.0',
+      compatibility: 'compatible',
+      offlinePeerRecommendedVersion: null,
+      rollbackReason: null,
+      lastCheckedAt: '2026-11-18T00:00:00.000Z',
+      lastCheckError: null,
+      incompatibilityReason: null,
+      notesSummary: 'fix',
+      hasOfficialDigest: true,
+      lastRollback: null,
+      upgradeCommand: 'docker compose pull && docker compose up -d',
+    };
+    const { calls, impl } = fakeFetch((url) =>
+      jsonEnvelope(200, {
+        ok: true,
+        data: url === '/api/v1/admin/update/apply' ? { accepted: true, status: 'restarting', version: '0.3.0' } : view,
+      }),
+    );
+    const client = new ConsoleClient({ fetchImpl: impl });
+    assert.deepEqual(await client.getAdminUpdate(), view);
+    assert.deepEqual(await client.checkAdminUpdate(), view);
+    assert.deepEqual(await client.applyAdminUpdate(), { accepted: true, status: 'restarting', version: '0.3.0' });
+    assert.deepEqual(await client.dismissUpdateRollback(), view);
+    assert.deepEqual(
+      calls.map((c) => `${c.init.method} ${c.url}`),
+      [
+        'GET /api/v1/admin/update',
+        'POST /api/v1/admin/update/check',
+        'POST /api/v1/admin/update/apply',
+        'POST /api/v1/admin/update/dismiss-rollback',
+      ],
+    );
+  });
+
+  test('highestPluginVersion 与 isMemberPluginOutdated 判定旧版插件温和提示徽标', () => {
+    const m1 = makeMember('aaaa', 'authorized', { pluginVersion: '2.5.0' });
+    const m2 = makeMember('bbbb', 'authorized', { pluginVersion: '2.6.0' });
+    const mLegacy = makeMember('cccc', 'authorized', { pluginVersion: null });
+    assert.equal(highestPluginVersion([m1, m2, mLegacy]), '2.6.0');
+    assert.equal(highestPluginVersion([m1, mLegacy], '2.7.0'), '2.7.0');
+    assert.equal(highestPluginVersion([mLegacy]), null);
+    assert.equal(isMemberPluginOutdated(m1.pluginVersion, '2.6.0'), true);
+    assert.equal(isMemberPluginOutdated(m2.pluginVersion, '2.6.0'), false);
+    assert.equal(isMemberPluginOutdated(mLegacy.pluginVersion, '2.6.0'), false);
+    assert.equal(isMemberPluginOutdated('2.7.0-beta.1', '2.7.0'), true);
   });
 });

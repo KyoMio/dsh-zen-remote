@@ -190,6 +190,15 @@ Admins access **Gateway Admin** from the top bar, organized into six functional 
 
 Back up both the database and `master.key` before upgrading the gateway, then upgrade peer plugins machine by machine (updating the desktop plugin alone does not update the standalone gateway container).
 
+### In-container hot-updates & 15s automatic rollback
+
+The container starts via `dist/bootstrap.js` (PID 1 supervisor) and supports in-container JS/Web hot-updates without exiting or recreating the container:
+
+- **One-click & idle auto-update**: In **Gateway Admin**, you can check for updates and click **Update now**, or enable **Auto-update gateway while idle** (enabled by default; checks every 12 hours and applies verified compatible releases after confirming zero live relay throughput twice at a 5-second interval).
+- **Release cache & retention (`/data/releases`)**: Hot-update bundles (`zen-remote-gateway-bundle.tar.gz`) are verified against the official GitHub Release SHA-256 digest (third-party mirror fallback is skipped whenever an official digest is absent), preflight-checked with `node --experimental-sqlite <staged>/dist/main.js --self-check`, and stored under `/data/releases/versions/<ver>` (retaining only the active and previous 2 generations). On startup, `bootstrap.js` always prefers whichever is newer between `/data/releases` and the container's base image (`baseVersion`).
+- **15s startup health confirmation & automatic rollback**: After hot-swapping (`exit 75`), the new gateway must send `zr-gateway-ready` within 15 seconds; otherwise `bootstrap.js` kills it, rolls `state.json` back to the previous working version (or base image), restarts immediately, and surfaces a dismissible rollback banner in the admin console.
+- **When `docker compose pull` is still required**: If a release increments `baseCompatEpoch` or `minNodeMajor` (native SQLite/Node ABI or supervisor changes), or when running outside `bootstrap.js`, the console prompts you to run `docker compose pull && docker compose up -d`.
+
 Paused peers keep a restricted control connection alive so resuming does not require re-joining. Initial hole-punching falls back to relay after ~1s, lost direct routes detect timeouts after 15s from the last valid packet, and relayed sessions re-probe for direct paths with `5s → 15s → 60s` progressive backoff. The WebSocket control plane runs `10s` Ping / `15s` Pong keepalives to reap half-open connections quickly and propagates monotonic `connSeq` epochs so both sides symmetrically re-anchor after reconnects. Known-length uploads allow an extra 20s recovery window subject to reachability.
 
 On `SIGTERM` / `SIGINT`, the gateway stops accepting new connections, flushes final telemetry within a 5s shutdown budget (up to 4s extra cleanup grace on error), and closes the database cleanly; set container stop grace periods accordingly.

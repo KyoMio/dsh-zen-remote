@@ -30,4 +30,4 @@ RUN mkdir -p /data /certs && chown -R zr:zr /data /certs
 VOLUME ["/data", "/certs"]
 EXPOSE 19393/tcp 19393/udp 19394/udp
 USER zr
-CMD ["node", "--experimental-sqlite", "dist/main.js"]
+CMD ["node", "--experimental-sqlite", "dist/bootstrap.js"]

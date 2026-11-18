@@ -477,3 +477,79 @@ export function derivePeerConnRow(
       return { dot: 'muted', kindWord: t('path.unknown'), reason: t('device.reasonUnknownPath'), latency: '—' };
   }
 }
+
+interface ParsedSemverParts {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: readonly string[];
+}
+
+function parseSemverParts(raw: string | null | undefined): ParsedSemverParts | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim().replace(/^v/i, '').split('+')[0] ?? '';
+  const [corePart = '', prePart] = trimmed.split('-', 2);
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(corePart);
+  if (!match) return null;
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: prePart ? prePart.split('.') : [],
+  };
+}
+
+/** 比较两个 semver 字符串；无法解析时返回 null */
+export function compareSemverStrings(a: string | null | undefined, b: string | null | undefined): number | null {
+  const pa = parseSemverParts(a);
+  const pb = parseSemverParts(b);
+  if (pa === null || pb === null) return null;
+  if (pa.major !== pb.major) return pa.major < pb.major ? -1 : 1;
+  if (pa.minor !== pb.minor) return pa.minor < pb.minor ? -1 : 1;
+  if (pa.patch !== pb.patch) return pa.patch < pb.patch ? -1 : 1;
+  if (pa.prerelease.length === 0 && pb.prerelease.length === 0) return 0;
+  if (pa.prerelease.length === 0) return 1;
+  if (pb.prerelease.length === 0) return -1;
+  const len = Math.max(pa.prerelease.length, pb.prerelease.length);
+  for (let i = 0; i < len; i += 1) {
+    const segA = pa.prerelease[i];
+    const segB = pb.prerelease[i];
+    if (segA === undefined) return -1;
+    if (segB === undefined) return 1;
+    const numA = /^\d+$/.test(segA) ? Number(segA) : null;
+    const numB = /^\d+$/.test(segB) ? Number(segB) : null;
+    if (numA !== null && numB !== null) {
+      if (numA !== numB) return numA < numB ? -1 : 1;
+    } else if (numA !== null || numB !== null) {
+      return numA !== null ? -1 : 1;
+    } else if (segA !== segB) {
+      return segA < segB ? -1 : 1;
+    }
+  }
+  return 0;
+}
+
+/** 计算网络内节点及已知最新插件版本中的最高版本号 */
+export function highestPluginVersion(
+  members: ReadonlyArray<{ pluginVersion?: string | null }>,
+  fallbackLatest?: string | null,
+): string | null {
+  let best: string | null = parseSemverParts(fallbackLatest) !== null ? (fallbackLatest ?? null) : null;
+  for (const m of members) {
+    if (parseSemverParts(m.pluginVersion) === null) continue;
+    const v = m.pluginVersion as string;
+    if (best === null || (compareSemverStrings(v, best) ?? 0) > 0) {
+      best = v;
+    }
+  }
+  return best;
+}
+
+/** 节点携带了有效的旧版插件版本号且严格落后于目标最高版本时返回 true */
+export function isMemberPluginOutdated(
+  memberVersion: string | null | undefined,
+  targetLatestVersion: string | null | undefined,
+): boolean {
+  const cmp = compareSemverStrings(memberVersion, targetLatestVersion);
+  return cmp !== null && cmp < 0;
+}

@@ -20,6 +20,7 @@ import { buildTopologyRoutes } from './http/routes-topology.js';
 import { createStaticHost } from './http/static-host.js';
 import type { StaticHost } from './http/static-host.js';
 import type { GatewayTlsBridge } from './tls/dual-protocol-server.js';
+import type { GatewayUpdateBridge } from './update/update-manager.js';
 import { ApiError } from './http/auth.js';
 import { StoreError } from './store/types.js';
 import type { ExtendedSystemSettings, GatewayStore } from './store/types.js';
@@ -79,6 +80,8 @@ export interface GatewayApiServerOptions {
   staticRoot?: string;
   /** GT-2/GT-3 原生单端口 TLS 控制器（/admin/runtime 与 /admin/tls* 使用） */
   tls?: GatewayTlsBridge;
+  /** T5 容器内热更新控制器（/admin/runtime 与 /admin/update* 使用） */
+  update?: GatewayUpdateBridge;
 }
 
 /**
@@ -224,6 +227,7 @@ export function createApiRequestHandler(options: GatewayApiServerOptions): (req:
       hooks: options.hooks ?? {},
       topology: options.topology,
       tls: options.tls,
+      update: options.update,
     },
   };
   const staticHost: StaticHost | null = options.staticRoot !== undefined ? createStaticHost(options.staticRoot) : null;

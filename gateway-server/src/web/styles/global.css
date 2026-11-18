@@ -2361,3 +2361,83 @@ html[data-theme='dark'] dialog.modal::backdrop {
     margin-top: 12px;
   }
 }
+
+/* ============================================================
+   T5：网关自更新横幅、设置区块与设备插件版本微标
+   ============================================================ */
+
+.update-banner {
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+
+.update-banner-pull {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.update-banner-cmd {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.update-banner-cmd code {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  padding: 4px 8px;
+  font-size: 12px;
+  border-radius: 4px;
+}
+
+.update-meta-grid {
+  margin-bottom: 12px;
+}
+
+.update-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.update-notes-box,
+.update-command-box {
+  margin-top: 10px;
+}
+
+.device-name-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.device-version {
+  font-size: 12px;
+  color: var(--ink-3);
+}
+
+.device-version-detail {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.badge-warn {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--warn);
+  background: var(--warn-tint);
+  border: 1px solid var(--line);
+}

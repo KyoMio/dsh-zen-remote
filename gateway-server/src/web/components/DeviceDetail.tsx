@@ -17,6 +17,8 @@ import {
   displayName,
   filterJoinedMembers,
   formatBytes,
+  highestPluginVersion,
+  isMemberPluginOutdated,
   memberStatusView,
   relativeText,
   relativeTime,
@@ -34,6 +36,7 @@ export interface DeviceDetailProps {
   t: TranslateFn;
   topology: TopologySnapshot;
   member: TopologyMemberRow;
+  latestPluginVersion?: string | null;
   ui: UiLocalState;
   onUi: (patch: Partial<UiLocalState>) => void;
   busy: boolean;
@@ -64,7 +67,9 @@ function natWord(natType: NatType, t: TranslateFn): string {
 }
 
 export function DeviceDetail(props: DeviceDetailProps) {
-  const { t, topology, member, ui, onUi, busy, onBack, onSelectDevice, onMemberAction, onRenameMember, onEditNote, onRemoveMember } = props;
+  const { t, topology, member, latestPluginVersion, ui, onUi, busy, onBack, onSelectDevice, onMemberAction, onRenameMember, onEditNote, onRemoveMember } = props;
+  const maxPluginVer = highestPluginVersion(topology.members, latestPluginVersion);
+  const pluginOutdated = isMemberPluginOutdated(member.pluginVersion, maxPluginVer);
   const [editingName, setEditingName] = useState(false);
   const [draftName, setDraftName] = useState(member.name ?? '');
   const [editingNote, setEditingNote] = useState(false);
@@ -260,6 +265,19 @@ export function DeviceDetail(props: DeviceDetailProps) {
         <div className="meta-item">
           <dt>{t('devices.totalRelay')}</dt>
           <dd className="mono">{formatBytes(member.cumulativeRelayBytes)}</dd>
+        </div>
+        <div className="meta-item">
+          <dt>{t('devices.pluginVersion')}</dt>
+          <dd className="device-version-detail">
+            {member.pluginVersion ? (
+              <span className="mono">v{member.pluginVersion}</span>
+            ) : (
+              <span className="muted">{t('devices.pluginVersionUnknown')}</span>
+            )}
+            {pluginOutdated && (
+              <span className="badge badge-warn">{t('devices.pluginOutdatedBadge')}</span>
+            )}
+          </dd>
         </div>
         <div className="meta-item">
           <dt>{t('devices.note')}</dt>

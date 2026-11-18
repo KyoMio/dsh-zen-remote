@@ -58,6 +58,13 @@ import {
 import { readRelayHeader } from './relay-frame.js';
 import { PeerRateLimiter } from './rate-limiter.js';
 import type { NatObservation } from './udp-stun.js';
+import {
+  GATEWAY_WIRE_COMPAT_LEVEL,
+  maxSemver,
+  parseSemver,
+  readPackageVersion,
+  resolveAppRootPackagePath,
+} from '../update/version.js';
 
 const WS_PATH = '/peer/v1/ws';
 /** auth/path-report 时间戳的新鲜度窗口（±） */
@@ -135,6 +142,12 @@ export interface PeerWsHubOptions {
   /** 生产实例的真实 UDP STUN 端口供给器：组合根在 UdpStunService.bind() 完成后才返回
    * 实际绑定值（不得用配置值或 HTTP 端口冒充）；返回 null 或缺省时 welcome 不带 stun 字段 */
   stunPorts?: () => { primaryPort: number; altPort: number | null } | null;
+  /** 动态网关版本号覆写（缺省从当前运行根目录 package.json#version 读取） */
+  gatewayVersion?: string | (() => string | null);
+  /** 外部感知的最新主插件版本号提供器（如 UpdateManager 查到的 GitHub Releases） */
+  getLatestKnownPluginVersion?: () => string | null;
+  /** 协议兼容代次范围（缺省 level=1, [1, 1]；单测可覆写驱动不兼容拒绝） */
+  wireCompatRange?: { level?: number; minClientLevel?: number; maxClientLevel?: number };
 }
 
 /**
@@ -168,6 +181,8 @@ interface ConnState {
   reflexive: { ip: string; port: number } | null;
   remoteIp: string | null;
   connectedAt: number;
+  pluginVersion: string | null;
+  recommendedGatewayVersion: string | null;
   /** 该节点上报到各 peer 的路径观测（PC-16a：路径限合法枚举，RTT 可为 null=未知） */
   pathReports: Map<string, { path: PeerReportPath; rttMs: number | null }>;
 }
@@ -180,6 +195,7 @@ interface PeerView {
   natType: NatType;
   reflexiveEndpoint: string | null;
   connSeq: number;
+  pluginVersion: string | null;
 }
 
 const connKey = (networkId: string, nodeId: string): string => `${networkId}|${nodeId}`;
@@ -197,6 +213,7 @@ function peerView(conn: ConnState): PeerView {
     natType: conn.natType,
     reflexiveEndpoint: endpointString(conn.reflexive),
     connSeq: conn.connSeq,
+    pluginVersion: conn.pluginVersion,
   };
 }
 
@@ -209,6 +226,21 @@ function sendJson(ws: WebSocket, message: Record<string, unknown>): void {
 function deny(ws: WebSocket, reason: string): void {
   sendJson(ws, { type: 'denied', reason });
   ws.close(1008, reason.slice(0, 120));
+}
+
+function denyWithVersion(ws: WebSocket, reason: string, gatewayVersion: string | null): void {
+  sendJson(ws, {
+    type: 'denied',
+    reason,
+    ...(gatewayVersion !== null ? { gatewayVersion } : {}),
+  });
+  ws.close(1008, reason.slice(0, 120));
+}
+
+function parseVersionField(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim().slice(0, 32);
+  return parseSemver(trimmed)?.normalized ?? null;
 }
 
 /** 被踢连接的宽限毫秒数：够 denied 消息冲出内核缓冲，也封死 close 握手挂住的可能 */
@@ -263,6 +295,12 @@ export class PeerWsHub {
   private nextConnSeq = 0;
   /** 真实 UDP STUN 端口供给器；null 表示组合根未接入（welcome 不带 stun 字段） */
   private readonly stunPorts: (() => { primaryPort: number; altPort: number | null } | null) | null;
+  private readonly gatewayVersionProvider: () => string | null;
+  private readonly getLatestKnownPluginVersion: (() => string | null) | null;
+  private readonly wireCompatLevel: number;
+  private readonly minClientWireCompatLevel: number;
+  private readonly maxClientWireCompatLevel: number;
+  private observedRecommendedGatewayVersion: string | null = null;
   private readonly wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
   /** 已授权在线路由表：networkId → nodeId → 连接 */
   private readonly conns = new Map<string, Map<string, ConnState>>();
@@ -340,6 +378,19 @@ export class PeerWsHub {
     this.maxTargetBufferedBytes = maxBuf;
     this.now = options.now ?? Date.now;
     this.stunPorts = options.stunPorts ?? null;
+    if (typeof options.gatewayVersion === 'function') {
+      this.gatewayVersionProvider = () => parseSemver(options.gatewayVersion && (options.gatewayVersion as () => string | null)())?.normalized ?? null;
+    } else if (typeof options.gatewayVersion === 'string') {
+      const fixed = parseSemver(options.gatewayVersion)?.normalized ?? null;
+      this.gatewayVersionProvider = () => fixed;
+    } else {
+      const pkgPath = resolveAppRootPackagePath(import.meta.url);
+      this.gatewayVersionProvider = () => readPackageVersion(pkgPath);
+    }
+    this.getLatestKnownPluginVersion = options.getLatestKnownPluginVersion ?? null;
+    this.wireCompatLevel = options.wireCompatRange?.level ?? GATEWAY_WIRE_COMPAT_LEVEL;
+    this.minClientWireCompatLevel = options.wireCompatRange?.minClientLevel ?? GATEWAY_WIRE_COMPAT_LEVEL;
+    this.maxClientWireCompatLevel = options.wireCompatRange?.maxClientLevel ?? GATEWAY_WIRE_COMPAT_LEVEL;
     this.limiter = new PeerRateLimiter({ now: this.now });
     void this.store
       .getSettings()
@@ -664,6 +715,7 @@ export class PeerWsHub {
       natType: conn.natType,
       reflexiveEndpoint: endpointString(conn.reflexive),
       connSeq: conn.connSeq,
+      pluginVersion: conn.pluginVersion,
     }, conn.nodeId);
     // 打洞协调：向配对节点对（新节点 ↔ 每个在线成员）同时下发；
     // publicKeyHex 供对端做 TOFU 锚定与 E2EE 握手
@@ -694,6 +746,43 @@ export class PeerWsHub {
     void this.publishTopology(conn.networkId);
   }
 
+  getGatewayVersion(): string | null {
+    return this.gatewayVersionProvider();
+  }
+
+  getObservedRecommendedGatewayVersion(): string | null {
+    return this.observedRecommendedGatewayVersion;
+  }
+
+  getRecommendedPluginVersion(networkId?: string, extraPluginVersion?: string | null): string | null {
+    const candidates: Array<string | null> = [
+      this.getLatestKnownPluginVersion?.() ?? null,
+      extraPluginVersion ?? null,
+    ];
+    if (networkId !== undefined) {
+      for (const peer of this.conns.get(networkId)?.values() ?? []) {
+        candidates.push(peer.pluginVersion);
+      }
+    } else {
+      for (const net of this.conns.values()) {
+        for (const peer of net.values()) {
+          candidates.push(peer.pluginVersion);
+        }
+      }
+    }
+    return maxSemver(...candidates);
+  }
+
+  private welcomeVersionFields(networkId: string, selfPluginVersion?: string | null): Record<string, unknown> {
+    const gatewayVersion = this.getGatewayVersion();
+    const recommendedPluginVersion = this.getRecommendedPluginVersion(networkId, selfPluginVersion);
+    return {
+      ...(gatewayVersion !== null ? { gatewayVersion } : {}),
+      recommendedPluginVersion,
+      wireCompatLevel: this.wireCompatLevel,
+    };
+  }
+
   private welcomeAuthorized(conn: ConnState): void {
     const peers = [...(this.conns.get(conn.networkId)?.values() ?? [])]
       .filter((c) => c !== conn)
@@ -707,6 +796,7 @@ export class PeerWsHub {
       maxPeers: conn.maxPeers,
       peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
       peers,
+      ...this.welcomeVersionFields(conn.networkId, conn.pluginVersion),
       ...(stunPorts !== null ? { stun: stunPorts } : {}),
     });
   }
@@ -742,6 +832,30 @@ export class PeerWsHub {
       deny(ws, 'challenge signature verification failed');
       return null;
     }
+    const clientWireCompat =
+      typeof message['wireCompatLevel'] === 'number' && Number.isInteger(message['wireCompatLevel'])
+        ? (message['wireCompatLevel'] as number)
+        : null;
+    const clientMinReq =
+      typeof message['minRequiredWireCompatLevel'] === 'number' && Number.isInteger(message['minRequiredWireCompatLevel'])
+        ? (message['minRequiredWireCompatLevel'] as number)
+        : null;
+    if (clientMinReq !== null && this.wireCompatLevel < clientMinReq) {
+      denyWithVersion(ws, 'version-incompatible:gateway-too-old', this.getGatewayVersion());
+      return null;
+    }
+    if (clientWireCompat !== null) {
+      if (clientWireCompat < this.minClientWireCompatLevel) {
+        denyWithVersion(ws, 'version-incompatible:plugin-too-old', this.getGatewayVersion());
+        return null;
+      }
+      if (clientWireCompat > this.maxClientWireCompatLevel) {
+        denyWithVersion(ws, 'version-incompatible:gateway-too-old', this.getGatewayVersion());
+        return null;
+      }
+    }
+    const pluginVersion = parseVersionField(message['pluginVersion']);
+    const recommendedGatewayVersion = parseVersionField(message['recommendedGatewayVersion']);
     // PS-5：读库前记录缓存容量代次，用于末尾同步判别并发 PATCH 是否已推送新上限。
     const preReadSeq = this.networkMaxPeers.get(networkId)?.seq ?? 0;
     let network: NetworkRecord | null;
@@ -853,8 +967,17 @@ export class PeerWsHub {
       reflexive: null,
       remoteIp,
       connectedAt: this.now(),
+      pluginVersion,
+      recommendedGatewayVersion,
       pathReports: new Map(),
     };
+
+    if ((member.status === 'authorized' || member.status === 'paused') && recommendedGatewayVersion !== null) {
+      this.observedRecommendedGatewayVersion = maxSemver(
+        this.observedRecommendedGatewayVersion,
+        recommendedGatewayVersion,
+      );
+    }
 
     switch (member.status) {
       case 'authorized': {
@@ -868,7 +991,13 @@ export class PeerWsHub {
         const hangKey = connKey(networkId, nodeId);
         const oldHang = this.hanging.get(hangKey);
         if (oldHang !== undefined) this.killConn(oldHang, 'replaced by a new connection');
-        sendJson(ws, { type: 'welcome', status: 'pending', maxPeers: conn.maxPeers, peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
+        sendJson(ws, {
+          type: 'welcome',
+          status: 'pending',
+          maxPeers: conn.maxPeers,
+          peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
+          ...this.welcomeVersionFields(networkId, conn.pluginVersion),
+        });
         this.hanging.set(hangKey, conn);
         this.startConnHeartbeat(conn);
         void this.publishTopology(networkId);
@@ -878,7 +1007,12 @@ export class PeerWsHub {
         const hangKey = connKey(networkId, nodeId);
         const oldHang = this.hanging.get(hangKey);
         if (oldHang !== undefined) this.killConn(oldHang, 'replaced by a new connection');
-        sendJson(ws, { type: 'welcome', status: 'mismatch', peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
+        sendJson(ws, {
+          type: 'welcome',
+          status: 'mismatch',
+          peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
+          ...this.welcomeVersionFields(networkId, conn.pluginVersion),
+        });
         this.hanging.set(hangKey, conn);
         this.startConnHeartbeat(conn);
         void this.publishTopology(networkId);
@@ -898,7 +1032,13 @@ export class PeerWsHub {
         const oldHang = this.hanging.get(hangKey);
         if (oldHang !== undefined) this.killConn(oldHang, 'replaced by a new connection');
         conn.state = 'paused';
-        sendJson(ws, { type: 'welcome', status: 'paused', maxPeers: conn.maxPeers, peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
+        sendJson(ws, {
+          type: 'welcome',
+          status: 'paused',
+          maxPeers: conn.maxPeers,
+          peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
+          ...this.welcomeVersionFields(networkId, conn.pluginVersion),
+        });
         this.pausedConns.set(hangKey, conn);
         this.startConnHeartbeat(conn);
         return conn;
@@ -1383,6 +1523,12 @@ export class PeerWsHub {
     });
     conn.maxPeers = limits.maxPeers;
     conn.peerDirectMaxRttMs = limits.peerDirectMaxRttMs;
+    if (conn.recommendedGatewayVersion !== null) {
+      this.observedRecommendedGatewayVersion = maxSemver(
+        this.observedRecommendedGatewayVersion,
+        conn.recommendedGatewayVersion,
+      );
+    }
     this.welcomeAuthorized(conn);
     this.registerAndAnnounce(conn);
   }
@@ -1645,6 +1791,7 @@ export class PeerWsHub {
         liveRelayKbps: rates.byNodeKbps.get(member.nodeId) ?? 0,
         cumulativeRelayBytes: member.cumulativeRelayBytes,
         lastSeenAt: member.lastSeenAt,
+        pluginVersion: conn?.pluginVersion ?? null,
       };
     });
     const links: TopologyLink[] = [];
@@ -1785,6 +1932,14 @@ export class PeerWsHub {
     for (const [networkId, net] of this.conns) {
       const owned = [...net.values()].some((conn) => conn.ownerId === userId);
       if (owned) total += this.limiter.liveRelayKbpsByNetwork(networkId);
+    }
+    return total;
+  }
+
+  getTotalLiveRelayKbps(): number {
+    let total = 0;
+    for (const networkId of this.conns.keys()) {
+      total += this.limiter.liveRelayKbpsByNetwork(networkId);
     }
     return total;
   }

@@ -45,6 +45,9 @@ import {
   TlsConfigError,
 } from '../tls/tls-manager.js';
 import type { AdminTlsView } from '../tls/tls-manager.js';
+import { DOCKER_UPGRADE_COMMAND } from '../update/update-manager.js';
+import type { AdminUpdateRuntimeSummary, AdminUpdateView } from '../update/update-manager.js';
+import { readPackageVersion, resolveAppRootPackagePath } from '../update/version.js';
 import { requestIsHttps } from './auth.js';
 import type { RouteContext, RouteDef, StoredSmtpConfig } from './auth.js';
 
@@ -130,6 +133,7 @@ async function buildSettingsView(ctx: RouteContext): Promise<Record<string, unkn
     relayRateKbps: ext.relayRateKbps,
     publicUrl: ext.publicUrl,
     sessionTtlDays: ext.sessionTtlDays,
+    autoUpdateEnabled: ext.autoUpdateEnabled,
     // 当前 is_default 组的 id；无默认组行时兜底内置 id（正常初始化流程不会发生）
     defaultGroupId: groups.find((g) => g.isDefault)?.id ?? DEFAULT_GROUP_ID,
     smtp: {
@@ -300,6 +304,12 @@ async function handlePatchSettings(ctx: RouteContext): Promise<void> {
   if (body['sessionTtlDays'] !== undefined) {
     extPatch.sessionTtlDays = parseIntInRange(body['sessionTtlDays'], 1, 90, 'sessionTtlDays');
   }
+  if (body['autoUpdateEnabled'] !== undefined) {
+    if (typeof body['autoUpdateEnabled'] !== 'boolean') {
+      throw new ApiError(400, 'INVALID_REQUEST', 'autoUpdateEnabled must be a boolean');
+    }
+    extPatch.autoUpdateEnabled = body['autoUpdateEnabled'];
+  }
   const ext = await ctx.store.getExtendedSettings();
   const savedSmtp = decodeSmtpConfig(ext.smtpConfigEnc, ctx.masterKey);
   let smtpProvided = false;
@@ -447,6 +457,9 @@ async function handleGetRuntime(ctx: RouteContext): Promise<void> {
     totalLiveRelayKbps,
     cumulativeRelayBytes,
     securityWarnings,
+    update: ctx.update !== undefined
+      ? ctx.update.getRuntimeSummary(ext.autoUpdateEnabled)
+      : fallbackUpdateRuntimeSummary(ext.autoUpdateEnabled),
   });
 }
 
@@ -1077,6 +1090,91 @@ async function handleReloadTls(ctx: RouteContext): Promise<void> {
   sendOk(ctx.res, view);
 }
 
+// ---------------------------------------------------------------- 容器内热更新（T5）
+
+function fallbackUpdateRuntimeSummary(autoUpdateEnabled: boolean): AdminUpdateRuntimeSummary {
+  const ver = readPackageVersion(resolveAppRootPackagePath(import.meta.url));
+  return {
+    currentVersion: ver,
+    baseVersion: ver,
+    activeSource: 'base',
+    supervisorManaged: false,
+    autoUpdateEnabled,
+    updateAvailable: false,
+    latestVersion: null,
+    latestPluginVersion: null,
+    compatibility: 'compatible',
+    offlinePeerRecommendedVersion: null,
+    rollbackReason: null,
+  };
+}
+
+function fallbackUpdateView(autoUpdateEnabled: boolean): AdminUpdateView {
+  return {
+    ...fallbackUpdateRuntimeSummary(autoUpdateEnabled),
+    lastCheckedAt: null,
+    lastCheckError: null,
+    incompatibilityReason: null,
+    notesSummary: null,
+    hasOfficialDigest: false,
+    lastRollback: null,
+    upgradeCommand: DOCKER_UPGRADE_COMMAND,
+  };
+}
+
+async function handleGetUpdate(ctx: RouteContext): Promise<void> {
+  await requireAdmin(ctx);
+  const ext = await ctx.store.getExtendedSettings();
+  const view = ctx.update !== undefined ? ctx.update.getStatusView(ext.autoUpdateEnabled) : fallbackUpdateView(ext.autoUpdateEnabled);
+  sendOk(ctx.res, view);
+}
+
+async function handleCheckUpdate(ctx: RouteContext): Promise<void> {
+  await requireAdmin(ctx);
+  if (ctx.update === undefined) {
+    throw new ApiError(503, 'UPDATE_UNAVAILABLE', 'update manager is not mounted');
+  }
+  const ext = await ctx.store.getExtendedSettings();
+  try {
+    const view = await ctx.update.checkNow(ext.autoUpdateEnabled);
+    sendOk(ctx.res, view);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'failed to check for updates';
+    throw new ApiError(502, 'UPDATE_CHECK_FAILED', msg);
+  }
+}
+
+async function handleApplyUpdate(ctx: RouteContext): Promise<void> {
+  await requireAdmin(ctx);
+  if (ctx.update === undefined) {
+    throw new ApiError(503, 'UPDATE_UNAVAILABLE', 'update manager is not mounted');
+  }
+  const ext = await ctx.store.getExtendedSettings();
+  const summary = ctx.update.getRuntimeSummary(ext.autoUpdateEnabled);
+  if (!summary.supervisorManaged) {
+    throw new ApiError(409, 'UPDATE_REQUIRES_SUPERVISOR', 'in-container hot update requires bootstrap supervisor');
+  }
+  const outcome = await ctx.update.applyNow(ext.autoUpdateEnabled);
+  if (outcome.status === 'image-pull-required') {
+    throw new ApiError(409, 'IMAGE_PULL_REQUIRED', outcome.reason ?? 'base image upgrade required');
+  }
+  if (outcome.accepted) {
+    sendOk(ctx.res, outcome, 202);
+    return;
+  }
+  sendOk(ctx.res, outcome, 200);
+}
+
+async function handleDismissRollback(ctx: RouteContext): Promise<void> {
+  await requireAdmin(ctx);
+  const ext = await ctx.store.getExtendedSettings();
+  if (ctx.update === undefined) {
+    sendOk(ctx.res, fallbackUpdateView(ext.autoUpdateEnabled));
+    return;
+  }
+  sendOk(ctx.res, ctx.update.dismissRollback(ext.autoUpdateEnabled));
+}
+
 export function buildAdminRoutes(): RouteDef[] {
   return [
     { method: 'GET', path: '/api/v1/admin/settings', handler: handleGetSettings },
@@ -1085,6 +1183,10 @@ export function buildAdminRoutes(): RouteDef[] {
     { method: 'POST', path: '/api/v1/admin/settings/api-key', handler: handleCreateApiKey },
     { method: 'DELETE', path: '/api/v1/admin/settings/api-key', handler: handleRevokeApiKey },
     { method: 'GET', path: '/api/v1/admin/runtime', handler: handleGetRuntime },
+    { method: 'GET', path: '/api/v1/admin/update', handler: handleGetUpdate },
+    { method: 'POST', path: '/api/v1/admin/update/check', handler: handleCheckUpdate },
+    { method: 'POST', path: '/api/v1/admin/update/apply', handler: handleApplyUpdate },
+    { method: 'POST', path: '/api/v1/admin/update/dismiss-rollback', handler: handleDismissRollback },
     { method: 'GET', path: '/api/v1/admin/tls', handler: handleGetTls },
     { method: 'PUT', path: '/api/v1/admin/tls/certificate', handler: handlePutTlsCertificate },
     { method: 'PATCH', path: '/api/v1/admin/tls', handler: handlePatchTls },
