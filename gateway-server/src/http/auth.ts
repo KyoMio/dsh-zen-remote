@@ -579,6 +579,12 @@ export class SlidingWindowRateLimiter {
     private readonly maxRequests: number,
   ) {}
 
+  /** 仅检视当前窗口是否仍有余量（不消耗计数，用于先验防爆破拦截） */
+  canConsume(key: string, now: number = Date.now()): boolean {
+    const fresh = (this.hits.get(key) ?? []).filter((t) => t > now - this.windowMs);
+    return fresh.length < this.maxRequests;
+  }
+
   /** 窗口内配额未满则记账并放行（true）；已满直接拒绝（false，拒绝不计入窗口） */
   tryConsume(key: string, now: number = Date.now()): boolean {
     this.calls += 1;
@@ -611,6 +617,14 @@ export class SlidingWindowRateLimiter {
 
 /** send-otp 与换绑邮箱申请共用的发码限流器（同一进程一个网关，进程级单例） */
 export const otpSendRateLimiter = new SlidingWindowRateLimiter(OTP_IP_WINDOW_MS, OTP_IP_MAX_REQUESTS);
+
+export const LOGIN_RATE_WINDOW_MS = 15 * 60_000;
+export const LOGIN_IP_MAX_ATTEMPTS = 20;
+export const LOGIN_ACCOUNT_MAX_ATTEMPTS = 10;
+
+/** 登录防爆破限流器：按客户端 IP 与 (IP, 归一化邮箱) 双维度限制错密尝试 */
+export const loginIpRateLimiter = new SlidingWindowRateLimiter(LOGIN_RATE_WINDOW_MS, LOGIN_IP_MAX_ATTEMPTS);
+export const loginAccountRateLimiter = new SlidingWindowRateLimiter(LOGIN_RATE_WINDOW_MS, LOGIN_ACCOUNT_MAX_ATTEMPTS);
 
 /**
  * 签发验证码并发信。发信失败（含配置非法）统一抛 502 SMTP_SEND_FAILED，SmtpClientError
@@ -803,10 +817,18 @@ async function handleLogin(ctx: RouteContext): Promise<void> {
   if (email.length === 0 || password.length === 0) {
     throw new ApiError(400, 'INVALID_REQUEST', 'email and password are required');
   }
+  const clientIp = requestClientIp(ctx.req);
+  const accountRateKey = `${clientIp}:${email}`;
+  if (!loginIpRateLimiter.canConsume(clientIp) || !loginAccountRateLimiter.canConsume(accountRateKey)) {
+    ctx.res.setHeader('retry-after', String(Math.ceil(LOGIN_RATE_WINDOW_MS / 1000)));
+    throw new ApiError(429, 'RATE_LIMITED', 'too many login attempts, try again later');
+  }
   const env = await loadAuthEnvironment(ctx);
   const user = await ctx.store.findUserByEmail(email);
   const passwordOk = await verifyPassword(password, user?.passwordHash ?? (await getDummyPasswordHash()));
   if (user === null || !passwordOk) {
+    loginIpRateLimiter.tryConsume(clientIp);
+    loginAccountRateLimiter.tryConsume(accountRateKey);
     throw new ApiError(401, 'INVALID_CREDENTIALS', 'invalid email or password');
   }
   if (!user.active) {

@@ -550,6 +550,12 @@ export function decideJoinAttempt(input: JoinDecisionInput): JoinDecision {
   const keyAdmitted = joinKeyMatched && (admissionMode === 'key' || admissionMode === 'both');
   if (existing !== null && existing.status !== 'revoked') {
     if (existing.publicKeyHex !== incomingPublicKeyHex) {
+      if (
+        (admissionMode === 'key' && !joinKeyMatched) ||
+        (admissionMode === 'both' && existing.status === 'authorized' && !joinKeyMatched)
+      ) {
+        return 'reject';
+      }
       if (existing.status === 'pending') {
         return capacityUsed < maxPeers ? 'mismatch' : 'limit-reached';
       }

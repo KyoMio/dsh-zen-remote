@@ -14,6 +14,8 @@ import {
   OTP_TTL_MS,
   encodeSmtpConfig,
   hashOtpCode,
+  loginAccountRateLimiter,
+  loginIpRateLimiter,
   otpSendRateLimiter,
 } from '../dist/http/auth.js';
 import { sendMail, SmtpClientError } from '../dist/mail/smtp-client.js';
@@ -709,5 +711,29 @@ describe('忘记密码重置、IP 限流、已登录改密与两步换绑邮箱�
     const r4Login = await api(handle.base, 'POST', '/api/v1/auth/login', { body: { email: 'r4@example.com', password: 'r4-pass-123456' } });
     assert.equal(r4Login.status, 403);
     assertEnvelopeError(r4Login.json, 'ACCOUNT_DISABLED');
+
+    // T7: Repeated wrong-password login triggers 429 RATE_LIMITED with Retry-After.
+    loginIpRateLimiter.clear();
+    loginAccountRateLimiter.clear();
+    try {
+      let rateLimited = null;
+      for (let i = 0; i < 15; i++) {
+        const res = await fetch(handle.base + '/api/v1/auth/login', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', origin: handle.base },
+          body: JSON.stringify({ email: 'brute@example.com', password: `wrong-pass-${i}` }),
+        });
+        const json = await res.json();
+        if (res.status === 429 && rateLimited === null) {
+          rateLimited = { status: res.status, json, retryAfter: res.headers.get('retry-after') };
+        }
+      }
+      assert.ok(rateLimited !== null, 'repeated wrong-password logins must trigger 429 RATE_LIMITED');
+      assertEnvelopeError(rateLimited.json, 'RATE_LIMITED');
+      assert.ok(Number(rateLimited.retryAfter) > 0, '429 response carries positive Retry-After header');
+    } finally {
+      loginIpRateLimiter.clear();
+      loginAccountRateLimiter.clear();
+    }
   });
 });

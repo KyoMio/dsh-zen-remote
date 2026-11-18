@@ -50,46 +50,124 @@ const memberKey = (m: MemberKey): string => `${m.networkId}|${m.nodeId}`;
 const pairKey = (networkId: string, a: string, b: string): string =>
   a < b ? `${networkId}|${a}|${b}` : `${networkId}|${b}|${a}`;
 
+/** 控制帧（HELLO/ACK/SACK/PING/PONG/RST）独立宽松限速：512 KiB/s 防恶意洪水，正常 SACK/握手永不误丢 */
+const CONTROL_BUCKET_RATE_BYTES_PER_SEC = 512 * 1024;
+/** 惰性桶清理窗口：超过此时长无流量的桶在周期扫表时淘汰，防长跑内存膨胀 */
+const BUCKET_STALE_MS = 10 * 60_000;
+const BUCKET_SWEEP_INTERVAL = 256;
+
+export interface NetworkRateSnapshot {
+  totalKbps: number;
+  byNodeKbps: Map<string, number>;
+  byPairKbps: Map<string, number>;
+}
+
 export class PeerRateLimiter {
   private readonly windowMs: number;
   private readonly now: () => number;
   private readonly buckets = new Map<string, TokenBucket>();
+  private readonly controlBuckets = new Map<string, TokenBucket>();
   private readonly pending = new Map<string, { member: MemberKey; bytes: number }>();
   private readonly events: WindowEvent[] = [];
   /** events[head] 起为窗口内事件；head 之前的死引用由摊销压缩统一释放 */
   private head = 0;
+  private bucketSweepCalls = 0;
 
   constructor(options: RateLimiterOptions = {}) {
     this.windowMs = options.windowMs ?? 5000;
     this.now = options.now ?? Date.now;
   }
 
-  /**
-   * 尝试按令牌桶放行一次转发。速率每次现取（bytes/s = rateKbps * 1024），
-   * 成功时记滑窗事件并累加 pending 字节；桶不够直接丢弃返回 false。
-   */
-  tryRelay(scope: RelayScope, bytes: number, rateKbps: number): boolean {
-    if (!Number.isFinite(bytes) || bytes <= 0 || !Number.isFinite(rateKbps) || rateKbps <= 0) return false;
-    const now = this.now();
-    const rateBytesPerSec = rateKbps * 1024;
+  private consumeBucket(
+    map: Map<string, TokenBucket>,
+    key: string,
+    bytes: number,
+    rateBytesPerSec: number,
+    now: number,
+  ): boolean {
+    this.bucketSweepCalls += 1;
+    if (this.bucketSweepCalls % BUCKET_SWEEP_INTERVAL === 0) {
+      this.sweepStaleBuckets(now);
+    }
     const capacity = rateBytesPerSec; // 突发 = 1 秒量
-    const key = memberKey(scope);
-    const bucket = this.buckets.get(key) ?? { tokens: capacity, updatedAt: now };
+    const bucket = map.get(key) ?? { tokens: capacity, updatedAt: now };
     const elapsedSec = Math.max(0, (now - bucket.updatedAt) / 1000);
     bucket.tokens = Math.min(capacity, bucket.tokens + elapsedSec * rateBytesPerSec);
     bucket.updatedAt = now;
     if (bucket.tokens < bytes) {
-      this.buckets.set(key, bucket);
+      map.set(key, bucket);
       return false;
     }
     bucket.tokens -= bytes;
-    this.buckets.set(key, bucket);
+    map.set(key, bucket);
+    return true;
+  }
+
+  private sweepStaleBuckets(now: number): void {
+    const cutoff = now - BUCKET_STALE_MS;
+    for (const [k, b] of this.buckets) {
+      if (b.updatedAt < cutoff) this.buckets.delete(k);
+    }
+    for (const [k, b] of this.controlBuckets) {
+      if (b.updatedAt < cutoff) this.controlBuckets.delete(k);
+    }
+  }
+
+  private recordAccepted(scope: RelayScope, key: string, bytes: number, now: number): void {
     this.events.push({ at: now, bytes, networkId: scope.networkId, nodeId: scope.nodeId, peerNodeId: scope.peerNodeId });
     this.pruneWindow(); // PC-18：写入路径同样淘汰窗口外事件，无人读取也保持有界
     const pending = this.pending.get(key) ?? { member: { networkId: scope.networkId, nodeId: scope.nodeId }, bytes: 0 };
     pending.bytes += bytes;
     this.pending.set(key, pending);
+  }
+
+  /**
+   * 尝试按令牌桶放行一次 DATA 转发。速率每次现取（bytes/s = rateKbps * 1024），
+   * 成功时记滑窗事件并累加 pending 字节；桶不够直接丢弃返回 false。
+   */
+  tryRelay(scope: RelayScope, bytes: number, rateKbps: number): boolean {
+    if (!Number.isFinite(bytes) || bytes <= 0 || !Number.isFinite(rateKbps) || rateKbps <= 0) return false;
+    const now = this.now();
+    const key = memberKey(scope);
+    if (!this.consumeBucket(this.buckets, key, bytes, rateKbps * 1024, now)) return false;
+    this.recordAccepted(scope, key, bytes, now);
     return true;
+  }
+
+  /**
+   * 尝试放行控制帧（HELLO/ACK/SACK/PING/PONG/RST）：与 DATA 桶完全隔离，
+   * 仅受独立宽松高频安全阀约束，避免切中转突发大数据时误丢 52B SACK/HELLO。
+   */
+  tryRelayControl(scope: RelayScope, bytes: number, maxBytesPerSec = CONTROL_BUCKET_RATE_BYTES_PER_SEC): boolean {
+    if (!Number.isFinite(bytes) || bytes <= 0 || !Number.isFinite(maxBytesPerSec) || maxBytesPerSec <= 0) return false;
+    const now = this.now();
+    const key = memberKey(scope);
+    if (!this.consumeBucket(this.controlBuckets, key, bytes, maxBytesPerSec, now)) return false;
+    this.recordAccepted(scope, key, bytes, now);
+    return true;
+  }
+
+  /** 节点断线或被移除时释放限流桶（保留 pending 字节待 flush 确认落库） */
+  removeNode(networkId: string, nodeId: string): void {
+    const key = memberKey({ networkId, nodeId });
+    this.buckets.delete(key);
+    this.controlBuckets.delete(key);
+  }
+
+  /** 网络被删除时释放该网下全部限流桶 */
+  removeNetwork(networkId: string): void {
+    const prefix = `${networkId}|`;
+    for (const k of this.buckets.keys()) {
+      if (k.startsWith(prefix)) this.buckets.delete(k);
+    }
+    for (const k of this.controlBuckets.keys()) {
+      if (k.startsWith(prefix)) this.controlBuckets.delete(k);
+    }
+  }
+
+  hasNodeBucket(networkId: string, nodeId: string): boolean {
+    const key = memberKey({ networkId, nodeId });
+    return this.buckets.has(key) || this.controlBuckets.has(key);
   }
 
   /**
@@ -140,6 +218,29 @@ export class PeerRateLimiter {
     return this.kbPerSec(
       this.sumWhere((e) => e.networkId === networkId && pairKey(networkId, e.nodeId, e.peerNodeId ?? '') === wanted),
     );
+  }
+
+  /** 单遍聚合成员/链路/全网实时速率，供 renderTopology 消除 (M + L + 1) 次全扫 */
+  snapshotNetworkRates(networkId: string): NetworkRateSnapshot {
+    this.pruneWindow();
+    let totalBytes = 0;
+    const byNodeBytes = new Map<string, number>();
+    const byPairBytes = new Map<string, number>();
+    for (let i = this.head; i < this.events.length; i++) {
+      const e = this.events[i] as WindowEvent;
+      if (e.networkId !== networkId) continue;
+      totalBytes += e.bytes;
+      byNodeBytes.set(e.nodeId, (byNodeBytes.get(e.nodeId) ?? 0) + e.bytes);
+      if (e.peerNodeId !== undefined) {
+        const pk = pairKey(networkId, e.nodeId, e.peerNodeId);
+        byPairBytes.set(pk, (byPairBytes.get(pk) ?? 0) + e.bytes);
+      }
+    }
+    const byNodeKbps = new Map<string, number>();
+    for (const [nodeId, bytes] of byNodeBytes) byNodeKbps.set(nodeId, this.kbPerSec(bytes));
+    const byPairKbps = new Map<string, number>();
+    for (const [pk, bytes] of byPairBytes) byPairKbps.set(pk, this.kbPerSec(bytes));
+    return { totalKbps: this.kbPerSec(totalBytes), byNodeKbps, byPairKbps };
   }
 
   /** 窗口字节 → KB/s（1024 字节/秒）。绝不乘 8：那是把单位变成 kilobits 的老错 */

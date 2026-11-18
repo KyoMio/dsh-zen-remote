@@ -436,6 +436,12 @@ describe('DualProtocolServer 单端口双协议复用与热切换（GT-2）', ()
       assert.match(rSlash, /^HTTP\/1\.1 302 Found\r\n/);
       assert.match(rSlash, new RegExp(`Location: https://gw\\.local:${port}/evil\\.com/steal\\r\\n`));
 
+      // T7: bare LF or control chars in path must not split 302 Location response headers
+      const rInjected = await rawTcpHttp(port, `GET /ok\nSet-Cookie:evil=1 HTTP/1.1\r\nHost: gw.local:${port}\r\n\r\n`);
+      assert.match(rInjected, /^HTTP\/1\.1 302 Found\r\n/);
+      assert.match(rInjected, new RegExp(`Location: https://gw\\.local:${port}/\\r\\n`));
+      assert.doesNotMatch(rInjected, /Set-Cookie:/i);
+
       const rBadHost = await rawTcpHttp(port, 'GET / HTTP/1.1\r\nHost: evil.com/bad\r\n\r\n');
       assert.match(rBadHost, /^HTTP\/1\.1 426 Upgrade Required\r\n/);
 

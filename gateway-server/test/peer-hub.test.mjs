@@ -482,6 +482,7 @@ async function startGateway(opts = {}) {
     ...(opts.now !== undefined ? { now: opts.now } : {}),
     ...(opts.pingIntervalMs !== undefined ? { pingIntervalMs: opts.pingIntervalMs } : {}),
     ...(opts.pongTimeoutMs !== undefined ? { pongTimeoutMs: opts.pongTimeoutMs } : {}),
+    ...(opts.maxTargetBufferedBytes !== undefined ? { maxTargetBufferedBytes: opts.maxTargetBufferedBytes } : {}),
   });
   const server = createGatewayApiServer({ store, masterKey, runtime: hub, hooks: hub.hooks, topology: hub });
   await new Promise((resolve, reject) => {
@@ -3510,6 +3511,196 @@ describe('PC-08a 网络容量变更广播与祖父缩容不踢', () => {
       assert.equal(resumed.maxPeers, 7);
       assert.equal(resumed.peerDirectMaxRttMs, 220);
       wsHold.close();
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+describe('T7：gateway-security-hardening（口令前置拦截与挂起连接隔离）', () => {
+  test('key / both 模式下同 nodeId 异公钥无口令 auth 被拒，DB 保持 authorized 不落 mismatch', async () => {
+    const gw = await startGateway();
+    try {
+      for (const mode of ['key', 'both']) {
+        const net = await createNetwork(gw, { mode });
+        const victim = identity();
+        const attacker = identity();
+
+        // 库里已存在授权成员（使用 attacker.nodeId 模拟 32-bit nodeId 碰撞目标，但公钥为 victim）
+        await gw.store.upsertMemberJoinAttempt({
+          networkId: net.id,
+          nodeId: attacker.nodeId,
+          name: 'victim-online',
+          publicKeyHex: victim.publicKeyHex,
+          joinKeyMatched: true,
+        });
+
+        const wsAttacker = await wsOpen(gw.base);
+        await authNode(wsAttacker, attacker, { networkId: net.id, omitProof: true, name: 'attacker' });
+        const verdict = await wsJson(wsAttacker);
+        assert.equal(verdict.type, 'denied', `${mode}: mismatched pubkey without joinKey must be denied`);
+        await wsClosed(wsAttacker);
+
+        const members = await gw.store.listMembers(net.id);
+        const row = members.find((m) => m.nodeId === attacker.nodeId);
+        assert.equal(row?.status, 'authorized', `${mode}: DB status must stay authorized, not mismatch`);
+        assert.equal(row?.publicKeyHex, victim.publicKeyHex);
+      }
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('manual 模式下 pending 不踢在线 authorized 节点，且 hanging 连接发 rename 不改 DB', async () => {
+    const gw = await startGateway();
+    try {
+      const mNet = await createNetwork(gw, { mode: 'manual', maxPeers: 4 });
+      const victim = identity();
+
+      const wsPending = await wsOpen(gw.base);
+      await authNode(wsPending, victim, { networkId: mNet.id, omitProof: true, name: 'orig-victim' });
+      assert.equal((await wsJson(wsPending)).status, 'pending');
+
+      // Pending hanging connection must not be able to rename DB member
+      wsPending.send(JSON.stringify({ type: 'rename', name: 'hijacked-pending' }));
+      await wsSilence(wsPending, 120);
+      let row = (await gw.store.listMembers(mNet.id)).find((m) => m.nodeId === victim.nodeId);
+      assert.equal(row?.name, 'orig-victim', 'pending connection must not mutate DB member name');
+
+      // Approve victim so wsPending becomes authorized online
+      await api(gw.base, 'POST', `/api/v1/networks/${mNet.id}/members/${victim.nodeId}/approve`, {
+        cookie: gw.tenantCookie,
+      });
+      assert.equal((await wsJson(wsPending)).status, 'authorized');
+      assert.equal(gw.hub.getOnlineCountByNetwork(mNet.id), 1);
+
+      // Re-joining without reconnect in manual mode produces pending; must NOT kick online wsPending
+      const wsNewPending = await wsOpen(gw.base);
+      await authNode(wsNewPending, victim, { networkId: mNet.id, omitProof: true, name: 'rejoin-pending' });
+      assert.equal((await wsJson(wsNewPending)).status, 'pending');
+      await wsSilence(wsPending, 120);
+      assert.equal(wsPending.readyState, wsPending.OPEN, 'pending connection must NOT kick online authorized connection');
+      assert.equal(gw.hub.getOnlineCountByNetwork(mNet.id), 1);
+
+      wsNewPending.send(JSON.stringify({ type: 'rename', name: 'hijacked-second' }));
+      await wsSilence(wsNewPending, 120);
+      row = (await gw.store.listMembers(mNet.id)).find((m) => m.nodeId === victim.nodeId);
+      assert.equal(row?.name, 'orig-victim', 'hanging connection must not mutate DB member name');
+
+      wsPending.close();
+      wsNewPending.close();
+    } finally {
+      await gw.close();
+    }
+  });
+});
+
+describe('T8：gateway-relay-backpressure-perf（控制帧免限速、背压、桶回收与拓扑合并）', () => {
+  test('打满 DATA 令牌桶后 DATA 被丢弃，但 52B SACK 与 HELLO 控制帧 100% 送达对端', async () => {
+    const clock = Date.now();
+    const gw = await startGateway({ now: () => clock });
+    try {
+      const { a, b, wsA, wsB } = await setupPair(gw);
+      // 1s burst capacity at 64 KB/s = 65,536 bytes. Drain completely with 64 x 1024B DATA frames (<= 1200B max frame).
+      for (let i = 0; i < 64; i++) {
+        wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 3, totalBytes: 1024 }));
+        await wsBinary(wsB);
+      }
+      // Next 1024B DATA frame exceeds remaining 0 bytes -> dropped
+      wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 3, totalBytes: 1024 }));
+      await wsSilence(wsB, 100);
+
+      // Now send 52B SACK (type=4) and 52B HELLO (type=1): both must bypass DATA bucket and arrive
+      const sack = frame({ src: a.nodeId, dst: b.nodeId, type: 4, totalBytes: 52 });
+      const hello = frame({ src: a.nodeId, dst: b.nodeId, type: 1, totalBytes: 52 });
+      wsA.send(sack);
+      wsA.send(hello);
+      const recv1 = await wsBinary(wsB);
+      const recv2 = await wsBinary(wsB);
+      assert.deepEqual(recv1, sack, '52B SACK control frame must arrive despite full DATA bucket');
+      assert.deepEqual(recv2, hello, '52B HELLO control frame must arrive despite full DATA bucket');
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('对端 ws.bufferedAmount 超限时丢弃 DATA 帧，控制帧不受背压丢弃影响', async () => {
+    const gw = await startGateway({ maxTargetBufferedBytes: 128 });
+    try {
+      const { net, a, b, wsA, wsB } = await setupPair(gw);
+      const targetConn = gw.hub.conns.get(net.id).get(b.nodeId);
+      assert.ok(targetConn?.ws);
+      let fakeBuffered = 512;
+      Object.defineProperty(targetConn.ws, 'bufferedAmount', {
+        configurable: true,
+        get: () => fakeBuffered,
+      });
+
+      // DATA frame is dropped while bufferedAmount (512) > maxTargetBufferedBytes (128)
+      wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 3, totalBytes: 64 }));
+      await wsSilence(wsB, 100);
+
+      // Control frame (SACK) still passes through under DATA backpressure
+      const sack = frame({ src: a.nodeId, dst: b.nodeId, type: 4, totalBytes: 52 });
+      wsA.send(sack);
+      const gotSack = await wsBinary(wsB);
+      assert.deepEqual(gotSack, sack);
+
+      // Once backpressure clears, DATA flows again
+      fakeBuffered = 0;
+      const data = frame({ src: a.nodeId, dst: b.nodeId, type: 3, totalBytes: 64 });
+      wsA.send(data);
+      const gotData = await wsBinary(wsB);
+      assert.deepEqual(gotData, data);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('节点断连后限流桶被释放，且 snapshotNetworkRates 单遍汇总与 publishTopology 并发合并', async () => {
+    const clock = Date.now();
+    const gw = await startGateway({ now: () => clock });
+    try {
+      const { net, a, b, wsA, wsB } = await setupPair(gw);
+      for (let i = 0; i < 5; i++) {
+        wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 3, totalBytes: 1024 }));
+        await wsBinary(wsB);
+      }
+      assert.equal(gw.hub.limiter.hasNodeBucket(net.id, a.nodeId), true);
+
+      // Single-pass snapshotNetworkRates matches individual getters
+      const snapRates = gw.hub.limiter.snapshotNetworkRates(net.id);
+      assert.equal(snapRates.totalKbps, gw.hub.limiter.liveRelayKbpsByNetwork(net.id));
+      assert.equal(snapRates.byNodeKbps.get(a.nodeId) ?? 0, gw.hub.limiter.liveRelayKbpsByNode(net.id, a.nodeId));
+      assert.equal(snapRates.byPairKbps.get(a.nodeId < b.nodeId ? `${net.id}|${a.nodeId}|${b.nodeId}` : `${net.id}|${b.nodeId}|${a.nodeId}`) ?? 0, gw.hub.limiter.liveRelayKbpsPair(net.id, a.nodeId, b.nodeId));
+
+      // Coalesce burst publishTopology calls
+      const sse = await openSse(gw.base, `/api/v1/networks/${net.id}/events`, gw.tenantCookie);
+      try {
+        await sse.pullEvent(); // initial snapshot
+        let listMembersCalls = 0;
+        const origListMembers = gw.store.listMembers.bind(gw.store);
+        gw.store.listMembers = async (...args) => {
+          listMembersCalls += 1;
+          return origListMembers(...args);
+        };
+        await Promise.all([
+          gw.hub.publishTopology(net.id),
+          gw.hub.publishTopology(net.id),
+          gw.hub.publishTopology(net.id),
+          gw.hub.publishTopology(net.id),
+          gw.hub.publishTopology(net.id),
+        ]);
+        assert.ok(listMembersCalls <= 2, `burst publishTopology must coalesce DB renders (got ${listMembersCalls})`);
+      } finally {
+        sse.close();
+      }
+
+      // Disconnect A -> bucket must be released
+      wsA.close();
+      await waitFor(() => gw.hub.getOnlineCountByNetwork(net.id) === 1);
+      assert.equal(gw.hub.limiter.hasNodeBucket(net.id, a.nodeId), false, 'offline node bucket must be released');
+      wsB.close();
     } finally {
       await gw.close();
     }

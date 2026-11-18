@@ -2854,3 +2854,42 @@ describe('GT-3: 原生 TLS 管理接口（/api/v1/admin/tls*）与 HTTPS 请求�
   });
 });
 
+describe('T8：server.ts getExtendedSettings() 短效缓存与写操作失效', () => {
+  test('连续多次请求命中 getExtendedSettings 缓存，PATCH /admin/settings 后立即失效', async () => {
+    const h = await startServer();
+    try {
+      await seedUsers(h.store);
+      const adminCookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      let dbReadCount = 0;
+      const origGetExt = h.store.getExtendedSettings.bind(h.store);
+      h.store.getExtendedSettings = async () => {
+        dbReadCount += 1;
+        return origGetExt();
+      };
+
+      // Direct store mutation invalidates cache without warming it; next 5 HTTP reads hit DB exactly once
+      await h.store.updateExtendedSettings({ allowSignup: false });
+      dbReadCount = 0;
+      for (let i = 0; i < 5; i++) {
+        const res = await api(h.base, 'GET', '/api/v1/auth/me');
+        assert.equal(res.status, 200);
+        assert.equal(res.json.data.allowSignup, false);
+      }
+      assert.equal(dbReadCount, 1, '5 consecutive requests within TTL must read getExtendedSettings from DB once');
+
+      // Mutate via admin PATCH -> cache invalidates immediately and next read reflects allowSignup=true
+      const patchRes = await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { allowSignup: true },
+      });
+      assert.equal(patchRes.status, 200);
+      const after = await api(h.base, 'GET', '/api/v1/auth/me');
+      assert.equal(after.status, 200);
+      assert.equal(after.json.data.allowSignup, true);
+      assert.ok(dbReadCount >= 2 && dbReadCount <= 3, `PATCH invalidates cache cleanly without repeated reads (got ${dbReadCount})`);
+    } finally {
+      await stopServer(h);
+    }
+  });
+});
+

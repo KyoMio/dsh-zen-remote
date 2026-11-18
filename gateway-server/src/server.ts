@@ -22,9 +22,44 @@ import type { StaticHost } from './http/static-host.js';
 import type { GatewayTlsBridge } from './tls/dual-protocol-server.js';
 import { ApiError } from './http/auth.js';
 import { StoreError } from './store/types.js';
-import type { GatewayStore } from './store/types.js';
+import type { ExtendedSystemSettings, GatewayStore } from './store/types.js';
 
 export type { GatewayTlsBridge } from './tls/dual-protocol-server.js';
+
+const SETTINGS_CACHE_TTL_MS = 2000;
+const storeSettingsInvalidators = new WeakMap<GatewayStore, Set<() => void>>();
+
+function attachStoreInvalidator(store: GatewayStore, invalidate: () => void): void {
+  let listeners = storeSettingsInvalidators.get(store);
+  if (listeners === undefined) {
+    listeners = new Set();
+    storeSettingsInvalidators.set(store, listeners);
+    const wrapMutator = (method: keyof GatewayStore): void => {
+      const orig = (store[method] as unknown) as ((...args: unknown[]) => Promise<unknown>) | undefined;
+      if (typeof orig !== 'function') return;
+      try {
+        Object.defineProperty(store, method, {
+          configurable: true,
+          writable: true,
+          value: async (...args: unknown[]) => {
+            try {
+              return await orig.apply(store, args);
+            } finally {
+              for (const cb of storeSettingsInvalidators.get(store) ?? []) cb();
+            }
+          },
+        });
+      } catch {
+        /* frozen or non-configurable store mock */
+      }
+    };
+    wrapMutator('updateExtendedSettings');
+    wrapMutator('updateSettings');
+    wrapMutator('updateUserGroup');
+    wrapMutator('deleteUserGroup');
+  }
+  listeners.add(invalidate);
+}
 
 export interface GatewayApiServerOptions {
   store: GatewayStore;
@@ -137,6 +172,42 @@ export function createApiRequestHandler(options: GatewayApiServerOptions): (req:
     publicUrl: options.publicUrl,
     runtimeMeta: options.runtimeMeta,
   };
+  let cachedSettings: ExtendedSystemSettings | null = null;
+  let cachedSettingsAt = 0;
+  let settingsEpoch = 0;
+  let settingsInFlight: Promise<ExtendedSystemSettings> | null = null;
+  const invalidateSettingsCache = (): void => {
+    settingsEpoch += 1;
+    cachedSettings = null;
+    cachedSettingsAt = 0;
+    settingsInFlight = null;
+  };
+  attachStoreInvalidator(options.store, invalidateSettingsCache);
+  const getExtendedSettingsCached = (): Promise<ExtendedSystemSettings> => {
+    const now = Date.now();
+    if (cachedSettings !== null && now - cachedSettingsAt < SETTINGS_CACHE_TTL_MS) {
+      return Promise.resolve(cachedSettings);
+    }
+    if (settingsInFlight !== null) return settingsInFlight;
+    const readEpoch = settingsEpoch;
+    const reqPromise = options.store
+      .getExtendedSettings()
+      .then((ext) => {
+        if (readEpoch === settingsEpoch) {
+          cachedSettings = ext;
+          cachedSettingsAt = Date.now();
+        }
+        return ext;
+      })
+      .finally(() => {
+        if (settingsInFlight === reqPromise) settingsInFlight = null;
+      });
+    settingsInFlight = reqPromise;
+    return reqPromise;
+  };
+  const cachedStore = Object.create(options.store) as GatewayStore;
+  cachedStore.getExtendedSettings = getExtendedSettingsCached;
+
   const deps: DispatchDeps = {
     routes: [
       ...buildAuthRoutes(),
@@ -146,7 +217,7 @@ export function createApiRequestHandler(options: GatewayApiServerOptions): (req:
       ...(options.topology !== undefined ? buildTopologyRoutes() : []),
     ],
     ctx: {
-      store: options.store,
+      store: cachedStore,
       masterKey: options.masterKey,
       config,
       runtime: options.runtime ?? NOOP_RUNTIME_STATS,

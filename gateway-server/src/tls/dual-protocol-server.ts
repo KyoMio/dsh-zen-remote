@@ -81,6 +81,7 @@ export function sanitizeRedirectHost(rawHost: string | undefined): string | null
 /** 剥离路径前导多斜杠 / 反斜杠，防止 `GET //evil.com` 变成跨站开放重定向 */
 export function sanitizeRedirectTarget(rawTarget: string | undefined): string {
   if (typeof rawTarget !== 'string' || rawTarget.length === 0) return '/';
+  if (/[\x00-\x1f\x7f]/.test(rawTarget)) return '/';
   let candidate = rawTarget;
   if (/^https?:\/\//i.test(candidate)) {
     try {

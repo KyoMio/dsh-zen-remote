@@ -70,6 +70,8 @@ const MAX_LAN_ENDPOINTS = 16;
 const MAX_CLOSE_FLUSH_ROUNDS = 8;
 /** GC-3：中转数据帧类型（relay-frame.ts 的 PeerFrameType.DATA），月度配额门禁只拦这一种 */
 const RELAY_FRAME_TYPE_DATA = 0x03;
+/** T8：目标 WS 发送缓冲上限（默认 4 MiB），超限丢弃 DATA 帧以防慢接收端拖垮网关内存 */
+const DEFAULT_MAX_TARGET_BUFFERED_BYTES = 4 * 1024 * 1024;
 
 /**
  * GC-3：网络属主的有效配额快照（内存缓存）。relayBinary 是同步热路径，月度
@@ -127,6 +129,8 @@ export interface PeerWsHubOptions {
   pingIntervalMs?: number;
   /** 控制面 WS 心跳 Pong 超时（ms）；默认 15_000 */
   pongTimeoutMs?: number;
+  /** 目标 WS 接收缓冲上限（bytes，默认 4 MiB），超限丢弃 DATA 帧 */
+  maxTargetBufferedBytes?: number;
   now?: () => number;
   /** 生产实例的真实 UDP STUN 端口供给器：组合根在 UdpStunService.bind() 完成后才返回
    * 实际绑定值（不得用配置值或 HTTP 端口冒充）；返回 null 或缺省时 welcome 不带 stun 字段 */
@@ -254,6 +258,7 @@ export class PeerWsHub {
   private readonly timestampWindowMs: number;
   private readonly pingIntervalMs: number;
   private readonly pongTimeoutMs: number;
+  private readonly maxTargetBufferedBytes: number;
   private readonly now: () => number;
   private nextConnSeq = 0;
   /** 真实 UDP STUN 端口供给器；null 表示组合根未接入（welcome 不带 stun 字段） */
@@ -309,6 +314,7 @@ export class PeerWsHub {
   // 任意路径拿到 ownerId 都回写）。快照缺失（冷缓存/被停用清掉）时 flush 仍能按它找到
   // 属主扣减 pending；属主被停用后刻意保留，让在途尾批 flush 也能正确对账清零。
   private readonly networkOwnerById = new Map<string, string>();
+  private readonly topologyPublish = new Map<string, { promise: Promise<void>; dirty: boolean }>();
   // GC-fix-batch1 R5：flush 提交序号（每次成功落库 +1）。快照记录读取时的序号，
   // flush 推进 dbUsedBytes 前比对，防止异步读取与 flush 交错时重复叠加/漏加。
   private committedFlushSeq = 0;
@@ -327,6 +333,11 @@ export class PeerWsHub {
     }
     this.pingIntervalMs = pingIntervalMs;
     this.pongTimeoutMs = pongTimeoutMs;
+    const maxBuf = options.maxTargetBufferedBytes ?? DEFAULT_MAX_TARGET_BUFFERED_BYTES;
+    if (!Number.isInteger(maxBuf) || maxBuf < 0) {
+      throw new TypeError('PeerWsHub: invalid maxTargetBufferedBytes');
+    }
+    this.maxTargetBufferedBytes = maxBuf;
     this.now = options.now ?? Date.now;
     this.stunPorts = options.stunPorts ?? null;
     this.limiter = new PeerRateLimiter({ now: this.now });
@@ -523,7 +534,7 @@ export class PeerWsHub {
         this.handlePathReport(conn, message);
         return;
       }
-      if (conn !== null && (conn.state === 'authorized' || conn.state === 'hanging') && message['type'] === 'rename') {
+      if (conn !== null && conn.state === 'authorized' && message['type'] === 'rename') {
         void this.handleRename(conn, message);
       }
       // 其余类型（含已认证后再发 auth）一律忽略
@@ -608,6 +619,7 @@ export class PeerWsHub {
       if (net !== undefined && net.get(conn.nodeId) === conn) {
         net.delete(conn.nodeId);
         if (net.size === 0) this.conns.delete(conn.networkId);
+        this.limiter.removeNode(conn.networkId, conn.nodeId);
         // 该节点下线后，其他成员上报的指向它的路径不再是可观测事实
         for (const other of this.conns.get(conn.networkId)?.values() ?? []) {
           other.pathReports.delete(conn.nodeId);
@@ -821,7 +833,6 @@ export class PeerWsHub {
       maxPeers: network.maxPeers,
       peerDirectMaxRttMs: network.peerDirectMaxRttMs,
     });
-    this.replaceExisting(networkId, nodeId);
     const conn: ConnState = {
       ws,
       stunAdmission: Symbol(),
@@ -847,21 +858,28 @@ export class PeerWsHub {
 
     switch (member.status) {
       case 'authorized': {
+        this.replaceExisting(networkId, nodeId);
         this.welcomeAuthorized(conn);
         this.registerAndAnnounce(conn);
         this.startConnHeartbeat(conn);
         return conn;
       }
       case 'pending': {
+        const hangKey = connKey(networkId, nodeId);
+        const oldHang = this.hanging.get(hangKey);
+        if (oldHang !== undefined) this.killConn(oldHang, 'replaced by a new connection');
         sendJson(ws, { type: 'welcome', status: 'pending', maxPeers: conn.maxPeers, peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
-        this.hanging.set(connKey(networkId, nodeId), conn);
+        this.hanging.set(hangKey, conn);
         this.startConnHeartbeat(conn);
         void this.publishTopology(networkId);
         return conn;
       }
       case 'mismatch': {
+        const hangKey = connKey(networkId, nodeId);
+        const oldHang = this.hanging.get(hangKey);
+        if (oldHang !== undefined) this.killConn(oldHang, 'replaced by a new connection');
         sendJson(ws, { type: 'welcome', status: 'mismatch', peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
-        this.hanging.set(connKey(networkId, nodeId), conn);
+        this.hanging.set(hangKey, conn);
         this.startConnHeartbeat(conn);
         void this.publishTopology(networkId);
         return conn;
@@ -874,9 +892,14 @@ export class PeerWsHub {
           deny(ws, `membership ${member.status}`);
           return null;
         }
+        const hangKey = connKey(networkId, nodeId);
+        const oldPaused = this.pausedConns.get(hangKey);
+        if (oldPaused !== undefined) this.killConn(oldPaused, 'replaced by a new connection');
+        const oldHang = this.hanging.get(hangKey);
+        if (oldHang !== undefined) this.killConn(oldHang, 'replaced by a new connection');
         conn.state = 'paused';
         sendJson(ws, { type: 'welcome', status: 'paused', maxPeers: conn.maxPeers, peerDirectMaxRttMs: conn.peerDirectMaxRttMs });
-        this.pausedConns.set(connKey(networkId, nodeId), conn);
+        this.pausedConns.set(hangKey, conn);
         this.startConnHeartbeat(conn);
         return conn;
       }
@@ -951,6 +974,9 @@ export class PeerWsHub {
     if (target === undefined) return; // 目标不在线（或非 authorized）
     const quota = this.currentOwnerQuota(conn.networkId);
     const isDataFrame = header.frameType === RELAY_FRAME_TYPE_DATA;
+    if (isDataFrame && target.ws.bufferedAmount > this.maxTargetBufferedBytes) {
+      return;
+    }
     // 受月度配额约束的属主视图（非 admin 且组设了 monthlyRelayQuotaBytes）；null = 不受约束
     const meteredQuota =
       quota !== null && !quota.isAdmin && quota.monthlyRelayQuotaBytes !== null ? quota : null;
@@ -967,7 +993,11 @@ export class PeerWsHub {
       return;
     }
     const effectiveRateKbps = quota === null ? this.rateKbps : quota.relayRateKbps;
-    if (!this.limiter.tryRelay({ networkId: conn.networkId, nodeId: conn.nodeId, peerNodeId: header.dstNodeId }, buf.length, effectiveRateKbps)) {
+    const scope = { networkId: conn.networkId, nodeId: conn.nodeId, peerNodeId: header.dstNodeId };
+    const allowed = isDataFrame
+      ? this.limiter.tryRelay(scope, buf.length, effectiveRateKbps)
+      : this.limiter.tryRelayControl(scope, buf.length);
+    if (!allowed) {
       return;
     }
     target.ws.send(buf, { binary: true }, () => {/* 写失败由 close 事件兜底 */});
@@ -1094,6 +1124,7 @@ export class PeerWsHub {
   // ------------------------------------------------------------ 路径遥测
 
   private async handleRename(conn: ConnState, message: Record<string, unknown>): Promise<void> {
+    if (conn.state !== 'authorized') return;
     if (typeof message['name'] !== 'string') return;
     const trimmed = message['name'].trim();
     if (trimmed.length < 1 || trimmed.length > 64) return;
@@ -1275,6 +1306,7 @@ export class PeerWsHub {
         break;
       }
       case 'remove': {
+        this.limiter.removeNode(event.networkId, event.nodeId);
         const conn = this.conns.get(event.networkId)?.get(event.nodeId);
         if (conn !== undefined) {
           this.broadcast(event.networkId, { type: 'peer-left', nodeId: event.nodeId }, event.nodeId);
@@ -1343,6 +1375,8 @@ export class PeerWsHub {
         conn.state !== 'hanging' || this.hanging.get(key) !== conn ||
         (this.memberEpochs.get(key) ?? 0) !== memberEpoch) return;
     this.hanging.delete(key);
+    const prevAuth = this.conns.get(event.networkId)?.get(event.nodeId);
+    if (prevAuth !== undefined) this.killConn(prevAuth, 'replaced by a new connection');
     const limits = this.resolveNetworkLimits(event.networkId, preReadSeq, freshCapacity, {
       maxPeers: conn.maxPeers,
       peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
@@ -1477,6 +1511,7 @@ export class PeerWsHub {
     this.subscribers.delete(networkId);
     this.lastPublishedKbps.delete(networkId);
     this.networkMaxPeers.delete(networkId);
+    this.limiter.removeNetwork(networkId);
     // GC-3：网络的属主配额快照与丢弃计数随网络消失（loadOwnerQuota 在途完成时
     // 若网络已删会返回 null，不会把孤儿条目写回）
     this.ownerQuotaByNetwork.delete(networkId);
@@ -1595,6 +1630,7 @@ export class PeerWsHub {
     if (network === null) return null;
     const members = await this.store.listMembers(networkId);
     const online = this.conns.get(networkId) ?? new Map<string, ConnState>();
+    const rates = this.limiter.snapshotNetworkRates(networkId);
 
     const rows: TopologyMemberRow[] = members.map((member) => {
       const conn = online.get(member.nodeId);
@@ -1606,7 +1642,7 @@ export class PeerWsHub {
         natType: conn?.natType ?? member.natType,
         lastIp: conn?.reflexive?.ip ?? member.lastIp,
         online: conn !== undefined,
-        liveRelayKbps: this.limiter.liveRelayKbpsByNode(networkId, member.nodeId),
+        liveRelayKbps: rates.byNodeKbps.get(member.nodeId) ?? 0,
         cumulativeRelayBytes: member.cumulativeRelayBytes,
         lastSeenAt: member.lastSeenAt,
       };
@@ -1614,12 +1650,13 @@ export class PeerWsHub {
     const links: TopologyLink[] = [];
     for (const conn of online.values()) {
       for (const [peerNodeId, report] of conn.pathReports) {
+        const pk = conn.nodeId < peerNodeId ? `${networkId}|${conn.nodeId}|${peerNodeId}` : `${networkId}|${peerNodeId}|${conn.nodeId}`;
         links.push({
           srcNodeId: conn.nodeId,
           peerNodeId,
           path: report.path,
           rttMs: report.rttMs,
-          liveRelayKbps: this.limiter.liveRelayKbpsPair(networkId, conn.nodeId, peerNodeId),
+          liveRelayKbps: rates.byPairKbps.get(pk) ?? 0,
         });
       }
     }
@@ -1636,7 +1673,7 @@ export class PeerWsHub {
       summary: {
         onlineDevices: online.size,
         pendingCount: pendingRows.length,
-        totalLiveRelayKbps: this.limiter.liveRelayKbpsByNetwork(networkId),
+        totalLiveRelayKbps: rates.totalKbps,
       },
       pending: pendingRows,
       members: rows,
@@ -1663,24 +1700,56 @@ export class PeerWsHub {
     };
   }
 
-  /** 重渲染并推送快照；渲染失败静默（下一轮 tick 还会拿到） */
-  private async publishTopology(networkId: string): Promise<void> {
+  /** 重渲染并推送快照（同网微任务合并 + 在途单飞，防止并发风暴与乱序）；渲染失败静默 */
+  private publishTopology(networkId: string): Promise<void> {
+    if (this.closed) return Promise.resolve();
     const set = this.subscribers.get(networkId);
-    if (set === undefined || set.size === 0) return;
-    let snapshot: NetworkTopologySnapshot | null;
-    try {
-      snapshot = await this.renderTopology(networkId);
-    } catch {
-      return;
+    if (set === undefined || set.size === 0) return Promise.resolve();
+    const existing = this.topologyPublish.get(networkId);
+    if (existing !== undefined) {
+      existing.dirty = true;
+      return existing.promise;
     }
-    if (snapshot === null) return;
-    for (const cb of set) {
-      try {
-        cb(snapshot);
-      } catch {
-        /* 单个订阅者写失败不拖累其他订阅者 */
-      }
-    }
+    const state: { promise: Promise<void>; dirty: boolean } = {
+      promise: Promise.resolve(),
+      dirty: true,
+    };
+    state.promise = new Promise<void>((resolve) => {
+      queueMicrotask(() => {
+        void (async () => {
+          try {
+            while (!this.closed && state.dirty) {
+              state.dirty = false;
+              const currentSubs = this.subscribers.get(networkId);
+              if (currentSubs === undefined || currentSubs.size === 0) break;
+              let snapshot: NetworkTopologySnapshot | null;
+              try {
+                snapshot = await this.renderTopology(networkId);
+              } catch {
+                continue;
+              }
+              if (snapshot === null || this.closed) continue;
+              const latestSubs = this.subscribers.get(networkId);
+              if (latestSubs === undefined || latestSubs.size === 0) continue;
+              for (const cb of latestSubs) {
+                try {
+                  cb(snapshot);
+                } catch {
+                  /* 单个订阅者写失败不拖累其他订阅者 */
+                }
+              }
+            }
+          } finally {
+            if (this.topologyPublish.get(networkId) === state) {
+              this.topologyPublish.delete(networkId);
+            }
+            resolve();
+          }
+        })();
+      });
+    });
+    this.topologyPublish.set(networkId, state);
+    return state.promise;
   }
 
   /** 3s 速率跳动：每网总速率与上次推送值不同才推（恒零不推） */
