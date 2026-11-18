@@ -1,218 +1,102 @@
 # AGENTS.md — dsh-zen-remote
 
-单一 npm 包 `dsh-zen-remote`，DSH（DeepSeek Harness）的 bundle 插件。
-一个包里有两半代码，但**对用户是一个插件**：文档、安装说明、README 都不要
-再按「两个包」叙述（2026-08-17 由 monorepo 的 `packages/gateway` +
-`packages/mobile-ui` 合并而来，包名 `dsh-mobile-pwa` 与
-`@dsh-external/dsh-mobile-nav` 已作废）。
-
-## 目录
-
-| 路径 | 作用 |
-| --- | --- |
-| `package.json` | 单包声明：`dsh.bundle.patch` → `cordis.patch.yml`，`dsh.client` → `exports["./client"]` |
-| `cordis.patch.yml` | 组合层，**一行** insert（`dsh-zen-remote`），随包自带；网关与推送由主入口按角色加载，不再各占一行 |
-| `src/index.ts` → `lib/index.js` | 主入口（插件行 `dsh-zen-remote`）：读 `role`，host 就 `ctx.plugin()` 加载网关与推送子插件，并挂 host 路由（附件上传 / 客户端配置 / 分享导出 / 管理 / 子客户端 / 中继） |
-| `src/config.ts` | 配置模型：四层回退（env > 插件行 > `lan-gate.config.json` > 默认值）、loader 的 `Config` schema（全 volatile）、`resolveRole`（`host` / `client` / `peer` 三角色，非精确串一律降级 host）与 `servesRole`（host+peer 对外服务）/ `connectsRole`（client+peer 对外连接）两个角色闸 |
-| `src/http.ts` | host 路由共用的 JSON 响应封装与同源 POST 门 |
-| `src/admin-routes.ts` | 设置页管理后端 `/_dsh/zen-remote/admin/*`：代调网关本机 API（配对 / 设备 / 测试推送）+ 共享开关 |
-| `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（三角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff）、`debug-report`（脱敏诊断报告，via 墙先于分派，CU-3） |
-| `src/client-pairing.ts` | 子客户端配对纯逻辑：服务端地址归一化（http 仅限内网段）、claim/探针结果分类 |
-| `src/state-store.ts` | 主进程三合一状态存储（MS-1）：`~/.dsh/zen-remote-state.json`（0600、tmp+rename 原子写）统一承载本机 `serverId`、共享表、已配对服务端（上限 `maxServers`，默认 8，PG-2 起可配），并做旧 `zen-remote-server.json` / `zen-remote-shares.json` 的一次性自动迁移与清理；PG-2 起另承载 peer 三块：`peerIdentity`（自证明 Ed25519 身份，读时校验 nodeId=hash(key)，坏块丢弃重建）、`peerNetwork`（入网成员记录）、`pinnedPeers`（本地 TOFU 公钥锚定，`verifyOrPinPeerKey` 绝不自动覆盖、`repinPeerKey` 仅显式调用换锚） |
-| `src/share-store.ts` | 共享会话表（读写 `~/.dsh/zen-remote-state.json` 的 `sessions` 段，持久化，重启恢复），中继访问控制的事实来源 |
-| `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
-| `src/share-ops.ts` | `agent/created` 的自动共享 / 分叉跟随 / busy 恢复 |
-| `src/share-export.ts` | 分享图路由 `GET /_dsh/mobile-nav/share-export`（完整日志折叠人类转写） |
-| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / `v1/http`（改动摘要 / diff 的 plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ `v1/upload`（远程会话附件字节转宿主暂存，返回回执）/ unshare |
-| `src/relay-access.ts` | 中继的按方法登记访问控制表（服务端那一张；`v1/http` 的按路由登记表也在这里） |
-| `src/relay-filter.ts` | 全局流与全局列表的输出过滤（`workspace/follow` / `session/control` / `session/list` / @ 引用候选行） |
-| `src/session-reference.ts` | 两端共用的 `dsh-session:` 引用编解码与「可注入文本」扫描规则（prompt content、排队消息 edit、`commands/execute` 全部字符串）：服务端照它校验、子客户端照它改写，同一份规则防两端漂移 |
-| `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别 |
-| `src/relay-pool.ts` | 多服务端中继连接池（MS-2，最多 8 台）：按配对顺序管理每台的 `RelayClient`，握手回写 `serverId`/`serverName` 并对同 `serverId` 的旧条目去重（保留最新配对），重名显示名按配对顺序派生 `-1`/`-2`（`deriveDisplayServerNames`），支持按 entryId/serverId 定位、单台/全部重连、移除与改名广播 |
-| `src/peer/` | 节点端（`peer`）双路径组网引擎：`wire.ts` 线协议纯编解码（28B 明文路由头 + ≤1200B 密文帧）与帧算术、`crypto.ts` 自证明 Ed25519 身份（`nodeId = sha256(pub)[0..8]`）、`zr-net://` 邀请链接解析与会话级 Ephemeral X25519 + AES-256-GCM AEAD（兼容 Node OpenSSL 与 Electron BoringSSL）、`arq.ts` 1200B 滑动窗口可靠流、`punch.ts` 双 UDP STUN 与 1000ms 打洞状态机（60s 静默重探、`lan`/`p2p` 路径分类）、`mux.ts` 虚拟 HTTP 多路复用、`engine.ts` 网关控制信令（`/peer/v1/ws` 挑战应答握手）与独立本地 TOFU 公钥锚定（mismatch 本机拦截）、挂载复用 `relay-pool` 的侧边栏合并 |
-| `src/intercept.ts` | 子客户端本机拦截：包装 `typertGateway`，远程会话调用改走中继、虚拟 id 改写、面板判定（客户端那张字段表也在这里） |
-| `src/intercept-shape.ts` | 被包装方法的形态检测，不符即拒绝安装远程拦截（本地行为不受影响） |
-| `src/plugin-bridge.ts` | 插件桥纯逻辑（PB-1）：桥接声明校验/规范化与 16 位摘要、`zenRemote` 注册表、两端比对 `compareBridges`；不 import DSH、不碰 I/O |
-| `src/plugin-loopback.ts` | 插件桥回环执行器（PB-3）：本机回环 GET 插件路由，token 换 cookie（401 重换一次），cookie 只存内存；https 仅对字面 127.0.0.1 放宽证书校验 |
-| `src/plugin-route-intercept.ts` | 子客户端改道（PB-4）：包装宿主 webServer 的 `match`，声明命中的虚拟 id 请求改走 `relay.pluginRequest`；未桥接一律统一 503（`x-zen-remote: unbridged`），绝不落本机插件 |
-| `src/plugin-adapter-core.ts` | 适配器框架核心（PB-11）：适配器路由/定位器的校验、三种定位（query/路径段/JSON 体）的「远程/本地/混合」判定与双向改写、适配器摘要与让位判定；纯逻辑，框架两半只 import 这里 |
-| `src/adapters/` | 适配器目录（PB-11）：`index.ts` 只导出 `ADAPTERS` 数组（本单为空，PB-12 加第一个），`types.ts` 放适配器作者接口，实现各占一个子目录；**除 `src/index.ts` 接线外任何文件不得 import 此目录**，适配器实现只可 import `types.ts` 与纯工具 |
-| `src/client-data/plugin-bridge.ts` | 设置页纯函数（PB-5）：桥接状态 → 文案键、整机数据同意表的切换（只动一键）；浏览器半边，不 import 主包 |
-| `src/fetch-route-intercept.ts` | 子客户端本机拦截的第二半：包装宿主连接服务 `fetchRoutes` 表的上传与导出两项——远程会话的非图片附件经 `relay/v1/upload` 流式转服务端（超限本地拒、失败回宿主自己的 200 失败信封）、虚拟 id 的导出后台 403（形态检测、懒装重试、卸载守卫） |
-| `src/virtual-id.ts` | `zr~<serverId>~<id>` 虚拟 id 算术（纯函数、零依赖；client-data 半边许可 import 它做 zr~ 判定，先例 remote-drop.ts / remote-status.ts） |
-| `src/log-ring.ts` | 诊断导出用内存日志环（CU-1）：上限 300 条、进程内不落盘；index.ts 两分支的 logWarn/logInfo 收口双写（ctx.logger + 环），生命周期事件（row apply/reload、网关 spawn/exit、relay online/offline、fetch-route 安装含 via）push 进环 |
-| `src/debug-report.ts` + `src/debug-redact.ts` | 诊断报告装配与脱敏器（CU-2，纯逻辑零 DSH import）：装配 getter 注入拼 `_meta/config/status/gateway/logs` 五板块、配置按字段名挑选（秘密构造性缺席）；脱敏器 URL 走**哨兵摘出-还原**（userinfo→`<token>@`、host→地址类型、端口与 path 保留、query 长值单独 token 化）、家目录折叠先于 token 趟；`test/debug-report.test.mjs` 真值表钉住全部形态（含哨兵伪造） |
-| `src/merge-streams.ts` | 三条全局流/列表的本地 + 远程合并状态机（侧边栏远程分组） |
-| `src/fingerprint.ts` | DSH 接口指纹：规范化描述符 → 分组 JSON Schema 哈希，供握手比对 |
-| `src/restart-fields.ts` / `restart-watcher.ts` | 需重启字段的指纹监测，变化即重载插件行 |
-| `src/client/**` → `lib/client.js` | 浏览器半边（同一插件行，经 `dsh.client` 发现）：app 外壳、slot、样式、设置区块（`settings/`）、共享与远程部件（`remote-*` / `Remote*`） |
-| `src/client-data/current-session.ts` + `src/client/current-session-report.ts` | 当前会话信号的浏览器上报（T62）：拦截层在后台进程读不到浏览器 localStorage，由浏览器端解析宿主选择存储、值变化时 POST 到 `client/current-session` 路由；纯函数（解析 + 变化判定）与上报循环分居两文件 |
-| `src/client-data/remote-group-expansion.ts` + `src/client/remote-group-expansion.ts` | 服务端分组展开状态的记忆与恢复（T64）：宿主 retainAccountKeys 每次加载都清掉 zr~ 分组的展开记录，浏览器端把宿主记录镜像进自己的存储键、宿主清掉后按记录（默认展开）点击行恢复；纯函数（规划 + 解析 + 上限淘汰）与 keeper 循环分居两文件 |
-| `lan-gate.mjs` | 网关子插件入口，由主入口按 host 角色加载（不再自己占插件行）：spawn 子进程，共享密钥只经它进子进程 |
-| `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，Node stdlib + `web-push`）：设备角色、标记头与共享密钥、desktop-client 只放行中继前缀 |
-| `dsh-push.mjs` | 推送子插件（与网关一起由主入口加载）：回合结束推送 + `push_notify` 工具 |
-| `bin/zen-remote.mjs` + `src/cli/**` → `lib/cli/` | 命令行工具 `dsh-zen-remote`（bin 入口只加载 `lib/cli/main.js`）：插件进程内的 0600 IPC socket 服务端与 CLI 侧发现/客户端（`ipc-server.ts` / `ipc-client.ts`）、防遮蔽配置写入（`config-writer.ts`）、参数解析与双语 i18n（`args.ts` / `i18n.ts`）、`status` / `host *` / `client *` / `peer *` 子命令（`commands-*.ts`）、`setup` 三步向导与三角色切换联动（`command-setup.ts`）、多选 profile 安装与 DSH 自动拉起（`bootstrap.ts`）；全部经 IPC 驱动插件进程，CLI 自己绝不 spawn caddy / cloudflared |
-| `gateway-server/` | 独立自建中继网关与 Web 控制台子包（源码同仓维护，**不进入** `dsh-zen-remote` npm 发布包；独立 `tsconfig` / `pnpm --dir gateway-server build\|verify\|test`，含 `gateway-server/test/peer-client-e2e.test.mjs` 跨端 E2E 与 `test/helpers/fixtures.mjs` 共享夹具，由 `.github/workflows/gateway-ci.yml` 独立守护，与主仓 `publish.yml` 及 `npm test` 保持零跨包依赖）：虚拟网络管理、五态成员准入（`pending` / `authorized` / `paused` / `mismatch` / `revoked`）、双端口 UDP STUN 打洞协调与零知识 E2EE 密文中转（网关无私钥、只路由密文帧），Docker 单容器交付；部署与运维文档见 `gateway-server/README.md`（只写给最终部署者，不含内部过程文档） |
-| `pwa/**` | manifest / service worker / 注入脚本 / 手势 / 壳级 CSS / 图标 |
-| `test/*.test.cjs` + `test/*.test.mjs` + `test/helpers/*.cjs` | 主仓统一 `node:test` 测试集（`.test.cjs` 驱动编译产物 `lib/*.js` 与 `lib/lan-gate-server.cjs`；`.test.mjs` 靠 Node ≥23.6 原生类型剥离直引 `src/client/**` / `src/client-data/**`、`.css.ts` 样式契约与仓库静态守卫；`test/helpers/` 放跨文件共用夹具） |
-| `scripts/run-tests.mjs` | 自适应并发测试运行器：扫描 `test/*.test.{cjs,mjs}`，按 `ZR_TEST_CONCURRENCY`（默认 `min(availableParallelism(), 6)`）驱动 `node --test` |
-| `scripts/verify-better-sidebar-tarballs.mjs` | 离线维护者脚本：按需校验 `/tmp/bs-versions/` 历史 tarball 与 `better-sidebar` 适配器表（不进默认 `npm test`） |
-| `scripts/build-client.mjs` | client 打包器（内联相对模块 → `__ModuleLoader__.load({id:"dsh-zen-remote"})`） |
-| `docs/**` | 深度文档，见下 |
+单一 npm 包 `dsh-zen-remote`，DSH（DeepSeek Harness）的 bundle 插件：host 半边（网关 / 中继 / 推送 / CLI）与 client 半边（浏览器 UI）同包分发，**对用户是一个插件**——文档、安装说明、README 一律不按「两个包」叙述（2026-08-17 合仓；旧包名 `dsh-mobile-pwa`、`@dsh-external/dsh-mobile-nav` 作废）。
 
 ## 命令
 
 ```sh
 pnpm install
-pnpm build     # tsc host + tsc client + build-client.mjs → lib/（产物入库，改 src/ 必须重跑并提交 lib/）
-pnpm verify    # 两个 tsconfig 的 --noEmit 类型检查
-pnpm test      # 经 scripts/run-tests.mjs 跑全量 test/*.test.{cjs,mjs} + 文档版本号一致性检查（支持 ZR_TEST_CONCURRENCY=2）
-pnpm --dir gateway-server verify && pnpm --dir gateway-server build && pnpm --dir gateway-server test  # 网关子包三件套（含 prebuild）
+pnpm build     # tsc host + tsc client + build-client.mjs → lib/（产物入库：改 src 必须重跑并提交 lib/）
+pnpm verify    # 两个 tsconfig 的 --noEmit
+pnpm test      # scripts/run-tests.mjs 全量 test/*.test.{cjs,mjs} + 文档版本一致性检查；ZR_TEST_CONCURRENCY=2 可低并发压测
+node --test test/<file>                                         # 主仓单文件
+pnpm --dir gateway-server verify && pnpm --dir gateway-server build && pnpm --dir gateway-server test   # 网关三件套（pretest 自动 build）
+node --experimental-sqlite --test gateway-server/test/<file>    # 网关单文件
 ```
 
-**版本号**：两份 README（`README.md` 英文为主文档，`README.zh-CN.md` 中文）里的
-release 徽章和 profile 依赖示例由 `scripts/sync-doc-version.mjs` 按 `package.json`
-改写，挂在 `version` 生命周期脚本上——`npm version patch` 会把改好的两份 README
-带进同一个发版提交，不用手改
-（徽章曾经一路卡在 v1.0.0 到 1.0.2）。`pnpm test` 里的 `--check` 会在漏同步时
-把测试挂掉。文档里的锚点变了就更新那个脚本：找不到标记它直接非零退出，不会
-默默通过。
+完成判据：改动 src 后 build 产物已随提交入库、verify 与 test 全绿；动了 `gateway-server/` 就单独跑完它的三件套。
 
-**发版**：全部由 tag 驱动，本地只做一步。
+## 按任务找入口
+
+| 做什么 | 先读 |
+| --- | --- |
+| 改通道半边（反代 / 配对 / 中继协议 / 推送 / 安全边界） | `docs/remote-access.md` |
+| 改界面半边（断点 / 设置区块 / 远程部件 / 调试徽章 / 安全区） | `docs/interface.md` |
+| 查某个文件的职责与非显然注记 | `docs/codebase-map.md` |
+| 适配第三方插件 | `docs/interface.md`「兼容插件」清单 + `src/client/styles/compat.css.ts` 现有段落 |
+| 部署网关子包 | `gateway-server/README.md` |
+| 做推广物料 | 项目级 skill `dsh-promo-video`（`.claude/skills/`，本地不入库） |
+
+## 硬约束
+
+真机事故攒出来的，改相关代码前逐条对照。
+
+### 产物与构建
+
+- **`lib/` 是产物，不手改**：改 `src/` → `pnpm build` → 提交 `lib/`。**删 src 时必须手动 `git rm` 对应 lib 产物**——tsc 只增量写、从不清理，CI 的 `git diff --exit-code -- lib` 关卡对死产物全盲（2026-10-24 PR #34 踩过）。
+- **`gateway-server/` 不进发布包**：`package.json` 的 `files` 白名单刻意不含它，主仓 build/verify/test 也不碰它。严禁 `git add -f` 被 `.gitignore` 忽略的设计 / 原型 / 过程文档（`.impeccable/`、`prototype/`、`PRODUCT.md`、`DESIGN.md`、`docs/`）。
+
+### 进程与安全边界
+
+- **网关是子进程**：`lan-gate.mjs` 只负责 spawn + 生命周期，永远不要把 `lib/lan-gate-server.cjs` import 进 DSH 进程。
+- **中继共享密钥不落地**：主入口每次 apply 现生成 `LAN_GATE_RELAY_SECRET`，只经环境变量交给网关子进程（无条件覆盖、缺失即删除），中继路由逐请求 `timingSafeEqual` 校验；不外部指定、不进日志和状态文件。
+- **访问控制按方法登记，两张表同步**：新增远程方法同时登记 `src/relay-access.ts` 的 `RELAY_METHODS`（服务端）与 `src/intercept.ts` 的 `CLIENT_METHOD_FIELDS`（客户端），一致性由 `test/intercept-core.test.cjs` 逐方法钉住；插件桥另走一条（声明注册表 + 路径完全相等 + 会话共享，`src/plugin-route-intercept.ts`）。**禁止「从参数里通用扫描会话 id」**——DSH 会悄悄丢掉不认识的参数名，扫描会被诱饵字段骗过；全局读（`session/list` 等）的安全靠输出过滤，不靠输入判定。
+- **适配器必须可插拔**：`src/adapters/` 整目录删掉后其余功能一字不改——框架只消费 `src/plugin-adapter-core.ts`，接线只有 `src/index.ts` 一处 import，改框架两半时不得新增对适配器目录的 import（`test/adapters-pluggable.test.cjs` 静态扫描钉住）；插件自己登记的协作声明永远优先于适配器。
+
+### 桌面端与宿主形状
+
+- **桌面端请求没有 `Origin`/`Sec-Fetch-Site`**：DSH 桌面端主进程校验过 `Origin: dsh-app://app` 后删掉 `host`/`origin`/`cookie`/`sec-fetch-site`。所以 `src/http.ts` 的 `sameOriginPost` 对「两个头都缺」**放行**——改成「缺 Origin 即拒」会挡掉桌面窗口的全部变更请求。真正要拒的是可辨认的跨站（`Sec-Fetch-Site: cross-site`、Origin 与 Host 不符）。
+- **桌面必须 no-op**：≥1024px 逐像素与未安装时一致。
+- **volatile 字段在使用时现场读取**：`Config` 每个字段都是 volatile（loader 交给 `apply()` 的是 `{ get() }` 包装）。读行配置走 `unwrapVolatile`（单字段）或 `resolveConfig`（整组），禁止 apply 时拍快照；`RESTART_FIELDS` 之外的字段改了不重载行，不现场读就永久拿到旧值。
+- **别用 `:has()` 写死宿主 DOM 层数**：槽位会额外套层（真实是 `flowItem > seat > AssistantMarkdown root > body > 块`），深度猜错的选择器**静默失效**——测试全绿、控制台干净，只有真界面能量出来。结构判断用 JS 沿父节点上溯（`foldsWholeRows` 写法），不假设层数。
+
+### 界面时序与缓存
+
+- **要藏宿主刚渲染出来的东西，别用 `requestAnimationFrame`**：React 在该帧 rAF 阶段之后才提交 DOM，mutation 里排的 rAF 落在下一帧，中间帧已上屏（三次事故：2026-08-18 回复晚出、08-22 工具行先显后折、08-25 流式抖动）。选择器能表达的交给样式表（`turn-fold.css.ts` 的 `BORN_FOLDED`，读宿主自己的 `data-chat-flow-kind`/`data-variant`，第一帧即隐藏）；表达不了的放进 MutationObserver 回调同步做（微任务，先于渲染）；rAF 只留给容忍晚一帧的活（全量重扫、插 chip、改文案）。
+- **首帧壳只能内联注入**：冷启动占位壳由网关 `injectBootShell` 写进第一帧 HTML（`BOOT_SHELL_*` 内联常量，不放进 `pwa/app.css` 或客户端样式），DSH 一渲染 `#root` 同步摘除，带 30s CSS 渐隐兜底；不能挪进客户端插件（那个 bundle 正是首帧要等的东西）、不能引入额外请求；显式 `desktop` 设备不注入、≥1024px 由 CSS 隐藏。`test/gateway.test.cjs` 钉住。
+- **长缓存只给内容寻址 URL**：网关只给 `/assets/` 下**哈希形状**（8+ 位且含数字或大小写混合，排除 `vendor-bootstrap.css` 这类普通词）且非 HTML 的响应补 `immutable`（上游已有缓存头让上游说话）；service worker 只对同一判定与 `?rev=<hex>` 插件批次缓存优先；响应类型必须与 URL 声明一致，HTML/错误页不进资源缓存。给无哈希 URL 做长缓存就是重演 v2「新 DOM + 旧 CSS」事故。
+- **CSS 分工**：排版规则在 `src/client/styles/`；`pwa/app.css` 只留壳级（iOS 防缩放、安全区滚动补偿、代码块横滚）。两边抢同一元素是历史事故根源，加规则前先确认归属。
+
+### 联调与验证
+
+- **同机联调必须用局域网 IP 连网关**：回环地址且无转发头被判定「本机直连」，不校验设备令牌——同机同时跑服务端与子客户端时 `serverUrl` 填局域网 IP。日常两台机器使用不受影响。
+- **改了界面就去真界面上量**：合成 DOM 猜不对宿主包裹层，静态自建页面会假阳性；打开 `127.0.0.1:3080` 读现有会话的 `getComputedStyle` 即可。**不要为验证建会话或发消息**（耗真实 token）。后台标签 rAF 不触发、chip 计 0 是观测假象，不是回归。
+
+## 测试规范
+
+1. **分层与后缀**：主仓运行时 / 后端单测 → `test/<domain>.test.cjs`，驱动编译产物 `lib/*.js` 与 `lib/lan-gate-server.cjs`，禁运行时 `require('typescript')` 抠源码、禁反向引用 `gateway-server/dist/`；主仓客户端逻辑 / 样式契约 / 仓库守卫 → `test/<domain>.test.mjs`，靠 Node ≥23.6 原生类型剥离直引 `src/client/**`、`src/client-data/**` 与 `.css.ts`，禁再在 `scripts/` 新增 `check-*.mjs`；网关子包与跨端 E2E → `gateway-server/test/*.mjs`，复用 `test/helpers/fixtures.mjs` 夹具，由 `gateway-ci.yml`（含真实 PostgreSQL）独立守护，与主仓 `publish.yml`、`npm test` 零跨包依赖。
+2. **防膨胀**：新功能或修 bug 优先追加进已有领域测试文件，禁按工单号（`t0xx-*`）或单条 CSS 规则拆独立小文件；单文件超 ~2,000 行且子域正交才拆，共享夹具下沉 `test/helpers/`。
+3. **铁律**：轮询 / 退避 / 宽限期走 `t.mock.timers`、注入 `clock` 或 20–150ms 短超时，禁秒级真实 sleep；`Promise.race` 的定时器在 `finally` 清 `clearTimeout`；子进程、端口、监听器、全局 mock 一律挂 `t.after` 清理，只读网关测试文件级共享子进程；端口一律传 `0`，模拟连接重置用 `test/util.cjs` 的 `startResetServer()`，禁 `freePort()`/`deadPort()` TOCTOU；背压测试用可控 Mock `ServerResponse` 或注入小阈值，禁灌几十 MiB 赌内核缓冲；异步到达用有界 `waitFor` 轮询，禁给真实时钟设 `<100ms` 上界；禁锁死源码变量名、缩进、精确调用次数的正则断言；临时文件与测试 `HOME` 一律 `os.tmpdir()` + `t.after` 回收，严禁写 `.scratch/`、禁 `process.chdir()`。
+
+## 发版
+
+全部由 tag 驱动，本地只做一步（发版前先把 CHANGELOG「未发布」标题改成版本号 + 日期，做成**独立的 `docs(changelog)` 提交**——`npm version` 要求完全干净树，「随 version commit 一起提交」的旧写法作废）：
 
 ```sh
-npm version patch      # 改 package.json + 同步两份 README + 建 commit 和 v* tag
-git push --follow-tags # 推 tag 才是真正的触发器
+npm version patch      # 改 package.json + 同步两份 README 徽章 + 建 commit 和 v* tag
+git push --follow-tags # 推 tag 才是真正触发器
 ```
 
-推上去之后 `.github/workflows/publish.yml` 依次做：装依赖 → `pnpm build` →
-**`git diff --exit-code -- lib`**（入库产物必须与重新构建的结果一致，挡住
-「改了 src 忘了 build 就打 tag」）→ `pnpm verify` → `pnpm test` →
-tag 名与 `package.json` 版本一致性 → `pnpm publish`（npm Trusted Publishing，
-OIDC 无令牌，provenance 自动生成）→ **建 GitHub Release**。
+- CHANGELOG 只记用户可感知的变化，未发布段落攒待发内容；GitHub Release 正文**就是** CHANGELOG 该版本段（workflow 用同一条 awk 提取，缺段在 npm 发布前被守卫挡下），其下附与上一 tag 的 compare 链接（不用 `--generate-notes`：无法与 `--notes-file` 共存，正文来源要可预测）。
+- `publish.yml` 链：装依赖 → `pnpm build` → **`git diff --exit-code -- lib`**（入库产物必须与重建一致）→ `pnpm verify` → `pnpm test` → tag 与版本一致性 → `pnpm publish`（Trusted Publishing，OIDC 无令牌）→ 建 GitHub Release（刻意排 npm 后：宣告的是「已发出去」；可重入；`fetch-depth: 0`）。
+- 人工配置仅一处：npmjs 包设置登记可信发布者 `KyoMio/dsh-zen-remote` + 文件名 `publish.yml`；Release 用自带 `GITHUB_TOKEN`，job `permissions` 的 `contents` 须 `write`。
+- README 版本徽章由 `scripts/sync-doc-version.mjs` 挂在 `version` 生命周期改写；`pnpm test` 的 `--check` 在漏同步时挂掉；锚点变了改脚本（找不到标记直接非零退出，不默默通过）。
 
-Release 那步刻意排在 npm 之后：它宣告的是「这个版本已经发出去了」，npm 失败就
-不该留下一个指向不存在版本的发布页。正文来源见下方 CHANGELOG 段（该版本的那一
-段 + 到上一 tag 的 compare 对比链接）；这一步可重入（先 `gh release view` 查在不在，
-在就跳过），重跑失败的 workflow 不会因为 Release 已存在而挂掉。checkout 带
-`fetch-depth: 0`（统计与上一 tag 间的提交数需要全历史）。
+网关子包独立发版：版本独立于主包，推 `gateway-v*` tag 触发 `gateway-docker.yml` 构建多架构镜像推 Docker Hub（配 `DOCKERHUB_USERNAME`/`TOKEN` secrets）；日常改动由 `gateway-ci.yml` 独立守护，与主包流水线零跨包依赖。
 
-CHANGELOG（2026-11-02 起有 `CHANGELOG.md`）：只记用户可感知的变化，未发布段落
-攒着待发内容；**发版前**把「未发布」标题改成该版本号 + 日期，随 `npm version
-patch` 的 version commit 一起提交（脚本只同步 README 徽章，CHANGELOG 是手动步）。
-此前「提交信息就是 changelog、不另维护文件」的约定作废。GitHub Release 正文
-**就是 CHANGELOG 里该版本的那一段**（workflow 用同一条 awk 提取，缺段会在 npm
-发布前被守卫挡下），其下自动附与上一 tag 的 GitHub compare 对比链接（替代冗长的逐条 git log，不再用 `--generate-notes`——它无法与 --notes-file 共存，且正文来源要可预测）。
+**发版踩坑（2026-09~11 三次事故复盘）**：
 
-需要人工配置的只有一处：npmjs.com 的包设置里登记可信发布者
-`KyoMio/dsh-zen-remote` + 文件名 `publish.yml`。GitHub Release 那步用的是
-workflow 自带的 `GITHUB_TOKEN`，不需要额外密钥——但 job 的 `permissions` 里
-`contents` 必须是 `write`（原来是 `read`）。
-
-## 测试体系与新增测试规范
-
-1. **分层与后缀归属**：
-   - **主仓运行时与后端单测**（宿主、网关 `lan-gate`、中继、拦截、CLI、插件桥、Peer）：放在 `test/<domain>.test.cjs`。统一导入编译产物 `lib/*.js` 与 `lib/lan-gate-server.cjs` 测试；**严禁**在测试运行时 `require('typescript')`、`registerHooks` 或用 `ts.createSourceFile` 抠源码，也**严禁**主仓测试反向引用 `gateway-server/dist/`。
-   - **主仓客户端逻辑、样式契约与仓库守卫**：放在 `test/<domain>.test.mjs`。借助 Node ≥23.6 原生类型剥离静态 `import` `src/client/**`、`src/client-data/**` 与 `.css.ts` 展开后真实常量；**禁止再在 `scripts/` 下新增 `check-*.mjs`**。
-   - **网关子包与跨端 Peer 全栈 E2E**：放在 `gateway-server/test/<domain>.test.mjs`（含跨端联调 `gateway-server/test/peer-client-e2e.test.mjs`）。复用 `gateway-server/test/helpers/fixtures.mjs` 预计算 `scrypt` 哈希与自签 TLS 证书，由 `.github/workflows/gateway-ci.yml`（含真实 PostgreSQL 服务）独立守护；主仓 `.github/workflows/publish.yml` 与 `npm test` 保持零跨包依赖。
-2. **防膨胀与组织原则**：
-   - 新功能或修 bug 一律优先追加进已有对应领域测试文件，**禁止**按工单号（如 `t0xx-*`、`*-v2`）或单条 CSS 规则拆出独立小文件。
-   - 仅当单文件超过 ~2,000 行且内部子域正交时，才按子域拆分成清晰的多文件，跨文件共享夹具下沉至 `test/helpers/` 或 `gateway-server/test/helpers/`。
-3. **快时钟、防竞态与低配机兼容铁律**：
-   - 轮询、退避与宽限期一律走 `t.mock.timers`、注入虚拟 `clock` 或可选短超时（`20–150ms`），禁止秒级真实 `sleep`。
-   - `Promise.race` 创建的定时器必须在 `finally` 中 `clearTimeout`（并按需 `.unref()`）；所有子进程、端口、监听器与全局 mock 必须挂 `t.after` 清理；只读网关测试优先在文件级 `before`/`after` 共享子进程。
-   - 端口分配一律传 `0`（含 `startGateway(0, ...)`），模拟连接重置一律使用 `test/util.cjs` 的 `startResetServer()`，**禁止** `freePort()` / `deadPort()`（listen-close 后再用）TOCTOU 模式。
-   - 背压与排空测试使用可控 Mock `ServerResponse` 或注入小阈值，禁止灌几十 MiB 数据赌内核 `wmem`/`rmem`。
-   - 异步事件到达使用有界 `waitFor` 轮询替代固定短 `sleep`，禁止给真实时钟或回环 UDP 设置 `< 100ms` 紧上界。
-   - 禁止编写锁死源码局部变量名、缩进格式或精确调用次数的源码正则断言。
-   - 临时文件与测试 `HOME` 一律创建于 `os.tmpdir()` 并挂 `t.after` 回收，**严禁**写入 `.scratch/` 或调用 `process.chdir()`。
-4. **运行命令**：
-   - 单文件调试：`node --test <file>`（网关子包：`node --experimental-sqlite --test <file>`）。
-   - 主仓全量：`pnpm test` 或 `npm test`（通过 `scripts/run-tests.mjs` 跑全部 `test/*.test.{cjs,mjs}` 及版本同步检查；传 `ZR_TEST_CONCURRENCY=2` 可做低并发压测）。
-   - 网关全量：`pnpm --dir gateway-server test` 或 `npm --prefix gateway-server test`（`pretest` 自动先执行 `build`）。
+- `npm version` 要求完全干净树；未跟踪的 `gateway-server/` 挡道时写进 `.git/info/exclude`（本地忽略，不动仓库）。
+- 本地重建 `lib/` 提交前核对 `lib/types/client/nav-store.d.ts` 是否被翻转（类型引用随本地 node_modules 形态变化：软链解析为 dsh-client-ui-slots，CI 全新 install 解析为 dsh-client-store，CI-canonical 是后者）；核对产物用 git worktree 全新 frozen install，不拿主检出当基准。
+- 剥离功能 / 吸收 PR 后必查 `lib/` 残留：`git diff --exit-code -- lib` 对死产物全盲，用 `git ls-files lib/` 对照 `src/`（或逐标识符 grep）找 stale 产物显式 `git rm`。
+- 已推送未发布的 tag 可删远端重打（`git push origin :refs/tags/vX` 再在修复提交上重打重推），流水线自动重跑；未曾发布的版本重指 tag 才干净。
+- `pnpm publish` 成功后 registry CDN 有几分钟传播延迟：`npm view`/tarball 404 是负缓存假象，用 dist-tags 端点 + cache-bust GET 判真伪，别急着重发。
+- 本地全绿 ≠ CI 绿（CI Node 24）：测试文件里 `await import()` ESM 时，所有 `require()` 放文件顶部且排在 import() 之前（Node 24 报 `ERR_REQUIRE_ESM_RACE_CONDITION`）；断言先 `waitFor` 再按 namespace/method 查。发版失败看 `gh run view --log-failed`。
 
 ## 深度文档
 
 | 文件 | 内容 |
 | --- | --- |
-| [`docs/remote-access.md`](docs/remote-access.md) | 通道半边：反代配置（nginx/Caddy/Lucky）、设备角色与配对、环境变量表、管理 API、远程中继协议、推送、安全边界 |
-| [`docs/interface.md`](docs/interface.md) | 界面半边：断点策略、设置区块与远程部件、调试徽章、安全区体系、兼容插件清单 |
-
-
-## 合仓后仍然成立的硬约束
-
-- **gateway-server 不进发布包**：`package.json` 的 `files` 白名单刻意不含
-  `gateway-server/`，主仓 build/verify/test 也不碰它——它有自己的
-  `pnpm --dir gateway-server <cmd>` 三件套。改动网关后记得单独跑那三条命令；
-  严禁 `git add -f` 它被 `.gitignore` 忽略的设计/原型/过程文档
-  （`.impeccable/`、`prototype/`、`PRODUCT.md`、`DESIGN.md`、`docs/`）。
-- **网关是子进程**：`lan-gate.mjs` 只负责 spawn + 生命周期，永远不要把
-  `lib/lan-gate-server.cjs` import 进 DSH 进程。
-- **中继共享密钥不落地**：主入口每次 apply 现生成 `LAN_GATE_RELAY_SECRET`，
-  只经环境变量交给网关子进程（无条件覆盖、缺失即删除），中继路由逐请求
-  `timingSafeEqual` 校验。不允许由外部环境指定，也不要把它写进日志或状态文件。
-- **中继访问控制按方法登记，两张表同步**：新增远程方法必须同时登记
-  `src/relay-access.ts` 的 `RELAY_METHODS`（服务端，授权看登记的归属字段）
-  和 `src/intercept.ts` 的 `CLIENT_METHOD_FIELDS`（客户端，改写判定），
-  一致性由 `test/intercept-core.test.cjs` 的逐方法比对测试钉住。插件桥的授权另走一条：声明注册表 + 路径完全相等 + 会话共享（`src/plugin-route-intercept.ts` / relay 的 `/v1/plugin`），同样不扫描参数；
-  禁止「从参数里
-  通用扫描会话 id」的写法——DSH 会悄悄丢掉不认识的参数名，扫描会被诱饵
-  字段骗过；全局读（`session/list` 等）安全靠输出过滤，不靠输入判定。
-- **适配器必须可插拔**：`src/adapters/` 整个目录删掉后其余功能一字不改——
-  框架只消费 `src/plugin-adapter-core.ts`（在适配器目录之外），接线只有
-  `src/index.ts` 一处 import `./adapters/index`，`createRelayHandler` /
-  `installPluginRouteIntercept` / admin 列表的适配器参数全部缺省空；改
-  框架两半时不得新增对适配器目录的 import（`test/adapters-pluggable.test.cjs`
-  的静态扫描钉住）。适配器让位规则：插件自己登记的协作声明永远优先，
-  运行时逐请求核对注册表摘要。
-- **桌面端请求没有 `Origin`/`Sec-Fetch-Site`**：DSH 桌面端主进程把窗口请求
-  转发给本机后台前，自己校验过 `Origin: dsh-app://app`，然后删掉
-  `host` / `origin` / `cookie` / `sec-fetch-site`。所以 `src/http.ts` 的
-  `sameOriginPost` 对「两个头都缺」的请求是**放行**的（`admit` 顶在前面）；
-  别把它改成「缺 Origin 即拒绝」，那会把桌面端窗口里的所有变更请求挡掉。
-  真正要拒的是可辨认的跨站（`Sec-Fetch-Site: cross-site`、Origin 与 Host 不符）。
-- **volatile 字段在使用时现场读取**：`Config` 的每个字段都是 volatile——
-  loader 交给 `apply()` 的是 `{ get() }` 包装而不是值。任何读行配置的地方
-  都要走 `unwrapVolatile`（单字段）或 `resolveConfig`（整组），禁止在
-  apply 时拍快照存着用；`RESTART_FIELDS` 之外的字段（`serverName`、
-  `idleHours`、`serverUrl`、`deviceToken`、界面旋钮）改了不重载行，
-  不现场读就是永久拿到旧值。
-- **CSS 分工没变**：排版类规则在 `src/client/styles/`；`pwa/app.css` 只留壳级
-  规则（iOS 输入框防缩放、安全区滚动补偿、代码块横向滚动）。两边抢同一个元素
-  是历史事故的根源，加规则前先确认归属。
-- **`lib/` 是产物，不手改**：改 `src/` → `pnpm build` → 提交 `lib/`。**删 src 时必须手动 `git rm` 对应 lib 产物**：tsc 只增量写、从不清理已删源文件的旧产物，CI 的 `git diff --exit-code -- lib` 关卡对死产物全盲（2026-10-24 PR #34 吸收剥离踩过，靠对抗审查拦下）。
-- **桌面必须 no-op**：≥1024px 逐像素与未安装时一致。
-  是从真机事故里攒出来的，改相关代码前先读。
-- **首帧壳只能内联注入**：冷启动占位壳由网关 `injectBootShell` 写进第一帧
-  HTML（`BOOT_SHELL_*`），DSH 一往 `#root` 渲染就同步摘掉。壳的 CSS/标记/脚本
-  都是网关里的内联常量（不放进 `pwa/app.css` 或客户端样式），带 30s CSS 渐隐
-  兜底；移除脚本有真实 vm 用例（DCL / 晚渲染 / `#root` 缺失 / 保险丝）。不能
-  挪进客户端插件——那个 bundle 正是首帧要等的东西；不能引入额外请求；显式
-  `desktop` 设备不注入、≥1024px 由 CSS 隐藏。`test/gateway.test.cjs` 钉住。
-- **长缓存只给内容寻址 URL**：网关只给 `/assets/` 下**哈希形状**（8+ 位且含
-  数字或大小写混合，排除 `vendor-bootstrap.css` 这类普通词）、且响应不是 HTML
-  的文件补 `immutable`（上游已有缓存头时让上游说话）；service worker 只对同一
-  判定与 `?rev=<hex 构建修订>`（DSH 按 mtime/ctime/size 生成，且 DSH 自己已
-  按 immutable 提供）的插件批次缓存优先；响应类型必须与 URL 声明一致，
-  HTML/错误页不得存进资源缓存。给无哈希 URL 做长缓存就是重演 v2 的「新 DOM + 旧 CSS」事故。
-- **要藏宿主刚渲染出来的东西，别用 `requestAnimationFrame`**：React 在该帧的
-  rAF 阶段之后才提交 DOM，所以从 mutation 里排的 rAF 落在**下一帧**——中间那
-  一帧已经画到屏幕上，用户就看见闪。两个月内三次「晚一帧」的 bug（2026-08-18
-  回复要等回合结束才出现、08-22 工具调用行先显后折、08-25 issue #3 流式抖动）
-  都是这个根子。两条出路：能用选择器表达的交给样式表（`turn-fold.css.ts` 的
-  `BORN_FOLDED`，读宿主自己的 `data-chat-flow-kind` / `data-variant`，React
-  插入节点的同一次提交里就带着，第一帧就是隐藏的）；表达不了的放进
-  MutationObserver 回调里同步做（`turn-fold.ts` 的 `markWholeRows`）——回调是
-  微任务，跑在这一帧渲染更新之前，两个方向都不会晚。rAF 只留给能容忍晚一帧的
-  活（全量重扫、插 chip、改文案）。
-- **别用 `:has()` 写死宿主的 DOM 层数**：包裹层数不等于组件源码看上去的层数
-  ——槽位会额外套一层（真实是 `flowItem > seat > AssistantMarkdown root >
-  body > 块`，比组件自身结构多一层）。深度猜错的选择器**静默失效**：测试全绿、
-  控制台干净，只有拿真界面量才看得出来。需要结构判断就用 JS 遍历
-  （`foldsWholeRow` 那种沿父节点上溯的写法），不假设层数。
-- **同机联调必须用局域网 IP 连网关**：回环地址且无转发头的请求被网关判定为「本机直连」，不校验设备令牌——同一台机器上同时跑服务端与子客户端做开发测试时，`serverUrl` 要填局域网 IP 而不是 `127.0.0.1` / `localhost`。只影响这种同机开发测试，日常两台机器（子客户端经内网/公网地址连服务端）的使用不受影响。
-- **改了界面就去真界面上量**：`turn-fold` 这类规则用自建的静态页面验证会给出
-  假阳性（合成 DOM 猜不对宿主的包裹层）。打开 `127.0.0.1:3080` 读现有会话的
-  `getComputedStyle` 即可，**不要为了验证去建会话或发消息**（耗真实 token，见
-  工作区 AGENTS.md 的硬约束）。注意浏览器标签在后台时 rAF 不触发，chip 会是 0
-  个——那是观测假象，不是回归，截图把窗口唤到前台再看。
+| `docs/remote-access.md` | 通道半边：反代配置、设备角色与配对、环境变量表、管理 API、中继协议、推送、安全边界 |
+| `docs/interface.md` | 界面半边：断点策略、设置区块与远程部件、调试徽章、安全区体系、兼容插件清单（含更新日志） |
+| `docs/codebase-map.md` | 逐文件职责与非显然注记 |
