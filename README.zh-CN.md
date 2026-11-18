@@ -133,7 +133,7 @@ dsh-zen-remote status --debug                                  # 导出脱敏诊
 // ~/.dsh/profiles/desktop/package.json
 {
   "dependencies": {
-    "dsh-zen-remote": "^2.5.1"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
+    "dsh-zen-remote": "^2.5.2"        // 本地开发换成 "link:/path/to/dsh-zen-remote"
   },
   "dsh": {
     "profile": {
