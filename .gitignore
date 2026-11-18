@@ -6,14 +6,9 @@ node_modules/
 .codegraph/
 .client-build/
 test/.tmp/
-.agents/*
-!.agents/skills/
-.agents/skills/*
-!.agents/skills/dsh-promo-video
-.claude/*
-!.claude/skills/
-.claude/skills/*
-!.claude/skills/dsh-promo-video/
+# Agent skill directories stay local, never tracked
+.claude/
+.agents/
 *.tgz
 
 # Local planning and engineering notes, deliberately not shipped
