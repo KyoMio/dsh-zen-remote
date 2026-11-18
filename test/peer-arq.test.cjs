@@ -1079,3 +1079,57 @@ test('1000 graceful duplex closes release live state and late FIN is re-ACKed', 
   assert.equal(sent.at(-1)[3], 1)
   arq.closeAll()
 })
+
+test('isRxComplete tracks whether inbound FIN has been delivered', () => {
+  let blocked = true
+  const { arq } = lifecycleSession({ onStreamData: () => !blocked })
+  assert.equal(arq.isRxComplete(1), false)
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(0, 'head'), 0)
+  assert.equal(arq.isRxComplete(1), false)
+  arq.handleFrame(PeerFrameType.DATA, 1, lifecycleFrame(1, '', true), 0)
+  assert.equal(arq.isRxComplete(1), false, 'blocked delivery must not mark rx complete')
+  blocked = false
+  arq.resume(1)
+  assert.equal(arq.isRxComplete(1), true)
+  arq.closeAll()
+})
+
+test('backpressure SACKs keep inflight stream alive past retryTimeoutMs up to 3x cap, while blackhole still times out at 1x', async () => {
+  // 1. Backpressure keeps stream alive past retryTimeoutMs=100ms, then completes on progress.
+  {
+    const { session, clock } = makeSession({ retryTimeoutMs: 100, chunkSize: 100, windowSize: 4 })
+    const p = session.write(1, Buffer.alloc(400, 0xab))
+    assert.equal(session.inflightTotal(), 4)
+    clock.advance(60)
+    session.handleFrame(PeerFrameType.SACK, 1, Buffer.alloc(8), 0)
+    clock.advance(60) // t=120 > retryTimeoutMs(100)
+    assert.equal(session.inflightTotal(), 4, 'stream must survive past 1x retryTimeoutMs while peer sends SACK')
+    session.handleFrame(PeerFrameType.SACK, 1, Buffer.alloc(8), 0)
+    clock.advance(60) // t=180
+    session.handleFrame(PeerFrameType.SACK, 1, Buffer.alloc(8), 4)
+    await p
+    session.closeAll()
+  }
+
+  // 2. Permanent stall with non-advancing SACKs still caps at 3 * retryTimeoutMs.
+  {
+    const { session, clock } = makeSession({ retryTimeoutMs: 100, chunkSize: 100 })
+    const p = session.write(1, Buffer.alloc(100, 0xcd))
+    for (let t = 50; t < 300; t += 50) {
+      clock.advance(50)
+      session.handleFrame(PeerFrameType.SACK, 1, Buffer.alloc(8), 0)
+    }
+    clock.advance(50) // t=300 === 3 * retryTimeoutMs
+    await assert.rejects(p, /no-progress timeout/)
+    session.closeAll()
+  }
+
+  // 3. True blackhole with zero SACKs still expires at 1 * retryTimeoutMs.
+  {
+    const { session, clock } = makeSession({ retryTimeoutMs: 100, chunkSize: 100 })
+    const p = session.write(1, Buffer.alloc(100, 0xef))
+    clock.advance(100)
+    await assert.rejects(p, /no-progress timeout/)
+    session.closeAll()
+  }
+})

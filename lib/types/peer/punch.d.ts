@@ -248,6 +248,11 @@ export declare class PeerPunchManager {
     } | null;
     /** Revoke gateway/local admission and discard all UDP state for this peer. */
     dropPeer(peerNodeId: string): void;
+    /**
+     * Demote a direct or punching session to idle relay mode when the peer
+     * unilaterally switched to WS relay (does not emit `onDirectLost`).
+     */
+    demoteSessionToRelay(peerNodeId: string): void;
     /** Stop everything: per-peer timers cleared, sessions dropped, socket closed. */
     close(): void;
     private createSession;
@@ -255,6 +260,7 @@ export declare class PeerPunchManager {
     private clearSessionTimers;
     private clearDirectRetryTimer;
     private startDirectChallengeRetry;
+    private addCandidate;
     private refreshLanEndpoints;
     private startPunchRounds;
     private punchIntervalMsOrDefault;

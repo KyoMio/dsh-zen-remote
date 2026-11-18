@@ -10,7 +10,7 @@ const { createHash } = require('node:crypto')
 const { PeerArqSession } = require('../lib/peer/arq.js')
 const { PeerMux } = require('../lib/peer/mux.js')
 const { generatePeerIdentity, generateEphemeralX25519, buildPeerHandshakeEnvelope } = require('../lib/peer/crypto.js')
-const { encodeFrameHeader, PeerFrameType, PEER_FRAME_MAGIC, PEER_FRAME_VERSION } = require('../lib/peer/wire.js')
+const { encodeFrameHeader, packEncryptedFrame, PeerFrameType, PEER_FRAME_MAGIC, PEER_FRAME_VERSION } = require('../lib/peer/wire.js')
 const { createRelayHandler } = require('../lib/relay-server.js')
 const { createShareStore } = require('../lib/share-store.js')
 
@@ -577,3 +577,239 @@ test('dispatchFrame self-heals beginHello after initial 2.4s retry exhaustion wi
     clearTimeout(timer)
   }
 })
+
+// -- 4. T1 symmetric WS demotion, flushInflight, enableRelayPath & early response RST --
+
+test('T1: PeerMux in udp auto-demotes to ws on newer encrypted WS frame, ignores stale pre-promote seq, and responds over ws', { timeout: 3000 }, async (t) => {
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const aDemoted = []
+  const aPathChanges = []
+  const aWsSent = []
+  const aUdpSent = []
+  const bUdpQueue = []
+  let dropUdpFromAToB = false
+
+  let A, B
+  A = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: a,
+    sendGatewayBinary: (bytes) => {
+      aWsSent.push(Buffer.from(bytes))
+      setImmediate(() => B.handleGatewayFrame(bytes))
+    },
+    relayHandler: () => async (_req, res) => { res.end('ok-via-ws') },
+    relaySecret: () => 'test-secret',
+    onPathChanged: (nodeId, path) => aPathChanges.push({ nodeId, path }),
+    onPeerRelayDemoted: (nodeId) => aDemoted.push(nodeId),
+  })
+  B = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: b,
+    sendGatewayBinary: (bytes) => {
+      setImmediate(() => A.handleGatewayFrame(bytes))
+    },
+    relayHandler: () => async (_req, res) => { res.end('from-b') },
+    relaySecret: () => 'test-secret',
+  })
+  t.after(() => { A.close(); B.close() })
+
+  A.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+  B.ensureSession(a.nodeId, a.publicKeyHex, 'A')
+  A.enableRelayPath(b.nodeId)
+  B.enableRelayPath(a.nodeId)
+
+  // Warm WS exchange so both have ciphers and seq >= 1n
+  assert.equal(await (await A.createFetchForPeer(b.nodeId)('http://peer/warm')).text(), 'from-b')
+  await immediate()
+
+  // Capture a stale encrypted WS frame from B before direct promotion
+  const sa = A.sessions.get(b.nodeId)
+  const sb = B.sessions.get(a.nodeId)
+  const staleFrame = packEncryptedFrame({
+    frameType: PeerFrameType.PING,
+    srcNodeId: b.nodeId,
+    dstNodeId: a.nodeId,
+    streamId: 0,
+    seq: sa.lastInboundWsSeq,
+    ack: 0,
+  }, Buffer.alloc(0), sb.ciphers)
+
+  // Promote both to UDP
+  A.setDirectPath(b.nodeId, (frameType, streamId, payload, ack) => {
+    aUdpSent.push({ frameType, streamId })
+    if (!dropUdpFromAToB) {
+      setImmediate(() => B.handleOpenedFrame({ srcNodeId: a.nodeId, frameType, streamId, ack }, payload))
+    }
+  })
+  B.setDirectPath(a.nodeId, (frameType, streamId, payload, ack) => {
+    bUdpQueue.push({ frameType, streamId, payload, ack })
+    setImmediate(() => A.handleOpenedFrame({ srcNodeId: b.nodeId, frameType, streamId, ack }, payload))
+  })
+  assert.equal(A.sessionPath(b.nodeId), 'udp')
+
+  // Stale WS frame (seq <= wsSeqAtDirectPromote) must NOT demote A
+  A.handleGatewayFrame(staleFrame)
+  assert.equal(A.sessionPath(b.nodeId), 'udp')
+  assert.deepEqual(aDemoted, [])
+
+  // Now B demotes to WS while A's UDP is dead; B sends request over WS (seq > wsSeqAtDirectPromote)
+  dropUdpFromAToB = true
+  const udpCountBefore = aUdpSent.length
+  const wsCountBefore = aWsSent.length
+  B.setRelayPath(a.nodeId)
+
+  const res = await responseWithin(B.createFetchForPeer(a.nodeId)('http://peer/hello-from-b'))
+  assert.equal(await res.text(), 'ok-via-ws')
+  assert.equal(A.sessionPath(b.nodeId), 'ws')
+  assert.deepEqual(aDemoted, [b.nodeId])
+  assert.ok(aPathChanges.some((e) => e.nodeId === b.nodeId && e.path === 'ws'))
+  assert.equal(aUdpSent.length, udpCountBefore, 'A must not send any frame back over dead UDP after symmetric demotion')
+  assert.ok(aWsSent.length > wsCountBefore, 'A must reply over WS')
+})
+
+test('T1: setRelayPath from udp to ws flushes inflight immediately, and enableRelayPath resets path to none when ciphers===null', () => {
+  const clock = makeFakeClock(1_000_000)
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const wsSent = []
+  const mux = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: a,
+    clock,
+    sendGatewayBinary: (bytes) => wsSent.push(Buffer.from(bytes)),
+    relayHandler: () => undefined,
+    relaySecret: () => 'test-secret',
+  })
+  try {
+    mux.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+    const state = mux.sessions.get(b.nodeId)
+
+    // 1. enableRelayPath with ciphers === null while in udp must first reset path to 'none'
+    mux.setDirectPath(b.nodeId, () => {})
+    assert.equal(mux.sessionPath(b.nodeId), 'udp')
+    mux.enableRelayPath(b.nodeId)
+    assert.equal(mux.sessionPath(b.nodeId), 'none')
+
+    // 2. Complete WS handshake, promote back to udp, queue inflight via fetch, then setRelayPath
+    const eph = generateEphemeralX25519()
+    const ackPayload = buildPeerHandshakeEnvelope({
+      kind: 'ack',
+      networkId: NETWORK_ID,
+      identity: b,
+      selfEphPubHex: eph.publicKeyHex,
+      peerNodeId: a.nodeId,
+      peerEphPubHex: state.myEph.publicKeyHex,
+      nonce: state.nonce,
+      timestamp: clock.now(),
+    })
+    const ackHdr = encodeFrameHeader({
+      magic: PEER_FRAME_MAGIC,
+      version: PEER_FRAME_VERSION,
+      frameType: PeerFrameType.HELLO,
+      srcNodeId: b.nodeId,
+      dstNodeId: a.nodeId,
+      streamId: 0,
+      seq: 0n,
+      ack: 0,
+    })
+    mux.handleGatewayFrame(Buffer.concat([ackHdr, ackPayload]))
+    assert.equal(mux.sessionPath(b.nodeId), 'ws')
+
+    mux.setDirectPath(b.nodeId, () => {}) // blackholed UDP
+    assert.equal(mux.sessionPath(b.nodeId), 'udp')
+    const pending = mux.createFetchForPeer(b.nodeId)('http://peer/inflight')
+    pending.catch(() => {})
+    const wsBefore = wsSent.length
+    assert.ok(state.arq.inflightTotal() > 0)
+
+    mux.setRelayPath(b.nodeId)
+    assert.equal(mux.sessionPath(b.nodeId), 'ws')
+    assert.ok(wsSent.length > wsBefore, 'setRelayPath from udp->ws must immediately flush inflight over WS without waiting RTO')
+  } finally {
+    mux.close()
+  }
+})
+
+test('T1: incoming hello envelope while in udp demotes to ws and invokes onPeerRelayDemoted', () => {
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const demoted = []
+  const mux = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: a,
+    sendGatewayBinary() {},
+    relayHandler: () => undefined,
+    relaySecret: () => 'test-secret',
+    onPeerRelayDemoted: (nodeId) => demoted.push(nodeId),
+  })
+  try {
+    mux.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+    mux.enableRelayPath(b.nodeId)
+    const state = mux.sessions.get(b.nodeId)
+    const k1 = generateEphemeralX25519().publicKeyHex
+    const ackPayload = buildPeerHandshakeEnvelope({
+      kind: 'ack',
+      networkId: NETWORK_ID,
+      identity: b,
+      selfEphPubHex: k1,
+      peerNodeId: a.nodeId,
+      peerEphPubHex: state.myEph.publicKeyHex,
+      nonce: state.nonce,
+      timestamp: Date.now(),
+    })
+    const hdr = encodeFrameHeader({ magic: PEER_FRAME_MAGIC, version: PEER_FRAME_VERSION, frameType: PeerFrameType.HELLO, srcNodeId: b.nodeId, dstNodeId: a.nodeId, streamId: 0, seq: 0n, ack: 0 })
+    mux.handleGatewayFrame(Buffer.concat([hdr, ackPayload]))
+    mux.setDirectPath(b.nodeId, () => {})
+    assert.equal(mux.sessionPath(b.nodeId), 'udp')
+
+    const k2 = generateEphemeralX25519().publicKeyHex
+    const helloPayload = buildPeerHandshakeEnvelope({
+      kind: 'hello',
+      networkId: NETWORK_ID,
+      identity: b,
+      selfEphPubHex: k2,
+      peerNodeId: a.nodeId,
+      peerEphPubHex: null,
+      nonce: '1122334455667788',
+      timestamp: Date.now(),
+    })
+    mux.handleGatewayFrame(Buffer.concat([hdr, helloPayload]))
+    assert.equal(mux.sessionPath(b.nodeId), 'ws')
+    assert.deepEqual(demoted, [b.nodeId])
+  } finally {
+    mux.close()
+  }
+})
+
+for (const status of [503, 413]) {
+  test(`T1: early ${status} inbound response before request EOF resets upload stream immediately`, { timeout: 2000 }, async (t) => {
+    const handler = status === 503 ? undefined : async (_req, res) => {
+      res.writeHead(413, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: false, error: { code: 'payload-too-large' } }))
+    }
+    const p = pair(t, handler)
+    let cancelled = false
+    let pulls = 0
+    const body = new ReadableStream({
+      pull(controller) {
+        pulls++
+        if (pulls <= 40) controller.enqueue(Buffer.alloc(16 * 1024, 0x41))
+        // stay open indefinitely unless cancelled
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    const res = await responseWithin(p.fetch('http://peer/early-reject', { method: 'POST', body }))
+    assert.equal(res.status, status)
+    await res.text()
+    const deadline = Date.now() + 500
+    while ((!cancelled || p.sa.streams.size > 0 || p.sb.streams.size > 0) && Date.now() < deadline) {
+      await immediate()
+    }
+    assert.equal(cancelled, true, 'initiator upload stream must be cancelled promptly without 30s timeout')
+    assert.equal(p.sa.streams.size, 0)
+    assert.equal(p.sb.streams.size, 0)
+  })
+}

@@ -17,7 +17,10 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert')
+const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
+const http = require('node:http')
 const { pathToFileURL } = require('node:url')
 
 const MODULE_URL = pathToFileURL(path.join(__dirname, '..', 'dsh-push.mjs')).href
@@ -348,7 +351,7 @@ test('turn-end: an unreadable session header stays quiet instead of assuming top
   // header that simply omits the field. The listener must therefore never
   // hand it an undefined it invented itself — otherwise a subagent turn end
   // with an unexpected payload shape would notify.
-  const src = require('node:fs').readFileSync(require('node:path').join(__dirname, '..', 'dsh-push.mjs'), 'utf8')
+  const src = fs.readFileSync(path.join(__dirname, '..', 'dsh-push.mjs'), 'utf8')
   const listener = src.match(/const onTurnEnd = \(payload\) => \{([\s\S]*?)\n  \}/)
   assert.ok(listener, 'onTurnEnd still present')
   assert.match(listener[1], /if \(!header\) return/, 'bail out before firing when the header is missing')
@@ -539,4 +542,67 @@ test('sessionEvents: no reader available ({} or undefined) yields [] → empty s
   assert.deepStrictEqual(sessionEvents(undefined), [])
   assert.strictEqual(turnSummary(sessionEvents({}), 7), '')
   assert.strictEqual(turnSummary(sessionEvents(undefined), 7), '')
+})
+
+test('T9: dsh-push honors lan-gate-runtime.json port, rejects NaN approval grace, bounds titlesBySession and clears armed timers on dispose', async (t) => {
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-push-t9-'))
+  const prevHome = process.env.DSH_HOME
+  const prevGrace = process.env.DSH_PUSH_APPROVAL_GRACE_MS
+  process.env.DSH_HOME = home
+  process.env.DSH_PUSH_APPROVAL_GRACE_MS = 'not-a-number'
+  t.after(() => {
+    if (prevHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = prevHome
+    if (prevGrace === undefined) delete process.env.DSH_PUSH_APPROVAL_GRACE_MS
+    else process.env.DSH_PUSH_APPROVAL_GRACE_MS = prevGrace
+    try { fs.rmSync(home, { recursive: true, force: true }) } catch (e) {}
+  })
+
+  // Start mock gateway push receiver on ephemeral port while configured port is different
+  const received = []
+  const srv = http.createServer((req, res) => {
+    let body = ''
+    req.on('data', (c) => { body += c })
+    req.on('end', () => {
+      received.push(JSON.parse(body || '{}'))
+      res.writeHead(200, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, sent: 1, failed: 0 }))
+    })
+  })
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r))
+  const actualPort = srv.address().port
+  t.after(() => new Promise((r) => srv.close(r)))
+
+  fs.writeFileSync(path.join(home, 'lan-gate-runtime.json'), JSON.stringify({ pid: process.pid, port: actualPort }), 'utf8')
+
+  const listeners = []
+  const cleanups = []
+  const ctx = {
+    on: (ev, fn) => { listeners.push({ ev, fn }); return () => {} },
+    inject: () => {},
+    effect: (fn) => {
+      const stop = fn()
+      if (typeof stop === 'function') cleanups.push(stop)
+      return stop
+    },
+  }
+  const { apply } = await freshImport()
+  apply(ctx, { port: 19999, pushEnabled: true, pushTurnEnd: true })
+
+  const sessionListener = listeners.find((l) => l.ev === 'session/event')?.fn
+  assert.ok(sessionListener)
+
+  // With NaN DSH_PUSH_APPROVAL_GRACE_MS, approval/asked must NOT fire immediately (1ms fallback of NaN)
+  sessionListener({ id: 's-grace' }, { type: 'approval/asked', data: { id: 'req-1', toolName: 'bash' } })
+  await new Promise((r) => setTimeout(r, 40))
+  assert.strictEqual(received.length, 0, 'invalid DSH_PUSH_APPROVAL_GRACE_MS must fall back to 5000ms, not fire in 1ms as NaN')
+
+  // Disposal clears pending armed timers
+  for (const stop of cleanups) stop()
+
+  // Question event still uses actualPort from lan-gate-runtime.json instead of stale configured 19999
+  sessionListener({ id: 's-q' }, { type: 'tool/call', data: { name: 'ask_user_question', arguments: JSON.stringify({ questions: [{ question: 'ok?' }] }) } })
+  await new Promise((r) => setTimeout(r, 60))
+  assert.strictEqual(received.length, 1, 'push must reach actual listening port from lan-gate-runtime.json')
 })

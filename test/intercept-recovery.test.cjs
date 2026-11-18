@@ -1804,3 +1804,116 @@ test('T4 session/page cache + full-path invalidation (unshared, not-shared, offl
   handle.uninstall()
   assert.equal(handle.historyCacheStats().totalBytes, 0, 'uninstall cleared all cache')
 })
+
+test('T4 Step 0 handoff enters foreground to preempt prewarm, and Case C persists latest snapshot/unchanged to cache before parkHandoff', async () => {
+  const relay = attachStreamSpy(createControllableRelay())
+  const snapRequests = []
+  relay.fetchSessionSnapshot = (req, signal) => {
+    const entry = { sessionId: req.address?.sessionId, signal, aborted: false }
+    signal?.addEventListener('abort', () => { entry.aborted = true }, { once: true })
+    snapRequests.push(entry)
+    return new Promise((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new RelayError('aborted', 'aborted')), { once: true })
+    })
+  }
+  const gateway = new FakeTypertGateway()
+  const clock = fakeClock()
+  const handle = installIntercept({
+    raw: gateway,
+    relay,
+    getServerId: () => H_SERVER_ID,
+    clock,
+    historyCache: { handoffTtlMs: 2000 },
+    prewarm: { idleDelayMs: 50, proactiveListDelayMs: 50, clock },
+  })
+
+  // 1. Case C snapshot write-back: if handoff expires via TTL, Step 1 must NOT fall back to old cursor 10
+  const gen0 = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } })
+  await waitForStream(relay, 1)
+  relay.streams[0].gate.push(makeFollowSnapshot(10, [makeFollowEvent(10)]))
+  await waitUntil(() => gen0.seen.length === 1)
+  relay.streams[0].gate.finish()
+  await gen0.outcome
+
+  const gen1Iter = (await gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } } },
+    undefined,
+    gateway.operatorPeer(),
+    undefined,
+    {},
+  ))[Symbol.asyncIterator]()
+  assert.equal((await gen1Iter.next()).value.cursor, 10)
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.push(makeFollowSnapshot(25, [makeFollowEvent(24), makeFollowEvent(25)], {
+    projections: { asOfSeq: 25, values: { model: 'm-new' } },
+    assistantStream: { revision: 3, activeAttempt: { attemptId: 'att-new' } },
+  }))
+  assert.equal((await gen1Iter.next()).done, true)
+  assert.equal(handle.historyCacheStats().handoffCount, 1)
+
+  // Handoff TTL expires unconsumed -> Gen 2 falls back to cache (Step 1)
+  clock.advance(2000)
+  assert.equal(handle.historyCacheStats().handoffCount, 0)
+  const gen2FallbackIter = (await gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } } },
+    undefined,
+    gateway.operatorPeer(),
+    undefined,
+    {},
+  ))[Symbol.asyncIterator]()
+  const fallbackFirst = await gen2FallbackIter.next()
+  assert.equal(fallbackFirst.value.cursor, 25, 'Case C must persist fresh snapshot to cache before parkHandoff')
+  await waitForStream(relay, 3)
+  relay.streams[2].gate.finish()
+  await gen2FallbackIter.next()
+
+  // 2. Step 0 enterForeground preempts in-flight prewarm for another session on same server
+  relay.invokeValues['session/list'] = {
+    items: [
+      { sessionId: LOCAL_ID, title: 'main', updatedAt: '2026-01-01T00:00:00Z' },
+      { sessionId: 's-other', title: 'other', updatedAt: '2026-01-01T00:00:01Z' },
+    ],
+  }
+  await gateway.rpcBridge('session/list', { args: {} }, undefined, gateway.operatorPeer())
+  // Park a Gen 1 -> Case C handoff for LOCAL_ID
+  const gen3Iter = (await gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } } },
+    undefined,
+    gateway.operatorPeer(),
+    undefined,
+    {},
+  ))[Symbol.asyncIterator]()
+  await gen3Iter.next()
+  await waitForStream(relay, 4)
+  relay.streams[3].gate.push(makeFollowSnapshot(30, [makeFollowEvent(30)], {
+    assistantStream: { revision: 4, activeAttempt: { attemptId: 'att-30' } },
+  }))
+  assert.equal((await gen3Iter.next()).done, true)
+  assert.equal(handle.historyCacheStats().handoffCount, 1)
+
+  // Let prewarm start fetching s-other after idleDelayMs
+  clock.advance(60)
+  await waitUntil(() => snapRequests.length >= 1)
+  const prewarmReq = snapRequests.at(-1)
+  assert.equal(prewarmReq.aborted, false)
+
+  // Gen 2 enters Step 0 (handoffInitial) -> must immediately enterForeground and abort prewarm
+  const gen4Iter = (await gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } } },
+    undefined,
+    gateway.operatorPeer(),
+    undefined,
+    {},
+  ))[Symbol.asyncIterator]()
+  const step0Snap = await gen4Iter.next()
+  assert.equal(step0Snap.value.cursor, 30)
+  assert.equal(prewarmReq.aborted, true, 'Step 0 handoff pickup must call enterForeground to abort concurrent prewarm')
+
+  relay.streams[3].gate.finish()
+  assert.equal((await gen4Iter.next()).done, true)
+  handle.uninstall()
+})

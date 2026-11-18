@@ -105,14 +105,20 @@ export declare function caddyPrebuiltDownload(platform: BinaryPlatform): {
  * host environment is detected as mainland China (or tried as fallbacks if
  * direct GitHub times out). */
 export declare const GITHUB_MIRROR_PREFIXES: readonly ["https://gh-proxy.com/", "https://ghfast.top/"];
+export declare const CADDY_RELEASE_API_URL = "https://api.github.com/repos/KyoMio/dsh-zen-remote/releases/tags/caddy-cloudflare";
+export declare const CLOUDFLARED_RELEASE_API_URL = "https://api.github.com/repos/cloudflare/cloudflared/releases/latest";
+export interface BinaryDownloadCandidate {
+    url: string;
+    archive: BinaryArchive;
+    mirrored: boolean;
+    assetName?: string;
+    releaseApiUrl?: string;
+}
 /** Ordered candidate downloads for one binary and platform:
  * - When `preferCnMirror` is true, GitHub Release URLs through mainland
  *   mirrors come first, followed by direct GitHub Release URL, and finally
  *   (for Caddy) the upstream `caddyserver.com/api/download` fallback.
  * - When `preferCnMirror` is false, direct GitHub Release comes first, then
  *   mainland mirrors, then the upstream build API fallback. */
-export declare function binaryDownloadCandidates(tool: IngressBinary, platform?: BinaryPlatform, preferCnMirror?: boolean): Array<{
-    url: string;
-    archive: BinaryArchive;
-}>;
+export declare function binaryDownloadCandidates(tool: IngressBinary, platform?: BinaryPlatform, preferCnMirror?: boolean): BinaryDownloadCandidate[];
 //# sourceMappingURL=binary.d.ts.map

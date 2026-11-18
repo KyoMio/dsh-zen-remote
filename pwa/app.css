@@ -112,10 +112,12 @@ html:not([data-lan-device="desktop"]) [data-slot="conversation"] [data-phase] {
  * zooms, and everything above it still scaling with the pinch gesture.
  *
  * dsh-mobile-nav does not add this workaround, so it stays here. */
-html:not([data-lan-device="desktop"]) input:not([type="file"]):not([type="checkbox"]):not([type="radio"]),
-html:not([data-lan-device="desktop"]) textarea,
-html:not([data-lan-device="desktop"]) [contenteditable]:not([contenteditable="false"]) {
-  font-size: max(16px, calc(1em * var(--dsh-pwa-font-scale, 1)));
+@media (max-width: 1023px) {
+  html:not([data-lan-device="desktop"]) input:not([type="file"]):not([type="checkbox"]):not([type="radio"]),
+  html:not([data-lan-device="desktop"]) textarea,
+  html:not([data-lan-device="desktop"]) [contenteditable]:not([contenteditable="false"]) {
+    font-size: max(16px, calc(1em * var(--dsh-pwa-font-scale, 1)));
+  }
 }
 
 /* Home-indicator clearance for the composer USED to live here, as
@@ -143,9 +145,11 @@ html:not([data-lan-device="desktop"]) [contenteditable]:not([contenteditable="fa
  * paths off-screen on phones — while desktop loopback (which never loads
  * this file) wrapped fine. Days of "why only on the phone" (2026-08-18);
  * inline-code wrapping is owned by styles/content.css.ts. */
-html:not([data-lan-device="desktop"]) pre,
-html:not([data-lan-device="desktop"]) pre code {
-  white-space: pre;
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
+@media (max-width: 1023px) {
+  html:not([data-lan-device="desktop"]) pre,
+  html:not([data-lan-device="desktop"]) pre code {
+    white-space: pre;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
 }

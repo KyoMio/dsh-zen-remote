@@ -70,7 +70,14 @@ export interface DownloadBinaryOptions {
      * (`binaryUrls` / `caddyDownload` / `cloudflaredDownload`), NOT guessed
      * from the URL shape. Default `'none'`: a bare executable. */
     archive?: BinaryArchive;
+    /** Optional expected lowercase 64-hex SHA-256 digest of the raw downloaded payload. */
+    expectedSha256?: string;
 }
+/**
+ * Query GitHub Releases API directly for an official asset's `sha256:...` digest.
+ * Returns lowercase 64-hex SHA-256 on success, or `undefined` on any network/API/shape miss.
+ */
+export declare function resolveOfficialAssetSha256(releaseApiUrl: string, assetName: string, fetchImpl?: typeof fetch): Promise<string | undefined>;
 /**
  * Download one binary from an explicit URL and install it. The archive
  * wrapper is the CALLER'S metadata (`options.archive`) — `ensureBinary`
@@ -83,6 +90,8 @@ export declare function downloadBinary(dshHome: string, tool: IngressBinary, url
 export interface EnsureBinaryOptions extends DownloadBinaryOptions {
     /** Force the platform mapping (tests); defaults to this process's. */
     platform?: BinaryPlatform;
+    /** Override CN mirror preference (tests); defaults to {@link detectCnNetwork}. */
+    preferCnMirror?: boolean;
 }
 /**
  * Detect whether the current host is in mainland China:

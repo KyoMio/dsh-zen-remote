@@ -244,3 +244,80 @@ test('REMOTE_SESSION_CSS hides stamped sidebar workspace rows and locales define
     assert.ok(typeof dict['settings.fieldHideInactiveRemoteWorkspacesHint'] === 'string')
   }
 })
+
+test('T9: MutationObserver coalesces burst DOM mutations into a single syncDom per animation frame', async (t) => {
+  const origDoc = globalThis.document
+  const origWin = globalThis.window
+  const origMo = globalThis.MutationObserver
+  const origRaf = globalThis.requestAnimationFrame
+  const origCaf = globalThis.cancelAnimationFrame
+
+  let queryCount = 0
+  let moCallback = null
+  const rafQueue = []
+  let rafId = 0
+
+  globalThis.document = {
+    body: {},
+    querySelectorAll: () => { queryCount += 1; return [] },
+  }
+  globalThis.window = {
+    addEventListener: () => {},
+    removeEventListener: () => {},
+  }
+  globalThis.MutationObserver = class {
+    constructor(cb) { moCallback = cb }
+    observe() {}
+    disconnect() { moCallback = null }
+  }
+  globalThis.requestAnimationFrame = (cb) => {
+    const id = ++rafId
+    rafQueue.push({ id, cb })
+    return id
+  }
+  globalThis.cancelAnimationFrame = (id) => {
+    const idx = rafQueue.findIndex((item) => item.id === id)
+    if (idx >= 0) rafQueue.splice(idx, 1)
+  }
+
+  t.after(() => {
+    globalThis.document = origDoc
+    globalThis.window = origWin
+    globalThis.MutationObserver = origMo
+    globalThis.requestAnimationFrame = origRaf
+    globalThis.cancelAnimationFrame = origCaf
+  })
+
+  const cleanups = []
+  const ctx = {
+    get: (name) => {
+      if (name === 'workspaces') return { list: { getSnapshot: () => ({ items: [], archivedSessionIds: [] }), subscribe: () => () => {} } }
+      if (name === 'sessions') return { list: { getSnapshot: () => ({ byId: {} }), subscribe: () => () => {} } }
+      return undefined
+    },
+    effect: (fn) => {
+      const stop = fn()
+      if (typeof stop === 'function') cleanups.push(stop)
+    },
+  }
+
+  installRemoteWorkspaceVisibility(ctx, {
+    probeRole: async () => 'peer',
+    readConfig: async () => ({ hideInactiveRemoteWorkspaces: true }),
+  })
+  await new Promise((r) => setTimeout(r, 0))
+  assert.ok(moCallback, 'MutationObserver attached')
+
+  queryCount = 0
+  for (let i = 0; i < 10; i++) moCallback()
+  assert.equal(queryCount, 0, 'burst mutations must defer DOM scan to rAF instead of running synchronously')
+  assert.equal(rafQueue.length, 1, '10 burst mutations coalesce into 1 scheduled rAF')
+  rafQueue.shift().cb(0)
+  assert.equal(queryCount, 1, 'exactly 1 syncDom scan executes when rAF fires')
+
+  // Cleanup cancels pending rAF
+  moCallback()
+  assert.equal(rafQueue.length, 1)
+  for (const stop of cleanups) stop()
+  assert.equal(rafQueue.length, 0, 'disposal must cancel pending rAF')
+})

@@ -176,6 +176,8 @@ export declare class PeerArqSession {
     inflightTotal(): number;
     /** Fragments queued but not yet admitted to the send window. */
     queuedTotal(): number;
+    /** Whether the inbound side of `streamId` has delivered its FIN. */
+    isRxComplete(streamId: number): boolean;
     /**
      * Dynamically adjust send window [1..64] and initial RTO [120..rtoMaxMs]
      * for the active transport leg without tearing down in-flight frames.

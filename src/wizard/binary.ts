@@ -153,6 +153,19 @@ export const GITHUB_MIRROR_PREFIXES = [
   'https://ghfast.top/',
 ] as const
 
+export const CADDY_RELEASE_API_URL =
+  'https://api.github.com/repos/KyoMio/dsh-zen-remote/releases/tags/caddy-cloudflare'
+export const CLOUDFLARED_RELEASE_API_URL =
+  'https://api.github.com/repos/cloudflare/cloudflared/releases/latest'
+
+export interface BinaryDownloadCandidate {
+  url: string
+  archive: BinaryArchive
+  mirrored: boolean
+  assetName?: string
+  releaseApiUrl?: string
+}
+
 /** Ordered candidate downloads for one binary and platform:
  * - When `preferCnMirror` is true, GitHub Release URLs through mainland
  *   mirrors come first, followed by direct GitHub Release URL, and finally
@@ -163,15 +176,28 @@ export function binaryDownloadCandidates(
   tool: IngressBinary,
   platform: BinaryPlatform = currentPlatform(),
   preferCnMirror = false,
-): Array<{ url: string; archive: BinaryArchive }> {
-  const primary = tool === 'caddy' ? caddyPrebuiltDownload(platform) : cloudflaredDownload(platform)
-  const mirrored = GITHUB_MIRROR_PREFIXES.map((prefix) => ({
-    url: `${prefix}${primary.url}`,
-    archive: primary.archive,
+): BinaryDownloadCandidate[] {
+  const primaryBase = tool === 'caddy' ? caddyPrebuiltDownload(platform) : cloudflaredDownload(platform)
+  const assetName = primaryBase.url.slice(primaryBase.url.lastIndexOf('/') + 1)
+  const releaseApiUrl = tool === 'caddy' ? CADDY_RELEASE_API_URL : CLOUDFLARED_RELEASE_API_URL
+  const primary: BinaryDownloadCandidate = {
+    url: primaryBase.url,
+    archive: primaryBase.archive,
+    mirrored: false,
+    assetName,
+    releaseApiUrl,
+  }
+  const mirrored: BinaryDownloadCandidate[] = GITHUB_MIRROR_PREFIXES.map((prefix) => ({
+    url: `${prefix}${primaryBase.url}`,
+    archive: primaryBase.archive,
+    mirrored: true,
+    assetName,
+    releaseApiUrl,
   }))
   const ordered = preferCnMirror ? [...mirrored, primary] : [primary, ...mirrored]
   if (tool === 'caddy') {
-    ordered.push(caddyDownload(platform))
+    const fallback = caddyDownload(platform)
+    ordered.push({ url: fallback.url, archive: fallback.archive, mirrored: false })
   }
   return ordered
 }

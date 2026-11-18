@@ -169,8 +169,8 @@ function publicConfigSnapshot(snapshot: AdminConfigSnapshot): AdminPublicConfig 
 export interface AdminHandlerOptions {
   /** The connection service's admit, injected by apply(); tests fake it. */
   admit: (req: IncomingMessage) => AdminAdmission
-  /** Gateway root — `http://127.0.0.1:<port>` in production. */
-  gatewayBase: string
+  /** Gateway root — `http://127.0.0.1:<port>` (or live resolver) in production. */
+  gatewayBase: string | (() => string)
   /** Fresh resolveConfig() per call — volatile row fields must not go stale,
    * and the test-push copy reads its `lang` from here per request. */
   getConfig: () => AdminConfigSnapshot
@@ -289,9 +289,10 @@ interface GatewayReply {
  */
 async function callGateway(options: AdminHandlerOptions, method: 'GET' | 'POST', path: string, payload?: unknown): Promise<GatewayReply> {
   const body = payload === undefined ? undefined : JSON.stringify(payload)
+  const base = typeof options.gatewayBase === 'function' ? options.gatewayBase() : options.gatewayBase
   return await new Promise((resolve, reject) => {
     const request = httpRequest(
-      new URL(path, options.gatewayBase),
+      new URL(path, base),
       {
         method,
         headers: body === undefined

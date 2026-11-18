@@ -85,8 +85,8 @@ export interface AdminPublicConfig {
 export interface AdminHandlerOptions {
     /** The connection service's admit, injected by apply(); tests fake it. */
     admit: (req: IncomingMessage) => AdminAdmission;
-    /** Gateway root — `http://127.0.0.1:<port>` in production. */
-    gatewayBase: string;
+    /** Gateway root — `http://127.0.0.1:<port>` (or live resolver) in production. */
+    gatewayBase: string | (() => string);
     /** Fresh resolveConfig() per call — volatile row fields must not go stale,
      * and the test-push copy reads its `lang` from here per request. */
     getConfig: () => AdminConfigSnapshot;

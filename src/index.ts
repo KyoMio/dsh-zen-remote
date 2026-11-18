@@ -838,10 +838,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   let servingRelayHandler: RelayHandler | undefined
   let servingGatewaySummary: (() => Promise<Record<string, unknown>>) | undefined
   const pluginLoopbackSecret = randomBytes(32).toString('hex')
-  const effectivePluginConsent = (): Record<string, boolean> => {
+  const effectivePluginConsent = (device?: string): Record<string, boolean> => {
     const resolved = resolveConfig(config, readFileConfig(), process.env)
     const rawConsent = resolved.values.pluginBridgeConsent
     if (resolved.values.role !== 'peer') return rawConsent
+    if (device !== undefined && !device.startsWith('peer:')) return rawConsent
     const merged: Record<string, boolean> = { ...rawConsent }
     for (const declaration of registry.list()) {
       if (!(declaration.plugin in merged)) merged[declaration.plugin] = true
@@ -871,14 +872,43 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // not configuration — the gateway's config stays exactly "resolved values
     // + relaySecret" for every spread, deep compare and serialization (the
     // role-wiring test pins that shape), while a direct read still finds it.
+    let liveGatewayPort: number | undefined
+    const resolveLiveGatewayPort = (fallbackPort: number): number => {
+      if (liveGatewayPort !== undefined && Number.isInteger(liveGatewayPort) && liveGatewayPort >= 1 && liveGatewayPort <= 65535) {
+        return liveGatewayPort
+      }
+      try {
+        const meta = JSON.parse(readFileSync(join(home, 'lan-gate-runtime.json'), 'utf8')) as { pid?: unknown; port?: unknown }
+        const p = Number(meta?.port)
+        const pid = meta?.pid
+        if (Number.isInteger(p) && p >= 1 && p <= 65535 && typeof pid === 'number' && Number.isInteger(pid) && pid > 0) {
+          try {
+            process.kill(pid, 0)
+            return p
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException)?.code === 'EPERM') return p
+          }
+        }
+      } catch { /* runtime port file optional; fall back to configured port */ }
+      return fallbackPort
+    }
     const gatewayEvent = (event: 'spawn' | 'exit', detail: Record<string, unknown>): void => {
       try {
         if (event === 'spawn') ring.push('info', 'gateway spawned (port=%s)', String(detail.port ?? '?'))
-        else ring.push('warn', 'gateway exited (code=%s signal=%s error=%s)', String(detail.code ?? '—'), String(detail.signal ?? '—'), String(detail.error ?? '—'))
+        else {
+          liveGatewayPort = undefined
+          ring.push('warn', 'gateway exited (code=%s signal=%s error=%s)', String(detail.code ?? '—'), String(detail.signal ?? '—'), String(detail.error ?? '—'))
+        }
       } catch { /* the ring must never break the wiring */ }
     }
     const gatewayConfig: Record<string, unknown> = { ...effective.values, relaySecret }
     Object.defineProperty(gatewayConfig, 'gatewayEvent', { value: gatewayEvent, enumerable: false })
+    Object.defineProperty(gatewayConfig, 'onGatewayPort', {
+      value: (p: unknown) => {
+        if (typeof p === 'number' && Number.isInteger(p) && p >= 1 && p <= 65535) liveGatewayPort = p
+      },
+      enumerable: false,
+    })
     ctx.plugin(gateway, gatewayConfig)
     ctx.plugin(push, effective.values)
     // The shared-session table backing the relay's access control. The relay
@@ -1085,11 +1115,12 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // One runtime probe per request: the gateway's own status (source-IP
     // detection + the ACTUAL port for snippets/QR), plus our processes'
     // liveness for the projection.
+    const liveGatewayBase = (): string => `http://127.0.0.1:${resolveLiveGatewayPort(getConfig().values.port)}`
     const buildRuntime = async () => {
       const lanAddresses = detectLanCandidates()
       const lanAddress = (lanAddresses.find((c) => c.kind === 'lan') ?? lanAddresses[0])?.ip
       try {
-        const response = await fetch(`http://127.0.0.1:${effective.values.port}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
+        const response = await fetch(`${liveGatewayBase()}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
         if (!response.ok) return { caddyRunning: caddyManager?.isRunning() === true, lanAddress, lanAddresses }
         const body = (await response.json()) as { host?: unknown; port?: unknown; lastForwardedSource?: unknown }
         return {
@@ -1120,7 +1151,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       }
     }
     const verification = createVerificationManager({
-      gatewayBase: `http://127.0.0.1:${effective.values.port}`,
+      gatewayBase: liveGatewayBase,
       getValues: () => getConfig().values,
       // runtimeReady now covers the managed paths: Caddy must actually be
       // alive; cloudflared arrives with GW-13b; the external path has no
@@ -1180,14 +1211,15 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
                 // port — same fallback as the caddy start route: probe
                 // /lan-gate/status first, fall back to the configured
                 // port when it does not answer (GW-fix-4/M2).
+                const fallbackPort = resolveLiveGatewayPort(getConfig().values.port)
                 try {
-                  const response = await fetch(`http://127.0.0.1:${getConfig().values.port}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
+                  const response = await fetch(`http://127.0.0.1:${fallbackPort}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
                   if (response.ok) {
                     const body = (await response.json()) as { port?: unknown }
                     if (typeof body?.port === 'number') return body.port
                   }
-                } catch { /* fall through to the configured port */ }
-                return getConfig().values.port
+                } catch { /* fall through to the resolved/configured port */ }
+                return fallbackPort
               },
               cloudflared: {
                 start: async (startInput: { tunnelToken: string }) => {
@@ -1232,7 +1264,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     })
     const adminOptionsFor = (admit: (req: IncomingMessage) => AdminAdmission): AdminHandlerOptions => ({
       admit,
-      gatewayBase: `http://127.0.0.1:${effective.values.port}`,
+      gatewayBase: liveGatewayBase,
       getConfig,
       // Shares routes (T33a): the table above is the truth they serve and
       // mutate. typertGateway and agents are deliberately NOT declared in
@@ -1425,8 +1457,8 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             // the registry through this apply's own closure, the consent
             // through resolveConfig on the SAME row object (a volatile field,
             // read at use time per the hard constraint, never snapshotted).
-            plugins: () => {
-              const consent = pluginConsent()
+            plugins: (device?: string) => {
+              const consent = pluginConsent(device)
               const table: Record<string, ServerPluginEntry> = {}
               for (const declaration of registry.list()) {
                 table[declaration.plugin] = {
@@ -1497,7 +1529,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
       let deviceCount: number | undefined
       let pushSubscriptions: number | undefined
       try {
-        const response = await fetch(`http://127.0.0.1:${effective.values.port}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
+        const response = await fetch(`${liveGatewayBase()}/lan-gate/status`, { signal: AbortSignal.timeout(3000) })
         reachable = response.ok
         if (reachable) {
           const body = await response.json() as { port?: unknown; devices?: unknown; pushSubscriptions?: unknown }

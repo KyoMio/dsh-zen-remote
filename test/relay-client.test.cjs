@@ -2874,3 +2874,144 @@ test('T3 client: openStream forwards knownCursor and fetchSessionSnapshot handle
   const resAfterCreds = await client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' } })
   assert.equal(resAfterCreds.ok, true)
 })
+
+test('T3 openStream: firstFrameTimeoutMs aborts ping-only streams without renewal and disarms once first semantic frame arrives', { timeout: 1000 }, async (t) => {
+  // 1. Ping-only stream (including info pings with serverName) must NOT renew firstFrameTimer.
+  {
+    let aborted = false
+    let interval
+    t.after(() => clearInterval(interval))
+    const client = createRelayClient({
+      getServerUrl: () => 'http://127.0.0.1:1',
+      getToken: () => 'tok',
+      requestTimeoutMs: 40,
+      idleTimeoutMs: 120,
+      firstFrameTimeoutMs: 70,
+      infoRefreshMs: 0,
+      fetchImpl: async (url, init) => {
+        if (String(url).endsWith('/v1/handshake')) {
+          return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        const stream = new ReadableStream({
+          start(controller) {
+            interval = setInterval(() => {
+              if (init?.signal?.aborted) { clearInterval(interval); return }
+              controller.enqueue(Buffer.from(JSON.stringify({ type: 'ping', serverName: 'S' }) + '\n'))
+            }, 20)
+            init?.signal?.addEventListener('abort', () => {
+              aborted = true
+              clearInterval(interval)
+              try { controller.error(new Error('aborted')) } catch {}
+            }, { once: true })
+          },
+        })
+        return new Response(stream, { status: 200, headers: { 'content-type': 'application/x-ndjson' } })
+      },
+    })
+    await client.connect()
+    const ac = new AbortController()
+    t.after(() => ac.abort())
+    const iter = client.openStream('session', 'follow', {}, ac.signal)[Symbol.asyncIterator]()
+    await assert.rejects(() => iter.next(), (e) => e instanceof RelayError && e.code === 'offline')
+    assert.equal(aborted, true)
+    assert.equal(client.state, 'offline')
+  }
+
+  // 2. Receiving first semantic frame disarms firstFrameTimer so long silence with ping stays alive past firstFrameTimeoutMs.
+  {
+    const client = createRelayClient({
+      getServerUrl: () => 'http://127.0.0.1:1',
+      getToken: () => 'tok',
+      requestTimeoutMs: 40,
+      idleTimeoutMs: 90,
+      firstFrameTimeoutMs: 60,
+      infoRefreshMs: 0,
+      fetchImpl: async (url, init) => {
+        if (String(url).endsWith('/v1/handshake')) {
+          return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+        }
+        const stream = new ReadableStream({
+          start(controller) {
+            const t1 = setTimeout(() => {
+              if (!init?.signal?.aborted) controller.enqueue(Buffer.from(JSON.stringify({ type: 'frame', frame: { n: 1 } }) + '\n'))
+            }, 15)
+            const t2 = setTimeout(() => {
+              if (!init?.signal?.aborted) controller.enqueue(Buffer.from(JSON.stringify({ type: 'ping' }) + '\n'))
+            }, 45)
+            const t3 = setTimeout(() => {
+              if (!init?.signal?.aborted) {
+                controller.enqueue(Buffer.from(JSON.stringify({ type: 'frame', frame: { n: 2 } }) + '\n'))
+                controller.enqueue(Buffer.from(JSON.stringify({ type: 'end' }) + '\n'))
+                controller.close()
+              }
+            }, 95)
+            init?.signal?.addEventListener('abort', () => {
+              clearTimeout(t1); clearTimeout(t2); clearTimeout(t3)
+              try { controller.error(new Error('aborted')) } catch {}
+            }, { once: true })
+          },
+        })
+        return new Response(stream, { status: 200, headers: { 'content-type': 'application/x-ndjson' } })
+      },
+    })
+    await client.connect()
+    const got = []
+    for await (const frame of client.openStream('session', 'follow', {})) got.push(frame)
+    assert.deepEqual(got, [{ n: 1 }, { n: 2 }])
+    assert.equal(client.state, 'online')
+  }
+})
+
+test('T3 peerRecoveryMarginMs: covers invoke, openStream headers, and fetchSessionSnapshot; snapshot transport death preserves online state', async () => {
+  let delayMs = 0
+  let failSnapshot = false
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok',
+    requestTimeoutMs: 40,
+    peerRecoveryMarginMs: 120,
+    infoRefreshMs: 0,
+    fetchImpl: async (url, init) => {
+      const path = new URL(String(url)).pathname
+      if (path.endsWith('/v1/handshake')) {
+        return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (path.endsWith('/v1/session-snapshot') && failSnapshot) {
+        throw new TypeError('socket hang up')
+      }
+      if (delayMs > 0) {
+        await new Promise((resolve, reject) => {
+          const t = setTimeout(resolve, delayMs)
+          init?.signal?.addEventListener('abort', () => { clearTimeout(t); reject(new Error('aborted')) }, { once: true })
+        })
+      }
+      if (path.endsWith('/v1/invoke')) {
+        return new Response(JSON.stringify({ ok: true, value: { pong: true } }), { status: 200 })
+      }
+      if (path.endsWith('/v1/session-snapshot')) {
+        return new Response(JSON.stringify({ ok: true, value: { mode: 'unchanged', cursor: 7, hasMore: false } }), { status: 200 })
+      }
+      if (path.endsWith('/v1/stream')) {
+        return new Response(JSON.stringify({ type: 'end' }) + '\n', { status: 200, headers: { 'content-type': 'application/x-ndjson' } })
+      }
+      return new Response(JSON.stringify({ ok: false }), { status: 404 })
+    },
+  })
+  await client.connect()
+  assert.equal(client.state, 'online')
+
+  // 70ms exceeds requestTimeoutMs (40ms) but fits inside 40 + 120 = 160ms
+  delayMs = 70
+  assert.deepEqual(await client.invoke('session', 'list', {}), { pong: true })
+  const snap = await client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' } })
+  assert.equal(snap.ok, true)
+  const items = []
+  for await (const frame of client.openStream('session', 'follow', {})) items.push(frame)
+  assert.deepEqual(items, [])
+
+  // Snapshot transport failure must NOT mark client offline
+  delayMs = 0
+  failSnapshot = true
+  await assert.rejects(() => client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' } }), (e) => e instanceof RelayError && e.code === 'offline')
+  assert.equal(client.state, 'online', 'fetchSessionSnapshot failure must keep client online')
+})

@@ -28,6 +28,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const dgram = require('node:dgram')
+const { EventEmitter } = require('node:events')
 const { createHash, createPrivateKey, createPublicKey, randomBytes, sign, verify } = require('node:crypto')
 
 const {
@@ -36,7 +37,7 @@ const {
   collectLanEndpoints,
   classifyPunchEndpoint,
 } = require('../lib/peer/punch.js')
-const { generatePeerIdentity, buildPeerHandshakeEnvelope } = require('../lib/peer/crypto.js')
+const { generatePeerIdentity, buildPeerHandshakeEnvelope, generateEphemeralX25519, derivePeerSessionCiphers } = require('../lib/peer/crypto.js')
 const { PeerFrameType, decodeFrameHeader, packEncryptedFrame, unpackEncryptedFrame } = require('../lib/peer/wire.js')
 const { PeerArqSession } = require('../lib/peer/arq.js')
 
@@ -1153,7 +1154,6 @@ test('real-clock keepalive: a receive between PING ticks moves the loss to that 
 })
 
 test('PC-V1: incoming recovery handshake survives the local reprobe deadline', async () => {
-  const { EventEmitter } = require('node:events')
   const A = generatePeerIdentity()
   const B = generatePeerIdentity()
   const clockA = manualClock()
@@ -1610,14 +1610,11 @@ test('T3: beginPunch while punching merges new candidates without rotating keys 
 
 // -- security: unannounced peers, low-order DH, replay/rollback & revocation (from peer-security) --
 
-const { EventEmitter: PunchEventEmitter } = require('node:events')
-const { generateEphemeralX25519, derivePeerSessionCiphers } = require('../lib/peer/crypto.js')
-
 const SEC_NET = '1234567890abcdef'
 const secOrigin = { address: '127.0.0.1', port: 55556 }
 const secClock = { now: () => 1000, setTimeout: () => 1, clearTimeout() {} }
 
-class FakeDatagram extends PunchEventEmitter {
+class FakeDatagram extends EventEmitter {
   constructor() {
     super()
     this.sent = []
@@ -1849,5 +1846,235 @@ test('revoking a peer drops ciphers and prevents late handshake resurrection', (
     assert.equal(f.manager.sessionCiphers(f.peer.nodeId), null)
   } finally {
     f.manager.close()
+  }
+})
+
+test('T2: demoteSessionToRelay clears direct state and timers without firing onDirectLost', async () => {
+  let lostCalls = 0
+  const pair = await establishPair({
+    onDirectLost: () => { lostCalls += 1 },
+  })
+  try {
+    const { mgrA, B, clockA } = pair
+    assert.equal(mgrA.peerState(B.nodeId).state, 'direct')
+    assert.ok(mgrA.sessionCiphers(B.nodeId))
+
+    mgrA.demoteSessionToRelay(B.nodeId)
+    assert.equal(mgrA.peerState(B.nodeId).state, 'idle')
+    assert.equal(mgrA.sessionCiphers(B.nodeId), null)
+    assert.equal(lostCalls, 0, 'demoteSessionToRelay must not fire onDirectLost')
+
+    // Advancing through normal keepalive loss window must not fire onDirectLost
+    clockA.advance(16_000)
+    assert.equal(lostCalls, 0)
+  } finally {
+    await closeManager({ mgr: pair.mgrA, socket: pair.sockA })
+    await closeManager({ mgr: pair.mgrB, socket: pair.sockB })
+  }
+})
+
+test('T2: onHello from non-candidate mapped port adds bounded candidate and converges after first HELLO drop without 15s stall', () => {
+  const clock = manualClock()
+  const local = generatePeerIdentity()
+  const peer = generatePeerIdentity()
+  const sockA = new FakeDatagram()
+  const sockB = new FakeDatagram()
+  const aAddr = { address: '127.0.0.1', port: 55555 }
+  const bNewAddr = { address: '127.0.0.1', port: 59999 }
+  sockA.address = () => aAddr
+  sockB.address = () => bNewAddr
+
+  const aQueue = []
+  const bQueue = []
+  let dropFirstAToNewPort = true
+  sockA.send = (bytes, port, host) => {
+    const buf = Buffer.from(bytes)
+    if (port === bNewAddr.port && buf[0] === 123) {
+      const parsed = JSON.parse(buf.toString('utf8'))
+      if (parsed.kind === 'zr-hello' && dropFirstAToNewPort) {
+        dropFirstAToNewPort = false
+        return // simulate lost first HELLO to newly learned mapped port
+      }
+    }
+    aQueue.push({ bytes: buf, port, host })
+  }
+  sockB.send = (bytes, port, host) => {
+    bQueue.push({ bytes: Buffer.from(bytes), port, host })
+  }
+
+  let aReady = 0
+  let bReady = 0
+  const mgrA = new PeerPunchManager({
+    networkId: SEC_NET,
+    identity: local,
+    socket: sockA,
+    clock,
+    punchIntervalMs: 50,
+    punchRounds: 10,
+    punchWindowMs: 500,
+    keepAliveMs: 5000,
+    keepAliveLostFrames: 3,
+    onDirectReady: () => { aReady += 1 },
+  })
+  const mgrB = new PeerPunchManager({
+    networkId: SEC_NET,
+    identity: peer,
+    socket: sockB,
+    clock,
+    punchIntervalMs: 50,
+    punchRounds: 10,
+    punchWindowMs: 500,
+    keepAliveMs: 5000,
+    keepAliveLostFrames: 3,
+    onDirectReady: () => { bReady += 1 },
+  })
+
+  try {
+    // A only knows stale candidate port 40000; B punches from new mapped port 59999
+    mgrA.beginPunch({ peerNodeId: peer.nodeId, peerPublicKeyHex: peer.publicKeyHex, lanEndpoints: ['127.0.0.1:40000'] })
+    mgrB.beginPunch({ peerNodeId: local.nodeId, peerPublicKeyHex: local.publicKeyHex, lanEndpoints: ['127.0.0.1:55555'] })
+
+    const flush = () => {
+      for (let guard = 0; guard < 100 && (aQueue.length || bQueue.length); guard++) {
+        while (bQueue.length) {
+          const pkt = bQueue.shift()
+          if (pkt.port === aAddr.port) mgrA.handlePacket(pkt.bytes, bNewAddr)
+        }
+        while (aQueue.length) {
+          const pkt = aQueue.shift()
+          if (pkt.port === bNewAddr.port) mgrB.handlePacket(pkt.bytes, aAddr)
+        }
+      }
+    }
+
+    // Also drop B's initial HELLO-ACKs if any arrived, only allowing round 2+ retry via candidate list
+    flush()
+    // Advance only 100ms (2 punch intervals, far below 5s/15s)
+    for (let i = 0; i < 4 && (aReady === 0 || bReady === 0); i++) {
+      clock.advance(50)
+      flush()
+    }
+    assert.ok(aReady >= 1 && bReady >= 1, 'both peers must converge via newly learned port within retry window')
+    assert.ok(mgrA.sessionCiphers(peer.nodeId))
+    assert.ok(mgrB.sessionCiphers(local.nodeId))
+
+    // Candidate list must remain bounded even if peer roams across many ports
+    const eph = generateEphemeralX25519()
+    for (let p = 60000; p < 60030; p++) {
+      mgrA.handlePacket(secControl(peer, eph.publicKeyHex, local.nodeId), { address: '127.0.0.1', port: p })
+    }
+    const candidates = mgrA.sessions.get(peer.nodeId).candidates
+    assert.ok(candidates.length <= 16, `candidates must stay bounded, got ${candidates.length}`)
+  } finally {
+    mgrA.close()
+    mgrB.close()
+  }
+})
+
+test('T2: direct-state peer re-handshakes cleanly on new ephemeral key from new port even if first HELLO & ACK drop', () => {
+  const clock = manualClock()
+  const local = generatePeerIdentity()
+  const peer = generatePeerIdentity()
+  const sockA = new FakeDatagram()
+  const sockB = new FakeDatagram()
+  const aAddr = { address: '127.0.0.1', port: 55555 }
+  const bAddr1 = { address: '127.0.0.1', port: 55556 }
+  const bAddr2 = { address: '127.0.0.1', port: 55577 }
+  sockA.address = () => aAddr
+  sockB.address = () => bAddr1
+
+  const aQueue = []
+  const bQueue = []
+  let activeBPort = bAddr1.port
+  let dropNextAHello = false
+  let dropNextAAck = false
+
+  sockA.send = (bytes, port, host) => {
+    const buf = Buffer.from(bytes)
+    if (buf[0] === 123 && port === bAddr2.port) {
+      const parsed = JSON.parse(buf.toString('utf8'))
+      if (parsed.kind === 'zr-hello' && dropNextAHello) {
+        dropNextAHello = false
+        return
+      }
+      if (parsed.kind === 'zr-hello-ack' && dropNextAAck) {
+        dropNextAAck = false
+        return
+      }
+    }
+    aQueue.push({ bytes: buf, port, host })
+  }
+  sockB.send = (bytes, port, host) => {
+    bQueue.push({ bytes: Buffer.from(bytes), port, host })
+  }
+
+  const mgrA = new PeerPunchManager({
+    networkId: SEC_NET,
+    identity: local,
+    socket: sockA,
+    clock,
+    punchIntervalMs: 50,
+    punchRounds: 10,
+    punchWindowMs: 500,
+  })
+  let mgrB = new PeerPunchManager({
+    networkId: SEC_NET,
+    identity: peer,
+    socket: sockB,
+    clock,
+    punchIntervalMs: 50,
+    punchRounds: 10,
+    punchWindowMs: 500,
+  })
+
+  const flush = () => {
+    for (let guard = 0; guard < 100 && (aQueue.length || bQueue.length); guard++) {
+      while (bQueue.length) {
+        const pkt = bQueue.shift()
+        if (pkt.port === aAddr.port) mgrA.handlePacket(pkt.bytes, { address: '127.0.0.1', port: activeBPort })
+      }
+      while (aQueue.length) {
+        const pkt = aQueue.shift()
+        if (pkt.port === activeBPort) mgrB.handlePacket(pkt.bytes, aAddr)
+      }
+    }
+  }
+
+  try {
+    mgrA.beginPunch({ peerNodeId: peer.nodeId, peerPublicKeyHex: peer.publicKeyHex, lanEndpoints: [`127.0.0.1:${bAddr1.port}`] })
+    mgrB.beginPunch({ peerNodeId: local.nodeId, peerPublicKeyHex: local.publicKeyHex, lanEndpoints: [`127.0.0.1:${aAddr.port}`] })
+    flush()
+    assert.equal(mgrA.peerState(peer.nodeId).state, 'direct')
+    const oldTxKey = mgrA.sessionCiphers(peer.nodeId).txKeyHex
+
+    // Peer B restarts on a new NAT port with new ephemeral key while A stays in 'direct'
+    mgrB.close()
+    activeBPort = bAddr2.port
+    sockB.address = () => bAddr2
+    dropNextAHello = true
+    dropNextAAck = true
+    mgrB = new PeerPunchManager({
+      networkId: SEC_NET,
+      identity: peer,
+      socket: sockB,
+      clock,
+      punchIntervalMs: 50,
+      punchRounds: 10,
+      punchWindowMs: 500,
+    })
+    mgrB.beginPunch({ peerNodeId: local.nodeId, peerPublicKeyHex: local.publicKeyHex, lanEndpoints: [`127.0.0.1:${aAddr.port}`] })
+    flush()
+    for (let i = 0; i < 5; i++) {
+      clock.advance(50)
+      flush()
+    }
+    const newA = mgrA.sessionCiphers(peer.nodeId)
+    const newB = mgrB.sessionCiphers(local.nodeId)
+    assert.ok(newA && newB, 'both sides must hold direct ciphers after re-handshake')
+    assert.notEqual(newA.txKeyHex, oldTxKey, 'new epoch must derive fresh ciphers')
+    assert.equal(newA.txKeyHex, newB.rxKeyHex, 'A and B keys must match without mismatch')
+  } finally {
+    mgrA.close()
+    mgrB.close()
   }
 })

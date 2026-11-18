@@ -276,10 +276,10 @@ function pickPreferredProfile(profiles: readonly string[]): string | undefined {
 
 /** The real `dsh plugin add` runner: exit code as a number, spawn failures
  * (ENOENT — no `dsh` on PATH) count as code 1. */
-function spawnDshPluginAdd(command: string, args: readonly string[]): Promise<number> {
+export function spawnDshPluginAdd(command: string, args: readonly string[]): Promise<number> {
   return new Promise((resolve) => {
     execFile(command, [...args], { timeout: 120_000 }, (error) => {
-      if (error === undefined) {
+      if (!error) {
         resolve(0)
         return
       }
@@ -445,10 +445,10 @@ const DEFAULT_MACOS_APP_PATH = '/Applications/DeepSeek Harness.app'
 const DEFAULT_SYSTEM_UNIT_DIR = '/etc/systemd/system'
 const MACOS_LAUNCHD_LABEL = 'ai.deepseek.dsh.web'
 
-function execProbeReal(command: string, args: readonly string[]): Promise<ExecProbeResult> {
+export function execProbeReal(command: string, args: readonly string[]): Promise<ExecProbeResult> {
   return new Promise((resolve) => {
     execFile(command, [...args], { timeout: 10_000 }, (error, stdout) => {
-      if (error === undefined) {
+      if (!error) {
         resolve({ code: 0, stdout: String(stdout ?? '') })
         return
       }

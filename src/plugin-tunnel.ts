@@ -90,10 +90,11 @@ function asAdapterRoute(route: NormalizedBridgeRoute): NormalizedAdapterRoute {
  * body is consumed by validating (the reader above), and the verdict carries
  * the bytes for the loopback. */
 export async function validatePluginCall(
-  bridge: { registry: BridgeRegistry; getConsent: () => Record<string, boolean> },
+  bridge: { registry: BridgeRegistry; getConsent: (device?: string) => Record<string, boolean> },
   coords: { pluginName: string; pluginVersion: string; pluginDigest: string; routePath: string; rawQuery: string },
   isAccessible: (sessionId: string) => boolean,
   readJsonBody?: PluginCallBodyReader,
+  device?: string,
 ): Promise<PluginCallValidation> {
   const declaration = bridge.registry.get(coords.pluginName)
   if (declaration === undefined) return { ok: false, status: 404, code: 'plugin-unknown' }
@@ -162,7 +163,7 @@ export async function validatePluginCall(
   if (route.scope === 'server') {
     let consent: Record<string, boolean> = {}
     try {
-      consent = bridge.getConsent()
+      consent = bridge.getConsent(device)
     } catch {
       consent = {}
     }
@@ -293,7 +294,9 @@ export function encodeRfc6455Frame(opcode: number, payload: Buffer, mask: boolea
  * the unsubscribe-all — or a non-object JSON) is admitted: there is no id
  * to check. */
 function frameShareVerdict(route: NormalizedBridgeRoute, frame: Rfc6455Frame, isAccessible: (sessionId: string) => boolean): { ok: true } | { ok: false; status: number; code: string } {
-  if (frame.opcode !== 0x1) return { ok: true }
+  if (!frame.fin || frame.opcode === 0x0) return { ok: false, status: 400, code: 'bad-request' }
+  if (frame.opcode === 0x8 || frame.opcode === 0x9 || frame.opcode === 0xA) return { ok: true }
+  if (frame.opcode !== 0x1 && frame.opcode !== 0x2) return { ok: false, status: 400, code: 'bad-request' }
   let parsed: unknown
   try {
     parsed = JSON.parse(frame.payload.toString('utf8'))
@@ -345,7 +348,7 @@ interface Tunnel {
 }
 
 export interface CreatePluginTunnelOptions {
-  bridge: { registry: BridgeRegistry; getConsent: () => Record<string, boolean>; loopback: PluginLoopback }
+  bridge: { registry: BridgeRegistry; getConsent: (device?: string) => Record<string, boolean>; loopback: PluginLoopback }
   /** The loopback web server bind, re-read per tunnel (same live discipline
    * as every target read in this plugin). */
   getTarget: () => { protocol: 'http:' | 'https:'; port: number }
@@ -515,7 +518,8 @@ export function createPluginTunnel(options: CreatePluginTunnelOptions): PluginTu
       // chain (nothing would ever own its ids); an `upgrade: true` one is
       // admitted with an empty session (PB-26b) — its ids arrive in the
       // later WebSocket frames and the send gate owns them.
-      const validation = await validatePluginCall(bridge, coords, options.isAccessible)
+      const device = deviceOf(req)
+      const validation = await validatePluginCall(bridge, coords, options.isAccessible, undefined, device)
       if (!validation.ok) {
         pluginBridgeError(res, validation.status, validation.code)
         return
@@ -526,7 +530,6 @@ export function createPluginTunnel(options: CreatePluginTunnelOptions): PluginTu
         pluginBridgeError(res, 404, 'route-undeclared')
         return
       }
-      const device = deviceOf(req)
       if (([...tunnels.values()].filter((tunnel) => tunnel.device === device)).length >= MAX_TUNNELS_PER_DEVICE) {
         pluginBridgeError(res, 429, 'busy')
         return
@@ -623,13 +626,20 @@ export function createPluginTunnel(options: CreatePluginTunnelOptions): PluginTu
       // holding a sub-chunk arrival for a fuller buffer would stall the
       // handshake and every early frame (the PB-10 e2e hang).
       let downstreamBuffer: Buffer = Buffer.alloc(0)
+      let drainPending = false
       const pumpDownstream = (): void => {
+        if (drainPending) return
         while (downstreamBuffer.length > 0) {
           const chunk = downstreamBuffer.subarray(0, TUNNEL_DOWN_CHUNK_BYTES)
           downstreamBuffer = downstreamBuffer.subarray(chunk.length)
           if (!writeLine(res, { type: 'data', b64: chunk.toString('base64') })) {
             upstream.pause()
-            res.once('drain', () => upstream.resume())
+            drainPending = true
+            res.once('drain', () => {
+              drainPending = false
+              upstream.resume()
+              pumpDownstream()
+            })
             return
           }
         }

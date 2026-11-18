@@ -32,6 +32,7 @@
  * mock server without touching the network.
  */
 
+import { createHash } from 'node:crypto'
 import {
   accessSync,
   chmodSync,
@@ -56,12 +57,15 @@ import {
   binaryDownloadCandidates,
   binaryInstallPath,
   binDir,
-  binaryUrls,
   currentPlatform,
   type BinaryArchive,
   type BinaryPlatform,
   type IngressBinary,
 } from './binary.js'
+
+const GITHUB_API_TIMEOUT_MS = 4_000
+const SHA256_DIGEST_PATTERN = /^sha256:([0-9a-f]{64})$/i
+const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/i
 
 /** Generous ceiling on one download; a mirror gone wrong must not be able
  * to fill the disk. Both real binaries sit far below 200 MB. */
@@ -159,17 +163,55 @@ export interface DownloadBinaryOptions {
    * (`binaryUrls` / `caddyDownload` / `cloudflaredDownload`), NOT guessed
    * from the URL shape. Default `'none'`: a bare executable. */
   archive?: BinaryArchive
+  /** Optional expected lowercase 64-hex SHA-256 digest of the raw downloaded payload. */
+  expectedSha256?: string
+}
+
+/**
+ * Query GitHub Releases API directly for an official asset's `sha256:...` digest.
+ * Returns lowercase 64-hex SHA-256 on success, or `undefined` on any network/API/shape miss.
+ */
+export async function resolveOfficialAssetSha256(
+  releaseApiUrl: string,
+  assetName: string,
+  fetchImpl: typeof fetch = fetch,
+): Promise<string | undefined> {
+  try {
+    const response = await fetchImpl(releaseApiUrl, {
+      redirect: 'follow',
+      headers: {
+        accept: 'application/vnd.github+json',
+        'user-agent': 'dsh-zen-remote',
+      },
+      signal: AbortSignal.timeout(GITHUB_API_TIMEOUT_MS),
+    })
+    if (!response.ok) return undefined
+    const payload = (await response.json()) as { assets?: unknown }
+    if (!Array.isArray(payload?.assets)) return undefined
+    for (const item of payload.assets) {
+      if (item === null || typeof item !== 'object') continue
+      const record = item as { name?: unknown; digest?: unknown }
+      if (record.name !== assetName || typeof record.digest !== 'string') continue
+      const match = SHA256_DIGEST_PATTERN.exec(record.digest.trim())
+      if (match !== null) return match[1]!.toLowerCase()
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
 }
 
 /** Write one fetched response body to `partPath` under the size cap and
- * per-chunk stall timeout so a throttled or hung mirror fails over quickly. */
+ * per-chunk stall timeout so a throttled or hung mirror fails over quickly.
+ * Returns the raw payload's lowercase hex SHA-256 digest. */
 async function streamToFile(
   tool: IngressBinary,
   url: string,
   body: NodeWebReadableStream<Uint8Array>,
   partPath: string,
   onProgress: DownloadProgress | undefined,
-): Promise<void> {
+): Promise<string> {
+  const hash = createHash('sha256')
   let received = 0
   let stallTimer: ReturnType<typeof setTimeout> | undefined
   const counter = new Transform({
@@ -179,6 +221,7 @@ async function streamToFile(
         done(new BinaryDownloadError(tool, url, null, `the download of ${tool} exceeds the ${MAX_DOWNLOAD_BYTES}-byte cap`))
         return
       }
+      hash.update(chunk)
       if (stallTimer !== undefined) clearTimeout(stallTimer)
       stallTimer = setTimeout(() => {
         counter.destroy(new BinaryDownloadError(tool, url, null, `the download of ${tool} stalled after ${received} bytes`))
@@ -194,6 +237,7 @@ async function streamToFile(
   if (typeof stallTimer.unref === 'function') stallTimer.unref()
   try {
     await pipeline(Readable.fromWeb(body), counter, createWriteStream(partPath, { mode: 0o644 }))
+    return hash.digest('hex')
   } catch (error) {
     rmSync(partPath, { force: true })
     throw error
@@ -283,6 +327,16 @@ export async function downloadBinary(
   const platform = options.platform ?? currentPlatform()
   const archive: BinaryArchive = options.archive ?? 'none'
   const installPath = binaryInstallPath(dshHome, tool, platform)
+  const expectedSha256 = options.expectedSha256?.toLowerCase()
+  if (expectedSha256 !== undefined && !SHA256_HEX_PATTERN.test(expectedSha256)) {
+    throw new BinaryDownloadError(
+      tool,
+      url,
+      null,
+      `invalid expected SHA-256 digest for ${tool}`,
+      { code: 'checksum-mismatch' },
+    )
+  }
   if (archive === 'zip') {
     // Refused BEFORE any network traffic: there is no zip reader in this
     // codebase yet (GW-fix-1/H1 item 3), and half-supporting the format
@@ -317,11 +371,26 @@ export async function downloadBinary(
   if (archive === 'tgz') {
     // Archive (or auto-detected bare binary if an upstream endpoint serves a
     // raw ELF/Mach-O image despite tgz metadata): land the bytes in a sibling,
-    // then either install directly when the payload already starts with a
-    // unix image magic or gunzip + extract the tar entry.
+    // verify SHA-256 if provided, then either install directly when the payload
+    // already starts with a unix image magic or gunzip + extract the tar entry.
     const tgzPath = `${installPath}.download.tgz`
     try {
-      await streamToFile(tool, url, response.body as unknown as NodeWebReadableStream<Uint8Array>, tgzPath, onProgress)
+      const actualSha256 = await streamToFile(
+        tool,
+        url,
+        response.body as unknown as NodeWebReadableStream<Uint8Array>,
+        tgzPath,
+        onProgress,
+      )
+      if (expectedSha256 !== undefined && actualSha256 !== expectedSha256) {
+        throw new BinaryDownloadError(
+          tool,
+          url,
+          response.status,
+          `the downloaded ${tool} failed SHA-256 checksum verification`,
+          { code: 'checksum-mismatch' },
+        )
+      }
       const rawBytes = readFileSync(tgzPath)
       const gzipMagic = rawBytes.length >= 2 && rawBytes[0] === 0x1f && rawBytes[1] === 0x8b
       const entry = (!gzipMagic && platform.os !== 'windows' && looksLikeUnixImage(rawBytes.subarray(0, 4)))
@@ -340,10 +409,25 @@ export async function downloadBinary(
     }
     return installPath
   }
-  // Bare executable: stream to the .part, gate the magic, then rename.
+  // Bare executable: stream to the .part, verify SHA-256 if provided, gate the magic, then rename.
   const partPath = `${installPath}.part`
   try {
-    await streamToFile(tool, url, response.body as unknown as NodeWebReadableStream<Uint8Array>, partPath, onProgress)
+    const actualSha256 = await streamToFile(
+      tool,
+      url,
+      response.body as unknown as NodeWebReadableStream<Uint8Array>,
+      partPath,
+      onProgress,
+    )
+    if (expectedSha256 !== undefined && actualSha256 !== expectedSha256) {
+      throw new BinaryDownloadError(
+        tool,
+        url,
+        response.status,
+        `the downloaded ${tool} failed SHA-256 checksum verification`,
+        { code: 'checksum-mismatch' },
+      )
+    }
     if (platform.os !== 'windows') assertUnixImageMagic(tool, url, response.status, headBytes(partPath))
     chmodExec(partPath)
     renameSync(partPath, installPath)
@@ -358,6 +442,8 @@ export async function downloadBinary(
 export interface EnsureBinaryOptions extends DownloadBinaryOptions {
   /** Force the platform mapping (tests); defaults to this process's. */
   platform?: BinaryPlatform
+  /** Override CN mirror preference (tests); defaults to {@link detectCnNetwork}. */
+  preferCnMirror?: boolean
 }
 
 /** Cached mainland-China network detection so repeated downloads do not
@@ -425,25 +511,43 @@ export async function ensureBinary(
   const platform = options.platform ?? currentPlatform()
   const existing = binaryPath(dshHome, tool, platform)
   if (existing !== undefined) return { path: existing, downloaded: false }
-  if (options.fetchImpl !== undefined) {
-    const urls = binaryUrls(platform)
-    const [url, archive] = tool === 'caddy' ? [urls.caddy, urls.caddyArchive] : [urls.cloudflared, urls.cloudflaredArchive]
-    const path = await downloadBinary(dshHome, tool, url, { ...options, archive })
-    return { path, downloaded: true }
-  }
-  const preferCnMirror = await detectCnNetwork()
+  const fetchImpl = options.fetchImpl ?? fetch
+  const preferCnMirror =
+    options.preferCnMirror ??
+    (options.fetchImpl !== undefined ? false : await detectCnNetwork())
   const candidates = binaryDownloadCandidates(tool, platform, preferCnMirror)
+  const digestCache = new Map<string, Promise<string | undefined>>()
+  const getOfficialDigest = (releaseApiUrl: string, assetName: string): Promise<string | undefined> => {
+    const key = `${releaseApiUrl}|${assetName}`
+    let pending = digestCache.get(key)
+    if (pending === undefined) {
+      pending = resolveOfficialAssetSha256(releaseApiUrl, assetName, fetchImpl)
+      digestCache.set(key, pending)
+    }
+    return pending
+  }
   let lastError: unknown
   for (const candidate of candidates) {
+    let expectedSha256: string | undefined
+    if (candidate.mirrored) {
+      if (!candidate.releaseApiUrl || !candidate.assetName) continue
+      expectedSha256 = await getOfficialDigest(candidate.releaseApiUrl, candidate.assetName)
+      if (expectedSha256 === undefined) {
+        // Never trust third-party mirrors when official GitHub release SHA-256 is unavailable.
+        continue
+      }
+    }
     try {
       const path = await downloadBinary(dshHome, tool, candidate.url, {
         ...options,
         archive: candidate.archive,
+        ...(expectedSha256 !== undefined ? { expectedSha256 } : {}),
       })
       return { path, downloaded: true }
     } catch (error) {
       lastError = error
     }
   }
-  throw lastError
+  if (lastError !== undefined) throw lastError
+  throw new BinaryDownloadError(tool, candidates[0]?.url ?? '', null, `no trusted download candidate succeeded for ${tool}`)
 }

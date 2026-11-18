@@ -75,14 +75,14 @@ export type PluginCallBodyReader = (maxBody: number) => Promise<{
  * the bytes for the loopback. */
 export declare function validatePluginCall(bridge: {
     registry: BridgeRegistry;
-    getConsent: () => Record<string, boolean>;
+    getConsent: (device?: string) => Record<string, boolean>;
 }, coords: {
     pluginName: string;
     pluginVersion: string;
     pluginDigest: string;
     routePath: string;
     rawQuery: string;
-}, isAccessible: (sessionId: string) => boolean, readJsonBody?: PluginCallBodyReader): Promise<PluginCallValidation>;
+}, isAccessible: (sessionId: string) => boolean, readJsonBody?: PluginCallBodyReader, device?: string): Promise<PluginCallValidation>;
 /** Largest single downstream data LINE (base64 will inflate by 4/3 — the cap
  * is on the RAW bytes carried, and the line stays well under typical proxy
  * line limits this way). */
@@ -126,7 +126,7 @@ export declare function encodeRfc6455Frame(opcode: number, payload: Buffer, mask
 export interface CreatePluginTunnelOptions {
     bridge: {
         registry: BridgeRegistry;
-        getConsent: () => Record<string, boolean>;
+        getConsent: (device?: string) => Record<string, boolean>;
         loopback: PluginLoopback;
     };
     /** The loopback web server bind, re-read per tunnel (same live discipline

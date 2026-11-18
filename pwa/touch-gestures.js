@@ -91,6 +91,14 @@
       localStorage.setItem(FONT_KEY, '1')
       reset.remove()
     })
-    document.body.appendChild(reset)
+    if (document.body) {
+      document.body.appendChild(reset)
+    } else {
+      document.addEventListener('DOMContentLoaded', () => {
+        if (document.body && !reset.isConnected && baseScale !== 1) {
+          document.body.appendChild(reset)
+        }
+      }, { once: true })
+    }
   }
 })()

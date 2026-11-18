@@ -32,6 +32,9 @@ export const name = 'dsh-zen-remote-push'
 export const inject = []
 
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
 // Config arrives as apply(ctx, config)'s already-resolved values — every
 // field merged from env > plugin row > lan-gate.config.json > defaults
 // (src/config.ts). Standalone loads (old single-row setups, tests) resolve
@@ -97,15 +100,37 @@ const ASK_USER_TOOL = 'ask_user_question'
 // legacy `pushApprovalGraceMs` file key keep working as before, read per
 // apply() so tests can shrink the window.
 function approvalPendingMs(fileConfig) {
-  return Number(process.env.DSH_PUSH_APPROVAL_GRACE_MS ?? fileConfig.pushApprovalGraceMs ?? 5000)
+  const raw = Number(process.env.DSH_PUSH_APPROVAL_GRACE_MS ?? fileConfig.pushApprovalGraceMs ?? 5000)
+  return Number.isFinite(raw) && raw >= 0 ? raw : 5000
+}
+
+function resolveGatewayPort(fallbackPort) {
+  try {
+    const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+    const meta = JSON.parse(readFileSync(join(home, 'lan-gate-runtime.json'), 'utf8'))
+    const p = meta && Number(meta.port)
+    if (!Number.isInteger(p) || p < 1 || p > 65535) return fallbackPort
+    if (typeof meta.pid === 'number' && Number.isInteger(meta.pid) && meta.pid > 0) {
+      try {
+        process.kill(meta.pid, 0)
+      } catch (e) {
+        if (!e || e.code !== 'EPERM') return fallbackPort
+      }
+    }
+    return p
+  } catch {
+    return fallbackPort
+  }
 }
 
 // Low-level sender shared by every leg: POSTs to the gateway's local
 // /pwa/push/send, which does the actual VAPID + aes128gcm encrypted delivery
 // to every subscribed device and replies { ok, sent, failed }.
-// gatewayPort comes from the resolved config's `port` (default 3088).
+// gatewayPort comes from the resolved config's `port` (default 3088),
+// dynamically refined from <DSH_HOME>/lan-gate-runtime.json if bound elsewhere.
 async function sendPush(title, body, gatewayPort) {
-  const res = await fetch(`http://127.0.0.1:${gatewayPort}/pwa/push/send`, {
+  const livePort = resolveGatewayPort(gatewayPort)
+  const res = await fetch(`http://127.0.0.1:${livePort}/pwa/push/send`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ title, body: body || '' })
@@ -492,13 +517,23 @@ export function apply(ctx, config) {
   // Session-title cache (P55-1): sessionId -> clipped title. Warm from the
   // `session/title` feed the moment a rename lands, so the approval and
   // question legs never re-walk the whole event log per fire.
+  const MAX_TITLE_CACHE = 500
   const titlesBySession = new Map()
+  const cacheSessionTitle = (sessionId, title) => {
+    if (!sessionId || !title) return
+    if (titlesBySession.has(sessionId)) titlesBySession.delete(sessionId)
+    else if (titlesBySession.size >= MAX_TITLE_CACHE) {
+      const oldest = titlesBySession.keys().next().value
+      if (oldest !== undefined) titlesBySession.delete(oldest)
+    }
+    titlesBySession.set(sessionId, title)
+  }
   const resolveSessionName = (session) => {
     if (!cfg.includeSessionName || !session) return ''
     const cached = session.id ? titlesBySession.get(session.id) : undefined
     if (cached) return cached
     const extracted = sessionTitle(sessionEvents(session))
-    if (extracted && session.id) titlesBySession.set(session.id, extracted)
+    if (extracted && session.id) cacheSessionTitle(session.id, extracted)
     return extracted
   }
 
@@ -554,16 +589,24 @@ export function apply(ctx, config) {
   // children included — those notify through here, they just never notify on
   // turn end.
   const armed = new Map() // ApprovalRequestId -> grace timer
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => () => {
+      for (const t of armed.values()) clearTimeout(t)
+      armed.clear()
+    })
+  }
   try {
     ctx.on('session/event', (_session, event) => {
       if (!event || !event.data) return
       // P55-1: warm the title cache the moment a rename lands, so a later
       // approval/question push names the session it came from.
       if (event.type === 'session/title' && typeof event.data.title === 'string' && _session && _session.id) {
-        titlesBySession.set(_session.id, clipTitle(event.data.title))
+        cacheSessionTitle(_session.id, clipTitle(event.data.title))
       }
       if (event.type === 'approval/asked') {
         const id = event.data.id
+        const prev = armed.get(id)
+        if (prev !== undefined) clearTimeout(prev)
         const toolName = event.data.toolName
         const timer = setTimeout(() => {
           armed.delete(id)

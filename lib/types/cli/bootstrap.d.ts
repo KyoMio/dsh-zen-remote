@@ -77,6 +77,9 @@ export interface CandidateProfile {
  * prompt's default check and the preferred-profile rule can rely on it.
  */
 export declare function scanCandidateProfiles(dshHome: string): CandidateProfile[];
+/** The real `dsh plugin add` runner: exit code as a number, spawn failures
+ * (ENOENT — no `dsh` on PATH) count as code 1. */
+export declare function spawnDshPluginAdd(command: string, args: readonly string[]): Promise<number>;
 export interface EnsurePluginInstalledOptions {
     dshHome: string;
     /** Explicit `--profile p1,p2` targets; skips the scan-and-ask flow and
@@ -159,6 +162,7 @@ export type EnsureDshRunningResult = {
     outcome: 'permission-denied' | 'no-daemon' | 'timeout';
     message: string;
 };
+export declare function execProbeReal(command: string, args: readonly string[]): Promise<ExecProbeResult>;
 /**
  * Find (or launch) a DSH this CLI can drive: discovery first — a live
  * version-matching socket answers immediately (preferring the target role

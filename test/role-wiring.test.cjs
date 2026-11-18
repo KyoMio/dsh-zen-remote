@@ -1572,6 +1572,7 @@ test('peer role registers /_dsh/zen-remote/client exactly once on webServer (no 
     for (const stop of disposers.splice(0)) {
       try { stop() } catch { /* ignore */ }
     }
+    fs.rmSync(path.join(TEMP_HOME, 'zen-remote-state.json'), { force: true })
   }
 })
 
@@ -1703,4 +1704,230 @@ test('PS-2: unreadable zen-remote-state.json degrades safely at apply() without 
     }
     fs.rmSync(stateFile, { force: true })
   }
+})
+
+test('T6 peer consent split: peer:<nodeId> defaults server-scope plugin consent ON while lan-gate desktop-client defaults OFF', async () => {
+  const index = await import(INDEX_URL)
+  const webRoutes = []
+  const disposers = []
+  const pluginCalls = []
+  const provides = []
+  const gatewayService = {
+    invoke: async () => ({}),
+    stream: async () => (async function* () {})(),
+  }
+  const services = {
+    logger: { info() {}, warn() {} },
+    webServer: {
+      register(entry) {
+        webRoutes.push(entry)
+        return () => {}
+      },
+    },
+    typertGateway: gatewayService,
+    connection: { admit: () => ({ peer: {} }) },
+    sessions: { get: () => undefined },
+    sessionQuery: {},
+  }
+  const listeners = []
+  const ctx = {
+    logger: services.logger,
+    plugin(mod, cfg) { pluginCalls.push({ mod, cfg }) },
+    provide(name, val) { provides.push({ name, val }); return () => {} },
+    on(event, listener) { listeners.push({ event, listener }); return () => {} },
+    effect(fn) {
+      const stop = fn()
+      if (typeof stop === 'function') disposers.push(stop)
+      return stop
+    },
+    reflect: { get: () => undefined },
+    inject(deps, cb) {
+      if (deps.every((d) => services[d] !== undefined)) {
+        cb(Object.assign(Object.create(ctx), services))
+      }
+    },
+  }
+  index.apply(ctx, { role: 'peer', autoShareNewSessions: true })
+  const onCreated = listeners.find((l) => l.event === 'agent/created')?.listener
+  assert.ok(onCreated, 'agent/created listener registered')
+  onCreated({ agent: { id: 's1', session: { id: 's1', header: { version: 4, id: 's1', createdAt: Date.now(), isSeeded: false } } }, source: 'startup' })
+
+  const zrService = provides.find((p) => p.name === 'zenRemote')?.val
+  assert.ok(zrService, 'zenRemote service provided')
+  const stopBridge = zrService.bridge({
+    plugin: 't6-server-panel',
+    version: '1.0.0',
+    routes: [{ path: '/t6-panel/info', scope: 'server', methods: ['GET'] }],
+  })
+  disposers.push(stopBridge)
+
+  const relayEntry = webRoutes.find((r) => r.kind === 'prefix' && r.path === '/_dsh/zen-remote/relay')
+  assert.ok(relayEntry, 'relay prefix mounted')
+  const gateCall = pluginCalls.find((c) => typeof c.cfg?.relaySecret === 'string' && c.cfg.relaySecret.length > 0)
+  assert.ok(gateCall, 'relaySecret wired into gateway child config')
+  const secret = gateCall.cfg.relaySecret
+
+  const server = http.createServer((req, res) => {
+    void relayEntry.handler(req, res)
+  })
+  const base = await listen(server)
+  try {
+    // 1. Handshake reports serverScopeConsent=true for peer:abcd1234 and false for external desktop-client abcd1234
+    const hsPeer = await fetch(`${base}/_dsh/zen-remote/relay/v1/handshake`, {
+      method: 'POST',
+      headers: {
+        'x-zen-remote-secret': secret,
+        'x-zen-remote-via': 'gateway',
+        'x-zen-remote-role': 'desktop-client',
+        'x-zen-remote-device': 'peer:abcd1234',
+        'content-type': 'application/json',
+      },
+      body: '{}',
+    })
+    assert.equal(hsPeer.status, 200)
+    const hsPeerBody = await hsPeer.json()
+    assert.equal(hsPeerBody.plugins['t6-server-panel'].serverScopeConsent, true)
+
+    const hsExt = await fetch(`${base}/_dsh/zen-remote/relay/v1/handshake`, {
+      method: 'POST',
+      headers: {
+        'x-zen-remote-secret': secret,
+        'x-zen-remote-via': 'gateway',
+        'x-zen-remote-role': 'desktop-client',
+        'x-zen-remote-device': 'abcd1234',
+        'content-type': 'application/json',
+      },
+      body: '{}',
+    })
+    assert.equal(hsExt.status, 200)
+    const hsExtBody = await hsExt.json()
+    assert.equal(hsExtBody.plugins['t6-server-panel'].serverScopeConsent, false)
+
+    // 2. /v1/plugin call: external abcd1234 is rejected 403 consent-off; peer:abcd1234 passes consent gate
+    const pluginHeaders = {
+      'x-zen-remote-secret': secret,
+      'x-zen-remote-via': 'gateway',
+      'x-zen-remote-role': 'desktop-client',
+      'x-zr-plugin': 't6-server-panel',
+      'x-zr-plugin-version': '1.0.0',
+      'x-zr-plugin-digest': hsPeerBody.plugins['t6-server-panel'].digest,
+      'x-zr-path': '/t6-panel/info',
+      'x-zr-query': 'sessionId=s1',
+      'x-zr-method': 'GET',
+    }
+    const extRes = await fetch(`${base}/_dsh/zen-remote/relay/v1/plugin`, {
+      method: 'POST',
+      headers: { ...pluginHeaders, 'x-zen-remote-device': 'abcd1234' },
+    })
+    assert.equal(extRes.status, 403)
+    assert.equal((await extRes.json()).error.code, 'consent-off')
+
+    const peerRes = await fetch(`${base}/_dsh/zen-remote/relay/v1/plugin`, {
+      method: 'POST',
+      headers: { ...pluginHeaders, 'x-zen-remote-device': 'peer:abcd1234' },
+    })
+    assert.notEqual(peerRes.status, 403, 'peer:<nodeId> must pass consent gate without consent-off')
+  } finally {
+    await close(server)
+    for (const stop of disposers.splice(0)) {
+      try { stop() } catch { /* ignore */ }
+    }
+    fs.rmSync(path.join(TEMP_HOME, 'zen-remote-state.json'), { force: true })
+  }
+})
+
+test('T9: host routes track drifted gateway port via lan-gate-runtime.json, onGatewayPort, and exit cleanup', async (t) => {
+  const index = await import(INDEX_URL)
+  const runtimeFile = path.join(TEMP_HOME, 'lan-gate-runtime.json')
+  const stateFile = path.join(TEMP_HOME, 'zen-remote-state.json')
+  const startMockGateway = async () => {
+    let port = 0
+    const server = http.createServer((req, res) => {
+      if (req.url === '/lan-gate/status') {
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ state: 'running', port, devices: [], pushSubscriptions: 0 }))
+        return
+      }
+      res.writeHead(404)
+      res.end()
+    })
+    await listen(server)
+    port = server.address().port
+    t.after(() => close(server))
+    return port
+  }
+  const fallbackPort = await startMockGateway()
+  const runtimePort = await startMockGateway()
+  const callbackPort = await startMockGateway()
+
+  fs.writeFileSync(runtimeFile, JSON.stringify({ pid: process.pid, port: runtimePort }))
+  t.after(() => {
+    fs.rmSync(runtimeFile, { force: true })
+    fs.rmSync(stateFile, { force: true })
+  })
+
+  const pluginCalls = []
+  const { ctx, routes } = ctxExecuting({
+    plugin(module, config) { pluginCalls.push({ module, config }) },
+    connection: { admit: () => ({ peer: {} }) },
+  })
+  index.apply(ctx, { role: 'host', port: fallbackPort })
+
+  const gwCall = pluginCalls.find((c) => c.module?.name === 'dsh-zen-remote-gateway')
+  assert.ok(gwCall, 'host role must register gateway sub-plugin')
+  assert.equal(typeof gwCall.config.onGatewayPort, 'function', 'gateway config carries non-enumerable onGatewayPort')
+  assert.equal(typeof gwCall.config.gatewayEvent, 'function', 'gateway config carries non-enumerable gatewayEvent')
+
+  const routeServer = http.createServer((req, res) => {
+    const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+    const matched = routes
+      .filter((r) => (r.kind === 'exact' ? pathname === r.path : pathname === r.path || pathname.startsWith(`${r.path}/`)))
+      .sort((a, b) => b.path.length - a.path.length)[0]
+    if (!matched) {
+      res.writeHead(404)
+      res.end()
+      return
+    }
+    void matched.handler(req, res)
+  })
+  const base = await listen(routeServer)
+  t.after(() => close(routeServer))
+
+  const readStatus = async () => {
+    const res = await fetch(`${base}/_dsh/zen-remote/admin/status`)
+    assert.equal(res.status, 200)
+    return res.json()
+  }
+  const readDebugReport = async () => {
+    const res = await fetch(`${base}/_dsh/zen-remote/client/debug-report`)
+    assert.equal(res.status, 200)
+    return res.json()
+  }
+
+  // 1. Mismatched configured port falls back to live lan-gate-runtime.json port.
+  const s1 = await readStatus()
+  assert.equal(s1.gatewayReachable, true)
+  assert.equal(s1.gateway?.port, runtimePort)
+  const d1 = await readDebugReport()
+  assert.equal(d1.gateway?.reachable, true)
+  assert.equal(d1.gateway?.port, runtimePort)
+
+  // 2. onGatewayPort callback updates live port immediately.
+  gwCall.config.onGatewayPort(callbackPort)
+  const s2 = await readStatus()
+  assert.equal(s2.gatewayReachable, true)
+  assert.equal(s2.gateway?.port, callbackPort)
+  const d2 = await readDebugReport()
+  assert.equal(d2.gateway?.reachable, true)
+  assert.equal(d2.gateway?.port, callbackPort)
+
+  // 3. gatewayEvent('exit') clears live port so removing runtime file falls back to configured port.
+  fs.rmSync(runtimeFile, { force: true })
+  gwCall.config.gatewayEvent('exit', { code: 0 })
+  const s3 = await readStatus()
+  assert.equal(s3.gatewayReachable, true)
+  assert.equal(s3.gateway?.port, fallbackPort)
+  const d3 = await readDebugReport()
+  assert.equal(d3.gateway?.reachable, true)
+  assert.equal(d3.gateway?.port, fallbackPort)
 })

@@ -23,7 +23,10 @@
 const { test } = require('node:test')
 const assert = require('node:assert')
 const net = require('node:net')
-const { startGateway, request, stopAll, freePort } = require('./util.cjs')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
+const { startGateway, startGatewayAt, request, stopAll, freePort } = require('./util.cjs')
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 
@@ -80,6 +83,28 @@ test('T17b: a port freed inside the retry window is rebound on the ORIGINAL port
     assert.strictEqual(JSON.parse(res.body).port, PORT)
   } finally {
     try { blocker.close(() => {}) } catch (e) {}
+    await stopAll(null, gw.child)
+  }
+})
+
+test('T9: gateway writes bound listening port to lan-gate-runtime.json and removes it on clean shutdown', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-runtime-port-'))
+  t.after(() => { try { fs.rmSync(home, { recursive: true, force: true }) } catch (e) {} })
+  const dummyTarget = net.createServer(() => {})
+  await new Promise((resolve) => dummyTarget.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => dummyTarget.close(resolve)))
+  const targetPort = dummyTarget.address().port
+  const gw = startGatewayAt(home, 0, targetPort)
+  try {
+    const boundPort = await gw.ready
+    assert.ok(boundPort > 0)
+    const runtimeFile = path.join(home, 'lan-gate-runtime.json')
+    assert.strictEqual(fs.existsSync(runtimeFile), true, 'gateway must write lan-gate-runtime.json with actual bound port')
+    const meta = JSON.parse(fs.readFileSync(runtimeFile, 'utf8'))
+    assert.strictEqual(meta.port, boundPort)
+    assert.strictEqual(meta.pid, gw.child.pid)
+    assert.strictEqual(fs.statSync(runtimeFile).mode & 0o777, 0o600)
+  } finally {
     await stopAll(null, gw.child)
   }
 })

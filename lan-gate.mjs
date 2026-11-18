@@ -118,6 +118,7 @@ export function apply(ctx, config) {
       if (isBatchWrapper || nodePath === process.execPath) env['ELECTRON_RUN_AS_NODE'] = '1'
       if (tokenUrl !== undefined) env['LAN_GATE_UPSTREAM_TOKEN_URL'] = tokenUrl
       else delete env['LAN_GATE_UPSTREAM_TOKEN_URL'] // 0.1.1 模式：变量不能残留
+      env['LAN_GATE_TARGET_PROTOCOL'] = proto
       handle = ctx.subprocess.spawn({
         argv: [nodePath, serverFile],
         cwd: here,
@@ -169,7 +170,16 @@ export function apply(ctx, config) {
             const collector = collected[stream]
             if (!collector) continue
             const read = collector.readFrom(offsets[stream])
-            if (read && read.text && !read.lossy) log(read.text.trim())
+            if (read && read.text && !read.lossy) {
+              log(read.text.trim())
+              if (stream === 'stdout') {
+                const m = read.text.match(/\[lan-gate\] listening on \S+:(\d+)/)
+                if (m) {
+                  const boundPort = Number(m[1])
+                  try { config?.onGatewayPort?.(boundPort) } catch (e) { /* ignore */ }
+                }
+              }
+            }
             if (read && typeof read.nextOffset === 'number') offsets[stream] = read.nextOffset
           }
         }

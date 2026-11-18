@@ -1718,6 +1718,45 @@ test('CU-3 debug-report: a status lastError with an embedded path comes out reda
   } finally { await closeServer(server) }
 })
 
+test('T6 client-routes: x-zen-remote-via blocks all client/* routes except remote-status with 403 via-gateway', async () => {
+  const row = makeRow()
+  const { server, port } = await startClientServer(row, {
+    remoteStatusOnly: false,
+    getRelayClient: () => fakeRelay({ state: 'online' }),
+    getLogSnapshot: () => [],
+  })
+  try {
+    const blocked = [
+      { method: 'GET', path: routes.CLIENT_STATUS_ROUTE },
+      { method: 'POST', path: routes.CLIENT_CLAIM_ROUTE, body: { serverUrl: 'http://127.0.0.1:1' } },
+      { method: 'POST', path: routes.CLIENT_UNPAIR_ROUTE, body: {} },
+      { method: 'POST', path: routes.CLIENT_UNSHARE_ROUTE, body: { sessionId: 's' } },
+      { method: 'GET', path: `${routes.CLIENT_HTTP_ROUTE_PREFIX}api/session/list` },
+      { method: 'POST', path: routes.CLIENT_CURRENT_SESSION_ROUTE, body: { sessionId: null } },
+      { method: 'POST', path: routes.CLIENT_RECONNECT_ROUTE, body: {} },
+      { method: 'POST', path: routes.CLIENT_NETWORK_HINT_ROUTE, body: {} },
+      { method: 'GET', path: routes.CLIENT_DEBUG_REPORT_ROUTE },
+      { method: 'GET', path: routes.CLIENT_PEER_STATUS_ROUTE },
+    ]
+    for (const reqOpts of blocked) {
+      const res = await request(port, {
+        ...reqOpts,
+        headers: { 'x-zen-remote-via': 'gateway', origin: `http://127.0.0.1:${port}`, host: `127.0.0.1:${port}` },
+      })
+      assert.equal(res.status, 403, `${reqOpts.method} ${reqOpts.path} must return 403 when x-zen-remote-via is present`)
+      assert.equal(JSON.parse(res.body).error.code, 'via-gateway', `${reqOpts.path} must return via-gateway`)
+    }
+    const allowed = await request(port, {
+      method: 'GET',
+      path: routes.CLIENT_REMOTE_STATUS_ROUTE,
+      headers: { 'x-zen-remote-via': 'gateway' },
+    })
+    assert.equal(allowed.status, 200, 'client/remote-status must remain reachable with x-zen-remote-via')
+  } finally {
+    await closeServer(server)
+  }
+})
+
 test('CU-fix S2: a rejected upload reaches the log ring through the warn the route hands in', async () => {
   // Required BEFORE the dynamic import below pulls lib/ in as ESM (the
   // ERR_REQUIRE_ESM_RACE_CONDITION note at the top of this file).

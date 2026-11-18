@@ -15,6 +15,7 @@ const http = require('node:http')
 const os = require('node:os')
 const path = require('node:path')
 const zlib = require('node:zlib')
+const { createHash } = require('node:crypto')
 const { pathToFileURL } = require('node:url')
 
 const load = (rel) => import(pathToFileURL(path.join(__dirname, '..', 'lib', 'wizard', rel)).href)
@@ -327,4 +328,100 @@ test('an HTTP error answer and a dead endpoint both become typed download-failed
   assert.equal(transport.code, 'download-failed')
   assert.equal(transport.status, null, 'no answer, no status')
   assert.equal(binaryIo.binaryPath(home, 'caddy', { os: 'linux', arch: 'amd64' }), undefined)
+})
+
+// --- T5: mirror SHA-256 verification against api.github.com ------------------
+
+test('T5: binaryDownloadCandidates marks mirrors with releaseApiUrl and assetName metadata', () => {
+  const caddy = binary.binaryDownloadCandidates('caddy', { os: 'linux', arch: 'amd64' }, true)
+  assert.equal(caddy[0].mirrored, true)
+  assert.equal(caddy[0].assetName, 'caddy-linux-amd64.tgz')
+  assert.equal(caddy[0].releaseApiUrl, 'https://api.github.com/repos/KyoMio/dsh-zen-remote/releases/tags/caddy-cloudflare')
+  assert.equal(caddy[2].mirrored, false)
+
+  const cloudflared = binary.binaryDownloadCandidates('cloudflared', { os: 'darwin', arch: 'arm64' }, true)
+  assert.equal(cloudflared[0].mirrored, true)
+  assert.equal(cloudflared[0].assetName, 'cloudflared-darwin-arm64.tgz')
+  assert.equal(cloudflared[0].releaseApiUrl, 'https://api.github.com/repos/cloudflare/cloudflared/releases/latest')
+})
+
+test('T5: mirror tampered payload fails with checksum-mismatch, cleans temp files, and falls back to next candidate', async () => {
+  const goodTgz = zlib.gzipSync(tarOf('caddy', elfPayload('good-caddy-elf')))
+  const badTgz = zlib.gzipSync(tarOf('caddy', elfPayload('tampered-caddy-elf')))
+  const goodSha = createHash('sha256').update(goodTgz).digest('hex')
+  const installPath = binary.binaryInstallPath(home, 'caddy', { os: 'linux', arch: 'amd64' })
+  fs.rmSync(installPath, { force: true })
+
+  // 1. Direct downloadBinary with mismatched expectedSha256 rejects checksum-mismatch and cleans .download.tgz
+  server.bodies['/tampered.tgz'] = badTgz
+  const directErr = await binaryIo.downloadBinary(home, 'caddy', mockUrl('tampered.tgz'), {
+    platform: { os: 'linux', arch: 'amd64' },
+    archive: 'tgz',
+    expectedSha256: goodSha,
+  }).then(() => { throw new Error('must have failed') }, (e) => e)
+  assert.equal(directErr.code, 'checksum-mismatch')
+  assert.ok(!fs.existsSync(installPath))
+  assert.ok(!fs.existsSync(`${installPath}.download.tgz`))
+
+  // 2. ensureBinary: mirror 1 tampered -> rejected & falls back to mirror 2 (valid SHA-256)
+  const visited = []
+  let apiCalls = 0
+  const ensured = await binaryIo.ensureBinary(home, 'caddy', {
+    platform: { os: 'linux', arch: 'amd64' },
+    preferCnMirror: true,
+    fetchImpl: async (url) => {
+      const s = String(url)
+      visited.push(s)
+      if (s === 'https://api.github.com/repos/KyoMio/dsh-zen-remote/releases/tags/caddy-cloudflare') {
+        apiCalls += 1
+        return new Response(JSON.stringify({
+          assets: [{ name: 'caddy-linux-amd64.tgz', digest: `sha256:${goodSha}` }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (s.startsWith('https://gh-proxy.com/')) {
+        return new Response(badTgz, { status: 200 })
+      }
+      if (s.startsWith('https://ghfast.top/')) {
+        return new Response(goodTgz, { status: 200 })
+      }
+      return new Response('', { status: 404 })
+    },
+  })
+  assert.equal(ensured.downloaded, true)
+  assert.equal(apiCalls, 1, 'official GitHub release digest must be cached across mirror attempts')
+  assert.ok(visited.some((u) => u.startsWith('https://gh-proxy.com/')))
+  assert.ok(visited.some((u) => u.startsWith('https://ghfast.top/')))
+  assert.deepEqual(fs.readFileSync(installPath), elfPayload('good-caddy-elf'))
+  fs.rmSync(installPath, { force: true })
+})
+
+test('T5: when api.github.com returns 500 or errors, all mirrored candidates are skipped and official source installs', async () => {
+  const goodTgz = zlib.gzipSync(tarOf('cloudflared', machoPayload('official-cloudflared')))
+  const installPath = binary.binaryInstallPath(home, 'cloudflared', { os: 'darwin', arch: 'arm64' })
+  fs.rmSync(installPath, { force: true })
+
+  const visited = []
+  const ensured = await binaryIo.ensureBinary(home, 'cloudflared', {
+    platform: { os: 'darwin', arch: 'arm64' },
+    preferCnMirror: true,
+    fetchImpl: async (url) => {
+      const s = String(url)
+      visited.push(s)
+      if (s === 'https://api.github.com/repos/cloudflare/cloudflared/releases/latest') {
+        return new Response('rate limited', { status: 500 })
+      }
+      if (s.startsWith('https://gh-proxy.com/') || s.startsWith('https://ghfast.top/')) {
+        throw new Error('mirror must never be downloaded without official SHA-256')
+      }
+      if (s === 'https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz') {
+        return new Response(goodTgz, { status: 200 })
+      }
+      return new Response('', { status: 404 })
+    },
+  })
+  assert.equal(ensured.downloaded, true)
+  assert.equal(visited.some((u) => u.startsWith('https://gh-proxy.com/') || u.startsWith('https://ghfast.top/')), false)
+  assert.ok(visited.includes('https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz'))
+  assert.deepEqual(fs.readFileSync(installPath), machoPayload('official-cloudflared'))
+  fs.rmSync(installPath, { force: true })
 })

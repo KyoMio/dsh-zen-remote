@@ -127,8 +127,10 @@ function sizeBackedTimeoutMs(requestTimeoutMs: number, bytes: number | undefined
 }
 
 /** The budget one invoke exchange gets, from its serialized body size. */
-function invokeTimeoutMs(requestTimeoutMs: number, bodyJson: string): number {
-  return sizeBackedTimeoutMs(requestTimeoutMs, Buffer.byteLength(bodyJson, 'utf8'))
+function invokeTimeoutMs(requestTimeoutMs: number, bodyJson: string, recoveryMarginMs = 0): number {
+  const base = sizeBackedTimeoutMs(requestTimeoutMs, Buffer.byteLength(bodyJson, 'utf8'))
+  if (recoveryMarginMs <= 0) return base
+  return Math.min(base + recoveryMarginMs, Math.max(requestTimeoutMs, INVOKE_TIMEOUT_CAP_MS))
 }
 
 /**
@@ -312,14 +314,16 @@ export interface CreateRelayClientOptions {
    * undefined and no comparison ever runs (the host role's client, tests). */
   computeOwnFingerprints?: () => Promise<Record<string, string>> | Record<string, string>
   /**
-   * PC-05: the ONE path-recovery margin added to KNOWN-length upload budgets
-   * ({@link uploadBudgetMs}). Only the pool's peer-virtual mounts pass it —
-   * plain pair() clients leave it unset and keep the T51 budget verbatim
-   * (the internal wiring difference, never a user knob). An unknown length
-   * never gains it (the cap already is the honest budget for an end not in
-   * sight), and it never lifts the 900 s total cap.
+   * PC-05 + 2.5.x: path-recovery margin added for peer-virtual mounts across
+   * known-length uploads, invoke, openStream headers/first-frame, and
+   * fetchSessionSnapshot so a 15s UDP loss + WS recovery window never trips
+   * client-side request timeouts prematurely.
    */
+  peerRecoveryMarginMs?: number
+  /** Legacy alias for {@link peerRecoveryMarginMs}; kept for backwards compatibility. */
   uploadRecoveryMarginMs?: number
+  /** Override for the stream pre-first-frame deadline (default `max(requestTimeoutMs, 30_000) + peerRecoveryMarginMs`). */
+  firstFrameTimeoutMs?: number
 }
 
 export interface RelayClient {
@@ -539,6 +543,8 @@ export interface RelayStreamOptions {
   uplinkWindow?: { maxBytes: number; frameOverheadBytes: number }
   /** Optional cached cursor for `session/follow` `snapshot-sync` negotiation. */
   knownCursor?: number
+  /** Optional per-stream override for the pre-first-frame timeout (used in tests). */
+  firstFrameTimeoutMs?: number
 }
 
 export interface SessionSnapshotRequest {
@@ -727,10 +733,16 @@ async function parseStreamLine(line: string, decoder: TextDecoder): Promise<Line
 export function createRelayClient(options: CreateRelayClientOptions): RelayClient {
   const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS
   const requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS
-  // PC-05: the peer-virtual wiring passes the production margin; a plain
-  // client leaves it unset. A build-time wiring fact, like the timeouts —
-  // never a volatile row field.
-  const uploadRecoveryMarginMs = options.uploadRecoveryMarginMs ?? 0
+  // PC-05 + 2.5.x: the peer-virtual wiring passes the production margin; a plain
+  // client leaves it unset. Effective margin honors both peerRecoveryMarginMs
+  // and legacy uploadRecoveryMarginMs.
+  const peerRecoveryMarginMs = Math.max(
+    0,
+    Number.isFinite(options.peerRecoveryMarginMs) ? options.peerRecoveryMarginMs! : 0,
+    Number.isFinite(options.uploadRecoveryMarginMs) ? options.uploadRecoveryMarginMs! : 0,
+  )
+  const defaultFirstFrameTimeoutMs =
+    options.firstFrameTimeoutMs ?? Math.max(requestTimeoutMs, 30_000) + peerRecoveryMarginMs
   const fetchImpl: typeof fetch = options.fetchImpl ?? ((url, init) => fetch(url, init))
   const clock: RelayClock = options.clock ?? defaultClock
 
@@ -1389,7 +1401,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     signal: AbortSignal | undefined,
     applySuccessState: boolean,
     creds: { url: string; token: string },
-    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean; acceptGzip?: boolean } = {},
+    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean; transportSetsOffline?: boolean; acceptGzip?: boolean } = {},
   ): Promise<Record<string, unknown>> {
     return exchangeRequest(
       `${creds.url}${pathName}`,
@@ -1625,7 +1637,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     // the connection state — a slow prompt is a slow call, not a dead link.
     const bodyJson = JSON.stringify({ namespace, method, args })
     const payload = await exchange(INVOKE_PATH, bodyJson, signal, true, creds, {
-      timeoutMs: invokeTimeoutMs(requestTimeoutMs, bodyJson),
+      timeoutMs: invokeTimeoutMs(requestTimeoutMs, bodyJson, peerRecoveryMarginMs),
       timeoutSetsOffline: false,
       acceptGzip: true,
     })
@@ -1641,7 +1653,9 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     try {
       const payload = await exchange(SESSION_SNAPSHOT_PATH, JSON.stringify(request), signal, true, creds, {
         acceptGzip: true,
+        timeoutMs: requestTimeoutMs + peerRecoveryMarginMs,
         timeoutSetsOffline: false,
+        transportSetsOffline: false,
       })
       const value = payload.value
       if (!isRecord(value)) {
@@ -1743,7 +1757,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       uploadInit(creds.token, body),
       signal,
       true,
-      { timeoutMs: uploadBudgetMs(requestTimeoutMs, options.bytes, uploadRecoveryMarginMs), timeoutSetsOffline: false, transportSetsOffline: false },
+      { timeoutMs: uploadBudgetMs(requestTimeoutMs, options.bytes, peerRecoveryMarginMs), timeoutSetsOffline: false, transportSetsOffline: false },
     )
     const value = payload.value
     if (
@@ -2193,8 +2207,13 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     }
 
     let idleFired = false
+    let firstFrameTimedOut = false
+    let firstFrameReceived = false
     let headersTimedOut = false
+    const headerTimeoutMs = requestTimeoutMs + peerRecoveryMarginMs
+    const firstFrameTimeoutMs = options?.firstFrameTimeoutMs ?? defaultFirstFrameTimeoutMs
     let idleTimer: ReturnType<typeof setTimeout> | undefined
+    let firstFrameTimer: ReturnType<typeof setTimeout> | undefined
     const armIdle = (): void => {
       if (idleTimer !== undefined) {
         const refreshable = idleTimer as unknown as { refresh?: () => void }
@@ -2216,8 +2235,29 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         idleTimer = undefined
       }
     }
+    const armFirstFrame = (): void => {
+      if (firstFrameReceived || firstFrameTimer !== undefined) return
+      firstFrameTimer = setTimeout(() => {
+        firstFrameTimedOut = true
+        controller.abort()
+      }, firstFrameTimeoutMs)
+      if (typeof firstFrameTimer.unref === 'function') firstFrameTimer.unref()
+    }
+    const disarmFirstFrame = (): void => {
+      if (firstFrameTimer !== undefined) {
+        clearTimeout(firstFrameTimer)
+        firstFrameTimer = undefined
+      }
+    }
+    const markFirstSemanticFrame = (): void => {
+      if (!firstFrameReceived) {
+        firstFrameReceived = true
+        disarmFirstFrame()
+      }
+    }
     async function* emitVerdict(verdict: LineVerdict, rearmAfterYield: boolean): AsyncGenerator<unknown, boolean> {
       if (verdict.kind === 'frame') {
+        markFirstSemanticFrame()
         // The idle clock measures TRANSPORT silence, not the consumer's
         // processing time: it is paused across the yield and re-armed
         // when the value is pulled.
@@ -2226,16 +2266,22 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         if (rearmAfterYield) armIdle()
         return false
       }
-      if (verdict.kind === 'end') return true
+      if (verdict.kind === 'end') {
+        markFirstSemanticFrame()
+        return true
+      }
       if (verdict.kind === 'error') {
+        markFirstSemanticFrame()
         noteServerRestart(verdict.error)
         throw verdict.error
       }
       if (verdict.kind === 'info') {
         // T59: the heartbeat's names, folded in quietly — a state-sparing
         // notify wakes the interceptor's rename path without any reconnect.
+        // Pings (with or without info) never extend or cancel firstFrameTimer.
         applyInfoDelta(verdict.serverName, verdict.deviceName)
       } else if (verdict.kind === 'uplink' && assignedStreamId === undefined) {
+        markFirstSemanticFrame()
         // TA-1: the duplex handshake. The FIRST line names the stream;
         // any later one is ignored (one id per stream, ever).
         assignedStreamId = verdict.streamId
@@ -2243,7 +2289,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       }
       return false
     }
-    // Headers get the request timeout; the BODY is governed by the idle
+    // Headers get the request timeout (+ peer recovery margin); the BODY is governed by the idle
     // clock alone — a healthy stream stays silent for hours. The timer is
     // disarmed the moment the response HEADERS arrive (it is cleared again
     // in the finally for the pre-header failure paths), or it would abort
@@ -2251,7 +2297,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     const headerTimer = setTimeout(() => {
       headersTimedOut = true
       controller.abort()
-    }, requestTimeoutMs)
+    }, headerTimeoutMs)
     if (typeof headerTimer.unref === 'function') headerTimer.unref()
     // Hoisted for the teardown below: even a fetchImpl that ignores the
     // signal must have its response body released (T23a-fix).
@@ -2283,7 +2329,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         if (signal?.aborted) return
         noteFailure('offline')
         setState('offline')
-        throw new RelayError('offline', headersTimedOut ? `no response within ${requestTimeoutMs} ms` : messageOf(error))
+        throw new RelayError('offline', headersTimedOut ? `no response within ${headerTimeoutMs} ms` : messageOf(error))
       }
       if (!response.ok) {
         // The NDJSON protocol only starts once the stream is allowed — a
@@ -2309,6 +2355,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       setState('online')
       if (response.body === null) return
       armIdle()
+      armFirstFrame()
       // TA-1: the uplink consume task starts with the downstream — frames
       // the host pushes before the handshake line arrives land in
       // pendingItems and flush the moment the id is known.
@@ -2418,8 +2465,16 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       // Anything else escaping the body read is the transport dying.
       noteFailure('offline')
       setState('offline')
-      throw new RelayError('offline', idleFired ? `no line received for ${idleTimeoutMs} ms` : messageOf(error))
+      throw new RelayError(
+        'offline',
+        firstFrameTimedOut
+          ? `no first frame within ${firstFrameTimeoutMs} ms`
+          : idleFired
+            ? `no line received for ${idleTimeoutMs} ms`
+            : messageOf(error),
+      )
     } finally {
+      disarmFirstFrame()
       disarmIdle()
       clearTimeout(headerTimer)
       if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)

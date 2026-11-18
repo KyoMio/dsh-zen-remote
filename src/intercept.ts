@@ -5572,6 +5572,14 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
 
     // Step 0: Gen 2 atomic handoff pickup
     if (handoffInitial !== undefined) {
+      const leaveFg = enterForeground(serverId)
+      let fgLeft = false
+      const releaseFg = (): void => {
+        if (!fgLeft) {
+          fgLeft = true
+          leaveFg()
+        }
+      }
       const rawSnap = isPlainObject(handoffInitial.snapshot) ? handoffInitial.snapshot : { type: 'snapshot', cursor: 0, records: [] }
       historyCache.putSnapshot(serverId, rawAddress, rawSnap, 'visited')
       const snapToYield = prepareSnapshotForYield(rawSnap, wantsAssistantStream, true)
@@ -5579,27 +5587,31 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       if (isPlainObject(snapToYield.header)) {
         recordRemoteSessionCwd(serverId, snapToYield.header.id, snapToYield.header.cwd)
       }
-      yield rewriteFrame('session/follow', snapToYield, serverId, remoteDefaultOf(serverId))
-      const yieldedRev = isPlainObject(snapToYield.assistantStream) && typeof snapToYield.assistantStream.revision === 'number'
-        ? snapToYield.assistantStream.revision
-        : 0
-      const upstreamRev = typeof handoffInitial.upstreamRevision === 'number' ? handoffInitial.upstreamRevision : yieldedRev
-      const revOffset = yieldedRev - upstreamRev
       const abortParked = (): void => {
         if (typeof handoffInitial.abortUpstream === 'function') (handoffInitial.abortUpstream as () => void)()
         else void Promise.resolve(handoffInitial.upstreamIterator?.return?.()).catch(() => {})
       }
       if (callerAborted()) {
+        releaseFg()
         abortParked()
         return
       }
       signal?.addEventListener('abort', abortParked, { once: true })
       try {
+        yield rewriteFrame('session/follow', snapToYield, serverId, remoteDefaultOf(serverId))
+        releaseFg()
+        const yieldedRev = isPlainObject(snapToYield.assistantStream) && typeof snapToYield.assistantStream.revision === 'number'
+          ? snapToYield.assistantStream.revision
+          : 0
+        const upstreamRev = typeof handoffInitial.upstreamRevision === 'number' ? handoffInitial.upstreamRevision : yieldedRev
+        const revOffset = yieldedRev - upstreamRev
+        if (callerAborted()) return
         const iter = handoffInitial.upstreamIterator
         if (iter !== undefined) {
           yield* consumeTail(iter as AsyncIterator<unknown>, revOffset, initialClient, abortParked)
         }
       } finally {
+        releaseFg()
         signal?.removeEventListener('abort', abortParked)
         abortParked()
       }
@@ -5733,6 +5745,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
 
           // Case C: cross-window gap, projection change, activeAttempt, stale, or rewind -> Gen 2 handoff
           let freshSnapshot: Record<string, unknown> | undefined
+          let freshFromDelta = false
           if (firstFrame.type === 'snapshot') {
             freshSnapshot = firstFrame
           } else if (firstFrame.type === 'snapshot-sync' && firstFrame.mode === 'unchanged') {
@@ -5756,6 +5769,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
               assistantStream: firstFrame.assistantStream,
             })
             if (merged !== undefined) {
+              freshFromDelta = true
               freshSnapshot = {
                 ...merged,
                 ...(firstFrame.header !== undefined ? { header: firstFrame.header } : {}),
@@ -5768,6 +5782,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             // Cannot synthesize complete snapshot from delta when local cache is stale:
             // exit cleanly so Gen 2 opens a full stream directly.
             return
+          }
+          if (!freshFromDelta) {
+            historyCache.putSnapshot(serverId, rawAddress, freshSnapshot, 'visited')
           }
 
           // Detach Gen 1 abort BEFORE returning so RemoteStream's Gen 1 cleanup

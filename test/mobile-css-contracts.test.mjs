@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
 import test from 'node:test'
 import { BASE_CSS } from '../src/client/styles/base.css.ts'
 import { COMPAT_CSS } from '../src/client/styles/compat.css.ts'
@@ -116,4 +118,16 @@ test('dsh-vision-router compat CSS: single eye icon, 28px round, phone-only, att
   for (const line of selectors) {
     assert.match(line, /\[data-vision-router-mode-toggle\]/, `ungated selector: ${line.trim()}`)
   }
+})
+
+test('T9: pwa/app.css gates input 16px floor and pre code scroll under max-width: 1023px and touch-gestures defers null body mount', () => {
+  const appCss = fs.readFileSync(path.join(import.meta.dirname, '..', 'pwa', 'app.css'), 'utf8')
+  const mediaBlocks = [...appCss.matchAll(/@media\s*\(max-width:\s*1023px\)\s*\{([\s\S]*?\n)\}/g)].map((m) => m[1])
+  assert.ok(mediaBlocks.length >= 2, 'pwa/app.css must wrap mobile input and pre rules in @media (max-width: 1023px)')
+  const combinedMedia = mediaBlocks.join('\n')
+  assert.match(combinedMedia, /html:not\(\[data-lan-device="desktop"\]\)\s+input:not\(\[type="file"\]\)/)
+  assert.match(combinedMedia, /html:not\(\[data-lan-device="desktop"\]\)\s+pre,/)
+
+  const touchJs = fs.readFileSync(path.join(import.meta.dirname, '..', 'pwa', 'touch-gestures.js'), 'utf8')
+  assert.match(touchJs, /DOMContentLoaded/)
 })

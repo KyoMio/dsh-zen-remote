@@ -20,6 +20,7 @@
 | `src/share-export.ts` | 分享图路由 `GET /_dsh/mobile-nav/share-export`（完整日志折叠人类转写） |
 | `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream（含 `knownCursor` 增量 `snapshot-sync` 与 `writeChain` 串行 gzip 封装）/ `v1/session-snapshot`（冷安全单帧快照与增量，并发上限 2）/ event-result / `v1/http`（plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ `v1/upload`（附件字节转宿主暂存）/ unshare |
 | `src/relay-access.ts` | 中继按方法登记访问控制表（服务端那张）；`v1/http` 按路由登记表也在这里 |
+| `src/upload-limits.ts` | 单一载荷上限真相源：`MAX_UPLOAD_BYTES`（500 MiB）、`DEFAULT_MAX_UPLOAD_BYTES`（20 MiB，手机端附件默认上限）、`MAX_INVOKE_BODY_BYTES`（72 MiB，容纳 50 MiB base64 内联图片）、`MAX_FILE_MEDIA_BYTES`（20 MiB，单次转发媒体上限） |
 | `src/relay-filter.ts` | 全局流与列表的输出过滤（`workspace/follow` / `session/control` / `session/list` / @ 引用候选行） |
 | `src/session-reference.ts` | 两端共用 `dsh-session:` 引用编解码与「可注入文本」扫描规则（prompt content、排队 edit、`commands/execute` 字符串）：服务端照它校验、子客户端照它改写，同一份规则防漂移 |
 | `src/session-history-cache.ts` | 纯内存远程会话历史缓存（不落盘）：四级预算（全进程 `64 MiB` / 单设备 `24 MiB` & `32` 会话 / 单快照 `8 MiB` / `session/page` `16 MiB` & `128` 页）、双层 LRU（`prewarmed` 先于 `visited` 淘汰）、`600` 条整轮裁头、`peekSnapshotMeta` 只读轻量元信息查询、`30 min` 离线回收与 `2,000 ms` 一次性交接槽 |
@@ -45,9 +46,9 @@
 | `src/client/**` → `lib/client.js` | 浏览器半边（经 `dsh.client` 发现）：app 外壳、slot、样式、设置区块（`settings/`）、远程部件（`remote-*` / `Remote*`） |
 | `src/client-data/current-session.ts` + `src/client/current-session-report.ts` | 当前会话信号浏览器上报（T62）：拦截层读不到浏览器 localStorage，由浏览器端解析宿主选择存储、变化时 POST `client/current-session`；纯函数（解析 + 变化判定）与上报循环分居 |
 | `src/client-data/remote-group-expansion.ts` + `src/client/remote-group-expansion.ts` | 服务端分组展开记忆与恢复（T64）：宿主 retainAccountKeys 每次加载清掉 zr~ 分组记录，浏览器端镜像进自己存储、按记录（默认展开）点击行恢复；纯函数与 keeper 循环分居 |
-| `lan-gate.mjs` | 网关子插件入口（host 角色加载）：只 spawn + 生命周期，共享密钥只经它进子进程 |
-| `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，stdlib + `web-push`）：设备角色、标记头与共享密钥、desktop-client 只放行中继前缀 |
-| `dsh-push.mjs` | 推送子插件（与网关一起加载）：回合结束推送 + `push_notify` 工具 |
+| `lan-gate.mjs` | 网关子插件入口（host 角色加载）：只 spawn + 生命周期，共享密钥与 `LAN_GATE_TARGET_PROTOCOL` 经它进子进程，并消费监听端口回调 |
+| `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，stdlib + `web-push`）：设备角色、标记头与共享密钥、desktop-client 只放行中继前缀、`0o600` 原子写盘与 `.corrupt.*` 备份、900s 上传超时放宽、`https:` 上游与 `<DSH_HOME>/lan-gate-runtime.json` 实际端口探测 |
+| `dsh-push.mjs` | 推送子插件（与网关一起加载）：回合结束推送 + `push_notify` 工具；动态从 `lan-gate-runtime.json` 读实际端口并校验 `pid` 存活 |
 | `bin/zen-remote.mjs` + `src/cli/**` → `lib/cli/` | CLI `dsh-zen-remote`：插件进程内 0600 IPC socket 服务端与客户端、防遮蔽配置写入（`config-writer.ts`）、双语 i18n（`args.ts` / `i18n.ts`）、`status`/`host *`/`client *`/`peer *` 子命令、`setup` 三步向导与角色切换联动（`command-setup.ts`）、多 profile 安装与 DSH 自动拉起（`bootstrap.ts`）；全部经 IPC 驱动插件进程，CLI 绝不 spawn caddy / cloudflared |
 | `gateway-server/` | 独立中继网关与 Web 控制台子包——不进发布包、独立三件套与流水线，细则见 AGENTS.md 硬约束与 `gateway-server/README.md`：虚拟网络管理、五态成员准入（`pending`/`authorized`/`paused`/`mismatch`/`revoked`）、双端口 UDP STUN 协调与零知识 E2EE 中转（网关无私钥只路由密文帧）、Docker 交付 |
 | `pwa/**` | manifest / service worker / 注入脚本 / 手势 / 壳级 CSS / 图标（CSS 分工铁律见 AGENTS.md） |

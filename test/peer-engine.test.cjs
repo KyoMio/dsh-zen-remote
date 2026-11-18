@@ -13,7 +13,8 @@ const { pathToFileURL } = require('node:url')
 const { createPeerEngine } = require('../lib/peer/engine.js')
 const { PeerPunchManager } = require('../lib/peer/punch.js')
 const { generatePeerIdentity } = require('../lib/peer/crypto.js')
-const { PeerFrameType } = require('../lib/peer/wire.js')
+const { PeerFrameType, decodeFrameHeader } = require('../lib/peer/wire.js')
+const { PeerMux } = require('../lib/peer/mux.js')
 const { createRelayPool } = require('../lib/relay-pool.js')
 const {
   ensurePeerIdentity,
@@ -1504,4 +1505,293 @@ test('gateway control signaling: manual pending, paused/resume & denied/removed 
   gateway.send({ type: 'denied', reason: 'removed' })
   await waitFor(() => node.engine.status().gatewayState === 'revoked', 'revoked')
   assert.ok(readPeerRevokedNotice(node.stateFile), 'revoked notice persisted')
+})
+
+function makeP2pNatSocket(realSocket, clock) {
+  const pingSends = []
+  const origOn = realSocket.on.bind(realSocket)
+  const wrapper = {
+    pingSends,
+    send(buf, offset, length, port, host, cb) {
+      if (typeof length === 'string') {
+        cb = port; host = length; port = offset; offset = 0; length = buf.length
+      }
+      const actualHost = host === '203.0.113.2' ? '127.0.0.1' : host
+      if (length >= 4 && buf[offset + 3] === PeerFrameType.PING) pingSends.push(clock.now())
+      realSocket.send(buf, offset, length, port, actualHost, cb)
+    },
+    on(event, listener) {
+      if (event === 'message') {
+        return origOn('message', (buf, rinfo) => {
+          listener(buf, { ...rinfo, address: rinfo.address === '127.0.0.1' ? '203.0.113.2' : rinfo.address })
+        })
+      }
+      return origOn(event, listener)
+    },
+    once: (...args) => realSocket.once(...args),
+    removeListener: (...args) => realSocket.removeListener(...args),
+    address: () => realSocket.address(),
+    unref: () => realSocket.unref(),
+    ref: () => realSocket.ref(),
+    bind: (...args) => realSocket.bind(...args),
+    close: () => realSocket.close(),
+  }
+  return wrapper
+}
+
+test('T2: onPeerRelayDemoted syncs member state, restores relay ARQ profile, and stops UDP keepalive; resetPeerForReanchor(false) restores relay ARQ profile', async (t) => {
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-t2-engine-'))
+  const clock = manualClock(Date.now())
+  const logs = []
+  const stateFileA = path.join(home, 'a-state.json')
+  const identityA = ensurePeerIdentity(stateFileA)
+  const identityB = generatePeerIdentity()
+  const rawSocketA = await openUdp()
+  const natSocketA = makeP2pNatSocket(rawSocketA, clock)
+  const socketB = await openUdp()
+  const gateB = makeGate(socketB)
+
+  const wsSockets = []
+  let onBinaryFromEngine = null
+  const server = http.createServer()
+  server.on('upgrade', (req, socket) => {
+    wsSockets.push(socket)
+    socket.on('error', () => {})
+    let buf = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      for (;;) {
+        const parsed = readClientFrame(buf)
+        if (!parsed) break
+        buf = parsed.rest
+        if (parsed.opcode === 8) { socket.end(); return }
+        if (parsed.opcode === 9) {
+          socket.write(Buffer.concat([Buffer.from([0x8a, parsed.payload.length]), parsed.payload]))
+          continue
+        }
+        if (parsed.opcode === 2) {
+          onBinaryFromEngine?.(Buffer.from(parsed.payload))
+          continue
+        }
+        if (parsed.opcode !== 1) continue
+        let msg
+        try { msg = JSON.parse(parsed.payload.toString('utf8')) } catch { continue }
+        if (msg?.type === 'auth') {
+          socket.write(wsFrame({
+            type: 'welcome', status: 'authorized', connSeq: 1, maxPeers: 8,
+            peers: [{
+              nodeId: identityB.nodeId,
+              publicKeyHex: identityB.publicKeyHex,
+              name: 'peer-B',
+              lanEndpoints: [`203.0.113.2:${socketB.address().port}`],
+              reflexiveEndpoint: null,
+              connSeq: 1,
+            }],
+          }))
+        }
+      }
+    })
+    const accept = createHash('sha1').update(String(req.headers['sec-websocket-key']) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    socket.write(Buffer.concat([
+      Buffer.from(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`),
+      wsFrame({ type: 'challenge', challengeHex: 'a1b2c3d4e5f60718' }),
+    ]))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+
+  const sendWsBinaryToEngine = (bytes) => {
+    const payload = Buffer.from(bytes)
+    let hdr
+    if (payload.length < 126) hdr = Buffer.from([0x82, payload.length])
+    else {
+      hdr = Buffer.alloc(4)
+      hdr[0] = 0x82; hdr[1] = 126; hdr.writeUInt16BE(payload.length, 2)
+    }
+    for (const s of wsSockets) if (!s.destroyed) s.write(Buffer.concat([hdr, payload]))
+  }
+
+  let dropBInboundFromA = false
+  let holdBDataFrames = false
+  const heldDataFrames = []
+  let mountedFetch = null
+  let engine = null
+  let muxB = null
+
+  const engineRelayFrames = []
+  onBinaryFromEngine = (bytes) => {
+    const h = decodeFrameHeader(bytes)
+    if (h && h.frameType === PeerFrameType.DATA) {
+      engineRelayFrames.push(h)
+      if (holdBDataFrames) {
+        heldDataFrames.push(bytes)
+        return
+      }
+    }
+    muxB?.handleGatewayFrame(bytes)
+  }
+
+  muxB = new PeerMux({
+    networkId: NET_ID,
+    identity: identityB,
+    clock,
+    sendGatewayBinary: (bytes) => sendWsBinaryToEngine(bytes),
+    relayHandler: () => async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.end('ok-from-b')
+    },
+    relaySecret: () => 'test',
+  })
+  muxB.ensureSession(identityA.nodeId, identityA.publicKeyHex, 'node-A')
+
+  const mgrB = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: identityB,
+    socket: gateB,
+    clock,
+    keepAliveMs: KEEPALIVE_MS,
+    keepAliveLostFrames: 3,
+    reprobeIntervalMs: 800,
+    onEncryptedFrame: (header, plaintext) => {
+      if (!dropBInboundFromA) muxB.handleOpenedFrame(header, plaintext)
+    },
+  })
+  await mgrB.ready()
+
+  engine = createPeerEngine({
+    stateFile: stateFileA,
+    identity: identityA,
+    relayPool: {
+      maxServers: () => 8,
+      mountVirtual: (input) => { mountedFetch = input.fetchImpl; return { entryId: input.entryId, serverId: input.serverId, serverName: input.serverName, displayName: input.serverName } },
+      unmountVirtual: () => true,
+      updateVirtualName: () => true,
+      reconnect: () => Promise.resolve(true),
+    },
+    relayHandler: () => async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.end('ok-from-a')
+    },
+    relaySecret: () => 'test',
+    serverName: () => 'node-A',
+    udpSocket: natSocketA,
+    udpProbe: null,
+    clock,
+    log: (line) => logs.push(line),
+    directMaxRttMs: () => 0,
+    punch: { keepAliveMs: KEEPALIVE_MS, keepAliveLostFrames: 3, reprobeIntervalMs: 800 },
+  })
+  writePeerNetwork(stateFileA, {
+    gatewayWsUrl: `ws://127.0.0.1:${port}`,
+    gatewayHttpOrigin: `http://127.0.0.1:${port}`,
+    networkId: NET_ID,
+    joinedAt: 1,
+  })
+  t.after(async () => {
+    mgrB.close(); muxB.close(); engine.stop()
+    for (const s of wsSockets) s.destroy()
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(home, { recursive: true, force: true })
+  })
+
+  // Establish WS relay ciphers first, then direct UDP 'p2p' path
+  mgrB.beginPunch({ peerNodeId: identityA.nodeId, peerPublicKeyHex: identityA.publicKeyHex, lanEndpoints: [] })
+  engine.resumeFromState()
+  await waitFor(() => engine.status().peers[0]?.path === 'p2p', 'initial p2p path')
+  await waitFor(() => wsSockets.length >= 1, 'engine ws connected')
+  muxB.enableRelayPath(identityA.nodeId)
+  await waitFor(() => muxB.sessionPath(identityA.nodeId) !== 'none' && muxB.sessions.get(identityA.nodeId)?.ciphers !== null, 'muxB WS ciphers ready')
+  muxB.setDirectPath(identityA.nodeId, mgrB.frameSenderFor(identityA.nodeId))
+
+  // Part 1: resetPeerForReanchor(..., false) must restore relay ARQ window=64 (not leave p2p window=16)
+  for (const s of wsSockets) {
+    if (!s.destroyed) {
+      s.write(wsFrame({
+        type: 'punch-coordinate',
+        peerNodeId: identityB.nodeId,
+        publicKeyHex: identityB.publicKeyHex,
+        lanEndpoints: ['203.0.113.2:19999'],
+        reflexiveEndpoint: null,
+        connSeq: 1,
+      }))
+    }
+  }
+  await waitFor(() => logs.some((l) => l.includes('re-anchored') && l.includes('endpoints changed')), 'pure UDP rebind')
+  assert.equal(engine.status().peers[0].path, 'relay')
+
+  engineRelayFrames.length = 0
+  holdBDataFrames = true
+  const reanchorUpload = mountedFetch('http://peer/burst-1', { method: 'POST', body: Buffer.alloc(25 * 1100, 0x41) })
+  reanchorUpload.catch(() => {})
+  await waitFor(() => engineRelayFrames.length >= 16, 'burst frames sent over WS')
+  await sleep(30)
+  assert.ok(engineRelayFrames.length >= 25, `resetPeerForReanchor(false) must restore relay window=64, sent ${engineRelayFrames.length}`)
+  holdBDataFrames = false
+  for (const f of heldDataFrames.splice(0)) muxB.handleGatewayFrame(f)
+  assert.equal(await (await reanchorUpload).text(), 'ok-from-b')
+
+  // Part 2: Re-promote to p2p, then B unilaterally demotes to WS while A->B UDP is blackholed
+  const socketB2 = await openUdp()
+  const gateB2 = makeGate(socketB2)
+  mgrB.close()
+  const mgrB2 = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: identityB,
+    socket: gateB2,
+    clock,
+    keepAliveMs: KEEPALIVE_MS,
+    keepAliveLostFrames: 3,
+    reprobeIntervalMs: 800,
+    onEncryptedFrame: (header, plaintext) => {
+      if (!dropBInboundFromA) muxB.handleOpenedFrame(header, plaintext)
+    },
+  })
+  await mgrB2.ready()
+  t.after(() => mgrB2.close())
+  mgrB2.beginPunch({ peerNodeId: identityA.nodeId, peerPublicKeyHex: identityA.publicKeyHex, lanEndpoints: [`127.0.0.1:${rawSocketA.address().port}`] })
+  for (const s of wsSockets) {
+    if (!s.destroyed) {
+      s.write(wsFrame({
+        type: 'punch-coordinate',
+        peerNodeId: identityB.nodeId,
+        publicKeyHex: identityB.publicKeyHex,
+        lanEndpoints: [`203.0.113.2:${socketB2.address().port}`],
+        reflexiveEndpoint: null,
+        connSeq: 1,
+      }))
+    }
+  }
+  await waitFor(() => engine.status().peers[0]?.path === 'p2p', 're-promoted to p2p')
+  muxB.setDirectPath(identityA.nodeId, mgrB2.frameSenderFor(identityA.nodeId))
+
+  // B unilaterally switches to WS and sends request while A's UDP is dead
+  gateB2.dropAll = true
+  dropBInboundFromA = true
+  muxB.setRelayPath(identityA.nodeId)
+  const bRes = await muxB.createFetchForPeer(identityA.nodeId)('http://peer/from-b')
+  assert.equal(await bRes.text(), 'ok-from-a')
+
+  const peerAfter = engine.status().peers[0]
+  assert.equal(peerAfter.path, 'relay')
+  assert.equal(peerAfter.directDemoted, true)
+  assert.equal(peerAfter.rttMs, null)
+
+  // UDP keepalive must have stopped on A
+  const pingsBefore = natSocketA.pingSends.length
+  clock.advance(KEEPALIVE_MS * 2)
+  await sleep(10)
+  assert.equal(natSocketA.pingSends.length, pingsBefore, 'demoteSessionToRelay must stop direct keepalive PINGs')
+
+  // ARQ window must also be restored to 64 (not stuck at p2p's 16)
+  engineRelayFrames.length = 0
+  holdBDataFrames = true
+  const afterDemoteUpload = mountedFetch('http://peer/burst-2', { method: 'POST', body: Buffer.alloc(25 * 1100, 0x42) })
+  afterDemoteUpload.catch(() => {})
+  await waitFor(() => engineRelayFrames.length >= 16, 'burst-2 frames sent over WS')
+  await sleep(30)
+  assert.ok(engineRelayFrames.length >= 25, `onPeerRelayDemoted must restore relay window=64, sent ${engineRelayFrames.length}`)
+  holdBDataFrames = false
+  for (const f of heldDataFrames.splice(0)) muxB.handleGatewayFrame(f)
+  assert.equal(await (await afterDemoteUpload).text(), 'ok-from-b')
 })

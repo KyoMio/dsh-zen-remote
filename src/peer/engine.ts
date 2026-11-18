@@ -456,6 +456,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     if (resetMux) {
       mux?.enableRelayPath(member.nodeId)
     } else {
+      applyArqProfile(member, 'relay', true)
       mux?.setRelayPath(member.nodeId)
     }
     log(`peer engine: re-anchored ${member.nodeId} (${reason})`)
@@ -1350,6 +1351,19 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         if (path === 'ws' || path === 'udp') {
           void options.relayPool.reconnect?.(peerNodeId)
         }
+      },
+      onPeerRelayDemoted: (peerNodeId) => {
+        if (stopped) return
+        const member = members.get(peerNodeId.toLowerCase())
+        if (member === undefined) return
+        member.path = 'relay'
+        member.directActive = false
+        member.directDemoted = true
+        member.directGoodStreak = 0
+        applyArqProfile(member, 'relay', true)
+        punch?.demoteSessionToRelay(peerNodeId)
+        schedulePathReport()
+        log(`peer engine: peer ${member.nodeId} demoted to relay — syncing local path`)
       },
       log,
       debug: options.debug,

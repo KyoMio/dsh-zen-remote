@@ -169,14 +169,16 @@ export interface CreateRelayClientOptions {
      * undefined and no comparison ever runs (the host role's client, tests). */
     computeOwnFingerprints?: () => Promise<Record<string, string>> | Record<string, string>;
     /**
-     * PC-05: the ONE path-recovery margin added to KNOWN-length upload budgets
-     * ({@link uploadBudgetMs}). Only the pool's peer-virtual mounts pass it —
-     * plain pair() clients leave it unset and keep the T51 budget verbatim
-     * (the internal wiring difference, never a user knob). An unknown length
-     * never gains it (the cap already is the honest budget for an end not in
-     * sight), and it never lifts the 900 s total cap.
+     * PC-05 + 2.5.x: path-recovery margin added for peer-virtual mounts across
+     * known-length uploads, invoke, openStream headers/first-frame, and
+     * fetchSessionSnapshot so a 15s UDP loss + WS recovery window never trips
+     * client-side request timeouts prematurely.
      */
+    peerRecoveryMarginMs?: number;
+    /** Legacy alias for {@link peerRecoveryMarginMs}; kept for backwards compatibility. */
     uploadRecoveryMarginMs?: number;
+    /** Override for the stream pre-first-frame deadline (default `max(requestTimeoutMs, 30_000) + peerRecoveryMarginMs`). */
+    firstFrameTimeoutMs?: number;
 }
 export interface RelayClient {
     readonly state: RelayState;
@@ -397,6 +399,8 @@ export interface RelayStreamOptions {
     };
     /** Optional cached cursor for `session/follow` `snapshot-sync` negotiation. */
     knownCursor?: number;
+    /** Optional per-stream override for the pre-first-frame timeout (used in tests). */
+    firstFrameTimeoutMs?: number;
 }
 export interface SessionSnapshotRequest {
     address: unknown;

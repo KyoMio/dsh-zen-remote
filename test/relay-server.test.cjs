@@ -11,12 +11,14 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
+const net = require('node:net')
 const zlib = require('node:zlib')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { createRelayHandler, loadServerId, encodeSessionReferenceUri, decodeSessionReferenceUri } = require('../lib/relay-server.js')
 const { createShareStore } = require('../lib/share-store.js')
+const { MAX_INVOKE_BODY_BYTES } = require('../lib/upload-limits.js')
 
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-relay-'))
 process.on('exit', () => { try { fs.rmSync(ROOT, { recursive: true, force: true }) } catch { /* best effort */ } })
@@ -655,16 +657,23 @@ test('invoke: a body over the generic 1 MiB cap now parses (T31 prompt headroom)
   } finally { await server.stop() }
 })
 
-test('invoke: a body past the invoke cap (32 MiB) drains and answers 413 payload-too-large', async () => {
+test('invoke: accepts 50 MiB base64 payload (~68 MB) up to MAX_INVOKE_BODY_BYTES (72 MiB) and drains oversize with 413 payload-too-large', async () => {
   const parts = makeParts('invoke-huge')
+  parts.store.share('session-a')
   const server = await startServer(parts.handler)
   try {
-    const body = JSON.stringify({ namespace: 'fileUploads', method: 'upload', args: { agentId: 'session-a', request: { data: 'A'.repeat(33 * 1024 * 1024) } } })
-    assert.ok(body.length > 32 * 1024 * 1024)
-    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body })
+    const allowedBody = JSON.stringify({ namespace: 'fileUploads', method: 'upload', args: { agentId: 'session-a', request: { data: 'A'.repeat(68_000_000) } } })
+    assert.ok(allowedBody.length <= MAX_INVOKE_BODY_BYTES, '68 MB payload must fit inside MAX_INVOKE_BODY_BYTES')
+    const okRes = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: allowedBody })
+    assert.equal(okRes.status, 200)
+    assert.equal(parts.calls.length, 1)
+
+    const overBody = JSON.stringify({ namespace: 'fileUploads', method: 'upload', args: { agentId: 'session-a', request: { data: 'A'.repeat(MAX_INVOKE_BODY_BYTES + 1024) } } })
+    assert.ok(overBody.length > MAX_INVOKE_BODY_BYTES)
+    const res = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', { method: 'POST', headers: { ...AUTH, 'content-type': 'application/json' }, body: overBody })
     assert.equal(res.status, 413, 'oversize is 413 — a 400 would read as malformed JSON')
     assert.deepEqual(await res.json(), { ok: false, error: { code: 'payload-too-large', details: {} } })
-    assert.equal(parts.calls.length, 0)
+    assert.equal(parts.calls.length, 1)
   } finally { await server.stop() }
 })
 
@@ -1454,6 +1463,38 @@ test('T51 upload: a shared session dispatches the exact bytes with the original 
     assert.equal(body.value.status, 200)
     assert.equal(body.value.contentType, 'application/json; charset=utf-8')
     assert.equal(body.value.body, RECEIPT)
+  } finally { await server.stop() }
+})
+
+test('T3 upload: premature TCP disconnect before body EOF errors pumpUploadBody instead of committing truncated upload', async () => {
+  const api = fakeUploadApiFetch(new Response(JSON.stringify({ ok: true }), { status: 200 }))
+  const parts = makeUploadParts('t3-upload-truncated', { getApiFetch: () => api.dispatch, uploadCapBytes: 65_536 })
+  parts.store.share('session-1')
+  const server = await startServer(parts.handler)
+  try {
+    await new Promise((resolve) => {
+      const socket = net.connect(server.port, '127.0.0.1', () => {
+        socket.write(
+          `POST /_dsh/zen-remote/relay/v1/upload?sessionId=session-1&name=partial.bin HTTP/1.1\r\n` +
+          `Host: 127.0.0.1:${server.port}\r\n` +
+          `x-zen-remote-secret: ${SECRET}\r\n` +
+          `x-zen-remote-via: gateway\r\n` +
+          `x-zen-remote-role: desktop-client\r\n` +
+          `x-zen-remote-device: device-9\r\n` +
+          `content-type: application/octet-stream\r\n` +
+          `transfer-encoding: chunked\r\n\r\n` +
+          `d\r\npartial-chunk\r\n`,
+        )
+        setTimeout(() => { socket.end(); resolve() }, 30)
+      })
+      socket.on('error', () => resolve())
+    })
+    const deadline = Date.now() + 1000
+    while (api.seen.length === 0 && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10))
+    }
+    assert.equal(api.seen.length, 1)
+    assert.ok(api.seen[0].bodyError instanceof Error, 'premature TCP close must error the pumped upload stream, not close cleanly')
   } finally { await server.stop() }
 })
 

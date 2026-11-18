@@ -155,6 +155,7 @@ interface TxStream {
   finPromise: Promise<void> | null
   finAcked: boolean
   cumulative: number
+  lastProgressAt: number
   progressTimer: unknown
   pendingBytes: number
   pendingWrites: number
@@ -465,6 +466,11 @@ export class PeerArqSession {
     return total
   }
 
+  /** Whether the inbound side of `streamId` has delivered its FIN. */
+  isRxComplete(streamId: number): boolean {
+    return this.rxStreams.get(streamId)?.gotFin === true
+  }
+
   /**
    * Dynamically adjust send window [1..64] and initial RTO [120..rtoMaxMs]
    * for the active transport leg without tearing down in-flight frames.
@@ -622,13 +628,13 @@ export class PeerArqSession {
     if (tx?.finAcked && !tx.queue.length && !tx.inflight.size && this.rxStreams.get(id)?.gotFin) this.retire(id)
   }
 
-  private armProgress(id: number, tx: TxStream): void {
+  private armProgress(id: number, tx: TxStream, timeoutMs = this.retryTimeoutMs): void {
     this.clock.clearTimeout(tx.progressTimer)
     tx.progressTimer = this.clock.setTimeout(() => {
       if (this.txStreams.get(id) !== tx) return
       this.retire(id, new Error(`stream ${id} DATA no-progress timeout`))
       this.startReset(id)
-    }, this.retryTimeoutMs)
+    }, timeoutMs)
   }
 
   private startReset(id: number): void {
@@ -658,7 +664,7 @@ export class PeerArqSession {
   private ensureTx(streamId: number): TxStream {
     let tx = this.txStreams.get(streamId)
     if (!tx) {
-      tx = { nextSeq: 0, queue: [], inflight: new Map(), finQueued: false, finPromise: null, finAcked: false, cumulative: 0, progressTimer: null, pendingBytes: 0, pendingWrites: 0 }
+      tx = { nextSeq: 0, queue: [], inflight: new Map(), finQueued: false, finPromise: null, finAcked: false, cumulative: 0, lastProgressAt: this.clock.now(), progressTimer: null, pendingBytes: 0, pendingWrites: 0 }
       this.txStreams.set(streamId, tx)
     }
     return tx
@@ -686,7 +692,10 @@ export class PeerArqSession {
       }
       frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
       tx.inflight.set(seq, frag)
-      if (tx.progressTimer === null) this.armProgress(streamId, tx)
+      if (tx.progressTimer === null) {
+        tx.lastProgressAt = this.clock.now()
+        this.armProgress(streamId, tx)
+      }
       this.trySendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
     }
   }
@@ -780,12 +789,29 @@ export class PeerArqSession {
   }
 
   private onSack(streamId: number, payload: Uint8Array, ack: number): void {
+    const tx = this.txStreams.get(streamId)
+    const beforeCumulative = tx?.cumulative ?? 0
     this.applyCumulative(streamId, ack)
     if (!ArrayBuffer.isView(payload) || ack < 0) return
     const view = asBufferView(payload)
     for (let bit = 0; bit < SACK_BITMAP_BITS; bit++) {
       const byte = view[bit >> 3] ?? 0
       if ((byte & (1 << (bit & 7))) !== 0) this.settleFragment(streamId, ack + bit)
+    }
+    // Valid SACK confirming peer liveness under backpressure (no cumulative advance)
+    // renews progressTimer within a hard cap of 3 * retryTimeoutMs since last progress.
+    if (
+      tx &&
+      this.txStreams.get(streamId) === tx &&
+      ack === beforeCumulative &&
+      ack === tx.cumulative &&
+      ack <= tx.nextSeq &&
+      (tx.inflight.size > 0 || tx.queue.length > 0)
+    ) {
+      const remaining = tx.lastProgressAt + 3 * this.retryTimeoutMs - this.clock.now()
+      if (remaining > 0) {
+        this.armProgress(streamId, tx, Math.min(this.retryTimeoutMs, remaining))
+      }
     }
   }
 
@@ -795,6 +821,7 @@ export class PeerArqSession {
     if (!tx || ack > tx.nextSeq) return
     if (ack > tx.cumulative) {
       tx.cumulative = ack
+      tx.lastProgressAt = this.clock.now()
       this.armProgress(streamId, tx)
     }
     for (const [seq, frag] of tx.inflight) {

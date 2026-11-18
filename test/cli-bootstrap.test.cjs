@@ -919,3 +919,12 @@ test('ensureDshRunning: Linux 无任何守护单元 → 手动指引；触发后
     cleanup(home)
   }
 })
+
+test('T4 real subprocess: spawnDshPluginAdd and execProbeReal handle Node execFile error === null on exit 0 without TypeError', async () => {
+  const bootstrap = await import(BOOTSTRAP_URL)
+  const addCode = await bootstrap.spawnDshPluginAdd(process.execPath, ['-e', 'process.exit(0)'])
+  assert.equal(addCode, 0)
+  const probeRes = await bootstrap.execProbeReal(process.execPath, ['-e', 'process.stdout.write("probe-ok"); process.exit(0)'])
+  assert.equal(probeRes.code, 0)
+  assert.equal(probeRes.stdout, 'probe-ok')
+})

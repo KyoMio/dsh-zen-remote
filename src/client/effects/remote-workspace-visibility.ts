@@ -138,11 +138,43 @@ export function installRemoteWorkspaceVisibility(
       }
     }
 
+    let pendingSyncHandle: number | ReturnType<typeof setTimeout> | undefined
+    let pendingViaRaf = false
+
+    const cancelPendingSync = (): void => {
+      if (pendingSyncHandle === undefined) return
+      if (pendingViaRaf && typeof cancelAnimationFrame === 'function') {
+        cancelAnimationFrame(pendingSyncHandle as number)
+      } else {
+        clearTimeout(pendingSyncHandle)
+      }
+      pendingSyncHandle = undefined
+      pendingViaRaf = false
+    }
+
+    const scheduleSync = (): void => {
+      if (disposed || pendingSyncHandle !== undefined) return
+      if (typeof requestAnimationFrame === 'function') {
+        pendingViaRaf = true
+        pendingSyncHandle = requestAnimationFrame(() => {
+          pendingSyncHandle = undefined
+          pendingViaRaf = false
+          if (!disposed) syncDom()
+        })
+      } else {
+        pendingViaRaf = false
+        pendingSyncHandle = setTimeout(() => {
+          pendingSyncHandle = undefined
+          if (!disposed) syncDom()
+        }, 0)
+      }
+    }
+
     const ensureObserver = (): void => {
       if (observer !== undefined || typeof MutationObserver === 'undefined' || typeof document === 'undefined') return
       if (document.body === null) return
       observer = new MutationObserver(() => {
-        syncDom()
+        scheduleSync()
       })
       observer.observe(document.body, { childList: true, subtree: true })
     }
@@ -184,6 +216,7 @@ export function installRemoteWorkspaceVisibility(
 
     return () => {
       disposed = true
+      cancelPendingSync()
       observer?.disconnect()
       observer = undefined
       if (typeof window !== 'undefined' && typeof window.removeEventListener === 'function') {

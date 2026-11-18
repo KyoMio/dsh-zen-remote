@@ -128,7 +128,7 @@ export interface RelayServerInfo {
     serverName: () => string;
     dshVersion: string;
     fingerprints?: () => Record<string, string> | Promise<Record<string, string>>;
-    plugins?: () => Record<string, ServerPluginEntry>;
+    plugins?: (device?: string) => Record<string, ServerPluginEntry>;
 }
 export interface RelayHandlerOptions {
     /** The per-apply shared secret; an empty one refuses every request. */
@@ -186,7 +186,7 @@ export interface RelayHandlerOptions {
         registry: BridgeRegistry;
         /** The row's per-plugin whole-machine-data consent, read LIVE per request
          * (a volatile row field — never snapshotted). */
-        getConsent: () => Record<string, boolean>;
+        getConsent: (device?: string) => Record<string, boolean>;
         /** The loopback executor performing the actual plugin GET. */
         loopback: PluginLoopback;
         /** The WebSocket byte tunnel's server half (PB-10). Absent — a wiring

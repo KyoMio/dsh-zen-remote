@@ -15,9 +15,12 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const net = require('node:net')
+const http = require('node:http')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { EventEmitter } = require('node:events')
+const { Readable } = require('node:stream')
 const { pathToFileURL } = require('node:url')
 const { request } = require('./util.cjs')
 const { waitFor } = require('./helpers/plugin-bridge-harness.cjs')
@@ -184,7 +187,6 @@ function readLines(res) {
 /** The tunnel test's own base URL: a tiny HTTP server exposing ONLY the
  * three tunnel routes (the relay-server gate lives elsewhere). */
 async function startTunnelServer(tunnel) {
-  const http = require('node:http')
   const server = http.createServer((req, res) => {
     const route = new URL(req.url ?? '/', 'http://x').pathname
     if (route.endsWith('/open')) void tunnel.open(req, res).catch(() => { try { res.destroy() } catch { /* gone */ } })
@@ -448,5 +450,196 @@ test('PB-10 tunnel: sub-chunk upstream bytes travel NOW — a live session never
   } finally {
     await stop()
     await wiring.upstream.stop()
+  }
+})
+
+function buildMaskedWsFrame(opcode, fin, payloadBuf) {
+  const mask = Buffer.from([0x12, 0x34, 0x56, 0x78])
+  const b0 = (fin ? 0x80 : 0x00) | (opcode & 0x0f)
+  const len = payloadBuf.length
+  let hdr
+  if (len < 126) {
+    hdr = Buffer.from([b0, 0x80 | len])
+  } else {
+    hdr = Buffer.alloc(4)
+    hdr[0] = b0; hdr[1] = 0xfe; hdr.writeUInt16BE(len, 2)
+  }
+  const masked = Buffer.from(payloadBuf)
+  for (let i = 0; i < masked.length; i++) masked[i] ^= mask[i % 4]
+  return Buffer.concat([hdr, mask, masked])
+}
+
+test('T6 plugin-tunnel: json-body gate enforces share check on binary 0x2 frames and refuses fragmented/0x0 frames with 400', async () => {
+  const registryMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'plugin-bridge.js')).href)
+  const tunnelMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'plugin-tunnel.js')).href)
+  const decl = {
+    plugin: 'sidechat-ws',
+    version: '1.0.0',
+    routes: [
+      { path: '/sidechat/ws', scope: 'session', upgrade: true, locator: { in: 'json-body', fields: ['threadIds'] } },
+    ],
+  }
+  const declared = registryMod.normalizeDeclaration(decl)
+  const registry = registryMod.createBridgeRegistry()
+  registry.register(decl)
+  const upstream = await startUpstream()
+  const upstreamReceived = []
+  upstream.hooks.onConnection = (entry) => {
+    entry.socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
+    entry.socket.on('data', (chunk) => upstreamReceived.push(Buffer.from(chunk)))
+  }
+  const tunnel = tunnelMod.createPluginTunnel({
+    bridge: { registry, getConsent: () => ({ 'sidechat-ws': true }), loopback: { cookieHeader: async () => 'dsh-auth=t' } },
+    getTarget: () => ({ protocol: 'http:', port: upstream.port }),
+    isAccessible: (id) => id === 'session-shared',
+    heartbeatMs: 15_000,
+  })
+  const { base, stop } = await startTunnelServer(tunnel)
+
+  const sendFrame = async (tunnelId, seq, rawFrame) => fetch(`${base}/send`, {
+    method: 'POST',
+    headers: { 'x-zen-remote-device': 'dev-1', 'x-zr-tunnel': tunnelId, 'x-zr-seq': String(seq), 'content-type': 'application/octet-stream' },
+    body: rawFrame,
+  })
+
+  try {
+    // 1. Binary frame (opcode=0x2) with unshared sessionId -> 403 not-shared
+    const open1 = await fetch(`${base}/open`, {
+      method: 'POST',
+      headers: {
+        'x-zen-remote-device': 'dev-1',
+        'x-zr-plugin': 'sidechat-ws',
+        'x-zr-plugin-version': '1.0.0',
+        'x-zr-plugin-digest': declared.digest,
+        'x-zr-path': '/sidechat/ws',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13' } }),
+    })
+    assert.equal(open1.status, 200)
+    const r1 = open1.body.getReader()
+    try {
+      const firstChunk = Buffer.from((await r1.read()).value).toString('utf8')
+      const id1 = JSON.parse(firstChunk.split('\n')[0]).tunnel
+      const unsharedBin = buildMaskedWsFrame(0x2, true, Buffer.from(JSON.stringify({ op: 'watch', threadIds: ['session-secret'] })))
+      const resBin = await sendFrame(id1, 0, unsharedBin)
+      assert.equal(resBin.status, 403)
+      assert.equal((await resBin.json()).error.code, 'not-shared')
+      assert.equal(upstreamReceived.length, 0, 'unshared binary frame must never reach upstream')
+    } finally {
+      await r1.cancel().catch(() => {})
+    }
+
+    // 2. Fragmented frame (fin=false, opcode=0x1) -> 400 bad-request
+    const open2 = await fetch(`${base}/open`, {
+      method: 'POST',
+      headers: {
+        'x-zen-remote-device': 'dev-1',
+        'x-zr-plugin': 'sidechat-ws',
+        'x-zr-plugin-version': '1.0.0',
+        'x-zr-plugin-digest': declared.digest,
+        'x-zr-path': '/sidechat/ws',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13' } }),
+    })
+    const r2 = open2.body.getReader()
+    try {
+      const id2 = JSON.parse(Buffer.from((await r2.read()).value).toString('utf8').split('\n')[0]).tunnel
+      const fragFrame = buildMaskedWsFrame(0x1, false, Buffer.from('{"op":"watch"'))
+      const resFrag = await sendFrame(id2, 0, fragFrame)
+      assert.equal(resFrag.status, 400)
+      assert.equal((await resFrag.json()).error.code, 'bad-request')
+    } finally {
+      await r2.cancel().catch(() => {})
+    }
+
+    // 3. Control frame (ping=0x9, fin=true) -> 200 allowed
+    const open3 = await fetch(`${base}/open`, {
+      method: 'POST',
+      headers: {
+        'x-zen-remote-device': 'dev-1',
+        'x-zr-plugin': 'sidechat-ws',
+        'x-zr-plugin-version': '1.0.0',
+        'x-zr-plugin-digest': declared.digest,
+        'x-zr-path': '/sidechat/ws',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify({ headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13' } }),
+    })
+    const r3 = open3.body.getReader()
+    try {
+      const id3 = JSON.parse(Buffer.from((await r3.read()).value).toString('utf8').split('\n')[0]).tunnel
+      const pingFrame = buildMaskedWsFrame(0x9, true, Buffer.from('hi'))
+      const resPing = await sendFrame(id3, 0, pingFrame)
+      assert.equal(resPing.status, 200)
+    } finally {
+      await r3.cancel().catch(() => {})
+    }
+  } finally {
+    await stop()
+    await upstream.stop()
+  }
+})
+
+test('T6 plugin-tunnel: pumpDownstream drains buffered tail after backpressure without duplicate drain listeners', async () => {
+  const tunnelMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'plugin-tunnel.js')).href)
+  const upstream = await startUpstream()
+  const payload = Buffer.alloc(60 * 1024, 0x42) // > 48 KiB single chunk, fits in single TCP read so tail stalls without drain pump
+  upstream.hooks.onConnection = (entry) => {
+    entry.socket.write(payload)
+  }
+  const registryMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'plugin-bridge.js')).href)
+  const declared = registryMod.normalizeDeclaration(DECL)
+  const registry = registryMod.createBridgeRegistry()
+  registry.register(DECL)
+  const tunnel = tunnelMod.createPluginTunnel({
+    bridge: { registry, getConsent: () => ({}), loopback: { cookieHeader: async () => 'dsh-auth=t' } },
+    getTarget: () => ({ protocol: 'http:', port: upstream.port }),
+    isAccessible: (id) => id === 'session-shared',
+    heartbeatMs: 15_000,
+  })
+
+  const req = Readable.from([Buffer.from(JSON.stringify({ headers: { 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', 'sec-websocket-version': '13' } }))])
+  req.headers = {
+    'x-zen-remote-device': 'dev-1',
+    'x-zr-plugin': 'ws-panel',
+    'x-zr-plugin-version': '1.0.0',
+    'x-zr-plugin-digest': declared.digest,
+    'x-zr-path': '/panel/ws',
+    'x-zr-query': 'sessionId=session-shared',
+  }
+  const res = new EventEmitter()
+  const writtenLines = []
+  let backpressured = false
+  res.destroyed = false
+  res.writableEnded = false
+  res.writeHead = () => {}
+  res.end = () => { res.writableEnded = true }
+  res.write = (buf) => {
+    writtenLines.push(JSON.parse(Buffer.from(buf).toString('utf8')))
+    if (writtenLines.some((l) => l.type === 'data') && backpressured) return false
+    return true
+  }
+
+  try {
+    backpressured = true
+    await tunnel.open(req, res)
+    await waitFor(() => writtenLines.some((l) => l.type === 'data'))
+    assert.equal(res.listenerCount('drain'), 1, 'exactly one drain listener registered under backpressure')
+    const countBeforeDrain = writtenLines.filter((l) => l.type === 'data').length
+    assert.equal(countBeforeDrain, 1)
+
+    // Release backpressure: remaining buffered tail must flush immediately on drain without waiting for new upstream data
+    backpressured = false
+    res.emit('drain')
+    await waitFor(() => {
+      const total = Buffer.concat(writtenLines.filter((l) => l.type === 'data').map((l) => Buffer.from(l.b64, 'base64'))).length
+      return total === payload.length
+    }, 800, 'remaining buffered tail must flush on drain')
+    assert.equal(res.listenerCount('drain'), 0)
+  } finally {
+    res.emit('close')
+    await upstream.stop()
   }
 })

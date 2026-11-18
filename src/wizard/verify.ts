@@ -36,8 +36,8 @@ import { normalizeServerUrl } from '../client-pairing.js'
 import { probeHostPath, type HostPathOutcome } from './probe.js'
 
 export interface VerificationManagerOptions {
-  /** Loopback base of the gateway child, `http://127.0.0.1:<port>`. */
-  gatewayBase: string
+  /** Loopback base of the gateway child, `http://127.0.0.1:<port>` (or live resolver). */
+  gatewayBase: string | (() => string)
   /** Fresh resolved config values per call (volatile discipline). */
   getValues: () => ZenRemoteConfig
   /** The hostPath probe; injectable for tests (defaults to GW-8's real one). */
@@ -123,7 +123,8 @@ export function createVerificationManager(options: VerificationManagerOptions): 
    * null on any failure — every caller degrades, none throws. */
   const callGateway = async (method: 'GET' | 'POST', path: string, payload?: unknown): Promise<{ status: number; body: unknown } | null> => {
     try {
-      const response = await fetchImpl(`${options.gatewayBase}${path}`, {
+      const base = typeof options.gatewayBase === 'function' ? options.gatewayBase() : options.gatewayBase
+      const response = await fetchImpl(`${base}${path}`, {
         method,
         headers: payload === undefined ? undefined : { 'Content-Type': 'application/json' },
         ...(payload === undefined ? {} : { body: JSON.stringify(payload) }),

@@ -132,6 +132,10 @@ interface MuxSession {
   seq: bigint
   /** 明文 envelope 头的序列（只需唯一）。 */
   envelopeSeq: bigint
+  /** 最近一次经网关解包验真的加密 WS 帧 seq。 */
+  lastInboundWsSeq: bigint
+  /** 最近一次切上 UDP 直连时记录的 lastInboundWsSeq（过滤切路前在途旧 WS 帧）。 */
+  wsSeqAtDirectPromote: bigint
   arq: PeerArqSession
   punchSender: PunchFrameSender | null
   streams: Map<number, MuxStream>
@@ -155,6 +159,8 @@ export interface PeerMuxOptions {
   clock?: MuxClock
   /** 会话有效路径变化时回调（engine 由此发 path-report）。 */
   onPathChanged?: (nodeId: string, path: PeerPath) => void
+  /** 对端率先切入 WS 中转（收到新 WS 帧或 hello）时通知上层同步降级直连状态。 */
+  onPeerRelayDemoted?: (nodeId: string) => void
   log?: (line: string) => void
   /** 逐请求噪声通道（T3）：inbound request / body 生命周期行量太大，
    * 走它而不是 `log`，由 logLevel=debug 时才落环。 */
@@ -208,6 +214,8 @@ export class PeerMux {
       peerEphPubHex: null,
       seq: 0n,
       envelopeSeq: 0n,
+      lastInboundWsSeq: -1n,
+      wsSeqAtDirectPromote: -1n,
       arq: new PeerArqSession({
         sendFrame: (frameType, streamId, payload, ack) => this.dispatchFrame(session, frameType, streamId, payload, ack),
         onStreamData: (streamId, chunk, final) => this.onStreamData(session, streamId, chunk, final),
@@ -319,12 +327,15 @@ export class PeerMux {
     if (!session || session.closed || this.closed) return
     if (session.ciphers !== null) {
       if (session.path !== 'ws') {
-        const before = session.path
         session.path = 'ws'
-        if (before === 'none') session.arq.flushInflight()
+        session.arq.flushInflight()
         this.options.onPathChanged?.(session.nodeId, 'ws')
       }
       return
+    }
+    if (session.path !== 'none') {
+      session.path = 'none'
+      this.options.onPathChanged?.(session.nodeId, 'none')
     }
     this.beginHello(session)
   }
@@ -334,6 +345,7 @@ export class PeerMux {
     const session = this.sessions.get(nodeId.toLowerCase())
     if (!session || session.closed || this.closed) return
     session.punchSender = sender
+    session.wsSeqAtDirectPromote = session.lastInboundWsSeq
     const before = session.path
     session.path = 'udp'
     if (before === 'none') session.arq.flushInflight()
@@ -347,7 +359,7 @@ export class PeerMux {
     const before = session.path
     session.path = session.ciphers !== null ? 'ws' : 'none'
     if (session.path === 'none') this.beginHello(session)
-    else if (before === 'none') session.arq.flushInflight()
+    else if (before !== session.path && session.path === 'ws') session.arq.flushInflight()
     if (before !== session.path) this.options.onPathChanged?.(session.nodeId, session.path)
   }
 
@@ -386,6 +398,15 @@ export class PeerMux {
     if (session.ciphers === null) return
     const opened = unpackEncryptedFrame(bytes, session.ciphers)
     if (opened === null) return
+    if (opened.header.seq > session.lastInboundWsSeq) {
+      session.lastInboundWsSeq = opened.header.seq
+    }
+    if (session.path === 'udp' && opened.header.seq > session.wsSeqAtDirectPromote) {
+      session.path = 'ws'
+      session.arq.flushInflight()
+      this.options.onPathChanged?.(session.nodeId, 'ws')
+      this.options.onPeerRelayDemoted?.(session.nodeId)
+    }
     try {
       session.arq.handleFrame(opened.header.frameType, opened.header.streamId, opened.plaintext, opened.header.ack)
     } catch {
@@ -672,6 +693,17 @@ export class PeerMux {
       // HELLO is replayable within its TTL. Only a fresh challenge response
       // may replace the working key; keep our DH key stable when unchanged.
       if (session.peerEphPubHex !== parsed.ephPubHex || session.ciphers === null) this.beginHello(session)
+      if (session.path === 'udp') {
+        if (session.ciphers !== null) {
+          session.path = 'ws'
+          session.arq.flushInflight()
+          this.options.onPathChanged?.(session.nodeId, 'ws')
+        } else {
+          session.path = 'none'
+          this.options.onPathChanged?.(session.nodeId, 'none')
+        }
+        this.options.onPeerRelayDemoted?.(session.nodeId)
+      }
       return
     }
     // 回显 nonce 把 ack 绑定到我们在途的那一轮 hello。
@@ -1025,7 +1057,12 @@ export class PeerMux {
   private finishResponse(session: MuxSession, stream: MuxStream): void {
     if (session.streams.get(stream.streamId) !== stream || stream.outboundFinished) return
     stream.outboundFinished = true
-    void session.arq.finish(stream.streamId).catch(error => {
+    const rxIncomplete = !session.arq.isRxComplete(stream.streamId)
+    void session.arq.finish(stream.streamId).then(() => {
+      if (rxIncomplete && session.streams.get(stream.streamId) === stream && !session.arq.isRxComplete(stream.streamId)) {
+        this.resetStream(session, stream, new Error('inbound response finished before request EOF'))
+      }
+    }, error => {
       this.resetStream(session, stream, error instanceof Error ? error : new Error(String(error)))
     })
   }

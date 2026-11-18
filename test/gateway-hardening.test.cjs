@@ -35,7 +35,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
-const { GATEWAY, REMOTE_HEADERS, startMockAuthTarget, startGateway, request, stopAll, pairDevice, pairDesktop, freePort } = require('./util.cjs')
+const { GATEWAY, REMOTE_HEADERS, startMockAuthTarget, startGateway, startGatewayAt, request, stopAll, pairDevice, pairDesktop } = require('./util.cjs')
 
 // The current gateway/target pair; tests run sequentially in this file, so
 // each test's boot overwrites them freely (module scope mirrors relay-e2e's
@@ -320,13 +320,16 @@ test('orphan guard: a gateway whose parent died exits within a few seconds', { t
     'const c = spawn(process.execPath, [process.env.GW], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });' +
     'c.stdout.on("data", (d) => process.stdout.write(d)); c.stderr.on("data", (d) => process.stderr.write(d));' +
     'c.on("exit", () => process.exit(0))'
+  const dummyTarget = net.createServer(() => {})
+  await new Promise((resolve) => dummyTarget.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => dummyTarget.close(resolve)))
   const parent = spawn(process.execPath, ['-e', SPAWNER], {
     env: {
       ...process.env,
       GW: GATEWAY,
       DSH_HOME: home,
       LAN_GATE_PORT: '0',
-      LAN_GATE_TARGET_PORT: String(await freePort()),
+      LAN_GATE_TARGET_PORT: String(dummyTarget.address().port),
       LAN_GATE_ORPHAN_CHECK_MS: '80',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -377,5 +380,118 @@ test('orphan guard: a gateway whose parent died exits within a few seconds', { t
   } finally {
     try { parent.kill('SIGKILL') } catch (e) {}
     try { fs.rmSync(home, { recursive: true, force: true }) } catch (e) {}
+  }
+})
+
+test('T9: saveState writes 0o600, corrupt JSON backs up to .corrupt.*, auth exchange blocks // open redirect & tapThrough escapes quotes, stream errors keep gateway alive', { timeout: 20000 }, async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-t9-gw-'))
+  t.after(() => { try { fs.rmSync(home, { recursive: true, force: true }) } catch (e) {} })
+
+  // Target that returns 401 on normal GETs (for auth exchange / tap-through) and resets on /abort-stream
+  const target = http.createServer((req, res) => {
+    const u = req.url || '/'
+    if (u.startsWith('/?token=')) {
+      res.writeHead(303, { Location: '/', 'Set-Cookie': 'dsh-auth=ok; Path=/; HttpOnly' })
+      res.end()
+      return
+    }
+    if (u === '/abort-stream') {
+      res.writeHead(200, { 'Content-Type': 'application/octet-stream' })
+      res.write('partial')
+      setTimeout(() => res.socket.destroy(), 20)
+      return
+    }
+    res.writeHead(401, { 'Content-Type': 'text/plain' })
+    res.end('unauthorized')
+  })
+  await new Promise((r) => target.listen(0, '127.0.0.1', r))
+  const targetPort = target.address().port
+
+  let gw = startGatewayAt(home, 0, targetPort, { LAN_GATE_UPSTREAM_TOKEN_URL: `http://127.0.0.1:${targetPort}/?token=secret-t9` })
+  try {
+    const port1 = await gw.ready
+    const statePath = path.join(home, 'lan-gate-state.json')
+    assert.strictEqual(fs.statSync(statePath).mode & 0o777, 0o600, 'lan-gate-state.json must have 0o600 permissions')
+
+    // Pair a web device so forwarded routes are tested
+    const dev = await pairDevice(port1)
+
+    // 1. Open redirect check: //evil.example/x must NOT produce Location: //evil.example/...
+    const rawExchange = await new Promise((resolve, reject) => {
+      const sock = net.connect(port1, '127.0.0.1', () => {
+        sock.write(
+          `GET //evil.example/x HTTP/1.1\r\n` +
+          `Host: gw.local:${port1}\r\n` +
+          `Cookie: ${dev.cookie}\r\n` +
+          `Accept: text/html\r\n` +
+          `X-Forwarded-For: 203.0.113.9\r\n` +
+          `X-Forwarded-Proto: https\r\n` +
+          `Connection: close\r\n\r\n`,
+        )
+      })
+      let buf = ''
+      sock.on('data', (c) => { buf += c.toString('utf8') })
+      sock.on('end', () => resolve(buf))
+      sock.on('error', reject)
+    })
+    assert.match(rawExchange, /^HTTP\/1\.1 303 /m)
+    assert.doesNotMatch(rawExchange, /^Location:\s*\/\//im, 'Location must never be a protocol-relative // URL')
+    assert.match(rawExchange, /^Location:\s*\/evil\.example\/x\?dsh-auth-retry=1/im)
+
+    // 2. Tap-through HTML attribute escape check
+    const rawTap = await new Promise((resolve, reject) => {
+      const sock = net.connect(port1, '127.0.0.1', () => {
+        sock.write(
+          `GET /p?dsh-auth-retry=1&q="onclick="alert(1) HTTP/1.1\r\n` +
+          `Host: gw.local:${port1}\r\n` +
+          `Cookie: ${dev.cookie}\r\n` +
+          `Accept: text/html\r\n` +
+          `X-Forwarded-For: 203.0.113.9\r\n` +
+          `X-Forwarded-Proto: https\r\n` +
+          `Connection: close\r\n\r\n`,
+        )
+      })
+      let buf = ''
+      sock.on('data', (c) => { buf += c.toString('utf8') })
+      sock.on('end', () => resolve(buf))
+      sock.on('error', reject)
+    })
+    assert.match(rawTap, /^HTTP\/1\.1 200 /m)
+    assert.doesNotMatch(rawTap, /href="[^"]*"onclick=/i, 'raw quote in target must not inject href attribute')
+
+    // 3. Upstream stream reset mid-response must NOT crash gateway
+    await new Promise((resolve) => {
+      const sock = net.connect(port1, '127.0.0.1', () => {
+        sock.write(
+          `GET /abort-stream HTTP/1.1\r\n` +
+          `Host: gw.local:${port1}\r\n` +
+          `Cookie: ${dev.cookie}\r\n` +
+          `X-Forwarded-For: 203.0.113.9\r\n` +
+          `X-Forwarded-Proto: https\r\n` +
+          `Connection: close\r\n\r\n`,
+        )
+      })
+      sock.on('data', () => {})
+      sock.setTimeout(1500, () => { sock.destroy(); resolve() })
+      sock.on('end', resolve)
+      sock.on('close', resolve)
+      sock.on('error', resolve)
+    })
+    const stillAlive = await request(port1, { path: '/lan-gate/status' })
+    assert.strictEqual(stillAlive.status, 200)
+
+    await stopAll(null, gw.child)
+    gw = null
+
+    // 4. Corrupt state JSON backup on reboot
+    fs.writeFileSync(statePath, '{corrupt-t9-json', 'utf8')
+    gw = startGatewayAt(home, 0, targetPort)
+    await gw.ready
+    const backups = fs.readdirSync(home).filter((f) => f.startsWith('lan-gate-state.json.corrupt.'))
+    assert.strictEqual(backups.length, 1, 'corrupt state file must be backed up instead of silently overwritten')
+    assert.strictEqual(fs.readFileSync(path.join(home, backups[0]), 'utf8'), '{corrupt-t9-json')
+  } finally {
+    try { target.closeAllConnections?.() } catch (e) {}
+    await stopAll(target, gw && gw.child)
   }
 })

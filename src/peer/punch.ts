@@ -59,6 +59,7 @@ import type { PeerFrameHeader } from './wire.js'
 const NODE_ID_PATTERN = /^[0-9a-f]{8}$/
 const NETWORK_ID_PATTERN = /^[0-9a-fA-F]{16}$/
 const HEX64 = /^[0-9a-fA-F]{64}$/
+const MAX_PUNCH_CANDIDATES = 16
 
 /** STUN 探针控制包的域分隔前缀。 */
 export const STUN_PROBE_DOMAIN = 'zr-stun-probe-v1'
@@ -729,6 +730,35 @@ export class PeerPunchManager {
     this.sessions.delete(nodeId)
   }
 
+  /**
+   * Demote a direct or punching session to idle relay mode when the peer
+   * unilaterally switched to WS relay (does not emit `onDirectLost`).
+   */
+  demoteSessionToRelay(peerNodeId: string): void {
+    if (this.closed) return
+    const session = this.sessions.get(peerNodeId.toLowerCase())
+    if (!session) return
+    if (session.state === 'idle') {
+      session.ciphers = null
+      session.peerEphPubHex = null
+      session.derivedPair = null
+      return
+    }
+    this.clearSessionTimers(session)
+    session.state = 'idle'
+    session.awaitingAck = false
+    session.peerEphPubHex = null
+    session.derivedPair = null
+    session.ciphers = null
+    session.rttMs = null
+    session.lastPingSentAt = null
+    session.lastPingPayload = null
+    session.lastPingCountsForMiss = true
+    session.missedPings = 0
+    session.reprobeAttempts = 0
+    this.scheduleReprobe(session)
+  }
+
   /** Stop everything: per-peer timers cleared, sessions dropped, socket closed. */
   close(): void {
     if (this.closed) return
@@ -798,17 +828,19 @@ export class PeerPunchManager {
   private startDirectChallengeRetry(session: PunchSession, target: string): void {
     this.clearDirectRetryTimer(session)
     this.sendHellos(session, [target])
+    const intervalMs = this.punchIntervalMsOrDefault()
+    const maxRetries = Math.max(5, Math.min(10, this.punchRoundsOrDefault()))
     let retries = 0
     const step = (): void => {
       session.directRetryTimer = null
       if (this.closed || session.state !== 'direct' || !session.awaitingAck) return
       retries += 1
       this.sendHellos(session, [target])
-      if (retries < 5) {
+      if (retries < maxRetries) {
         const handle = this.clock.setTimeout(() => {
           session.timers.delete(handle)
           step()
-        }, 100)
+        }, intervalMs)
         session.directRetryTimer = handle
         session.timers.add(handle)
       }
@@ -816,9 +848,18 @@ export class PeerPunchManager {
     const handle = this.clock.setTimeout(() => {
       session.timers.delete(handle)
       step()
-    }, 100)
+    }, intervalMs)
     session.directRetryTimer = handle
     session.timers.add(handle)
+  }
+
+  private addCandidate(session: PunchSession, target: string): void {
+    if (!parseEndpoint(target) || session.candidates.includes(target)) return
+    if (session.candidates.length >= MAX_PUNCH_CANDIDATES) {
+      const evictIdx = session.candidates.findIndex((ep) => ep !== session.endpoint)
+      session.candidates.splice(evictIdx >= 0 ? evictIdx : 0, 1)
+    }
+    session.candidates.push(target)
   }
 
   private refreshLanEndpoints(port: number): void {
@@ -1023,6 +1064,8 @@ export class PeerPunchManager {
       this.startPunchRounds(session)
     }
     this.sendHelloAck(session, parsed.nonce, parsed.ephPubHex, rinfo)
+    const target = `${rinfo.address}:${rinfo.port}`
+    this.addCandidate(session, target)
     // A signed HELLO can be recorded forever. Never adopt its key or endpoint:
     // ask the live identity to sign our fresh nonce instead. Keep the local DH
     // key stable so simultaneous handshakes converge.
@@ -1031,7 +1074,6 @@ export class PeerPunchManager {
         session.nonce = randomBytes(8).toString('hex')
         session.awaitingAck = true
       }
-      const target = `${rinfo.address}:${rinfo.port}`
       if (session.state === 'direct') {
         this.startDirectChallengeRetry(session, target)
       } else {

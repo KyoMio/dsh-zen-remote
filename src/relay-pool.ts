@@ -255,7 +255,7 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
    * A peer-virtual mount passes the upload recovery margin (PC-05): only
    * its known-length uploads ride the peer transport's mid-flight path
    * recovery. */
-  const createClientFor = (record: PairedServerRecord, fetchOverride?: typeof fetch, uploadRecoveryMarginMs?: number): RelayClient => {
+  const createClientFor = (record: PairedServerRecord, fetchOverride?: typeof fetch, peerRecoveryMarginMs?: number): RelayClient => {
     const liveRecord = (): PairedServerRecord => pool.get(record.id)?.record ?? record
     const clientOptions: CreateRelayClientOptions = {
       getServerUrl: () => liveRecord().serverUrl,
@@ -266,7 +266,7 @@ export function createRelayPool(options: RelayPoolOptions): RelayPool {
         : options.fetchImpl !== undefined ? { fetchImpl: options.fetchImpl } : {}),
       ...(options.clock !== undefined ? { clock: options.clock } : {}),
       ...(options.requestTimeoutMs !== undefined ? { requestTimeoutMs: options.requestTimeoutMs } : {}),
-      ...(uploadRecoveryMarginMs !== undefined ? { uploadRecoveryMarginMs } : {}),
+      ...(peerRecoveryMarginMs !== undefined ? { peerRecoveryMarginMs } : {}),
     }
     return createClientImpl(clientOptions)
   }

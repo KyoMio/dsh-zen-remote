@@ -33,8 +33,8 @@
 import type { ZenRemoteConfig } from '../config.js';
 import { type HostPathOutcome } from './probe.js';
 export interface VerificationManagerOptions {
-    /** Loopback base of the gateway child, `http://127.0.0.1:<port>`. */
-    gatewayBase: string;
+    /** Loopback base of the gateway child, `http://127.0.0.1:<port>` (or live resolver). */
+    gatewayBase: string | (() => string);
     /** Fresh resolved config values per call (volatile discipline). */
     getValues: () => ZenRemoteConfig;
     /** The hostPath probe; injectable for tests (defaults to GW-8's real one). */

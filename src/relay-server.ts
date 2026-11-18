@@ -254,7 +254,7 @@ export interface RelayServerInfo {
   serverName: () => string
   dshVersion: string
   fingerprints?: () => Record<string, string> | Promise<Record<string, string>>
-  plugins?: () => Record<string, ServerPluginEntry>
+  plugins?: (device?: string) => Record<string, ServerPluginEntry>
 }
 
 export interface RelayHandlerOptions {
@@ -313,7 +313,7 @@ export interface RelayHandlerOptions {
     registry: BridgeRegistry
     /** The row's per-plugin whole-machine-data consent, read LIVE per request
      * (a volatile row field — never snapshotted). */
-    getConsent: () => Record<string, boolean>
+    getConsent: (device?: string) => Record<string, boolean>
     /** The loopback executor performing the actual plugin GET. */
     loopback: PluginLoopback
     /** The WebSocket byte tunnel's server half (PB-10). Absent — a wiring
@@ -617,6 +617,7 @@ function pumpUploadBody(
 ): PumpedUploadBody {
   let received = 0
   let tooLarge = false
+  let ended = false
   const onClientGone = (): void => {
     if (!res.writableEnded) hangUp.abort()
   }
@@ -647,6 +648,7 @@ function pumpUploadBody(
         if (controller.desiredSize !== null && controller.desiredSize <= 0) req.pause()
       })
       req.on('end', () => {
+        ended = true
         if (tooLarge) return
         try {
           controller.close()
@@ -663,7 +665,15 @@ function pumpUploadBody(
         }
       })
       req.on('close', () => {
-        if (tooLarge) return
+        if (tooLarge || ended) return
+        if (!req.complete) {
+          try {
+            controller.error(new Error('upload stream closed prematurely'))
+          } catch {
+            // Already errored.
+          }
+          return
+        }
         try {
           controller.close()
         } catch {
@@ -1543,9 +1553,10 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       // (not-on-server), never a failed handshake. The field is ALWAYS
       // present in the reply: only its ABSENCE (an older server) can ever
       // mean server-too-old on the client.
+      const deviceHeader = headerValue(req, 'x-zen-remote-device') ?? ''
       let plugins: Record<string, ServerPluginEntry> = {}
       try {
-        plugins = serverInfo.plugins?.() ?? {}
+        plugins = serverInfo.plugins?.(deviceHeader) ?? {}
       } catch {
         plugins = {}
       }
@@ -2023,7 +2034,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
           // same knob the cooperative server-scope routes read.
           let adapterConsent: Record<string, boolean> = {}
           try {
-            adapterConsent = bridge.getConsent()
+            adapterConsent = bridge.getConsent(headerValue(req, 'x-zen-remote-device') ?? '')
           } catch {
             adapterConsent = {}
           }
@@ -2312,6 +2323,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             return { kind: 'corrupt' as const }
           }
         },
+        headerValue(req, 'x-zen-remote-device') ?? '',
       )
       if (!validation.ok) {
         relayPluginError(res, validation.status, validation.code)
