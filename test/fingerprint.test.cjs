@@ -349,8 +349,17 @@ test('computeFingerprints: the dev closure pins the canonicalized session hash',
     // Other fingerprint groups are likewise unchanged. npm latest remains
     // 0.2.2-rc.1.
     '0.2.2-rc.4': 'r:c3b0734019c7',
+    // 0.2.2-rc.5: session typert.remote-client.js is byte-identical to rc.4
+    // (27 endpoints, same ids and order). dsh-web typert.remote-client.js
+    // only moves sourceLocation (stripped from the T42 hash); no new remote
+    // methods. The published upgrade is the shipped composition no longer
+    // pinning web.searchProvider, so DeepSeek-model conversations default
+    // to legacy Messages search. Live hash against the npm 0.2.2-rc.5
+    // closure is still r:c3b0734019c7. Other fingerprint groups are
+    // likewise unchanged. npm latest remains 0.2.2-rc.1.
+    '0.2.2-rc.5': 'r:c3b0734019c7',
   }
-  const ENDPOINTS = { '0.2.2-alpha.2': 27, '0.2.2-alpha.3': 27, '0.2.2-rc.1': 27, '0.2.2-rc.2': 27, '0.2.2-rc.3': 27, '0.2.2-rc.4': 27 }
+  const ENDPOINTS = { '0.2.2-alpha.2': 27, '0.2.2-alpha.3': 27, '0.2.2-rc.1': 27, '0.2.2-rc.2': 27, '0.2.2-rc.3': 27, '0.2.2-rc.4': 27, '0.2.2-rc.5': 27 }
   const { version } = require('../node_modules/@deepseek-ai/dsh-api-session-controller/package.json')
   assert.ok(PINS[version], `no session pin for dsh-api-session-controller ${version}: diff its typert.remote-client.js against the last pinned version, then record the new hash`)
   const remote = await import('../node_modules/@deepseek-ai/dsh-api-session-controller/lib/typert.remote-client.js')
