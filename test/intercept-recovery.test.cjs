@@ -1452,3 +1452,355 @@ test('CP5: a waterfall the aborted $events generation already decoded never reac
   )
   await iterator.return?.(undefined)
 })
+
+// -- T4: intercept-swr-bridge --------------------------------------------------
+
+function makeFollowSnapshot(cursor, records, extra = {}) {
+  return {
+    type: 'snapshot',
+    header: { id: LOCAL_ID, cwd: '/srv/repo', ...(extra.header ?? {}) },
+    cursor,
+    records,
+    hasMore: extra.hasMore ?? false,
+    projections: extra.projections ?? { asOfSeq: cursor, values: { model: 'm1' } },
+    assistantStream: extra.assistantStream ?? { revision: 0 },
+  }
+}
+
+function makeFollowEvent(seq, type = 'message') {
+  return { type: 'event', event: { seq, type, time: seq * 1000, data: { text: `msg-${seq}` } } }
+}
+
+function attachStreamSpy(relay) {
+  const origOpen = relay.openStream.bind(relay)
+  relay.streamOptions = []
+  relay.openStream = (namespace, method, args, signal, opts) => {
+    relay.streamOptions.push({ namespace, method, opts, signal })
+    return origOpen(namespace, method, args, signal, opts)
+  }
+  return relay
+}
+
+test('T4 SWR Case A (unchanged): 0ms cached open + background snapshot-sync(unchanged) + assistantStream revision offset', async () => {
+  const relay = attachStreamSpy(createControllableRelay())
+  const gateway = new FakeTypertGateway()
+  const clock = fakeClock()
+  const handle = installIntercept({ raw: gateway, relay, getServerId: () => H_SERVER_ID, clock })
+  assert.equal(typeof handle.historyCacheStats, 'function')
+
+  // 1. Cold miss: populates cache
+  const gen0 = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } })
+  await waitForStream(relay, 1)
+  relay.streams[0].gate.push(makeFollowSnapshot(10, [makeFollowEvent(9), makeFollowEvent(10)], { assistantStream: { revision: 4 } }))
+  await waitUntil(() => gen0.seen.length === 1)
+  relay.streams[0].gate.finish()
+  assert.equal(await gen0.outcome, 'ended-clean')
+  assert.equal(handle.historyCacheStats().snapshotCount, 1)
+
+  // 2. Warm hit: yields cached snapshot in 0ms (before background stream pushes anything!)
+  const ac = new AbortController()
+  const gen1Iter = (await gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } } },
+    undefined,
+    gateway.operatorPeer(),
+    ac.signal,
+    { signal: ac.signal },
+  ))[Symbol.asyncIterator]()
+  const firstPull = await gen1Iter.next()
+  assert.equal(firstPull.done, false)
+  assert.equal(firstPull.value.type, 'snapshot')
+  assert.equal(firstPull.value.header.id, VIRTUAL_ID)
+  assert.deepEqual(firstPull.value.assistantStream, { revision: 0 })
+
+  await waitForStream(relay, 2)
+  assert.equal(relay.streamOptions[1].opts?.knownCursor, 10)
+
+  // Background sends snapshot-sync(unchanged) with upstream revision=5, then assistant-stream rev 6, event 11, assistant-stream rev 7
+  relay.streams[1].gate.push({
+    type: 'snapshot-sync',
+    mode: 'unchanged',
+    cursor: 10,
+    hasMore: false,
+    projections: { asOfSeq: 10, values: { model: 'm1' } },
+    assistantStream: { revision: 5 },
+  })
+  relay.streams[1].gate.push({ type: 'assistant-stream', frame: { revision: 6, text: 'hello' } })
+  relay.streams[1].gate.push(makeFollowEvent(11))
+  relay.streams[1].gate.push({ type: 'assistant-stream', frame: { revision: 7, text: ' world' } })
+  relay.streams[1].gate.finish()
+
+  const rest = []
+  while (true) {
+    const step = await gen1Iter.next()
+    if (step.done) break
+    rest.push(step.value)
+  }
+  assert.deepEqual(rest, [
+    { type: 'assistant-stream', frame: { revision: 1, text: 'hello' } },
+    makeFollowEvent(11),
+    { type: 'assistant-stream', frame: { revision: 2, text: ' world' } },
+  ])
+  assert.equal(handle.historyCacheStats().visitedCount, 1)
+  handle.uninstall()
+})
+
+test('T4 SWR Case B (delta): 0ms cached open + contiguous delta event catch-up + revision offset', async () => {
+  const relay = attachStreamSpy(createControllableRelay())
+  const gateway = new FakeTypertGateway()
+  const handle = installIntercept({ raw: gateway, relay, getServerId: () => H_SERVER_ID })
+
+  const gen0 = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } })
+  await waitForStream(relay, 1)
+  relay.streams[0].gate.push(makeFollowSnapshot(10, [makeFollowEvent(10)]))
+  await waitUntil(() => gen0.seen.length === 1)
+  relay.streams[0].gate.finish()
+  await gen0.outcome
+
+  const gen1Iter = (await gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } } },
+    undefined,
+    gateway.operatorPeer(),
+    undefined,
+    {},
+  ))[Symbol.asyncIterator]()
+  const firstPull = await gen1Iter.next()
+  assert.equal(firstPull.value.cursor, 10)
+  await waitForStream(relay, 2)
+
+  relay.streams[1].gate.push({
+    type: 'snapshot-sync',
+    mode: 'delta',
+    baseCursor: 10,
+    cursor: 12,
+    records: [makeFollowEvent(11), makeFollowEvent(12)],
+    hasMore: false,
+    projections: { asOfSeq: 10, values: { model: 'm1' } },
+    assistantStream: { revision: 3 },
+  })
+  relay.streams[1].gate.push({ type: 'assistant-stream', frame: { revision: 4, text: 'delta-live' } })
+  relay.streams[1].gate.finish()
+
+  const rest = []
+  while (true) {
+    const step = await gen1Iter.next()
+    if (step.done) break
+    rest.push(step.value)
+  }
+  assert.deepEqual(rest, [
+    makeFollowEvent(11),
+    makeFollowEvent(12),
+    { type: 'assistant-stream', frame: { revision: 1, text: 'delta-live' } },
+  ])
+  handle.uninstall()
+})
+
+test('T4 SWR Case C (handoff): signal decoupling survives Gen 1 abort, Gen 2 takes over atomically, and unconsumed slot expires via TTL', async () => {
+  const relay = attachStreamSpy(createControllableRelay())
+  const gateway = new FakeTypertGateway()
+  const clock = fakeClock()
+  const handle = installIntercept({
+    raw: gateway,
+    relay,
+    getServerId: () => H_SERVER_ID,
+    clock,
+    historyCache: { handoffTtlMs: 2000 },
+  })
+
+  // Seed cache at cursor 10
+  const gen0 = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } })
+  await waitForStream(relay, 1)
+  relay.streams[0].gate.push(makeFollowSnapshot(10, [makeFollowEvent(10)]))
+  await waitUntil(() => gen0.seen.length === 1)
+  relay.streams[0].gate.finish()
+  await gen0.outcome
+
+  // Gen 1 hits cache; background returns activeAttempt snapshot (Case C)
+  const gen1Ac = new AbortController()
+  const gen1Iter = (await gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } } },
+    undefined,
+    gateway.operatorPeer(),
+    gen1Ac.signal,
+    { signal: gen1Ac.signal },
+  ))[Symbol.asyncIterator]()
+  const g1First = await gen1Iter.next()
+  assert.equal(g1First.value.cursor, 10)
+  await waitForStream(relay, 2)
+  const bgSignal = relay.streamOptions[1].signal
+
+  relay.streams[1].gate.push(makeFollowSnapshot(20, [makeFollowEvent(19), makeFollowEvent(20)], {
+    assistantStream: { revision: 8, activeAttempt: { attemptId: 'att-9' } },
+  }))
+  const g1End = await gen1Iter.next()
+  assert.equal(g1End.done, true, 'Gen 1 ends cleanly to trigger RemoteStream Gen 2 reopen')
+  // DSH RemoteStream's finally aborts Gen 1 signal immediately on exit
+  gen1Ac.abort()
+  assert.equal(bgSignal.aborted, false, 'Case C must decouple Gen 1 abort from parked upstream stream')
+  assert.equal(handle.historyCacheStats().handoffCount, 1)
+
+  // Gen 2 opens and consumes handoff in 0ms without opening a 3rd relay stream
+  const gen2Iter = (await gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } } },
+    undefined,
+    gateway.operatorPeer(),
+    undefined,
+    {},
+  ))[Symbol.asyncIterator]()
+  const g2First = await gen2Iter.next()
+  assert.equal(g2First.done, false)
+  assert.equal(g2First.value.cursor, 20)
+  assert.deepEqual(g2First.value.assistantStream, { revision: 8, activeAttempt: { attemptId: 'att-9' } })
+  assert.equal(relay.streams.length, 2, 'Gen 2 reused parked upstream without extra relay stream')
+  assert.equal(handle.historyCacheStats().handoffCount, 0)
+
+  relay.streams[1].gate.push({ type: 'assistant-stream', frame: { revision: 9, text: 'streaming' } })
+  relay.streams[1].gate.finish()
+  const g2Next = await gen2Iter.next()
+  assert.deepEqual(g2Next.value, { type: 'assistant-stream', frame: { revision: 9, text: 'streaming' } })
+  assert.equal((await gen2Iter.next()).done, true)
+
+  // Unconsumed handoff expires after 2000ms and aborts upstream
+  const gen3Iter = (await gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, assistantStream: true } } },
+    undefined,
+    gateway.operatorPeer(),
+    undefined,
+    {},
+  ))[Symbol.asyncIterator]()
+  await gen3Iter.next()
+  await waitForStream(relay, 3)
+  const bgSignal3 = relay.streamOptions[2].signal
+  relay.streams[2].gate.push(makeFollowSnapshot(30, [makeFollowEvent(30)], {
+    projections: { asOfSeq: 30, values: { model: 'm2' } },
+  }))
+  assert.equal((await gen3Iter.next()).done, true)
+  assert.equal(handle.historyCacheStats().handoffCount, 1)
+  assert.equal(bgSignal3.aborted, false)
+  clock.advance(2000)
+  assert.equal(handle.historyCacheStats().handoffCount, 0)
+  assert.equal(bgSignal3.aborted, true, 'expired handoff aborts unconsumed upstream')
+  handle.uninstall()
+})
+
+test('T4 session/page cache + full-path invalidation (unshared, not-shared, offline TTL, revoked, uninstall)', async () => {
+  const relay = attachStreamSpy(createControllableRelay())
+  const gateway = new FakeTypertGateway()
+  const clock = fakeClock()
+  const handle = installIntercept({
+    raw: gateway,
+    relay,
+    getServerId: () => H_SERVER_ID,
+    clock,
+    historyCache: { offlineTtlMs: 30 * 60 * 1000 },
+  })
+  relay.invokes.length = 0 // discard proactive install-time modelCatalog probe
+
+  // 1. session/page cache hit ignores throughSeq and clones returned value
+  relay.invokeValues['session/page'] = { records: [makeFollowEvent(5)], hasMore: true }
+  const page1 = await gateway.rpcBridge(
+    'session/page',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, beforeSeq: 10, throughSeq: 15, maxMessages: 20, turnWindow: { minMessages: 5, minTurns: 1 } } } },
+    undefined,
+    gateway.operatorPeer(),
+  )
+  assert.equal(page1.ok, true)
+  assert.equal(relay.invokes.length, 1)
+  page1.value.records.push('mutated')
+
+  const page2 = await gateway.rpcBridge(
+    'session/page',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, beforeSeq: 10, throughSeq: 99, maxMessages: 20, turnWindow: { minMessages: 5, minTurns: 1 } } } },
+    undefined,
+    gateway.operatorPeer(),
+  )
+  assert.equal(page2.ok, true)
+  assert.equal(relay.invokes.length, 1, 'second session/page hits cache with 0 RPC')
+  assert.equal(page2.value.records.length, 1, 'caller mutation did not poison cached page')
+
+  // beforeSeq > throughSeq + 1 bypasses cache
+  await gateway.rpcBridge(
+    'session/page',
+    { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID }, beforeSeq: 20, throughSeq: 15, maxMessages: 20, turnWindow: { minMessages: 5, minTurns: 1 } } } },
+    undefined,
+    gateway.operatorPeer(),
+  )
+  assert.equal(relay.invokes.length, 2)
+
+  // 2. unshared mid-SWR clears session family and holds silently per T73
+  const gen0 = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } })
+  await waitForStream(relay, 1)
+  relay.streams[0].gate.push(makeFollowSnapshot(10, [makeFollowEvent(10)]))
+  await waitUntil(() => gen0.seen.length === 1)
+  relay.streams[0].gate.finish()
+  await gen0.outcome
+  assert.equal(handle.historyCacheStats().snapshotCount, 1)
+
+  const swrAc = new AbortController()
+  const swrFrames = []
+  const swrDone = (async () => {
+    for await (const frame of await gateway.wireTap(
+      'session/follow',
+      { args: { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } } },
+      undefined,
+      gateway.operatorPeer(),
+      swrAc.signal,
+      { signal: swrAc.signal },
+    )) {
+      swrFrames.push(frame)
+    }
+  })()
+  await waitForStream(relay, 2)
+  relay.streams[1].gate.throwNow(new RelayError('unshared', 'gone', undefined, 'manual'))
+  await waitUntil(() => handle.historyCacheStats().snapshotCount === 0)
+  assert.equal(handle.historyCacheStats().pageCount, 0, 'unshared clears both snapshots and pages for session family')
+  swrAc.abort()
+  await swrDone
+
+  // 3. offline TTL clears cache after 30 min; online cancels; revoked & uninstall clear immediately
+  const genA = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } })
+  await waitForStream(relay, 3)
+  relay.streams[2].gate.push(makeFollowSnapshot(10, [makeFollowEvent(10)]))
+  await waitUntil(() => genA.seen.length === 1)
+  relay.streams[2].gate.finish()
+  await genA.outcome
+  assert.equal(handle.historyCacheStats().snapshotCount, 1)
+
+  relay.transition('offline')
+  clock.advance(15 * 60 * 1000)
+  relay.transition('online')
+  clock.advance(20 * 60 * 1000)
+  assert.equal(handle.historyCacheStats().snapshotCount, 1, 'online cancelled offline TTL wipe')
+
+  relay.transition('offline')
+  clock.advance(30 * 60 * 1000)
+  assert.equal(handle.historyCacheStats().totalBytes, 0, 'offline TTL cleared server cache')
+
+  // Repopulate and verify revoked + uninstall clear
+  const genB = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } })
+  await waitForStream(relay, 4)
+  relay.streams[3].gate.push(makeFollowSnapshot(11, [makeFollowEvent(11)]))
+  await waitUntil(() => genB.seen.length === 1)
+  relay.streams[3].gate.finish()
+  await genB.outcome
+  assert.equal(handle.historyCacheStats().snapshotCount, 1)
+
+  relay.transition('revoked')
+  assert.equal(handle.historyCacheStats().totalBytes, 0, 'revoked cleared server cache')
+
+  relay.transition('online')
+  const genC = consumeStream(gateway, 'session/follow', { request: { address: { kind: 'session', sessionId: VIRTUAL_ID } } })
+  await waitForStream(relay, 5)
+  relay.streams[4].gate.push(makeFollowSnapshot(12, [makeFollowEvent(12)]))
+  await waitUntil(() => genC.seen.length === 1)
+  relay.streams[4].gate.finish()
+  await genC.outcome
+  assert.equal(handle.historyCacheStats().snapshotCount, 1)
+
+  handle.uninstall()
+  assert.equal(handle.historyCacheStats().totalBytes, 0, 'uninstall cleared all cache')
+})

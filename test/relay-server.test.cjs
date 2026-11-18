@@ -11,6 +11,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
+const zlib = require('node:zlib')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -2142,5 +2143,169 @@ test('API-6 relay-server: agentPresets zero-share gate, workspace/insertSessionB
     )
     assert.equal(insertMissingWs.status, 403)
     assert.deepEqual(await insertMissingWs.json(), { ok: false, error: { code: 'workspace/not-found' } })
+  } finally { await server.stop() }
+})
+
+test('T3 /v1/session-snapshot: cold-safe single-next+return, post-await share recheck, cap=2, gzip, and knownCursor', async () => {
+  const parts = makeParts('t3-session-snapshot')
+  parts.store.share('S-a')
+  parts.store.share('S-b')
+  const snapshotPayload = (id, cursor, records, extra = {}) => ({
+    type: 'snapshot',
+    header: { id },
+    cursor,
+    records,
+    hasMore: false,
+    projections: { asOfSeq: cursor, values: {} },
+    assistantStream: extra.assistantStream ?? { revision: 0 },
+  })
+  const makeRec = (seq, text = `msg-${seq}`) => ({ type: 'event', event: { seq, type: 'message', data: { text } } })
+
+  let nextCalls = 0
+  let returnCalls = 0
+  let promoteCalled = false
+  let customStreamFactory
+  let touchCount = 0
+  const origTouch = parts.store.touch.bind(parts.store)
+  parts.store.touch = (id) => {
+    touchCount += 1
+    return origTouch(id)
+  }
+  const initialLastActivityAt = parts.store.list().find((e) => e.sessionId === 'S-a').lastActivityAt
+
+  parts.gateway.stream = async (call) => {
+    parts.calls.push(call)
+    if (customStreamFactory) return customStreamFactory(call)
+    return {
+      [Symbol.asyncIterator]() {
+        let pulled = 0
+        return {
+          async next() {
+            nextCalls += 1
+            pulled += 1
+            if (pulled === 1) {
+              return {
+                done: false,
+                value: snapshotPayload('S-a', 3, [makeRec(1, 'x'.repeat(500)), makeRec(2, 'x'.repeat(500)), makeRec(3, 'x'.repeat(500))]),
+              }
+            }
+            promoteCalled = true
+            return { done: true, value: undefined }
+          },
+          async return() {
+            returnCalls += 1
+            return { done: true, value: undefined }
+          },
+        }
+      },
+    }
+  }
+
+  const server = await startServer(parts.handler)
+  try {
+    // 1. Unshared -> 403 not-shared without calling gateway.stream
+    const unshared = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-secret' } }, AUTH))
+    assert.equal(unshared.status, 403)
+    assert.deepEqual(await unshared.json(), { ok: false, error: { code: 'not-shared' } })
+    assert.equal(parts.calls.length, 0)
+
+    // 2. Bad address / invalid knownCursor -> 400 bad-request
+    const badAddr = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'nope' } }, AUTH))
+    assert.equal(badAddr.status, 400)
+    assert.deepEqual(await badAddr.json(), { ok: false, error: { code: 'bad-request' } })
+
+    const badCursor = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' }, knownCursor: -2 }, AUTH))
+    assert.equal(badCursor.status, 400)
+    assert.deepEqual(await badCursor.json(), { ok: false, error: { code: 'bad-request' } })
+
+    // 3. Cold-safe pull + gzip negotiation: next() called ONCE, return() called, promoteCalled=false, viewers=0, touchActivity=0
+    const okGz = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', {
+      method: 'POST',
+      headers: { ...AUTH, 'content-type': 'application/json', 'x-zr-accept-encoding': 'gzip' },
+      body: JSON.stringify({ address: { kind: 'session', sessionId: 'S-a' }, maxMessages: 500, turnWindow: { minMessages: 50, minTurns: 2 } }),
+    })
+    assert.equal(okGz.status, 200)
+    assert.equal(okGz.headers.get('x-zr-content-encoding'), 'gzip')
+    const parsedGz = JSON.parse(zlib.gunzipSync(Buffer.from(await okGz.arrayBuffer())).toString('utf8'))
+    assert.equal(parsedGz.ok, true)
+    assert.equal(parsedGz.value.mode, 'full')
+    assert.equal(parsedGz.value.snapshot.cursor, 3)
+    assert.equal(nextCalls, 1)
+    assert.equal(returnCalls, 1)
+    assert.equal(promoteCalled, false)
+    assert.equal(parts.handler.viewerCount('S-a'), 0)
+    assert.equal(touchCount, 0)
+    assert.equal(parts.store.list().find((e) => e.sessionId === 'S-a').lastActivityAt, initialLastActivityAt)
+
+    // 4. knownCursor unchanged / delta / activeAttempt fallback
+    const unchanged = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' }, knownCursor: 3 }, AUTH))
+    assert.equal(unchanged.status, 200)
+    const unchangedBody = await unchanged.json()
+    assert.equal(unchangedBody.value.mode, 'unchanged')
+    assert.equal(unchangedBody.value.cursor, 3)
+    assert.equal('records' in unchangedBody.value, false)
+
+    const delta = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' }, knownCursor: 1 }, AUTH))
+    assert.equal(delta.status, 200)
+    const deltaBody = await delta.json()
+    assert.equal(deltaBody.value.mode, 'delta')
+    assert.equal(deltaBody.value.baseCursor, 1)
+    assert.equal(deltaBody.value.cursor, 3)
+    assert.deepEqual(deltaBody.value.records.map((r) => r.event.seq), [2, 3])
+
+    // 5. Post-await unshare check -> 403 not-shared
+    customStreamFactory = () => ({
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            parts.store.unshare('S-b', 'manual')
+            return { done: false, value: snapshotPayload('S-b', 1, [makeRec(1)]) }
+          },
+          async return() {
+            return { done: true, value: undefined }
+          },
+        }
+      },
+    })
+    const raceUnshare = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-b' } }, AUTH))
+    assert.equal(raceUnshare.status, 403)
+    assert.deepEqual(await raceUnshare.json(), { ok: false, error: { code: 'not-shared' } })
+
+    // 6. Per-device concurrency cap = 2 -> 3rd gets 429 too-many-snapshots
+    const gates = []
+    customStreamFactory = () => ({
+      [Symbol.asyncIterator]() {
+        return {
+          next: () => new Promise((resolve) => gates.push(() => resolve({ done: false, value: snapshotPayload('S-a', 1, []) }))),
+          async return() { return { done: true, value: undefined } },
+        }
+      },
+    })
+    const p1 = server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, AUTH))
+    const p2 = server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, AUTH))
+    await new Promise((r) => {
+      const check = () => (gates.length >= 2 ? r() : setTimeout(check, 5))
+      check()
+    })
+    const third = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, AUTH))
+    assert.equal(third.status, 429)
+    assert.deepEqual(await third.json(), { ok: false, error: { code: 'too-many-snapshots' } })
+    gates.forEach((fn) => fn())
+    const [r1, r2] = await Promise.all([p1, p2])
+    assert.equal(r1.status, 200)
+    assert.equal(r2.status, 200)
+
+    // 7. Non-snapshot first frame -> 502 internal
+    customStreamFactory = () => ({
+      [Symbol.asyncIterator]() {
+        return {
+          async next() { return { done: false, value: { type: 'not-a-snapshot' } } },
+          async return() { return { done: true, value: undefined } },
+        }
+      },
+    })
+    const badFirst = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, AUTH))
+    assert.equal(badFirst.status, 502)
+    assert.deepEqual(await badFirst.json(), { ok: false, error: { code: 'internal' } })
   } finally { await server.stop() }
 })

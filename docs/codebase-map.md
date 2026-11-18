@@ -18,14 +18,16 @@
 | `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
 | `src/share-ops.ts` | `agent/created` 的自动共享 / 分叉跟随 / busy 恢复 |
 | `src/share-export.ts` | 分享图路由 `GET /_dsh/mobile-nav/share-export`（完整日志折叠人类转写） |
-| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream / event-result / `v1/http`（plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ `v1/upload`（附件字节转宿主暂存）/ unshare |
+| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream（含 `knownCursor` 增量 `snapshot-sync` 与 `writeChain` 串行 gzip 封装）/ `v1/session-snapshot`（冷安全单帧快照与增量，并发上限 2）/ event-result / `v1/http`（plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ `v1/upload`（附件字节转宿主暂存）/ unshare |
 | `src/relay-access.ts` | 中继按方法登记访问控制表（服务端那张）；`v1/http` 按路由登记表也在这里 |
 | `src/relay-filter.ts` | 全局流与列表的输出过滤（`workspace/follow` / `session/control` / `session/list` / @ 引用候选行） |
 | `src/session-reference.ts` | 两端共用 `dsh-session:` 引用编解码与「可注入文本」扫描规则（prompt content、排队 edit、`commands/execute` 字符串）：服务端照它校验、子客户端照它改写，同一份规则防漂移 |
-| `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别 |
+| `src/session-history-cache.ts` | 纯内存远程会话历史缓存（不落盘）：四级预算（全进程 `64 MiB` / 单设备 `24 MiB` & `32` 会话 / 单快照 `8 MiB` / `session/page` `16 MiB` & `128` 页）、双层 LRU（`prewarmed` 先于 `visited` 淘汰）、`600` 条整轮裁头、`peekSnapshotMeta` 只读轻量元信息查询、`30 min` 离线回收与 `2,000 ms` 一次性交接槽 |
+| `src/session-prewarm.ts` | 冷安全后台自动预热调度器：按 `updatedAt` 降序、每在线设备 `concurrency = 1` 预热 Top `16` 根会话（跳过 `subagent`），前沿请求即刻 `abort()`、空闲 `300 ms` 后恢复，联动 `workspace/follow` 移出、`session/control` 水印、`api-session/status` 及 `404`/`403` 降级 |
+| `src/relay-client.ts` | 子客户端中继客户端：握手、接口指纹比对、退避重连、吊销识别、`O(N)` `Uint8Array` 流式行切分（`64 MiB` 上限）、协商式 `gzip` 解压与 `64 MiB` 防炸弹、`/v1/session-snapshot` 与 `knownCursor` 流参数 |
 | `src/relay-pool.ts` | 多服务端连接池（最多 8 台）：同 `serverId` 去重（保留最新配对）、重名显示名派生 `-1`/`-2`（`deriveDisplayServerNames`）、按 entryId/serverId 定位、单台/全部重连与改名广播 |
 | `src/peer/` | 节点端双路径组网引擎：`wire.ts` 线协议（28B 明文路由头 + ≤1200B 密文帧）、`crypto.ts` 自证明身份（`nodeId = sha256(pub)[0..8]`）、`zr-net://` 邀请链接与会话级 X25519+AES-256-GCM AEAD（兼容 OpenSSL 与 BoringSSL）、`arq.ts` 滑动窗口可靠流、`punch.ts` 双 UDP STUN 打洞（60s 静默重探、`lan`/`p2p` 分类）、`mux.ts` 虚拟 HTTP 复用、`engine.ts` 网关信令（`/peer/v1/ws` 挑战应答）与独立 TOFU 锚定 |
-| `src/intercept.ts` | 子客户端本机拦截：包装 `typertGateway`、远程调用走中继、虚拟 id 改写、面板判定（客户端字段表在这里） |
+| `src/intercept.ts` | 子客户端本机拦截：包装 `typertGateway`、远程调用走中继、虚拟 id 改写、面板判定（客户端字段表在这里），以及 `session/follow` SWR 0ms 秒开三路追平、`session/page` 缓存、前台忙碌追踪与自动预热调度接线 |
 | `src/intercept-shape.ts` | 被包装方法形态检测，不符即拒绝安装远程拦截（本地行为不受影响） |
 | `src/plugin-bridge.ts` | 插件桥纯逻辑（PB-1）：桥接声明校验/规范化与 16 位摘要、`zenRemote` 注册表、两端 `compareBridges`；不 import DSH、不碰 I/O |
 | `src/plugin-loopback.ts` | 插件桥回环执行器（PB-3）：本机回环 GET 插件路由，token 换 cookie（401 重换一次），cookie 只存内存；https 仅对字面 127.0.0.1 放宽证书校验 |

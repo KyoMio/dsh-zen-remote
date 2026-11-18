@@ -12,6 +12,8 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
+const zlib = require('node:zlib')
+const { createRelayClient } = require('../lib/relay-client.js')
 const { EventEmitter } = require('node:events')
 const { Readable } = require('node:stream')
 const fs = require('node:fs')
@@ -1693,5 +1695,244 @@ test('alpha.3: $events opens and $events/result answers as the SAME owner/answer
     assert.equal(parts.eventResults[0].peer, peer, '$events/result answered by the Peer that opened the stream')
     parts.eventsGate().finish()
     await open.done
+  } finally { await server.stop() }
+})
+
+// ---- 9. T1 (relay-line-gzip): server negotiated gzip & FIFO writeChain ----
+
+test('T1 server /v1/invoke: negotiated gzip >= 1024 B, skips < 1024 B / non-200 / legacy client', async () => {
+  const largePayload = { items: Array.from({ length: 80 }, (_, i) => ({ sessionId: 'session-a', title: `item-${i}-` + 'repeated-session-title-'.repeat(3) })) }
+  const smallPayload = { ok: 'tiny' }
+
+  let nextReturn = largePayload
+  const parts = makeParts('t1-invoke-gz', {
+    shared: ['session-a'],
+    overrides: { invoke: async () => nextReturn },
+  })
+  const server = await startServer(parts.handler)
+  try {
+    // 1. Legacy client without x-zr-accept-encoding gets plain JSON
+    const plainRes = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', {
+      method: 'POST',
+      headers: { ...AUTH, 'content-type': 'application/json' },
+      body: JSON.stringify({ namespace: 'session', method: 'list', args: {} }),
+    })
+    assert.equal(plainRes.status, 200)
+    assert.equal(plainRes.headers.get('x-zr-content-encoding'), null)
+    assert.match(plainRes.headers.get('content-type') ?? '', /application\/json/)
+    assert.deepEqual(await plainRes.json(), { ok: true, value: largePayload })
+
+    // 2. Client with x-zr-accept-encoding: gzip gets compressed response for >= 1024 B compressible payload
+    const gzRes = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', {
+      method: 'POST',
+      headers: { ...AUTH, 'content-type': 'application/json', 'x-zr-accept-encoding': 'gzip' },
+      body: JSON.stringify({ namespace: 'session', method: 'list', args: {} }),
+    })
+    assert.equal(gzRes.status, 200)
+    assert.equal(gzRes.headers.get('x-zr-content-encoding'), 'gzip')
+    assert.equal(gzRes.headers.get('content-type'), 'application/octet-stream')
+    assert.equal(gzRes.headers.get('x-content-type-options'), 'nosniff')
+    const gzBuf = Buffer.from(await gzRes.arrayBuffer())
+    const expectedPlain = Buffer.from(JSON.stringify({ ok: true, value: largePayload }), 'utf8')
+    assert.ok(gzBuf.byteLength < expectedPlain.byteLength)
+    assert.deepEqual(JSON.parse(zlib.gunzipSync(gzBuf).toString('utf8')), { ok: true, value: largePayload })
+
+    // 3. Small payload (< 1024 B) is not compressed even with header
+    nextReturn = smallPayload
+    const smallRes = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', {
+      method: 'POST',
+      headers: { ...AUTH, 'content-type': 'application/json', 'x-zr-accept-encoding': 'gzip' },
+      body: JSON.stringify({ namespace: 'session', method: 'page', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } }),
+    })
+    assert.equal(smallRes.status, 200)
+    assert.equal(smallRes.headers.get('x-zr-content-encoding'), null)
+    assert.deepEqual(await smallRes.json(), { ok: true, value: smallPayload })
+
+    // 4. Non-200 refusal stays plain JSON even with x-zr-accept-encoding: gzip
+    const refusedRes = await server.fetch('/_dsh/zen-remote/relay/v1/invoke', {
+      method: 'POST',
+      headers: { ...AUTH, 'content-type': 'application/json', 'x-zr-accept-encoding': 'gzip' },
+      body: JSON.stringify({ namespace: 'session', method: 'page', args: { request: { address: { kind: 'session', sessionId: 'unshared-s' } } } }),
+    })
+    assert.equal(refusedRes.status, 403)
+    assert.equal(refusedRes.headers.get('x-zr-content-encoding'), null)
+    assert.deepEqual(await refusedRes.json(), { ok: false, error: { code: 'not-shared' } })
+  } finally { await server.stop() }
+})
+
+test('T1 server /v1/stream: compresses large frames inside writeChain preserving strict FIFO ordering with small/end frames', async () => {
+  const parts = makeParts('t1-stream-gz', { shared: ['session-a'] })
+  const server = await startServer(parts.handler)
+  const bigSnapshot = {
+    type: 'snapshot',
+    cursor: 100,
+    records: Array.from({ length: 1000 }, (_, i) => ({ seq: i + 1, type: 'message', text: `line-${i}-` + 'x'.repeat(250) })),
+  }
+  const smallEvent = { type: 'event', event: { seq: 101, type: 'message', text: 'tiny' } }
+  // Deterministic high-entropy CJK string (~1.2 KiB) where gzip+base64 wrapper is larger than plain JSON
+  let seed = 1337
+  let highEntropyText = ''
+  for (let i = 0; i < 400; i += 1) {
+    seed = (seed * 1664525 + 1013904223) >>> 0
+    highEntropyText += String.fromCharCode(0x4e00 + (seed % 20000))
+  }
+  const incompressibleFrame = { type: 'event', event: { seq: 102, type: 'message', text: highEntropyText } }
+  try {
+    // 1. Negotiated gzip stream: large snapshot wrapped in gz, small event & non-smaller frame & end stay plain, FIFO preserved
+    const openGz = await openStream(
+      server,
+      { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } },
+      { ...AUTH, 'x-zr-accept-encoding': 'gzip' },
+    )
+    const gateGz = parts.streams[0]
+    gateGz.push(bigSnapshot)
+    gateGz.push(smallEvent)
+    gateGz.push(incompressibleFrame)
+    gateGz.finish()
+    await openGz.done
+
+    assert.equal(openGz.lines.length, 4)
+    assert.equal(openGz.lines[0].type, 'gz', 'large frame >= 1024 B is wrapped as gz')
+    assert.equal(typeof openGz.lines[0].b64, 'string')
+    const decodedFirst = JSON.parse(zlib.gunzipSync(Buffer.from(openGz.lines[0].b64, 'base64')).toString('utf8'))
+    assert.deepEqual(decodedFirst, { type: 'frame', frame: bigSnapshot })
+    assert.deepEqual(openGz.lines[1], { type: 'frame', frame: smallEvent }, 'small event stays plain and stays AFTER compressed snapshot')
+    assert.deepEqual(openGz.lines[2], { type: 'frame', frame: incompressibleFrame }, 'non-smaller >=1024B frame stays plain')
+    assert.deepEqual(openGz.lines[3], { type: 'end' }, 'end tail stays plain and stays LAST')
+
+    // 2. Legacy client without x-zr-accept-encoding receives plain uncompressed frames
+    const openPlain = await openStream(
+      server,
+      { namespace: 'session', method: 'follow', args: { request: { address: { kind: 'session', sessionId: 'session-a' } } } },
+      AUTH,
+    )
+    const gatePlain = parts.streams[1]
+    gatePlain.push(bigSnapshot)
+    gatePlain.push(smallEvent)
+    gatePlain.finish()
+    await openPlain.done
+    assert.deepEqual(openPlain.lines, [
+      { type: 'frame', frame: bigSnapshot },
+      { type: 'frame', frame: smallEvent },
+      { type: 'end' },
+    ])
+
+    // 3. End-to-end RelayClient <-> RelayHandler gzip round-trip (invoke + stream)
+    const client = createRelayClient({
+      getServerUrl: () => `http://127.0.0.1:${server.port}`,
+      getToken: () => 'tok',
+      fetchImpl: async (url, init) => {
+        const headers = { ...init.headers, ...AUTH }
+        return fetch(url, { ...init, headers })
+      },
+    })
+    await client.connect()
+    const streamFrames = []
+    const iterPromise = (async () => {
+      for await (const frame of client.openStream('session', 'follow', { request: { address: { kind: 'session', sessionId: 'session-a' } } })) {
+        streamFrames.push(frame)
+      }
+    })()
+    await waitFor(() => parts.streams.length >= 3)
+    const gateE2e = parts.streams[2]
+    gateE2e.push(bigSnapshot)
+    gateE2e.push(smallEvent)
+    gateE2e.finish()
+    await iterPromise
+    assert.deepEqual(streamFrames, [bigSnapshot, smallEvent])
+  } finally { await server.stop() }
+})
+
+// ---- 10. T3 (relay-snapshot-delta): /v1/stream knownCursor snapshot-sync ----
+
+test('T3 /v1/stream session/follow knownCursor: unchanged, delta, activeAttempt/gap fallback, and legacy omission', async () => {
+  const parts = makeParts('t3-stream-sync', { shared: ['session-a'] })
+  const server = await startServer(parts.handler)
+  const makeRec = (seq) => ({ type: 'event', event: { seq, type: 'message', data: { text: `m-${seq}` } } })
+  const baseSnap = (cursor, records, assistantStream = { revision: 2 }) => ({
+    type: 'snapshot',
+    header: { id: 'session-a' },
+    cursor,
+    records,
+    hasMore: false,
+    projections: { asOfSeq: cursor, values: {} },
+    assistantStream,
+  })
+  const liveTail = { type: 'event', event: { seq: 11, type: 'message', data: { text: 'live' } } }
+
+  try {
+    // 1. unchanged: cursor === knownCursor, no activeAttempt -> emits snapshot-sync(unchanged) without records + live tail
+    const openUnchanged = await openStream(server, {
+      namespace: 'session',
+      method: 'follow',
+      args: { request: { address: { kind: 'session', sessionId: 'session-a' } } },
+      knownCursor: 10,
+    })
+    parts.streams[0].push(baseSnap(10, [makeRec(8), makeRec(9), makeRec(10)]))
+    parts.streams[0].push(liveTail)
+    parts.streams[0].finish()
+    await openUnchanged.done
+    assert.equal(openUnchanged.lines[0].type, 'frame')
+    assert.equal(openUnchanged.lines[0].frame.type, 'snapshot-sync')
+    assert.equal(openUnchanged.lines[0].frame.mode, 'unchanged')
+    assert.equal(openUnchanged.lines[0].frame.cursor, 10)
+    assert.equal('records' in openUnchanged.lines[0].frame, false)
+    assert.deepEqual(openUnchanged.lines[1], { type: 'frame', frame: liveTail })
+    assert.deepEqual(openUnchanged.lines[2], { type: 'end' })
+
+    // 2. delta: cursor > knownCursor and (knownCursor, cursor] contiguous -> snapshot-sync(delta)
+    const openDelta = await openStream(server, {
+      namespace: 'session',
+      method: 'follow',
+      args: { request: { address: { kind: 'session', sessionId: 'session-a' } } },
+      knownCursor: 8,
+    })
+    parts.streams[1].push(baseSnap(10, [makeRec(8), makeRec(9), makeRec(10)]))
+    parts.streams[1].push(liveTail)
+    parts.streams[1].finish()
+    await openDelta.done
+    assert.equal(openDelta.lines[0].frame.type, 'snapshot-sync')
+    assert.equal(openDelta.lines[0].frame.mode, 'delta')
+    assert.equal(openDelta.lines[0].frame.baseCursor, 8)
+    assert.equal(openDelta.lines[0].frame.cursor, 10)
+    assert.deepEqual(openDelta.lines[0].frame.records.map((r) => r.event.seq), [9, 10])
+    assert.deepEqual(openDelta.lines[1], { type: 'frame', frame: liveTail })
+
+    // 3. Fallback to full snapshot on gap (knownCursor=5 but window starts at 8) or activeAttempt
+    const openGap = await openStream(server, {
+      namespace: 'session',
+      method: 'follow',
+      args: { request: { address: { kind: 'session', sessionId: 'session-a' } } },
+      knownCursor: 5,
+    })
+    const gapSnap = baseSnap(10, [makeRec(8), makeRec(9), makeRec(10)])
+    parts.streams[2].push(gapSnap)
+    parts.streams[2].finish()
+    await openGap.done
+    assert.deepEqual(openGap.lines[0], { type: 'frame', frame: gapSnap })
+
+    const openActive = await openStream(server, {
+      namespace: 'session',
+      method: 'follow',
+      args: { request: { address: { kind: 'session', sessionId: 'session-a' } } },
+      knownCursor: 10,
+    })
+    const activeSnap = baseSnap(10, [makeRec(10)], { revision: 2, activeAttempt: { id: 'att-1' } })
+    parts.streams[3].push(activeSnap)
+    parts.streams[3].finish()
+    await openActive.done
+    assert.deepEqual(openActive.lines[0], { type: 'frame', frame: activeSnap })
+
+    // 4. Malformed knownCursor is ignored and emits full snapshot
+    const openMalformed = await openStream(server, {
+      namespace: 'session',
+      method: 'follow',
+      args: { request: { address: { kind: 'session', sessionId: 'session-a' } } },
+      knownCursor: 'not-a-number',
+    })
+    parts.streams[4].push(gapSnap)
+    parts.streams[4].finish()
+    await openMalformed.done
+    assert.deepEqual(openMalformed.lines[0], { type: 'frame', frame: gapSnap })
   } finally { await server.stop() }
 })

@@ -268,6 +268,9 @@ export interface RelayClient {
      * (single-flight batched, strictly ordered); an uplink refusal surfaces as
      * the stream's error, and the host iterable is always released. */
     openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal, options?: RelayStreamOptions): AsyncIterable<unknown>;
+    /** Cold-safe single-shot session snapshot fetch (T3), degrading to
+     * `{ ok: false, reason: 'unsupported' }` when the server returns 404. */
+    fetchSessionSnapshot(request: SessionSnapshotRequest, signal?: AbortSignal): Promise<FetchSessionSnapshotResult>;
     /** One plain-HTTP round-trip (T41b): `route` / `query` name a registered
      * `/api` GET (relay-access's RELAY_HTTP_ROUTES; `query` is the URL-encoded
      * query string with the session id already restored). Resolves with the
@@ -392,7 +395,42 @@ export interface RelayStreamOptions {
         maxBytes: number;
         frameOverheadBytes: number;
     };
+    /** Optional cached cursor for `session/follow` `snapshot-sync` negotiation. */
+    knownCursor?: number;
 }
+export interface SessionSnapshotRequest {
+    address: unknown;
+    maxMessages?: number;
+    turnWindow?: unknown;
+    assistantStream?: boolean;
+    knownCursor?: number;
+}
+export type FetchSessionSnapshotResult = {
+    ok: true;
+    mode: 'full';
+    snapshot: unknown;
+} | {
+    ok: true;
+    mode: 'unchanged';
+    cursor: number;
+    header?: unknown;
+    hasMore: boolean;
+    projections?: unknown;
+    assistantStream?: unknown;
+} | {
+    ok: true;
+    mode: 'delta';
+    baseCursor: number;
+    cursor: number;
+    header?: unknown;
+    records: unknown[];
+    hasMore: boolean;
+    projections?: unknown;
+    assistantStream?: unknown;
+} | {
+    ok: false;
+    reason: 'unsupported';
+};
 /**
  * The credential digest recorded beside a completed handshake (T23a-fix):
  * sha256 over `url + "\n" + token`, first 16 hex chars. Enough to detect a

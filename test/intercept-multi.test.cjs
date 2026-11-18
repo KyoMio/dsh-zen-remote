@@ -11,10 +11,16 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
+const http = require('node:http')
+const fs = require('node:fs')
+const os = require('node:os')
+const path = require('node:path')
 
 const { installIntercept } = require('../lib/intercept.js')
+const { createRelayClient, RelayError } = require('../lib/relay-client.js')
+const { createRelayHandler, loadServerId } = require('../lib/relay-server.js')
+const { createShareStore } = require('../lib/share-store.js')
 const { toVirtual, VIRTUAL_GROUP_NAME_MARK: MARK, encodeServerIdZeroWidth } = require('../lib/virtual-id.js')
-const { RelayError } = require('../lib/relay-client.js')
 
 const SID_A = 'aaa11111'
 const SID_B = 'bbb22222'
@@ -1233,4 +1239,173 @@ test('peer-resilience: an aborted held wait releases BOTH subscriptions and neve
   assert.equal(relayA2.streams.length, 0, 'no waiter leaked to the new client')
 
   handle.uninstall()
+})
+
+test('T5 e2e: real relay server + client auto-prewarms cold-safely, upgrades to visited on open, and preempts on foreground RPC', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-t5-e2e-'))
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }))
+  const secret = 'a1b2c3d4'.repeat(8)
+  const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
+  store.share('s-pre')
+  store.share('s-two')
+  const serverId = loadServerId(home)
+
+  let nextCount = 0
+  let returnCount = 0
+  let promoteCalled = false
+  let holdSecondSnapshot = null
+  const makeRec = (seq, type = 'message') => ({ type: 'event', event: { seq, type, data: { text: `m-${seq}` } } })
+
+  const handler = createRelayHandler({
+    secret,
+    store,
+    serverInfo: { serverId, serverName: () => 'SrvA', dshVersion: '0.2.1', fingerprints: {} },
+    gateway: {
+      invoke: async (call) => {
+        if (call.namespace === 'session' && call.method === 'list') {
+          return {
+            items: [
+              { sessionId: 's-pre', updatedAt: '2026-11-17T10:00:00Z', running: false },
+              { sessionId: 's-two', updatedAt: '2026-11-17T09:00:00Z', running: false },
+            ],
+            hasMore: false,
+          }
+        }
+        if (call.namespace === 'session' && call.method === 'modelCatalog') {
+          return { providers: {}, default: undefined }
+        }
+        if (call.namespace === 'session' && call.method === 'page') {
+          return { records: [], hasMore: false }
+        }
+        return {}
+      },
+      stream: async (call) => {
+        if (call.namespace === 'session' && call.method === 'follow') {
+          const id = call.args?.request?.address?.sessionId
+          return {
+            [Symbol.asyncIterator]() {
+              let pulled = 0
+              return {
+                async next() {
+                  nextCount += 1
+                  pulled += 1
+                  if (id === 's-two' && pulled === 1 && holdSecondSnapshot !== null) {
+                    await holdSecondSnapshot.promise
+                  }
+                  if (pulled === 1) {
+                    return {
+                      done: false,
+                      value: {
+                        type: 'snapshot',
+                        header: { id },
+                        cursor: 2,
+                        records: [makeRec(0, 'turn/start'), makeRec(1), makeRec(2)],
+                        hasMore: false,
+                        projections: { asOfSeq: 2, values: {} },
+                        assistantStream: { revision: 0 },
+                      },
+                    }
+                  }
+                  promoteCalled = true
+                  await new Promise((resolve) => {
+                    if (call.signal?.aborted) resolve()
+                    else call.signal?.addEventListener('abort', resolve, { once: true })
+                  })
+                  return { done: true, value: undefined }
+                },
+                async return() {
+                  returnCount += 1
+                  return { done: true, value: undefined }
+                },
+              }
+            },
+          }
+        }
+        return (async function* () {})()
+      },
+    },
+  })
+
+  const srv = http.createServer((req, res) => {
+    req.headers['x-zen-remote-secret'] = secret
+    req.headers['x-zen-remote-via'] = 'gateway'
+    req.headers['x-zen-remote-role'] = 'desktop-client'
+    req.headers['x-zen-remote-device'] = 'dev-t5'
+    handler(req, res).catch(() => { try { res.destroy() } catch { /* ignore */ } })
+  })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => { srv.closeAllConnections(); srv.close(resolve) }))
+  const port = srv.address().port
+
+  const client = createRelayClient({
+    getServerUrl: () => `http://127.0.0.1:${port}`,
+    getToken: () => 'tok',
+    infoRefreshMs: 0,
+  })
+  t.after(() => client.stop())
+  await client.connect()
+
+  let releaseTwo
+  holdSecondSnapshot = { promise: new Promise((resolve) => { releaseTwo = resolve }) }
+  let abortedPrewarmCount = 0
+  const origFetchSnap = client.fetchSessionSnapshot.bind(client)
+  client.fetchSessionSnapshot = (req, signal) => {
+    signal?.addEventListener('abort', () => { abortedPrewarmCount += 1 }, { once: true })
+    return origFetchSnap(req, signal)
+  }
+
+  const pool = createFakePool([{
+    entryId: `entry-${serverId}`,
+    serverId,
+    displayName: 'SrvA',
+    client,
+  }])
+  const gateway = new FakeTypertGateway()
+  const handle = installIntercept({
+    raw: gateway,
+    pool,
+    prewarm: { proactiveListDelayMs: 20, idleDelayMs: 30 },
+  })
+  t.after(() => handle.uninstall())
+
+  const deadline = Date.now() + 2000
+  while (handle.historyCacheStats().prewarmedCount < 1) {
+    if (Date.now() > deadline) throw new Error('timed out waiting for s-prewarm')
+    await new Promise((r) => setTimeout(r, 10))
+  }
+  assert.equal(handler.viewerCount('s-pre'), 0, 'prewarm leaves viewerCount at 0')
+  assert.equal(promoteCalled, false, 'prewarm never calls second next() / promote')
+  assert.ok(returnCount >= 1)
+
+  const pageRes = await gateway.rpcBridge(
+    'session/page',
+    { args: { request: { address: { kind: 'session', sessionId: toVirtual(serverId, 's-pre') } } } },
+    undefined,
+    gateway.operatorPeer(),
+  )
+  assert.equal(pageRes.ok, true)
+  assert.equal(abortedPrewarmCount >= 1, true, 'foreground RPC aborted in-flight prewarm')
+
+  releaseTwo()
+  const deadline2 = Date.now() + 2000
+  while (handle.historyCacheStats().prewarmedCount < 2) {
+    if (Date.now() > deadline2) throw new Error('timed out waiting for s-two prewarm after idle')
+    await new Promise((r) => setTimeout(r, 10))
+  }
+
+  const ac = new AbortController()
+  const iter = (await gateway.wireTap(
+    'session/follow',
+    { args: { request: { address: { kind: 'session', sessionId: toVirtual(serverId, 's-pre') }, assistantStream: true } } },
+    undefined,
+    gateway.operatorPeer(),
+    ac.signal,
+    { signal: ac.signal },
+  ))[Symbol.asyncIterator]()
+  const opened = await iter.next()
+  assert.equal(opened.value.type, 'snapshot')
+  assert.equal(opened.value.cursor, 2)
+  assert.equal(handle.historyCacheStats().visitedCount, 1)
+  ac.abort()
+  await iter.return?.()
 })

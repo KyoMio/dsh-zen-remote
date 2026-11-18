@@ -238,6 +238,39 @@ export declare function loadServerId(home: string): string;
  * report `'unknown'`). Never throws.
  */
 export declare function resolveDshVersion(): string;
+/** Whether the client opted into negotiated `x-zr-content-encoding: gzip`. */
+export declare function acceptsZrGzip(req: IncomingMessage): boolean;
+/**
+ * Send JSON, gzipping (level 1) on 200 responses >= 1024 B when the client
+ * negotiated `x-zr-accept-encoding: gzip` and the compressed bytes are strictly
+ * smaller; otherwise delegates to plain {@link responseJsonBytes}.
+ */
+export declare function responseCompressedJson(req: IncomingMessage, res: ServerResponse, status: number, payload: unknown): Promise<void>;
+export type KnownCursorEvalResult = {
+    mode: 'full';
+    snapshot: Record<string, unknown>;
+} | {
+    mode: 'unchanged';
+    cursor: number;
+    header?: unknown;
+    hasMore: boolean;
+    projections?: unknown;
+    assistantStream?: unknown;
+} | {
+    mode: 'delta';
+    baseCursor: number;
+    cursor: number;
+    header?: unknown;
+    records: unknown[];
+    hasMore: boolean;
+    projections?: unknown;
+    assistantStream?: unknown;
+};
+/**
+ * Shared pure evaluator for `knownCursor` incremental snapshot negotiation
+ * across `/v1/session-snapshot` and `/v1/stream` (`session/follow`).
+ */
+export declare function evaluateKnownCursor(frame: unknown, knownCursor: unknown): KnownCursorEvalResult;
 /**
  * Build the relay route handler mounted under {@link RELAY_PREFIX}. Exported
  * as a factory so the route tests can drive it against a plain node:http

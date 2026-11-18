@@ -82,6 +82,8 @@ import type { RelayClient, RelayClock } from './relay-client.js';
 import type { RelayPool } from './relay-pool.js';
 import type { GatewayShapeCheck } from './intercept-shape.js';
 import { type ResultAttachment } from './invoke-binary.js';
+import { type SessionHistoryCache, type SessionHistoryCacheOptions, type SessionHistoryCacheStats } from './session-history-cache.js';
+import { type SessionPrewarmOptions } from './session-prewarm.js';
 import { virtualizeProjectionValues } from './merge-streams.js';
 export { virtualizeProjectionValues };
 import type { MergerLang } from './merge-streams.js';
@@ -386,6 +388,11 @@ export interface InstallInterceptOptions {
     /** Language for error messages and sidebar group suffixes (`'zh'` default,
      * `'en'` English). Accepts a getter for live resolution. */
     lang?: InterceptLang | (() => InterceptLang) | undefined;
+    /** T4: optional in-memory session history cache (instance, options, or `false`
+     * to disable). Defaults to a `64 MiB` cache using the install clock. */
+    historyCache?: SessionHistoryCache | SessionHistoryCacheOptions | false;
+    /** T5: optional cold-safe automatic session prewarm options, or `false` to disable. */
+    prewarm?: SessionPrewarmOptions | false;
 }
 export interface InterceptHandle {
     /** Remove both own properties, restoring exactly what was installed over
@@ -433,6 +440,8 @@ export interface InterceptHandle {
         serverId: string;
         sessionId: string;
     } | undefined;
+    /** T4: read-only snapshot of the in-memory session history cache stats. */
+    historyCacheStats?(): SessionHistoryCacheStats;
 }
 /**
  * Execute `fn` while bypassing {@link installIntercept} on this process's

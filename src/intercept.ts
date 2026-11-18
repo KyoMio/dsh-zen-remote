@@ -88,6 +88,19 @@ import type { GatewayShapeCheck } from './intercept-shape.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
 import { INVOKE_BINARY_RESULT_METHODS, extractResultAttachments, restoreInvokeBinary, type ResultAttachment } from './invoke-binary.js'
 import {
+  createSessionHistoryCache,
+  normalizeSessionAddress,
+  type SessionAddressInput,
+  type SessionHistoryCache,
+  type SessionHistoryCacheOptions,
+  type SessionHistoryCacheStats,
+} from './session-history-cache.js'
+import {
+  createSessionPrewarmScheduler,
+  type SessionPrewarmOptions,
+  type SessionPrewarmScheduler,
+} from './session-prewarm.js'
+import {
   composeMergedWorkspaceFrames,
   createControlMerger,
   createForgeStatesMerger,
@@ -847,6 +860,11 @@ export interface InstallInterceptOptions {
   /** Language for error messages and sidebar group suffixes (`'zh'` default,
    * `'en'` English). Accepts a getter for live resolution. */
   lang?: InterceptLang | (() => InterceptLang) | undefined
+  /** T4: optional in-memory session history cache (instance, options, or `false`
+   * to disable). Defaults to a `64 MiB` cache using the install clock. */
+  historyCache?: SessionHistoryCache | SessionHistoryCacheOptions | false
+  /** T5: optional cold-safe automatic session prewarm options, or `false` to disable. */
+  prewarm?: SessionPrewarmOptions | false
 }
 
 export interface InterceptHandle {
@@ -889,6 +907,8 @@ export interface InterceptHandle {
    * a Markdown image of a remote session's reply loads from the server's
    * disk instead of 404ing on the sub-client's own. */
   resolveRemoteFileScope(path: string): { serverId: string; sessionId: string } | undefined
+  /** T4: read-only snapshot of the in-memory session history cache stats. */
+  historyCacheStats?(): SessionHistoryCacheStats
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -1358,6 +1378,77 @@ function restoreSessionReferences(
   return { args: mapped, ok }
 }
 
+/** Cycle- and depth-safe structural equality for snapshot projection objects. */
+function deepEqualJson(a: unknown, b: unknown, depth = 0): boolean {
+  if (Object.is(a, b)) return true
+  if (depth > 32 || a === null || b === null || typeof a !== 'object' || typeof b !== 'object') return false
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false
+    for (let i = 0; i < a.length; i += 1) {
+      if (!deepEqualJson(a[i], b[i], depth + 1)) return false
+    }
+    return true
+  }
+  const recA = a as Record<string, unknown>
+  const recB = b as Record<string, unknown>
+  const keysA = Object.keys(recA).filter((k) => recA[k] !== undefined)
+  const keysB = Object.keys(recB).filter((k) => recB[k] !== undefined)
+  if (keysA.length !== keysB.length) return false
+  for (const key of keysA) {
+    if (!Object.prototype.hasOwnProperty.call(recB, key)) return false
+    if (!deepEqualJson(recA[key], recB[key], depth + 1)) return false
+  }
+  return true
+}
+
+function unwrapFollowSeq(record: unknown): number | undefined {
+  if (!isPlainObject(record)) return undefined
+  const ev = record.type === 'event' && isPlainObject(record.event) ? record.event : record
+  return typeof ev.seq === 'number' && Number.isSafeInteger(ev.seq) ? ev.seq : undefined
+}
+
+function extractContiguousDelta(records: unknown[], fromCursor: number, toCursor: number): unknown[] | undefined {
+  if (toCursor <= fromCursor) return undefined
+  let expected = fromCursor + 1
+  const out: unknown[] = []
+  for (const rec of records) {
+    const seq = unwrapFollowSeq(rec)
+    if (seq === undefined) return undefined
+    if (seq <= fromCursor) continue
+    if (seq === expected && seq <= toCursor) {
+      out.push(isPlainObject(rec) && rec.type === 'event' ? rec : { type: 'event', event: rec })
+      expected += 1
+    } else {
+      return undefined
+    }
+  }
+  return expected === toCursor + 1 ? out : undefined
+}
+
+function adjustAssistantRevision(frame: unknown, revOffset: number): unknown {
+  if (revOffset === 0 || !isPlainObject(frame) || frame.type !== 'assistant-stream') return frame
+  if (isPlainObject(frame.frame) && typeof frame.frame.revision === 'number') {
+    return { ...frame, frame: { ...frame.frame, revision: frame.frame.revision + revOffset } }
+  }
+  if (typeof frame.revision === 'number') {
+    return { ...frame, revision: frame.revision + revOffset }
+  }
+  return frame
+}
+
+function prepareSnapshotForYield(
+  snap: Record<string, unknown>,
+  wantsAssistantStream: boolean,
+  preserveLiveAssistant = false,
+): Record<string, unknown> {
+  const hasAsst = 'assistantStream' in snap && snap.assistantStream !== undefined
+  if (hasAsst) {
+    return preserveLiveAssistant ? snap : { ...snap, assistantStream: { revision: 0 } }
+  }
+  if (!wantsAssistantStream) return snap
+  return { ...snap, assistantStream: { revision: 0 } }
+}
+
 /** Rewrite one stream frame's session ids to virtual form. */
 export function rewriteFrame(endpoint: string, frame: unknown, serverId: string, remoteDefault?: unknown): unknown {
   const virtualize = (id: string): string => toVirtual(serverId, id)
@@ -1709,6 +1800,7 @@ interface MergedGlobalStreamDeps {
    * {@link SessionInventorySlot}). One slot per merged stream, disposed with
    * it; absent when the wiring passed no factory. */
   createSessionInventorySlot?: () => SessionInventorySlot
+  onRemoteFrame?: (serverId: string, endpoint: 'workspace/follow' | 'session/control', frame: unknown) => void
   lang?: InterceptLang | (() => InterceptLang) | undefined
 }
 
@@ -2066,6 +2158,7 @@ async function* mergedGlobalStream(deps: MergedGlobalStreamDeps): AsyncGenerator
             // stale one (see informCurrentSession above) — the close of the
             // session the user JUST opened must keep its tombstone.
             informCurrentSession()
+            deps.onRemoteFrame?.(identity.serverId, endpoint, frame)
             const out = merger.onRemote(frame)
             for (const outFrame of out) channel.push(outFrame)
             noteForwardedSessions(out)
@@ -2219,6 +2312,7 @@ interface MergedEventsStreamDeps {
    * and this leg runs the fetch-and-announce (see runSummarySync below). */
   summarySync: SessionSummarySync
   getRemoteDefault: (serverId: string) => unknown
+  onSessionStatus?: (serverId: string, sessionId: string, running: boolean) => void
 }
 
 /**
@@ -2746,7 +2840,11 @@ async function* mergedEventsStream(deps: MergedEventsStreamDeps): AsyncGenerator
             // untouched.
             if (isPlainObject(frame) && frame.type === 'emit' && frame.event === 'api-session/status') {
               const rowId = Array.isArray(frame.args) ? frame.args[0] : undefined
-              if (typeof rowId === 'string' && rowId !== '') liveStatusSeq.set(rowId, ++statusSeq)
+              const rawRunning = Array.isArray(frame.args) ? frame.args[1] : undefined
+              if (typeof rowId === 'string' && rowId !== '') {
+                liveStatusSeq.set(rowId, ++statusSeq)
+                if (typeof rawRunning === 'boolean') deps.onSessionStatus?.(identity.serverId, rowId, rawRunning)
+              }
               // PB-26a: the rewritten frame is the proved shape (`args` =
               // [virtualId, running]). Remember the live flag under the
               // VIRTUAL id, and — when this stream has not announced the row
@@ -2894,6 +2992,7 @@ interface MergedGlobalStreamMultiDeps {
    * Every broadcast re-scans the slot set. */
   watchPool(fn: () => void): () => void
   workspaceEpochs?: Map<string, number>
+  onRemoteFrame?: (serverId: string, endpoint: 'workspace/follow' | 'session/control', frame: unknown) => void
   lang?: InterceptLang | (() => InterceptLang) | undefined
 }
 
@@ -3101,6 +3200,7 @@ async function* mergedGlobalStreamMulti(deps: MergedGlobalStreamMultiDeps): Asyn
               slot.reopenDelayMs = REMOTE_REOPEN_FIRST_MS
             }
             informCurrentSession()
+            deps.onRemoteFrame?.(slot.serverId, endpoint, frame)
             const out = slot.merger.onRemote(frame)
             if (out.length > 0) {
               if (isWorkspace) {
@@ -3644,6 +3744,7 @@ interface MergedEventsStreamMultiDeps {
   watchPool(fn: () => void): () => void
   onServerSessionsRemoved?: (fn: (serverId: string, virtualIds: readonly string[]) => void) => () => void
   rememberSession?: (virtualId: string) => void
+  onSessionStatus?: (serverId: string, sessionId: string, running: boolean) => void
 }
 
 /**
@@ -3928,7 +4029,11 @@ async function* mergedEventsStreamMulti(deps: MergedEventsStreamMultiDeps): Asyn
             // globally unique (virtual or original-then-virtualized).
             if (isPlainObject(frame) && frame.type === 'emit' && frame.event === 'api-session/status') {
               const rowId = Array.isArray(frame.args) ? frame.args[0] : undefined
-              if (typeof rowId === 'string' && rowId !== '') liveStatusSeq.set(rowId, ++statusSeq)
+              const rawRunning = Array.isArray(frame.args) ? frame.args[1] : undefined
+              if (typeof rowId === 'string' && rowId !== '') {
+                liveStatusSeq.set(rowId, ++statusSeq)
+                if (typeof rawRunning === 'boolean') deps.onSessionStatus?.(slot.serverId, rowId, rawRunning)
+              }
               const args = isPlainObject(rewritten) && Array.isArray(rewritten.args) ? rewritten.args : undefined
               const virtualId = args?.[0]
               const running = args?.[1]
@@ -4237,6 +4342,40 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   // outlives individual stream generations so a nudge from a workspace leg
   // reaches whichever $events generation is open.
   const summarySync = createSessionSummarySync()
+  // T4: pure in-memory session history cache (64 MiB default, injectable for tests).
+  const historyCache: SessionHistoryCache | undefined =
+    options.historyCache === false
+      ? undefined
+      : options.historyCache !== undefined &&
+          'putSnapshot' in options.historyCache &&
+          typeof options.historyCache.putSnapshot === 'function'
+        ? options.historyCache
+        : createSessionHistoryCache({
+            clock,
+            ...(options.historyCache ?? {}),
+          })
+  // Foreground busy tracking per serverId (consumed by T5 auto-prewarm scheduler).
+  const foregroundActiveByServer = new Map<string, number>()
+  const foregroundBusyListeners = new Set<(serverId: string, busy: boolean) => void>()
+  const enterForeground = (serverId: string): (() => void) => {
+    const prev = foregroundActiveByServer.get(serverId) ?? 0
+    foregroundActiveByServer.set(serverId, prev + 1)
+    if (prev === 0) {
+      for (const listener of [...foregroundBusyListeners]) listener(serverId, true)
+    }
+    let left = false
+    return () => {
+      if (left) return
+      left = true
+      const next = (foregroundActiveByServer.get(serverId) ?? 1) - 1
+      if (next <= 0) {
+        foregroundActiveByServer.delete(serverId)
+        for (const listener of [...foregroundBusyListeners]) listener(serverId, false)
+      } else {
+        foregroundActiveByServer.set(serverId, next)
+      }
+    }
+  }
   // PB-25b: the inventory slot factory (the wiring's union feed) — passed
   // down to every merged stream, which owns one slot for its lifetime.
   const createSessionInventorySlot = options.createSessionInventorySlot
@@ -4494,6 +4633,48 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
   // generation's caches on every later state change.
   const catalogWatched = new Map<string, () => void>()
   const entryServerIds = new Map<string, string>()
+  const prewarmScheduler: SessionPrewarmScheduler | undefined =
+    historyCache !== undefined && options.prewarm !== false
+      ? createSessionPrewarmScheduler({
+          cache: historyCache,
+          getOnlineTargets: () => {
+            try {
+              if (pool !== undefined) {
+                return pool
+                  .entries()
+                  .filter(
+                    (e): e is typeof e & { serverId: string } =>
+                      typeof (e.client as { fetchSessionSnapshot?: unknown }).fetchSessionSnapshot === 'function' &&
+                      e.serverId !== undefined &&
+                      e.client.state === 'online',
+                  )
+                  .map((e) => ({ serverId: e.serverId, client: e.client }))
+              }
+              if (
+                typeof (singleRelay as { fetchSessionSnapshot?: unknown }).fetchSessionSnapshot !== 'function' ||
+                singleRelay.state !== 'online'
+              ) {
+                return []
+              }
+              const identity = relayIdentityOf(singleRelay)
+              return identity !== undefined ? [{ serverId: identity.serverId, client: singleRelay }] : []
+            } catch {
+              return []
+            }
+          },
+          isForegroundBusy: (sid) => (foregroundActiveByServer.get(sid) ?? 0) > 0,
+          isSessionActivelyFollowed: (sid, sessId) => {
+            for (const rec of activeRemoteFollows.values()) {
+              if (rec.serverId === sid && rec.sessionId === sessId) return true
+            }
+            return false
+          },
+          ...(options.prewarm ?? {}),
+        })
+      : undefined
+  if (prewarmScheduler !== undefined) {
+    foregroundBusyListeners.add((sid, busy) => prewarmScheduler.notifyForegroundBusy(sid, busy))
+  }
   const purgeRemovedServer = (oldServerId: string): void => {
     const drained = new Set<string>()
     const known = knownVirtualSessionsByServer.get(oldServerId)
@@ -4529,17 +4710,42 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     }
     catalogGenerations.set(oldServerId, (catalogGenerations.get(oldServerId) ?? 0) + 1)
     serverCatalogCaches.delete(oldServerId)
+    historyCache?.deleteServer(oldServerId)
+    prewarmScheduler?.onServerRemoved(oldServerId)
     for (const sink of [...eventRemovalSinks]) sink(oldServerId, [...drained])
   }
   if (pool === undefined) {
+    let lastSingleServerId = singleGetServerId()
     try {
       offCatalogWatch = singleRelay.subscribe((state) => {
+        const sid = singleRelay.handshakeInfo?.serverId ?? singleGetServerId() ?? lastSingleServerId
         if (state === 'unpaired' || state === 'revoked') {
           catalogGeneration += 1
           serverCatalogCache = undefined
+          if (sid !== undefined) {
+            historyCache?.deleteServer(sid)
+            prewarmScheduler?.onServerRemoved(sid)
+          }
+          if (lastSingleServerId !== undefined && lastSingleServerId !== sid) {
+            historyCache?.deleteServer(lastSingleServerId)
+            prewarmScheduler?.onServerRemoved(lastSingleServerId)
+          }
+          lastSingleServerId = undefined
+          return
+        }
+        if (state === 'offline') {
+          if (sid !== undefined) {
+            historyCache?.markServerOffline(sid)
+            prewarmScheduler?.onServerOffline(sid)
+          }
           return
         }
         if (state !== 'online') return
+        if (sid !== undefined) {
+          lastSingleServerId = sid
+          historyCache?.markServerOnline(sid)
+          prewarmScheduler?.onServerOnline(sid)
+        }
         const identity = relayIdentityOf(singleRelay)
         if (identity !== undefined) fetchServerCatalog(identity)
       })
@@ -4548,7 +4754,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       // cache now instead (T52-fix3).
       if (singleRelay.state === 'online') {
         const identity = relayIdentityOf(singleRelay)
-        if (identity !== undefined) fetchServerCatalog(identity)
+        if (identity !== undefined) {
+          lastSingleServerId = identity.serverId
+          fetchServerCatalog(identity)
+        }
       }
     } catch (error) {
       // Subscription failed: the cache still fills whenever the UI opens a
@@ -4597,9 +4806,18 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           if (state === 'unpaired' || state === 'revoked') {
             catalogGenerations.set(serverId, (catalogGenerations.get(serverId) ?? 0) + 1)
             serverCatalogCaches.delete(serverId)
+            historyCache?.deleteServer(serverId)
+            prewarmScheduler?.onServerRemoved(serverId)
+            return
+          }
+          if (state === 'offline') {
+            historyCache?.markServerOffline(serverId)
+            prewarmScheduler?.onServerOffline(serverId)
             return
           }
           if (state !== 'online') return
+          historyCache?.markServerOnline(serverId)
+          prewarmScheduler?.onServerOnline(serverId)
           const current = live ?? entry
           if (current.serverId !== undefined) {
             fetchServerCatalogFor({ serverId: current.serverId, displayName: current.displayName, client: current.client })
@@ -4625,6 +4843,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // Run the initial scan through the hub so the same rescan logic runs.
     for (const listener of [...poolListeners]) listener()
   }
+  prewarmScheduler?.syncTargets()
   const registerClosed = (sessionId: string, reason: ClosedSessionRecord['reason']): void => {
     closedSessions.delete(sessionId)
     if (closedSessions.size >= MAX_CLOSED_SESSIONS) {
@@ -4879,7 +5098,53 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       if (!references.ok) {
         return failEnvelope(endpoint, 'remote-unsupported', copy().referenceNotOnServer)
       }
-      const value = await client.invoke(namespace, method, clone, signal)
+      const pageRequest = endpoint === 'session/page' && isPlainObject(clone) && isPlainObject(clone.request) ? clone.request : undefined
+      const pageBeforeSeq = pageRequest?.beforeSeq
+      const pageThroughSeq = pageRequest?.throughSeq
+      const pageTurnWindow = isPlainObject(pageRequest?.turnWindow) ? pageRequest.turnWindow : undefined
+      const pageAddress = pageRequest?.address
+      const pageCacheable =
+        historyCache !== undefined &&
+        pageRequest !== undefined &&
+        pageAddress !== undefined &&
+        typeof pageBeforeSeq === 'number' &&
+        Number.isSafeInteger(pageBeforeSeq) &&
+        pageBeforeSeq >= 0 &&
+        typeof pageThroughSeq === 'number' &&
+        Number.isSafeInteger(pageThroughSeq) &&
+        pageBeforeSeq <= pageThroughSeq + 1
+      const pageParams = pageCacheable
+        ? {
+            beforeSeq: pageBeforeSeq,
+            ...(typeof pageRequest.maxMessages === 'number' && Number.isSafeInteger(pageRequest.maxMessages)
+              ? { maxMessages: pageRequest.maxMessages }
+              : {}),
+            ...(pageTurnWindow !== undefined &&
+            typeof pageTurnWindow.minMessages === 'number' &&
+            Number.isSafeInteger(pageTurnWindow.minMessages)
+              ? { minMessages: pageTurnWindow.minMessages }
+              : {}),
+            ...(pageTurnWindow !== undefined &&
+            typeof pageTurnWindow.minTurns === 'number' &&
+            Number.isSafeInteger(pageTurnWindow.minTurns)
+              ? { minTurns: pageTurnWindow.minTurns }
+              : {}),
+          }
+        : undefined
+      if (pageCacheable && pageParams !== undefined) {
+        const cachedPage = historyCache.getPage(serverId, pageAddress as SessionAddressInput, pageParams)
+        if (cachedPage !== undefined) {
+          clearClosed(virtuals)
+          return { ok: true, value: structuredClone(cachedPage) }
+        }
+      }
+      const leaveFg = enterForeground(serverId)
+      let value: unknown
+      try {
+        value = await client.invoke(namespace, method, clone, signal)
+      } finally {
+        leaveFg()
+      }
       // The session answered: any closed-session entry for it is stale
       // (re-shared and served again) — the banner may go.
       clearClosed(virtuals)
@@ -4913,12 +5178,18 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         return { ok: true, value: { ...restored, workspace: ws } }
       }
       const rewrittenValue = rewriteResult(endpoint, restored, serverId, remoteDefaultOf(serverId))
+      if (pageCacheable && pageParams !== undefined) {
+        historyCache?.putPage(serverId, pageAddress as SessionAddressInput, pageParams, structuredClone(rewrittenValue))
+      }
       if ((endpoint === 'session/create' || endpoint === 'session/fork') && isPlainObject(rewrittenValue)) {
         rememberVirtualSessionId(rewrittenValue.sessionId)
       }
       return { ok: true, value: rewrittenValue }
     } catch (error) {
       const code = error instanceof RelayError ? error.code : 'internal'
+      if (error instanceof RelayError && (code === 'unshared' || code === 'not-shared')) {
+        for (const parts of virtuals) historyCache?.deleteSessionFamily(parts.serverId, parts.id)
+      }
       recordFailure(endpoint, code)
       // A call on a closed session reads like the banner, not like the
       // relay's bare code (T73).
@@ -5140,6 +5411,69 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
    * history stream after its first frame it ends nothing at all — the
    * stream goes silent until the page closes it (T73, at the catch below).
    */
+  async function handleStreamError(
+    endpoint: string,
+    error: unknown,
+    client: RelayClient,
+    serverId: string,
+    claimed: VirtualParts[],
+    signal: AbortSignal | undefined,
+    first: boolean,
+    reopenDelayMs: number,
+  ): Promise<{ action: 'hold-return' } | { action: 'reopen'; client: RelayClient; nextDelayMs: number }> {
+    const code = error instanceof RelayError ? error.code : 'internal'
+    if (error instanceof RelayError && (code === 'unshared' || code === 'not-shared')) {
+      for (const parts of claimed) {
+        registerClosed(toVirtual(parts.serverId, parts.id), closedReasonOf(error))
+        historyCache?.deleteSessionFamily(parts.serverId, parts.id)
+      }
+      recordFailure(endpoint, code)
+      if (endpoint === 'session/follow' && !first && signal !== undefined) {
+        let onCleared: (() => void) | undefined
+        await Promise.race([
+          untilAborted(signal),
+          new Promise<void>((resolve) => {
+            const waiter = (): void => {
+              closedClearWaiters.delete(waiter)
+              onCleared = undefined
+              resolve()
+            }
+            onCleared = waiter
+            closedClearWaiters.add(waiter)
+          }),
+        ])
+        if (onCleared !== undefined) closedClearWaiters.delete(onCleared)
+        return { action: 'hold-return' }
+      }
+      throw new CodedStreamError(code, copy().closed)
+    }
+    recordFailure(endpoint, code)
+    if (!(error instanceof RelayError) || !LINK_DOWN_CODES.has(code)) {
+      throw new CodedStreamError(code, messageOf(error))
+    }
+    if (!SESSION_STREAM_HOLD_ENDPOINTS.has(endpoint)) {
+      throw new CodedStreamError(code, messageOf(error))
+    }
+    let currentClient = client
+    let serve = await waitServeAgain(currentClient, signal, reopenDelayMs, serverId)
+    while (serve === 'swapped') {
+      const next = pool?.getByServerId(serverId)?.client ?? currentClient
+      currentClient = next
+      serve = await waitServeAgain(currentClient, signal, reopenDelayMs, serverId)
+    }
+    if (serve === 'aborted') return { action: 'hold-return' }
+    if (serve !== 'online') {
+      recordFailure(endpoint, serve)
+      const c = copy()
+      throw new CodedStreamError(serve, serve === 'revoked' ? c.revoked : c.unpaired)
+    }
+    return {
+      action: 'reopen',
+      client: currentClient,
+      nextDelayMs: Math.min(reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS),
+    }
+  }
+
   async function* rewriteUpstream(
     endpoint: string,
     initialClient: RelayClient,
@@ -5148,137 +5482,330 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     claimed: VirtualParts[],
     signal: AbortSignal | undefined,
     reopen: (client: RelayClient) => AsyncIterable<unknown>,
+    rawAddress?: SessionAddressInput,
   ): AsyncGenerator<unknown> {
-    // Pool mode (peer-resilience T1): the serving client is re-resolved from
-    // the pool by serverId after every wait — a peer-left/peer-joined swap
-    // installs a NEW RelayClient under the same serverId while the old one
-    // is stopped forever. `client` below always names the current leg; the
-    // single-server path never moves off the initial one.
     let client = initialClient
     let first = true
     let current = upstream
-    // The in-place reopen backoff (CP4, the merged pumps' discipline): starts
-    // at 1s, doubles per consecutive empty retry (cap 30s), resets the moment
-    // a frame is delivered.
+    let leaveFg: (() => void) | undefined = enterForeground(serverId)
     let reopenDelayMs = REMOTE_REOPEN_FIRST_MS
-    // Read through a function on purpose: the caller's signal MUTATES, and a
-    // direct `signal?.aborted === true` check after the entry check would be
-    // a type error (TS keeps the negative narrowing across the awaits below).
     const callerAborted = (): boolean => signal?.aborted === true
-    while (true) {
-      try {
-        for await (const frame of current) {
-          if (first) {
-            first = false
-            reopenDelayMs = REMOTE_REOPEN_FIRST_MS
-            // Frames are flowing: the session is being served again — a
-            // closed-session entry for it is stale (T34).
-            clearClosed(claimed)
+    try {
+      while (true) {
+        try {
+          for await (const frame of current) {
+            if (first) {
+              first = false
+              reopenDelayMs = REMOTE_REOPEN_FIRST_MS
+              leaveFg?.()
+              leaveFg = undefined
+              clearClosed(claimed)
+              if (endpoint === 'session/follow' && historyCache !== undefined && rawAddress !== undefined && isPlainObject(frame) && frame.type === 'snapshot') {
+                historyCache.putSnapshot(serverId, rawAddress, frame, 'visited')
+              }
+            } else if (endpoint === 'session/follow' && historyCache !== undefined && rawAddress !== undefined && isPlainObject(frame) && frame.type === 'event') {
+              historyCache.appendRecord(serverId, rawAddress, frame)
+            }
+            if (endpoint === 'session/follow' && isPlainObject(frame) && frame.type === 'snapshot' && isPlainObject(frame.header)) {
+              recordRemoteSessionCwd(serverId, frame.header.id, frame.header.cwd)
+            }
+            yield rewriteFrame(endpoint, frame, serverId, remoteDefaultOf(serverId))
           }
-          // P55-2: the snapshot's header carries the session identity and its
-          // cwd in ORIGINAL ids — record before the rewrite below virtualizes
-          // them, so /api/file can attribute the session's own image paths.
-          if (endpoint === 'session/follow' && isPlainObject(frame) && frame.type === 'snapshot' && isPlainObject(frame.header)) {
-            recordRemoteSessionCwd(serverId, frame.header.id, frame.header.cwd)
-          }
-          yield rewriteFrame(endpoint, frame, serverId, remoteDefaultOf(serverId))
+          return
+        } catch (error) {
+          leaveFg?.()
+          leaveFg = undefined
+          if (callerAborted()) return
+          const decision = await handleStreamError(endpoint, error, client, serverId, claimed, signal, first, reopenDelayMs)
+          if (decision.action === 'hold-return') return
+          if (callerAborted()) return
+          if (!first) return
+          client = decision.client
+          reopenDelayMs = decision.nextDelayMs
+          leaveFg = enterForeground(serverId)
+          current = reopen(client)
         }
-        return
+      }
+    } finally {
+      leaveFg?.()
+    }
+  }
+
+  async function* followSessionSwr(
+    initialClient: RelayClient,
+    serverId: string,
+    claimed: VirtualParts[],
+    signal: AbortSignal | undefined,
+    clone: unknown,
+    rawAddress: SessionAddressInput,
+    handoffInitial: ReturnType<SessionHistoryCache['takeHandoff']>,
+    cachedInitial: ReturnType<SessionHistoryCache['getSnapshot']>,
+  ): AsyncGenerator<unknown> {
+    if (historyCache === undefined) return
+    const wantsAssistantStream = isPlainObject(clone) && isPlainObject(clone.request) && clone.request.assistantStream === true
+    const callerAborted = (): boolean => signal?.aborted === true
+
+    const consumeTail = async function* (
+      iter: AsyncIterator<unknown>,
+      revOffset: number,
+      activeClient: RelayClient,
+      onAbortCleanup: () => void,
+    ): AsyncGenerator<unknown> {
+      try {
+        while (true) {
+          const step = await iter.next()
+          if (step.done) return
+          const frame = step.value
+          if (isPlainObject(frame) && frame.type === 'event') {
+            historyCache.appendRecord(serverId, rawAddress, frame)
+          }
+          yield rewriteFrame('session/follow', adjustAssistantRevision(frame, revOffset), serverId, remoteDefaultOf(serverId))
+        }
       } catch (error) {
+        onAbortCleanup()
         if (callerAborted()) return
-        // Same marker discipline as the refusals: a RelayError rising out of
-        // the relay's pump (unshared, offline, …) keeps its code; anything
-        // else travels as `internal`. Both are remote-call failures and land
-        // in the diagnostics ring.
-        const code = error instanceof RelayError ? error.code : 'internal'
-        // The server is no longer serving this session (T34): an `unshared`
-        // frame is the mid-stream closure with its structured reason; a
-        // `not-shared` refusal is the closure that happened before this page
-        // even opened — no event was observed, so the reason degrades to
-        // manual (T34-fix).
-        if (error instanceof RelayError && (code === 'unshared' || code === 'not-shared')) {
-          for (const parts of claimed) registerClosed(toVirtual(parts.serverId, parts.id), closedReasonOf(error))
-          recordFailure(endpoint, code)
-          // 远程已关闭 is the banner's verdict, not a page error (SPEC story
-          // 53, T73): the host renders ANY terminal error of the history
-          // stream as a line over the conversation — 「历史加载失败：
-          // {message}（{code}）」 (dsh-api-session-controller
-          // failEventStream). So a history stream that already delivered
-          // goes silent: the page keeps what it shows, and the page's own
-          // abort (navigating away disposes the session) ends the stream.
-          // Everything else still ends, with the banner's word instead of
-          // the server's internal message: a zero-frame stream is what the
-          // host's first open awaits (sessions.using waits on it — a hold
-          // would hang it), a panel stream would freeze silently, and
-          // without a signal nothing could ever release a hold.
-          if (endpoint === 'session/follow' && !first && signal !== undefined) {
-            // T73-fix: the quiet hold ends on TWO signals. The page's abort
-            // still ends it (below) — and so does this session's closed
-            // record being CLEARED: a successful call on the session (the
-            // user kept working through the still-enabled composer) or
-            // frames flowing for it again both mean the remote is being
-            // served once more. Ending the stream normally here is exactly
-            // the accepted-generation clean end the host answers by
-            // reopening with a fresh history snapshot, so a re-enabled
-            // remote comes back instead of staying blind under its banner.
-            // The race loser is cleaned up — no waiter leaks.
-            let onCleared: (() => void) | undefined
-            await Promise.race([
-              untilAborted(signal),
-              new Promise<void>((resolve) => {
-                const waiter = (): void => {
-                  closedClearWaiters.delete(waiter)
-                  onCleared = undefined
-                  resolve()
-                }
-                onCleared = waiter
-                closedClearWaiters.add(waiter)
-              }),
-            ])
-            if (onCleared !== undefined) closedClearWaiters.delete(onCleared)
+        const decision = await handleStreamError('session/follow', error, activeClient, serverId, claimed, signal, false, REMOTE_REOPEN_FIRST_MS)
+        if (decision.action === 'hold-return') return
+        return
+      }
+    }
+
+    // Step 0: Gen 2 atomic handoff pickup
+    if (handoffInitial !== undefined) {
+      const rawSnap = isPlainObject(handoffInitial.snapshot) ? handoffInitial.snapshot : { type: 'snapshot', cursor: 0, records: [] }
+      historyCache.putSnapshot(serverId, rawAddress, rawSnap, 'visited')
+      const snapToYield = prepareSnapshotForYield(rawSnap, wantsAssistantStream, true)
+      clearClosed(claimed)
+      if (isPlainObject(snapToYield.header)) {
+        recordRemoteSessionCwd(serverId, snapToYield.header.id, snapToYield.header.cwd)
+      }
+      yield rewriteFrame('session/follow', snapToYield, serverId, remoteDefaultOf(serverId))
+      const yieldedRev = isPlainObject(snapToYield.assistantStream) && typeof snapToYield.assistantStream.revision === 'number'
+        ? snapToYield.assistantStream.revision
+        : 0
+      const upstreamRev = typeof handoffInitial.upstreamRevision === 'number' ? handoffInitial.upstreamRevision : yieldedRev
+      const revOffset = yieldedRev - upstreamRev
+      const abortParked = (): void => {
+        if (typeof handoffInitial.abortUpstream === 'function') (handoffInitial.abortUpstream as () => void)()
+        else void Promise.resolve(handoffInitial.upstreamIterator?.return?.()).catch(() => {})
+      }
+      if (callerAborted()) {
+        abortParked()
+        return
+      }
+      signal?.addEventListener('abort', abortParked, { once: true })
+      try {
+        const iter = handoffInitial.upstreamIterator
+        if (iter !== undefined) {
+          yield* consumeTail(iter as AsyncIterator<unknown>, revOffset, initialClient, abortParked)
+        }
+      } finally {
+        signal?.removeEventListener('abort', abortParked)
+        abortParked()
+      }
+      return
+    }
+
+    // Step 1: 0ms SWR open from cache + background 3-way reconciliation
+    if (cachedInitial === undefined) return
+    const cachedSnapYield = prepareSnapshotForYield(cachedInitial.snapshot, wantsAssistantStream)
+    clearClosed(claimed)
+    if (isPlainObject(cachedSnapYield.header)) {
+      recordRemoteSessionCwd(serverId, cachedSnapYield.header.id, cachedSnapYield.header.cwd)
+    }
+
+    let client = initialClient
+    let reopenDelayMs = REMOTE_REOPEN_FIRST_MS
+    let upstreamAbort = new AbortController()
+    let onGen1Abort = (): void => {
+      upstreamAbort.abort()
+    }
+    signal?.addEventListener('abort', onGen1Abort, { once: true })
+    let handedOff = false
+    let iter: AsyncIterator<unknown> | undefined
+    let leaveFg: (() => void) | undefined
+
+    const kickOffBg = (): Promise<IteratorResult<unknown>> => {
+      leaveFg = enterForeground(serverId)
+      try {
+        const upstream = client.openStream(
+          'session',
+          'follow',
+          clone,
+          upstreamAbort.signal,
+          cachedInitial.stale ? undefined : { knownCursor: cachedInitial.cursor },
+        )
+        iter = upstream[Symbol.asyncIterator]()
+        return iter.next()
+      } catch (err) {
+        return Promise.reject(err)
+      }
+    }
+
+    try {
+      // Kick off background sync concurrently with the 0ms cached yield so
+      // network RTT overlaps with the caller's opening render.
+      let pendingFirstStep: Promise<IteratorResult<unknown>> | undefined = callerAborted() ? undefined : kickOffBg()
+      pendingFirstStep?.catch(() => {})
+
+      yield rewriteFrame('session/follow', cachedSnapYield, serverId, remoteDefaultOf(serverId))
+      if (callerAborted()) return
+
+      while (true) {
+        let bgFirstReceived = false
+        try {
+          const stepPromise = pendingFirstStep ?? kickOffBg()
+          pendingFirstStep = undefined
+          const firstStep = await stepPromise
+          bgFirstReceived = true
+          leaveFg?.()
+          leaveFg = undefined
+
+          if (firstStep.done || iter === undefined) return
+          const activeIter = iter
+          const firstFrame = firstStep.value
+          if (!isPlainObject(firstFrame) || (firstFrame.type !== 'snapshot' && firstFrame.type !== 'snapshot-sync')) {
+            yield rewriteFrame('session/follow', firstFrame, serverId, remoteDefaultOf(serverId))
+            yield* consumeTail(activeIter, 0, client, () => upstreamAbort.abort())
             return
           }
-          throw new CodedStreamError(code, copy().closed)
+
+          const upstreamAsstRev =
+            isPlainObject(firstFrame.assistantStream) && typeof firstFrame.assistantStream.revision === 'number'
+              ? firstFrame.assistantStream.revision
+              : 0
+          const hasActiveAttempt =
+            isPlainObject(firstFrame.assistantStream) && firstFrame.assistantStream.activeAttempt !== undefined
+          const projectionsSame = deepEqualJson(cachedInitial.snapshot.projections, firstFrame.projections)
+          const revOffset = 0 - upstreamAsstRev
+
+          // Case A: unchanged cursor, no activeAttempt, identical projections
+          const isUnchangedSync =
+            firstFrame.type === 'snapshot-sync' &&
+            firstFrame.mode === 'unchanged' &&
+            firstFrame.cursor === cachedInitial.cursor
+          const isUnchangedFull =
+            firstFrame.type === 'snapshot' &&
+            firstFrame.cursor === cachedInitial.cursor
+          if (!cachedInitial.stale && !hasActiveAttempt && projectionsSame && (isUnchangedSync || isUnchangedFull)) {
+            yield* consumeTail(activeIter, revOffset, client, () => upstreamAbort.abort())
+            return
+          }
+
+          // Case B: small contiguous delta, same projections, no activeAttempt
+          const remoteCursor = typeof firstFrame.cursor === 'number' ? firstFrame.cursor : undefined
+          if (
+            !cachedInitial.stale &&
+            !hasActiveAttempt &&
+            projectionsSame &&
+            remoteCursor !== undefined &&
+            remoteCursor > cachedInitial.cursor
+          ) {
+            let deltaRecords: unknown[] | undefined
+            if (
+              firstFrame.type === 'snapshot-sync' &&
+              firstFrame.mode === 'delta' &&
+              firstFrame.baseCursor === cachedInitial.cursor &&
+              Array.isArray(firstFrame.records)
+            ) {
+              deltaRecords = extractContiguousDelta(firstFrame.records, cachedInitial.cursor, remoteCursor)
+            } else if (firstFrame.type === 'snapshot' && Array.isArray(firstFrame.records)) {
+              deltaRecords = extractContiguousDelta(firstFrame.records, cachedInitial.cursor, remoteCursor)
+            }
+            if (deltaRecords !== undefined) {
+              const merged = historyCache.applyDelta(serverId, rawAddress, {
+                baseCursor: cachedInitial.cursor,
+                cursor: remoteCursor,
+                records: deltaRecords,
+                hasMore: Boolean(firstFrame.hasMore),
+                projections: firstFrame.projections,
+                assistantStream: firstFrame.assistantStream,
+              })
+              if (merged !== undefined) {
+                for (const ev of deltaRecords) {
+                  yield rewriteFrame('session/follow', ev, serverId, remoteDefaultOf(serverId))
+                }
+                yield* consumeTail(activeIter, revOffset, client, () => upstreamAbort.abort())
+                return
+              }
+            }
+          }
+
+          // Case C: cross-window gap, projection change, activeAttempt, stale, or rewind -> Gen 2 handoff
+          let freshSnapshot: Record<string, unknown> | undefined
+          if (firstFrame.type === 'snapshot') {
+            freshSnapshot = firstFrame
+          } else if (firstFrame.type === 'snapshot-sync' && firstFrame.mode === 'unchanged') {
+            const firstCachedSeq =
+              cachedInitial.snapshot.records.length > 0 ? unwrapFollowSeq(cachedInitial.snapshot.records[0]) : undefined
+            const hasMore = firstCachedSeq === 0 ? false : Boolean(firstFrame.hasMore || cachedInitial.snapshot.hasMore)
+            freshSnapshot = {
+              ...cachedInitial.snapshot,
+              ...(firstFrame.header !== undefined ? { header: firstFrame.header } : {}),
+              hasMore,
+              ...(firstFrame.projections !== undefined ? { projections: firstFrame.projections } : {}),
+              ...(firstFrame.assistantStream !== undefined ? { assistantStream: firstFrame.assistantStream } : {}),
+            }
+          } else if (firstFrame.type === 'snapshot-sync' && firstFrame.mode === 'delta' && Array.isArray(firstFrame.records)) {
+            const merged = historyCache.applyDelta(serverId, rawAddress, {
+              baseCursor: typeof firstFrame.baseCursor === 'number' ? firstFrame.baseCursor : cachedInitial.cursor,
+              cursor: typeof firstFrame.cursor === 'number' ? firstFrame.cursor : cachedInitial.cursor,
+              records: firstFrame.records,
+              hasMore: Boolean(firstFrame.hasMore),
+              projections: firstFrame.projections,
+              assistantStream: firstFrame.assistantStream,
+            })
+            if (merged !== undefined) {
+              freshSnapshot = {
+                ...merged,
+                ...(firstFrame.header !== undefined ? { header: firstFrame.header } : {}),
+                ...(firstFrame.assistantStream !== undefined ? { assistantStream: firstFrame.assistantStream } : {}),
+              }
+            }
+          }
+
+          if (freshSnapshot === undefined) {
+            // Cannot synthesize complete snapshot from delta when local cache is stale:
+            // exit cleanly so Gen 2 opens a full stream directly.
+            return
+          }
+
+          // Detach Gen 1 abort BEFORE returning so RemoteStream's Gen 1 cleanup
+          // does not kill the parked upstream stream before Gen 2 claims it!
+          signal?.removeEventListener('abort', onGen1Abort)
+          handedOff = true
+          const abortParked = (): void => upstreamAbort.abort()
+          historyCache.parkHandoff(serverId, rawAddress, {
+            snapshot: freshSnapshot,
+            upstreamIterator: iter,
+            upstreamRevision: upstreamAsstRev,
+            abortUpstream: abortParked,
+            cleanup: abortParked,
+          })
+          return
+        } catch (error) {
+          leaveFg?.()
+          leaveFg = undefined
+          if (callerAborted()) return
+          const decision = await handleStreamError('session/follow', error, client, serverId, claimed, signal, false, reopenDelayMs)
+          if (decision.action === 'hold-return') return
+          if (callerAborted()) return
+          if (bgFirstReceived) return
+          client = decision.client
+          reopenDelayMs = decision.nextDelayMs
+          signal?.removeEventListener('abort', onGen1Abort)
+          upstreamAbort = new AbortController()
+          onGen1Abort = (): void => upstreamAbort.abort()
+          signal?.addEventListener('abort', onGen1Abort, { once: true })
+          iter = undefined
         }
-        recordFailure(endpoint, code)
-        // A link-down fact (CP4), scoped by CP5: only the carrier-retry
-        // endpoints hold through the outage — everyone else ends with the
-        // original code right here (the pre-CP4 behavior; the RT evidence
-        // rides the list).
-        if (!(error instanceof RelayError) || !LINK_DOWN_CODES.has(code)) {
-          throw new CodedStreamError(code, messageOf(error))
-        }
-        if (!SESSION_STREAM_HOLD_ENDPOINTS.has(endpoint)) {
-          throw new CodedStreamError(code, messageOf(error))
-        }
-        let serve = await waitServeAgain(client, signal, reopenDelayMs, serverId)
-        while (serve === 'swapped') {
-          // The pool answered for this serverId with a DIFFERENT client
-          // (peer-left/peer-joined) — re-resolve and wait on the new leg.
-          // A bare absence kept waiting inside waitForOnline and only lands
-          // here once a client exists again.
-          const next = pool?.getByServerId(serverId)?.client ?? client
-          client = next
-          serve = await waitServeAgain(client, signal, reopenDelayMs, serverId)
-        }
-        if (serve === 'aborted') return
-        // The pairing wall came down while held (CP5): no ladder climbs back
-        // from `revoked`/`unpaired` — only the settings page can — so the
-        // hold ends here as a terminal error in the wall's own code, and the
-        // serve-wait's state listener is released with it. A silent hold
-        // would freeze the panel with no verdict and no wake-up.
-        if (serve !== 'online') {
-          recordFailure(endpoint, serve)
-          const c = copy()
-          throw new CodedStreamError(
-            serve,
-            serve === 'revoked' ? c.revoked : c.unpaired,
-          )
-        }
-        if (callerAborted()) return
-        if (!first) return // the accepted-generation clean end the UI retries
-        current = reopen(client)
-        reopenDelayMs = Math.min(reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS)
+      }
+    } finally {
+      leaveFg?.()
+      signal?.removeEventListener('abort', onGen1Abort)
+      if (!handedOff) {
+        upstreamAbort.abort()
+        void Promise.resolve(iter?.return?.()).catch(() => {})
       }
     }
   }
@@ -5334,6 +5861,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
         // P55-2: the RAW remote rows (original ids) feed the /api/file cwd
         // registry before the merge virtualizes them.
         noteRemoteSessionListCwds(result.value, result.serverId)
+        prewarmScheduler?.noteSessionList(result.serverId, result.value)
         value = mergeSessionList(value, result.value, result.serverId, remoteDefaultOf(result.serverId))
       }
       return { ok: true, value }
@@ -5343,6 +5871,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     try {
       const remote = await singleRelay.invoke('session', 'list', isPlainObject(args) ? args : {}, signal)
       noteRemoteSessionListCwds(remote, identity.serverId)
+      prewarmScheduler?.noteSessionList(identity.serverId, remote)
       return { ok: true, value: mergeSessionList(localEnvelope.value, remote, identity.serverId, remoteDefaultOf(identity.serverId)) }
     } catch (error) {
       recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
@@ -5866,6 +6395,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
               }
             },
             rememberSession: rememberVirtualSessionId,
+            onSessionStatus: (sid, sessId, running) => prewarmScheduler?.noteSessionStatus(sid, sessId, running),
           })
         }
         return mergedEventsStream({
@@ -5877,6 +6407,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           clock,
           summarySync,
           getRemoteDefault: remoteDefaultOf,
+          onSessionStatus: (sid, sessId, running) => prewarmScheduler?.noteSessionStatus(sid, sessId, running),
         })
       })()
     }
@@ -5975,6 +6506,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
               watchPool,
               workspaceEpochs,
               lang: options.lang,
+              onRemoteFrame: (sid, ep, frame) => {
+                if (ep === 'workspace/follow') prewarmScheduler?.noteWorkspaceFrame(sid, frame)
+                else prewarmScheduler?.noteControlFrame(sid, frame)
+              },
             })
           }
           return mergedGlobalStream({
@@ -5992,6 +6527,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             watchUninstall,
             summarySync,
             lang: options.lang,
+            onRemoteFrame: (sid, ep, frame) => {
+              if (ep === 'workspace/follow') prewarmScheduler?.noteWorkspaceFrame(sid, frame)
+              else prewarmScheduler?.noteControlFrame(sid, frame)
+            },
             ...(createSessionInventorySlot !== undefined
               ? { createSessionInventorySlot: () => createSessionInventorySlot(undefined) }
               : {}),
@@ -6048,48 +6587,65 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     const method = slash === -1 ? '' : endpoint.slice(slash + 1)
     let upstream: AsyncIterable<unknown>
     let clone: unknown
+    let held: AsyncGenerator<unknown>
     try {
       clone = structuredClone(args)
       const fields = allClientFields(endpoint)
       if (fields !== undefined) restoreRegisteredFields(fields, clone)
-      // Eager on purpose: an unpaired relay fails at CALL time, exactly like
-      // the real openWireStream fails on a bad endpoint. An OFFLINE relay
-      // does not fail here (openStream only validates credentials) — for the
-      // hold-list endpoints the rewriteUpstream pump holds the UI stream open
-      // through the outage and reopens the leg when the relay serves again
-      // (CP4); every other endpoint's first read fails out with the original
-      // code (CP5 scope, the pre-CP4 behavior).
-      upstream = forwardsUplink
-        ? client.openStream(
-            namespace,
-            method,
-            clone,
+
+      const rawFollowAddress =
+        endpoint === 'session/follow' && isPlainObject(clone) && isPlainObject(clone.request)
+          ? (clone.request.address as SessionAddressInput | undefined)
+          : undefined
+      const followAddressValid = rawFollowAddress !== undefined && normalizeSessionAddress(rawFollowAddress) !== undefined
+
+      if (endpoint === 'session/follow' && historyCache !== undefined && followAddressValid) {
+        const handoff = historyCache.takeHandoff(serverId, rawFollowAddress)
+        const cached = handoff === undefined ? historyCache.getSnapshot(serverId, rawFollowAddress, { promoteToVisited: true }) : undefined
+        if (handoff !== undefined || cached !== undefined) {
+          held = followSessionSwr(client, serverId, virtuals, signal, clone, rawFollowAddress, handoff, cached)
+        } else {
+          upstream = client.openStream(namespace, method, clone, signal)
+          held = rewriteUpstream(
+            endpoint,
+            client,
+            upstream,
+            serverId,
+            virtuals,
             signal,
-            {
-              uplink: uplink as AsyncIterable<unknown>,
-              ...(normalizedWindow !== undefined ? { uplinkWindow: normalizedWindow } : {}),
-            },
+            (serving) => serving.openStream(namespace, method, clone, signal),
+            rawFollowAddress,
           )
-        : client.openStream(namespace, method, clone, signal)
+        }
+      } else {
+        upstream = forwardsUplink
+          ? client.openStream(
+              namespace,
+              method,
+              clone,
+              signal,
+              {
+                uplink: uplink as AsyncIterable<unknown>,
+                ...(normalizedWindow !== undefined ? { uplinkWindow: normalizedWindow } : {}),
+              },
+            )
+          : client.openStream(namespace, method, clone, signal)
+        held = rewriteUpstream(
+          endpoint,
+          client,
+          upstream,
+          serverId,
+          virtuals,
+          signal,
+          (serving) => serving.openStream(namespace, method, clone, signal),
+          followAddressValid ? rawFollowAddress : undefined,
+        )
+      }
     } catch (error) {
-      // TA-2: a synchronous openStream failure (an unpaired relay) strands
-      // the forwarded inbox — the pump never started, so half-close it here.
       if (forwardsUplink) releaseUplink(uplink)
       const code = error instanceof RelayError ? error.code : 'internal'
       throwRecorded(endpoint, code, messageOf(error))
     }
-    // RelayError raised DURING iteration flows through the pump below: an
-    // `unshared` (or any non-link code) reaches the UI as a coded terminal
-    // error (a closure silences an already-delivering history stream
-    // instead, T73); a link-down fact holds the stream open and ends it
-    // cleanly once the relay serves again — the end the hold-list endpoints'
-    // UI treats as a carrier failure and immediately retries (CP4) — while
-    // the endpoints OUTSIDE the list end with the original code at once,
-    // their consumers rendering a clean end as a terminal (CP5,
-    // SESSION_STREAM_HOLD_ENDPOINTS).
-    const held = rewriteUpstream(endpoint, client, upstream, serverId, virtuals, signal, (serving) =>
-      serving.openStream(namespace, method, clone, signal),
-    )
     // P55-2: a remote session/follow is recorded the instant the wrap is
     // reached (before any frame, before any browser report) — the first
     // <img> of the page cannot race a 1s poll. The follow stays in
@@ -6134,6 +6690,10 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       entryServerIds.clear()
       activeRemoteFollows.clear()
       lastFollowedSession = undefined
+      prewarmScheduler?.dispose()
+      historyCache?.clearAll()
+      foregroundActiveByServer.clear()
+      foregroundBusyListeners.clear()
       for (const listener of [...uninstallListeners]) listener()
       // The catalog watcher dies with the wrap (T52-fix2): a late online
       // transition after this point belongs to another generation. MS-5: in
@@ -6184,6 +6744,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
       for (const listener of [...poolListeners]) listener()
     },
     resolveRemoteFileScope,
+    ...(historyCache !== undefined ? { historyCacheStats: () => historyCache.stats() } : {}),
   }
 }
 

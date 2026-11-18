@@ -15,6 +15,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const http = require('node:http')
+const zlib = require('node:zlib')
 const { startResetServer } = require('./util.cjs')
 const { createRelayClient, relayCredentialsDigest, volatileUpdateTouchesServerName, uploadBudgetMs, PEER_UPLOAD_RECOVERY_MARGIN_MS, RelayError } = require('../lib/relay-client.js')
 
@@ -2570,4 +2571,306 @@ test('networkRestored: the anti-storm gap refuses an immediate second hint', asy
     client.stop()
     await relay.stop()
   }
+})
+
+// ---- T1 (relay-line-gzip): O(N) byte line splitting & negotiated gzip ------
+
+test('T1 streamLines: O(N) byte splitting decodes >2 MiB snapshot in 1100 B chunks with cross-chunk UTF-8 and CRLF', async () => {
+  const repeated = '中文片段🔥-abcdefghijklmnopqrstuvwxyz0123456789-'
+  const bigText = repeated.repeat(Math.ceil((2.2 * 1024 * 1024) / Buffer.byteLength(repeated, 'utf8')))
+  const snapshotLine = JSON.stringify({ type: 'frame', frame: { type: 'snapshot', text: bigText } }) + '\r\n'
+  const eventLine = JSON.stringify({ type: 'frame', frame: { type: 'event', seq: 2 } }) + '\n'
+  const endLine = JSON.stringify({ type: 'end' }) + '\n'
+  const fullBytes = Buffer.from(snapshotLine + eventLine + endLine, 'utf8')
+  assert.ok(fullBytes.byteLength > 2 * 1024 * 1024)
+
+  const seenHeaders = []
+  const fetchImpl = async (url, init) => {
+    const pathname = new URL(String(url)).pathname
+    seenHeaders.push({ pathname, headers: init.headers })
+    if (pathname.endsWith('/v1/handshake')) {
+      return new Response(JSON.stringify(HANDSHAKE_OK()[1]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    const body = new ReadableStream({
+      start(controller) {
+        const CHUNK = 1100
+        for (let offset = 0; offset < fullBytes.byteLength; offset += CHUNK) {
+          controller.enqueue(fullBytes.subarray(offset, Math.min(offset + CHUNK, fullBytes.byteLength)))
+        }
+        controller.close()
+      },
+    })
+    return new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
+    })
+  }
+
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t1',
+    fetchImpl,
+  })
+  await client.connect()
+  const { frames, error } = await collect(client.openStream('session', 'follow', {}))
+  assert.equal(error, undefined)
+  assert.equal(frames.length, 2)
+  assert.equal(frames[0].type, 'snapshot')
+  assert.equal(frames[0].text, bigText)
+  assert.deepEqual(frames[1], { type: 'event', seq: 2 })
+  assert.equal(seenHeaders[0].headers['x-zr-accept-encoding'], undefined, 'handshake keeps existing headers')
+  assert.equal(seenHeaders[1].headers['x-zr-accept-encoding'], 'gzip', 'stream sends x-zr-accept-encoding: gzip')
+})
+
+test('T1 streamLines: line exceeding 64 MiB aborts stream with RelayError(line-too-large) without marking offline', async () => {
+  const MAX_LINE = 64 * 1024 * 1024
+  const oneMiB = Buffer.alloc(1024 * 1024, 0x61) // 'a', no newline
+  const fetchImpl = async (url) => {
+    const pathname = new URL(String(url)).pathname
+    if (pathname.endsWith('/v1/handshake')) {
+      return new Response(JSON.stringify(HANDSHAKE_OK()[1]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    let sent = 0
+    const body = new ReadableStream({
+      pull(controller) {
+        if (sent < MAX_LINE) {
+          controller.enqueue(oneMiB)
+          sent += oneMiB.byteLength
+        } else {
+          controller.enqueue(Buffer.from('b')) // 64 MiB + 1 byte without newline
+          controller.close()
+        }
+      },
+    })
+    return new Response(body, {
+      status: 200,
+      headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
+    })
+  }
+
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t1',
+    fetchImpl,
+  })
+  await client.connect()
+  assert.equal(client.state, 'online')
+  const { frames, error } = await collect(client.openStream('session', 'follow', {}))
+  assert.deepEqual(frames, [])
+  assert.ok(error instanceof RelayError)
+  assert.equal(error.code, 'line-too-large')
+  assert.equal(client.state, 'online', 'oversized line must not flip client offline')
+})
+
+test('T1 invoke: sends x-zr-accept-encoding: gzip, gunzips response, and rejects gzip bomb without going offline', async () => {
+  const largeValue = { items: Array.from({ length: 200 }, (_, i) => ({ id: i, text: 'payload-'.repeat(8) })) }
+  const plainJson = JSON.stringify({ ok: true, value: largeValue })
+  const gzipped = zlib.gzipSync(Buffer.from(plainJson, 'utf8'), { level: 1 })
+  // 65 MiB of zeros compresses to ~65 KiB: gzip bomb exceeding 64 MiB maxOutputLength
+  const bombGz = zlib.gzipSync(Buffer.alloc(65 * 1024 * 1024, 0x78), { level: 1 })
+
+  let mode = 'valid-gz'
+  let capturedInvokeHeaders
+  const fetchImpl = async (url, init) => {
+    const pathname = new URL(String(url)).pathname
+    if (pathname.endsWith('/v1/handshake')) {
+      return new Response(JSON.stringify(HANDSHAKE_OK()[1]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    capturedInvokeHeaders = init.headers
+    if (mode === 'valid-gz') {
+      return new Response(gzipped, {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream', 'x-zr-content-encoding': 'gzip' },
+      })
+    }
+    if (mode === 'corrupt-gz') {
+      return new Response(Buffer.from('not-a-gzip-stream'), {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream', 'x-zr-content-encoding': 'gzip' },
+      })
+    }
+    return new Response(bombGz, {
+      status: 200,
+      headers: { 'content-type': 'application/octet-stream', 'x-zr-content-encoding': 'gzip' },
+    })
+  }
+
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t1',
+    fetchImpl,
+  })
+  await client.connect()
+  const result = await client.invoke('session', 'list', {})
+  assert.deepEqual(result, largeValue)
+  assert.equal(capturedInvokeHeaders['x-zr-accept-encoding'], 'gzip')
+  assert.equal(client.state, 'online')
+
+  mode = 'corrupt-gz'
+  await assert.rejects(() => client.invoke('session', 'list', {}), (err) => err instanceof RelayError && err.code !== 'offline')
+  assert.equal(client.state, 'online', 'corrupt gzip payload must not mark client offline')
+
+  mode = 'bomb-gz'
+  await assert.rejects(() => client.invoke('session', 'list', {}), (err) => err instanceof RelayError && err.code !== 'offline')
+  assert.equal(client.state, 'online', 'gzip bomb must not mark client offline')
+})
+
+test('T1 streamLines: decodes {"type":"gz","b64":"..."} lines and rejects corrupt/bomb gz frames without going offline', async () => {
+  const bigFrame = { type: 'snapshot', text: 'hello-world-'.repeat(300) }
+  const gzB64 = zlib.gzipSync(Buffer.from(JSON.stringify({ type: 'frame', frame: bigFrame }), 'utf8'), { level: 1 }).toString('base64')
+  const tailGzB64 = zlib.gzipSync(Buffer.from(JSON.stringify({ type: 'frame', frame: { type: 'event', seq: 9 } }), 'utf8'), { level: 1 }).toString('base64')
+  const bombB64 = zlib.gzipSync(Buffer.alloc(65 * 1024 * 1024, 0x79), { level: 1 }).toString('base64')
+
+  let streamBody = ''
+  const fetchImpl = async (url) => {
+    const pathname = new URL(String(url)).pathname
+    if (pathname.endsWith('/v1/handshake')) {
+      return new Response(JSON.stringify(HANDSHAKE_OK()[1]), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    }
+    return new Response(streamBody, {
+      status: 200,
+      headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
+    })
+  }
+
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t1',
+    fetchImpl,
+  })
+  await client.connect()
+
+  // Valid gz + plain + trailing gz without newline
+  streamBody = [
+    JSON.stringify({ type: 'gz', b64: gzB64 }),
+    JSON.stringify({ type: 'frame', frame: { type: 'event', seq: 5 } }),
+    JSON.stringify({ type: 'gz', b64: tailGzB64 }),
+  ].join('\n')
+  const ok = await collect(client.openStream('session', 'follow', {}))
+  assert.equal(ok.error, undefined)
+  assert.deepEqual(ok.frames, [bigFrame, { type: 'event', seq: 5 }, { type: 'event', seq: 9 }])
+
+  // Corrupt gz frame must fail stream with RelayError, not silently skip or flip offline
+  streamBody = JSON.stringify({ type: 'gz', b64: Buffer.from('corrupt').toString('base64') }) + '\n'
+  const corrupt = await collect(client.openStream('session', 'follow', {}))
+  assert.ok(corrupt.error instanceof RelayError)
+  assert.ok(corrupt.error.code === 'bad-response' || corrupt.error.code === 'internal')
+  assert.equal(client.state, 'online')
+
+  // Gzip bomb (> 64 MiB) must fail stream with RelayError, not flip offline
+  streamBody = JSON.stringify({ type: 'gz', b64: bombB64 }) + '\n'
+  const bomb = await collect(client.openStream('session', 'follow', {}))
+  assert.ok(bomb.error instanceof RelayError)
+  assert.ok(bomb.error.code === 'bad-response' || bomb.error.code === 'internal')
+  assert.equal(client.state, 'online')
+})
+
+// ---- T3 (relay-snapshot-delta): fetchSessionSnapshot & knownCursor ----------
+
+test('T3 client: openStream forwards knownCursor and fetchSessionSnapshot handles gzip, 404 downgrade/reset, and 403', async () => {
+  const seen = []
+  let snapStatus = 200
+  let snapMode = 'full'
+  const bigSnap = {
+    type: 'snapshot',
+    header: { id: 's-1' },
+    cursor: 42,
+    records: Array.from({ length: 40 }, (_, i) => ({ type: 'event', event: { seq: i + 1, type: 'message', data: { text: 'pad-'.repeat(8) } } })),
+    hasMore: false,
+  }
+  const fetchImpl = async (url, init) => {
+    const pathname = new URL(String(url)).pathname
+    const body = init.body ? JSON.parse(String(init.body)) : undefined
+    seen.push({ pathname, headers: init.headers, body })
+    if (pathname.endsWith('/v1/handshake')) {
+      return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+    }
+    if (pathname.endsWith('/v1/stream')) {
+      return new Response(JSON.stringify({ type: 'end' }) + '\n', { status: 200, headers: { 'content-type': 'application/x-ndjson' } })
+    }
+    if (pathname.endsWith('/v1/session-snapshot')) {
+      if (snapStatus === 404) {
+        return new Response(JSON.stringify({ ok: false, error: { code: 'not-found' } }), { status: 404, headers: { 'content-type': 'application/json' } })
+      }
+      if (snapStatus === 403) {
+        return new Response(JSON.stringify({ ok: false, error: { code: 'not-shared' } }), { status: 403, headers: { 'content-type': 'application/json' } })
+      }
+      if (snapMode === 'unchanged') {
+        return new Response(JSON.stringify({ ok: true, value: { mode: 'unchanged', cursor: 42, hasMore: false } }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      const gz = zlib.gzipSync(Buffer.from(JSON.stringify({ ok: true, value: { mode: 'full', snapshot: bigSnap } }), 'utf8'), { level: 1 })
+      return new Response(gz, { status: 200, headers: { 'content-type': 'application/octet-stream', 'x-zr-content-encoding': 'gzip' } })
+    }
+    return new Response(JSON.stringify({ ok: false }), { status: 404 })
+  }
+
+  let token = 'tok-a'
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => token,
+    fetchImpl,
+  })
+  await client.connect()
+
+  // 1. openStream forwards valid knownCursor
+  await collect(client.openStream('session', 'follow', { request: { address: { kind: 'session', sessionId: 's-1' } } }, undefined, { knownCursor: 42 }))
+  const streamCall = seen.find((s) => s.pathname.endsWith('/v1/stream'))
+  assert.equal(streamCall.body.knownCursor, 42)
+
+  // 2. fetchSessionSnapshot receives gzipped full snapshot
+  const resFull = await client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' } })
+  assert.equal(resFull.ok, true)
+  assert.equal(resFull.mode, 'full')
+  assert.deepEqual(resFull.snapshot, bigSnap)
+  const snapCall = seen.filter((s) => s.pathname.endsWith('/v1/session-snapshot')).at(-1)
+  assert.equal(snapCall.headers['x-zr-accept-encoding'], 'gzip')
+
+  // 3. 403 not-shared throws RelayError('not-shared') without marking offline
+  snapStatus = 403
+  await assert.rejects(() => client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' } }), (e) => e instanceof RelayError && e.code === 'not-shared')
+  assert.equal(client.state, 'online')
+
+  // 4. 404 remembers unsupported and short-circuits subsequent calls without hitting wire; resets on connect() / credentialsChanged()
+  snapStatus = 404
+  const countBefore404 = seen.length
+  const res404 = await client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' } })
+  assert.deepEqual(res404, { ok: false, reason: 'unsupported' })
+  assert.equal(client.state, 'online', '404 must not mark client offline')
+  assert.equal(seen.length, countBefore404 + 1)
+
+  const resCachedUnsupported = await client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' } })
+  assert.deepEqual(resCachedUnsupported, { ok: false, reason: 'unsupported' })
+  assert.equal(seen.length, countBefore404 + 1, 'cached unsupported short-circuits without network RTT')
+
+  // Re-connect resets snapshotUnsupported
+  snapStatus = 200
+  snapMode = 'unchanged'
+  await client.connect()
+  const resAfterReconnect = await client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' }, knownCursor: 42 })
+  assert.equal(resAfterReconnect.ok, true)
+  assert.equal(resAfterReconnect.mode, 'unchanged')
+  assert.equal(resAfterReconnect.cursor, 42)
+
+  // credentialsChanged also resets snapshotUnsupported
+  snapStatus = 404
+  await client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' } })
+  token = 'tok-b'
+  snapStatus = 200
+  snapMode = 'full'
+  client.credentialsChanged()
+  await waitFor(() => seen.some((s) => s.pathname.endsWith('/v1/handshake') && s.headers.authorization === 'Bearer tok-b'))
+  const resAfterCreds = await client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' } })
+  assert.equal(resAfterCreds.ok, true)
 })

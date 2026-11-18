@@ -46,6 +46,8 @@
  */
 
 import { createHash } from 'node:crypto'
+import { promisify } from 'node:util'
+import { gunzip } from 'node:zlib'
 
 import { compareFingerprints } from './fingerprint.js'
 import type { RelayCompatVerdict } from './fingerprint.js'
@@ -57,6 +59,7 @@ const RELAY_PROTOCOL = 1
 const HANDSHAKE_PATH = '/_dsh/zen-remote/relay/v1/handshake'
 const INVOKE_PATH = '/_dsh/zen-remote/relay/v1/invoke'
 const STREAM_PATH = '/_dsh/zen-remote/relay/v1/stream'
+const SESSION_SNAPSHOT_PATH = '/_dsh/zen-remote/relay/v1/session-snapshot'
 /** TA-1: the duplex uplink's post route — one JSON body of frames per call,
  * sequenced by the pump below. */
 const STREAM_UPLINK_PATH = '/_dsh/zen-remote/relay/v1/stream-uplink'
@@ -76,6 +79,11 @@ const DEVICE_NAME_PATH = '/_dsh/zen-remote/relay/v1/device/name'
 
 /** How long a stream may stay line-silent before it is judged dead. */
 const DEFAULT_IDLE_TIMEOUT_MS = 45_000
+
+/** Hard cap on a single NDJSON line and gunzip output (64 MiB, bomb guard). */
+const MAX_STREAM_LINE_BYTES = 64 * 1024 * 1024
+const MAX_GUNZIP_BYTES = 64 * 1024 * 1024
+const gunzipAsync = promisify(gunzip)
 
 /** How long one request/response round-trip may take in full. */
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
@@ -406,6 +414,9 @@ export interface RelayClient {
    * (single-flight batched, strictly ordered); an uplink refusal surfaces as
    * the stream's error, and the host iterable is always released. */
   openStream(namespace: string, method: string, args: unknown, signal?: AbortSignal, options?: RelayStreamOptions): AsyncIterable<unknown>
+  /** Cold-safe single-shot session snapshot fetch (T3), degrading to
+   * `{ ok: false, reason: 'unsupported' }` when the server returns 404. */
+  fetchSessionSnapshot(request: SessionSnapshotRequest, signal?: AbortSignal): Promise<FetchSessionSnapshotResult>
   /** One plain-HTTP round-trip (T41b): `route` / `query` name a registered
    * `/api` GET (relay-access's RELAY_HTTP_ROUTES; `query` is the URL-encoded
    * query string with the session id already restored). Resolves with the
@@ -526,7 +537,41 @@ export interface RelayHttpResult {
 export interface RelayStreamOptions {
   uplink?: AsyncIterable<unknown>
   uplinkWindow?: { maxBytes: number; frameOverheadBytes: number }
+  /** Optional cached cursor for `session/follow` `snapshot-sync` negotiation. */
+  knownCursor?: number
 }
+
+export interface SessionSnapshotRequest {
+  address: unknown
+  maxMessages?: number
+  turnWindow?: unknown
+  assistantStream?: boolean
+  knownCursor?: number
+}
+
+export type FetchSessionSnapshotResult =
+  | { ok: true; mode: 'full'; snapshot: unknown }
+  | {
+      ok: true
+      mode: 'unchanged'
+      cursor: number
+      header?: unknown
+      hasMore: boolean
+      projections?: unknown
+      assistantStream?: unknown
+    }
+  | {
+      ok: true
+      mode: 'delta'
+      baseCursor: number
+      cursor: number
+      header?: unknown
+      records: unknown[]
+      hasMore: boolean
+      projections?: unknown
+      assistantStream?: unknown
+    }
+  | { ok: false; reason: 'unsupported' }
 
 /**
  * The credential digest recorded beside a completed handshake (T23a-fix):
@@ -565,7 +610,25 @@ function messageOf(error: unknown): string {
  * "no usable body".
  */
 async function readPayload(response: Response): Promise<unknown> {
-  const text = await response.text()
+  const zrEncoding = response.headers.get('x-zr-content-encoding')?.trim().toLowerCase()
+  let text: string
+  if (zrEncoding === 'gzip') {
+    const raw = Buffer.from(await response.arrayBuffer())
+    if (raw.byteLength === 0) return undefined
+    try {
+      const plain = await gunzipAsync(raw, { maxOutputLength: MAX_GUNZIP_BYTES })
+      text = plain.toString('utf8')
+    } catch (error) {
+      // Decompression failures / gzip bombs are malformed payloads, never a dead link:
+      // only throw RelayError on 2xx so non-2xx statuses still go through failureOf().
+      if (response.status >= 200 && response.status < 300) {
+        throw new RelayError('bad-response', `failed to gunzip relay payload: ${messageOf(error)}`, response.status)
+      }
+      return undefined
+    }
+  } else {
+    text = await response.text()
+  }
   if (text === '') return undefined
   try {
     return JSON.parse(text)
@@ -588,20 +651,14 @@ function infoString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined
 }
 
-function classifyLine(line: string): LineVerdict {
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(line)
-  } catch {
-    return { kind: 'none' } // a damaged line is skipped, never fatal
-  }
+function classifyParsed(parsed: unknown): LineVerdict {
   if (!isRecord(parsed)) return { kind: 'none' }
   if (parsed.type === 'frame' && 'frame' in parsed) return { kind: 'frame', frame: parsed.frame }
   if (parsed.type === 'end') return { kind: 'end' }
   // TA-1: the duplex handshake line — the server naming the stream id the
   // uplink posts must carry. A client that opened one-direction (or an older
   // client that predates the channel) never sees this verdict: the check
-  // rides inside classifyLine, so unrecognized shapes fall to `none` below.
+  // rides inside classifyParsed, so unrecognized shapes fall to `none` below.
   if (parsed.type === 'uplink' && typeof parsed.streamId === 'string' && parsed.streamId !== '') {
     return { kind: 'uplink', streamId: parsed.streamId }
   }
@@ -627,6 +684,42 @@ function classifyLine(line: string): LineVerdict {
   return { kind: 'none' }
 }
 
+function classifyLine(line: string): LineVerdict {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(line)
+  } catch {
+    return { kind: 'none' } // a damaged line is skipped, never fatal
+  }
+  return classifyParsed(parsed)
+}
+
+async function parseStreamLine(line: string, decoder: TextDecoder): Promise<LineVerdict> {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(line)
+  } catch {
+    return { kind: 'none' } // a damaged line is skipped, never fatal
+  }
+  if (isRecord(parsed) && parsed.type === 'gz') {
+    if (typeof parsed.b64 !== 'string' || parsed.b64 === '') {
+      throw new RelayError('bad-response', 'malformed gz stream frame: missing b64')
+    }
+    const compressed = Buffer.from(parsed.b64, 'base64')
+    if (compressed.byteLength === 0) {
+      throw new RelayError('bad-response', 'malformed gz stream frame: empty payload')
+    }
+    let plain: Buffer
+    try {
+      plain = await gunzipAsync(compressed, { maxOutputLength: MAX_GUNZIP_BYTES })
+    } catch (error) {
+      throw new RelayError('bad-response', `failed to gunzip stream frame: ${messageOf(error)}`)
+    }
+    return classifyLine(decoder.decode(plain))
+  }
+  return classifyParsed(parsed)
+}
+
 /**
  * Build one relay client. Pure state machine + fetch plumbing; the row is
  * only ever seen through the two getters.
@@ -646,6 +739,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
   let compat: RelayCompatVerdict | undefined
   let lastHandshakeDigest: string | undefined
   let connectInFlight: Promise<RelayHandshake> | undefined
+  let snapshotUnsupported = false
   // T43 reconnect machinery: the armed timer handle, how many consecutive
   // attempts have failed (the ladder index), when the armed timer fires, the
   // code of the most recent failure, and whether the row teardown stopped
@@ -1089,7 +1183,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
    * The JSON body arrives PRE-SERIALIZED: the invoke caller needs the JSON
    * once for its size-based timeout, so every route stringifies exactly
    * one. */
-  function requestInit(token: string, bodyJson: string): RequestInit {
+  function requestInit(token: string, bodyJson: string, acceptGzip = false): RequestInit {
     return {
       method: 'POST',
       headers: {
@@ -1098,6 +1192,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         // Load-bearing (module comment): without it the gateway's pairing
         // wall arrives as HTML and a revocation cannot be classified.
         accept: 'application/json',
+        ...(acceptGzip ? { 'x-zr-accept-encoding': 'gzip' } : {}),
       },
       body: bodyJson,
       // A wrong server must not walk the pairing token through a redirect.
@@ -1268,6 +1363,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         payload = await readPayload(response)
       } catch (error) {
         if (signal?.aborted) throw abortedError()
+        if (error instanceof RelayError) throw error
         noteFailure('offline')
         if (transportSetsOffline) setState('offline')
         throw new RelayError('offline', messageOf(error))
@@ -1293,9 +1389,15 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     signal: AbortSignal | undefined,
     applySuccessState: boolean,
     creds: { url: string; token: string },
-    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean } = {},
+    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean; acceptGzip?: boolean } = {},
   ): Promise<Record<string, unknown>> {
-    return exchangeRequest(`${creds.url}${pathName}`, requestInit(creds.token, bodyJson), signal, applySuccessState, opts)
+    return exchangeRequest(
+      `${creds.url}${pathName}`,
+      requestInit(creds.token, bodyJson, opts.acceptGzip === true),
+      signal,
+      applySuccessState,
+      opts,
+    )
   }
 
   function connect(): Promise<RelayHandshake> {
@@ -1374,6 +1476,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       // Digest of exactly the credentials this handshake used — never the
       // plaintext values (T23a-fix).
       lastHandshakeDigest = relayCredentialsDigest(creds.url, creds.token)
+      snapshotUnsupported = false
       setState('online')
       return handshakeInfo
     })()
@@ -1478,6 +1581,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     const digest = creds === undefined ? undefined : relayCredentialsDigest(creds.url, creds.token)
     if (digest === credentialsDigest) return
     credentialsDigest = digest
+    snapshotUnsupported = false
     // Same invalidation rule as setState's unpaired/revoked branch: a
     // verdict the current credentials never earned must not stay visible —
     // even when the very next handshake lands online, there is a window
@@ -1523,8 +1627,66 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     const payload = await exchange(INVOKE_PATH, bodyJson, signal, true, creds, {
       timeoutMs: invokeTimeoutMs(requestTimeoutMs, bodyJson),
       timeoutSetsOffline: false,
+      acceptGzip: true,
     })
     return payload.value
+  }
+
+  async function fetchSessionSnapshot(
+    request: SessionSnapshotRequest,
+    signal?: AbortSignal,
+  ): Promise<FetchSessionSnapshotResult> {
+    const creds = requireCredentials()
+    if (snapshotUnsupported) return { ok: false, reason: 'unsupported' }
+    try {
+      const payload = await exchange(SESSION_SNAPSHOT_PATH, JSON.stringify(request), signal, true, creds, {
+        acceptGzip: true,
+        timeoutSetsOffline: false,
+      })
+      const value = payload.value
+      if (!isRecord(value)) {
+        throw new RelayError('bad-response', 'session-snapshot answer carries no value')
+      }
+      if ((value.mode === 'full' || value.mode === undefined) && 'snapshot' in value) {
+        return { ok: true, mode: 'full', snapshot: value.snapshot }
+      }
+      if (value.mode === 'unchanged' && typeof value.cursor === 'number') {
+        return {
+          ok: true,
+          mode: 'unchanged',
+          cursor: value.cursor,
+          ...(value.header !== undefined ? { header: value.header } : {}),
+          hasMore: Boolean(value.hasMore),
+          ...(value.projections !== undefined ? { projections: value.projections } : {}),
+          ...(value.assistantStream !== undefined ? { assistantStream: value.assistantStream } : {}),
+        }
+      }
+      if (
+        value.mode === 'delta' &&
+        typeof value.baseCursor === 'number' &&
+        typeof value.cursor === 'number' &&
+        Array.isArray(value.records)
+      ) {
+        return {
+          ok: true,
+          mode: 'delta',
+          baseCursor: value.baseCursor,
+          cursor: value.cursor,
+          ...(value.header !== undefined ? { header: value.header } : {}),
+          records: value.records,
+          hasMore: Boolean(value.hasMore),
+          ...(value.projections !== undefined ? { projections: value.projections } : {}),
+          ...(value.assistantStream !== undefined ? { assistantStream: value.assistantStream } : {}),
+        }
+      }
+      throw new RelayError('bad-response', 'session-snapshot answer has unexpected shape')
+    } catch (error) {
+      if (error instanceof RelayError && error.status === 404) {
+        snapshotUnsupported = true
+        return { ok: false, reason: 'unsupported' }
+      }
+      throw error
+    }
   }
 
   async function postEventResult(eventId: string, result: unknown, signal?: AbortSignal): Promise<unknown> {
@@ -2034,7 +2196,14 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     let headersTimedOut = false
     let idleTimer: ReturnType<typeof setTimeout> | undefined
     const armIdle = (): void => {
-      if (idleTimer !== undefined) clearTimeout(idleTimer)
+      if (idleTimer !== undefined) {
+        const refreshable = idleTimer as unknown as { refresh?: () => void }
+        if (typeof refreshable.refresh === 'function') {
+          refreshable.refresh()
+          return
+        }
+        clearTimeout(idleTimer)
+      }
       idleTimer = setTimeout(() => {
         idleFired = true
         controller.abort()
@@ -2046,6 +2215,33 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         clearTimeout(idleTimer)
         idleTimer = undefined
       }
+    }
+    async function* emitVerdict(verdict: LineVerdict, rearmAfterYield: boolean): AsyncGenerator<unknown, boolean> {
+      if (verdict.kind === 'frame') {
+        // The idle clock measures TRANSPORT silence, not the consumer's
+        // processing time: it is paused across the yield and re-armed
+        // when the value is pulled.
+        disarmIdle()
+        yield verdict.frame
+        if (rearmAfterYield) armIdle()
+        return false
+      }
+      if (verdict.kind === 'end') return true
+      if (verdict.kind === 'error') {
+        noteServerRestart(verdict.error)
+        throw verdict.error
+      }
+      if (verdict.kind === 'info') {
+        // T59: the heartbeat's names, folded in quietly — a state-sparing
+        // notify wakes the interceptor's rename path without any reconnect.
+        applyInfoDelta(verdict.serverName, verdict.deviceName)
+      } else if (verdict.kind === 'uplink' && assignedStreamId === undefined) {
+        // TA-1: the duplex handshake. The FIRST line names the stream;
+        // any later one is ignored (one id per stream, ever).
+        assignedStreamId = verdict.streamId
+        void flushUplink()
+      }
+      return false
     }
     // Headers get the request timeout; the BODY is governed by the idle
     // clock alone — a healthy stream stays silent for hours. The timer is
@@ -2064,6 +2260,10 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     try {
       let response: Response
       try {
+        const knownCursor =
+          typeof options?.knownCursor === 'number' && Number.isSafeInteger(options.knownCursor) && options.knownCursor >= -1
+            ? options.knownCursor
+            : undefined
         response = await fetchImpl(`${url}${STREAM_PATH}`, {
           ...requestInit(
             token,
@@ -2073,7 +2273,9 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
               args,
               ...(uplink !== undefined ? { uplink: true } : {}),
               ...(uplink !== undefined && options?.uplinkWindow !== undefined ? { uplinkWindow: options.uplinkWindow } : {}),
+              ...(knownCursor !== undefined ? { knownCursor } : {}),
             }),
+            true,
           ),
           signal: controller.signal,
         })
@@ -2094,6 +2296,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
           payload = await readPayload(response)
         } catch (error) {
           if (signal?.aborted) return
+          if (error instanceof RelayError) throw error
           noteFailure('offline')
           setState('offline')
           throw new RelayError('offline', messageOf(error))
@@ -2131,62 +2334,78 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
           }
         })()
       }
-      const decoder = new TextDecoder()
-      let buffer = ''
+      const decoder = new TextDecoder('utf-8')
+      let pendingChunks: Uint8Array[] = []
+      let pendingBytes = 0
       reader = response.body.getReader()
       while (true) {
         const { done, value } = await reader.read()
         armIdle() // bytes arrived — any line content refreshes the clock
         if (done) break
-        buffer += decoder.decode(value, { stream: true })
-        let idx: number
-        while ((idx = buffer.indexOf('\n')) >= 0) {
-          const line = buffer.slice(0, idx)
-          buffer = buffer.slice(idx + 1)
-          const verdict = classifyLine(line)
-          if (verdict.kind === 'frame') {
-            // The idle clock measures TRANSPORT silence, not the consumer's
-            // processing time: it is paused across the yield and re-armed
-            // when the value is pulled.
-            disarmIdle()
-            yield verdict.frame
-            armIdle()
-          } else if (verdict.kind === 'end') {
-            return
-          } else if (verdict.kind === 'error') {
-            noteServerRestart(verdict.error)
-            throw verdict.error
-          } else if (verdict.kind === 'info') {
-            // T59: the heartbeat's names, folded in quietly — a state-sparing
-            // notify wakes the interceptor's rename path without any reconnect.
-            applyInfoDelta(verdict.serverName, verdict.deviceName)
-          } else if (verdict.kind === 'uplink') {
-            // TA-1: the duplex handshake. The FIRST line names the stream;
-            // any later one is ignored (one id per stream, ever).
-            if (assignedStreamId === undefined) {
-              assignedStreamId = verdict.streamId
-              void flushUplink()
+        if (value.byteLength === 0) continue
+        let pos = 0
+        while (pos < value.byteLength) {
+          const nl = value.indexOf(0x0a, pos)
+          if (nl === -1) {
+            const tailLen = value.byteLength - pos
+            if (pendingBytes + tailLen > MAX_STREAM_LINE_BYTES) {
+              throw new RelayError('line-too-large', `relay stream line exceeded ${MAX_STREAM_LINE_BYTES} bytes`)
             }
+            // Copy tail into an independent short buffer so V8 does not pin a multi-MB parent ArrayBuffer.
+            pendingChunks.push(value.slice(pos))
+            pendingBytes += tailLen
+            break
           }
+          const segLen = nl - pos
+          if (pendingBytes + segLen > MAX_STREAM_LINE_BYTES) {
+            throw new RelayError('line-too-large', `relay stream line exceeded ${MAX_STREAM_LINE_BYTES} bytes`)
+          }
+          let lineBytes: Uint8Array
+          if (pendingChunks.length === 0) {
+            const end = segLen > 0 && value[nl - 1] === 0x0d ? nl - 1 : nl
+            lineBytes = value.subarray(pos, end)
+          } else {
+            const total = pendingBytes + segLen
+            const combined = new Uint8Array(total)
+            let offset = 0
+            for (const chunk of pendingChunks) {
+              combined.set(chunk, offset)
+              offset += chunk.byteLength
+            }
+            if (segLen > 0) combined.set(value.subarray(pos, nl), offset)
+            pendingChunks = []
+            pendingBytes = 0
+            const end = total > 0 && combined[total - 1] === 0x0d ? total - 1 : total
+            lineBytes = end === total ? combined : combined.subarray(0, end)
+          }
+          pos = nl + 1
+          const line = decoder.decode(lineBytes)
+          const verdict = await parseStreamLine(line, decoder)
+          if (yield* emitVerdict(verdict, true)) return
         }
       }
       // Tolerant tail: a final line without its newline still counts.
-      buffer += decoder.decode()
-      if (buffer.trim() !== '') {
-        const verdict = classifyLine(buffer)
-        if (verdict.kind === 'frame') {
-          disarmIdle()
-          yield verdict.frame
-        } else if (verdict.kind === 'end') {
-          return
-        } else if (verdict.kind === 'error') {
-          noteServerRestart(verdict.error)
-          throw verdict.error
-        } else if (verdict.kind === 'info') {
-          applyInfoDelta(verdict.serverName, verdict.deviceName)
-        } else if (verdict.kind === 'uplink' && assignedStreamId === undefined) {
-          assignedStreamId = verdict.streamId
-          void flushUplink()
+      if (pendingBytes > 0) {
+        let tailBytes: Uint8Array
+        if (pendingChunks.length === 1) {
+          tailBytes = pendingChunks[0]!
+        } else {
+          tailBytes = new Uint8Array(pendingBytes)
+          let offset = 0
+          for (const chunk of pendingChunks) {
+            tailBytes.set(chunk, offset)
+            offset += chunk.byteLength
+          }
+        }
+        pendingChunks = []
+        pendingBytes = 0
+        if (tailBytes.byteLength > 0 && tailBytes[tailBytes.byteLength - 1] === 0x0d) {
+          tailBytes = tailBytes.subarray(0, tailBytes.byteLength - 1)
+        }
+        const tailLine = decoder.decode(tailBytes)
+        if (tailLine.trim() !== '') {
+          const verdict = await parseStreamLine(tailLine, decoder)
+          if (yield* emitVerdict(verdict, false)) return
         }
       }
     } catch (error) {
@@ -2256,6 +2475,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     credentialsChanged,
     stop,
     invoke,
+    fetchSessionSnapshot,
     unshare,
     postEventResult,
     openStream,

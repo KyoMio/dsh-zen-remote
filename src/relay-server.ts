@@ -32,6 +32,8 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { Readable, Transform } from 'node:stream'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
+import { gzip } from 'node:zlib'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { ShareStore } from './share-store.js'
 import { ensureServerIdMigrated, readStateFile, STATE_FILE_NAME, writeStateFile } from './state-store.js'
@@ -141,6 +143,9 @@ const MAX_UPLOADS_PER_DEVICE = 8
 
 /** Concurrent bridged plugin GETs one device may keep in flight (PB-3). */
 const MAX_PLUGIN_REQUESTS_PER_DEVICE = 8
+
+/** Concurrent cold-safe `/v1/session-snapshot` calls allowed per device (T3). */
+const MAX_SNAPSHOTS_PER_DEVICE = 2
 
 /** Most recent forwarded waterfall events remembered per `$zr/events`
  * subscription (T32-fix): the registry is only an ownership record, so this
@@ -407,8 +412,11 @@ export function resolveDshVersion(): string {
   return 'unknown'
 }
 
-function responseJson(res: ServerResponse, status: number, body: unknown): void {
-  const bytes = Buffer.from(JSON.stringify(body))
+/** Minimum UTF-8 payload size to consider negotiated gzip compression. */
+const ZR_GZIP_MIN_BYTES = 1024
+const gzipAsync = promisify(gzip)
+
+function responseJsonBytes(res: ServerResponse, status: number, bytes: Buffer): void {
   res.setHeader('Content-Type', 'application/json; charset=utf-8')
   res.setHeader('Content-Length', String(bytes.length))
   res.setHeader('Cache-Control', 'no-store')
@@ -416,6 +424,155 @@ function responseJson(res: ServerResponse, status: number, body: unknown): void 
   res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'")
   res.writeHead(status)
   res.end(bytes)
+}
+
+function responseJson(res: ServerResponse, status: number, body: unknown): void {
+  responseJsonBytes(res, status, Buffer.from(JSON.stringify(body)))
+}
+
+/** Whether the client opted into negotiated `x-zr-content-encoding: gzip`. */
+export function acceptsZrGzip(req: IncomingMessage): boolean {
+  const raw = req.headers['x-zr-accept-encoding']
+  const text = Array.isArray(raw) ? raw.join(',') : raw
+  if (typeof text !== 'string' || text === '') return false
+  return text.split(',').some((part) => {
+    const [encoding, ...params] = part.split(';')
+    if (encoding?.trim().toLowerCase() !== 'gzip') return false
+    return !params.some((p) => /^q=0(?:\.0+)?$/i.test(p.trim()))
+  })
+}
+
+/**
+ * Send JSON, gzipping (level 1) on 200 responses >= 1024 B when the client
+ * negotiated `x-zr-accept-encoding: gzip` and the compressed bytes are strictly
+ * smaller; otherwise delegates to plain {@link responseJsonBytes}.
+ */
+export async function responseCompressedJson(
+  req: IncomingMessage,
+  res: ServerResponse,
+  status: number,
+  payload: unknown,
+): Promise<void> {
+  const raw = Buffer.from(JSON.stringify(payload), 'utf8')
+  if (status !== 200 || !acceptsZrGzip(req) || raw.byteLength < ZR_GZIP_MIN_BYTES) {
+    responseJsonBytes(res, status, raw)
+    return
+  }
+  let compressed: Buffer
+  try {
+    compressed = await gzipAsync(raw, { level: 1 })
+  } catch {
+    if (!res.writableEnded && !res.destroyed && !res.headersSent) responseJsonBytes(res, status, raw)
+    return
+  }
+  if (res.writableEnded || res.destroyed || res.headersSent) return
+  if (compressed.byteLength >= raw.byteLength) {
+    responseJsonBytes(res, status, raw)
+    return
+  }
+  res.setHeader('Content-Type', 'application/octet-stream')
+  res.setHeader('Content-Length', String(compressed.byteLength))
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'")
+  res.setHeader('x-zr-content-encoding', 'gzip')
+  res.writeHead(status)
+  res.end(compressed)
+}
+
+export type KnownCursorEvalResult =
+  | { mode: 'full'; snapshot: Record<string, unknown> }
+  | {
+      mode: 'unchanged'
+      cursor: number
+      header?: unknown
+      hasMore: boolean
+      projections?: unknown
+      assistantStream?: unknown
+    }
+  | {
+      mode: 'delta'
+      baseCursor: number
+      cursor: number
+      header?: unknown
+      records: unknown[]
+      hasMore: boolean
+      projections?: unknown
+      assistantStream?: unknown
+    }
+
+function isValidKnownCursor(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= -1
+}
+
+function unwrapSnapshotRecordSeq(record: unknown): number | undefined {
+  if (!isPlainObject(record)) return undefined
+  const ev = record.type === 'event' && isPlainObject(record.event) ? record.event : record
+  return typeof ev.seq === 'number' && Number.isSafeInteger(ev.seq) ? ev.seq : undefined
+}
+
+/**
+ * Shared pure evaluator for `knownCursor` incremental snapshot negotiation
+ * across `/v1/session-snapshot` and `/v1/stream` (`session/follow`).
+ */
+export function evaluateKnownCursor(frame: unknown, knownCursor: unknown): KnownCursorEvalResult {
+  if (!isPlainObject(frame) || frame.type !== 'snapshot') {
+    return { mode: 'full', snapshot: isPlainObject(frame) ? frame : {} }
+  }
+  const cursor = frame.cursor
+  const records = frame.records
+  const hasActiveAttempt = isPlainObject(frame.assistantStream) && frame.assistantStream.activeAttempt !== undefined
+  if (
+    !isValidKnownCursor(knownCursor) ||
+    !isValidKnownCursor(cursor) ||
+    !Array.isArray(records) ||
+    hasActiveAttempt
+  ) {
+    return { mode: 'full', snapshot: frame }
+  }
+  if (cursor === knownCursor) {
+    return {
+      mode: 'unchanged',
+      cursor,
+      ...(frame.header !== undefined ? { header: frame.header } : {}),
+      hasMore: Boolean(frame.hasMore),
+      ...(frame.projections !== undefined ? { projections: frame.projections } : {}),
+      ...(frame.assistantStream !== undefined ? { assistantStream: frame.assistantStream } : {}),
+    }
+  }
+  if (cursor > knownCursor) {
+    let expectedSeq = knownCursor + 1
+    const deltaRecords: unknown[] = []
+    let contiguous = true
+    for (const rec of records) {
+      const seq = unwrapSnapshotRecordSeq(rec)
+      if (seq === undefined) {
+        contiguous = false
+        break
+      }
+      if (seq <= knownCursor) continue
+      if (seq === expectedSeq && seq <= cursor) {
+        deltaRecords.push(rec)
+        expectedSeq += 1
+      } else {
+        contiguous = false
+        break
+      }
+    }
+    if (contiguous && expectedSeq === cursor + 1) {
+      return {
+        mode: 'delta',
+        baseCursor: knownCursor,
+        cursor,
+        ...(frame.header !== undefined ? { header: frame.header } : {}),
+        records: deltaRecords,
+        hasMore: Boolean(frame.hasMore),
+        ...(frame.projections !== undefined ? { projections: frame.projections } : {}),
+        ...(frame.assistantStream !== undefined ? { assistantStream: frame.assistantStream } : {}),
+      }
+    }
+  }
+  return { mode: 'full', snapshot: frame }
 }
 
 /**
@@ -1069,6 +1226,9 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
    */
   const pluginsByDevice = new Map<string, number>()
 
+  /** Cold-safe `/v1/session-snapshot` calls currently in flight per device. */
+  const snapshotsByDevice = new Map<string, number>()
+
   /**
    * The device NAME this process last saw per device id (T59): every relay
    * request rides the gateway's fresh `x-zen-remote-device-name` marking
@@ -1692,12 +1852,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // (invoke-binary.ts) is restored on the client half (intercept.ts).
         const wire =
           INVOKE_BINARY_RESULT_METHODS.has(`${namespace}/${method}`) ? markInvokeBinary(travels) : travels
-        responseJson(res, 200, { ok: true, value: wire })
+        await responseCompressedJson(req, res, 200, { ok: true, value: wire })
       } catch (error) {
         // The gateway's own failures (unknown namespace, absent service) are
         // business answers, not transport errors: they ride a 200 envelope
         // like every other result, with the gateway's string code preserved.
-        responseJson(res, 200, errorEnvelopeOf(error))
+        await responseCompressedJson(req, res, 200, errorEnvelopeOf(error))
       } finally {
         res.off('close', onClientGone)
         // The invoke is over — answered, refused mid-flight, or its client
@@ -2598,6 +2758,154 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       return
     }
 
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/session-snapshot`) {
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      const reqObj = isPlainObject(body.request) ? body.request : body
+      let knownCursor: number | undefined
+      if (body.knownCursor !== undefined) {
+        if (!isValidKnownCursor(body.knownCursor)) {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+          return
+        }
+        knownCursor = body.knownCursor
+      }
+      const cleanRequest: Record<string, unknown> = {
+        address: reqObj.address,
+      }
+      if (reqObj.maxMessages !== undefined) {
+        if (typeof reqObj.maxMessages !== 'number' || !Number.isSafeInteger(reqObj.maxMessages) || reqObj.maxMessages < 1) {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+          return
+        }
+        cleanRequest.maxMessages = reqObj.maxMessages
+      }
+      if (reqObj.turnWindow !== undefined) {
+        if (!isPlainObject(reqObj.turnWindow)) {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+          return
+        }
+        const tw: Record<string, unknown> = {}
+        if (reqObj.turnWindow.minMessages !== undefined) {
+          if (
+            typeof reqObj.turnWindow.minMessages !== 'number' ||
+            !Number.isSafeInteger(reqObj.turnWindow.minMessages) ||
+            reqObj.turnWindow.minMessages < 0
+          ) {
+            responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+            return
+          }
+          tw.minMessages = reqObj.turnWindow.minMessages
+        }
+        if (reqObj.turnWindow.minTurns !== undefined) {
+          if (
+            typeof reqObj.turnWindow.minTurns !== 'number' ||
+            !Number.isSafeInteger(reqObj.turnWindow.minTurns) ||
+            reqObj.turnWindow.minTurns < 0
+          ) {
+            responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+            return
+          }
+          tw.minTurns = reqObj.turnWindow.minTurns
+        }
+        cleanRequest.turnWindow = tw
+      }
+      if (reqObj.assistantStream !== undefined) {
+        if (typeof reqObj.assistantStream !== 'boolean') {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+          return
+        }
+        cleanRequest.assistantStream = reqObj.assistantStream
+      } else {
+        cleanRequest.assistantStream = true
+      }
+
+      const decision = decideStream('session', 'follow', { request: cleanRequest }, isAccessible)
+      if (!decision.allow) {
+        if (decision.reason === 'not-shared') {
+          responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+        } else {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        }
+        return
+      }
+
+      const device = headerValue(req, 'x-zen-remote-device') ?? ''
+      if ((snapshotsByDevice.get(device) ?? 0) >= MAX_SNAPSHOTS_PER_DEVICE) {
+        responseJson(res, 429, { ok: false, error: { code: 'too-many-snapshots' } })
+        return
+      }
+      snapshotsByDevice.set(device, (snapshotsByDevice.get(device) ?? 0) + 1)
+
+      const hangUp = new AbortController()
+      const onClientGone = (): void => {
+        if (!res.writableEnded) hangUp.abort()
+      }
+      res.on('close', onClientGone)
+      res.on('error', onClientGone)
+      const killSnapshot = (): void => {
+        hangUp.abort()
+      }
+      openStreamKills.add(killSnapshot)
+
+      let iterator: AsyncIterator<unknown> | undefined
+      try {
+        if (serverClosedReason !== null) {
+          responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+          return
+        }
+        const iterable = await gateway.stream(
+          withPeer(
+            {
+              namespace: 'session',
+              method: 'follow',
+              args: { request: cleanRequest },
+              signal: hangUp.signal,
+            },
+            options.getPeer,
+          ),
+        )
+        iterator = iterable[Symbol.asyncIterator]()
+        // Pull ONLY the opening snapshot frame and return immediately so
+        // SessionHistoryController.follow pauses before promote().
+        const first = await iterator.next()
+        await Promise.resolve(iterator.return?.()).catch(() => {})
+        iterator = undefined
+
+        if (hangUp.signal.aborted || res.writableEnded || res.destroyed) return
+        if (serverClosedReason !== null) {
+          responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+          return
+        }
+        if (!decision.sessionIds.every((id) => isAccessible(id))) {
+          responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+          return
+        }
+        if (first.done || !isPlainObject(first.value) || first.value.type !== 'snapshot') {
+          responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+          return
+        }
+        const evaluated = evaluateKnownCursor(first.value, knownCursor)
+        const value = evaluated.mode === 'full' ? { mode: 'full', snapshot: evaluated.snapshot } : evaluated
+        await responseCompressedJson(req, res, 200, { ok: true, value })
+      } catch {
+        if (!hangUp.signal.aborted && !res.writableEnded && !res.destroyed && !res.headersSent) {
+          responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+        }
+      } finally {
+        if (iterator !== undefined) {
+          await Promise.resolve(iterator.return?.()).catch(() => {})
+        }
+        openStreamKills.delete(killSnapshot)
+        res.off('close', onClientGone)
+        res.off('error', onClientGone)
+        const remaining = (snapshotsByDevice.get(device) ?? 1) - 1
+        if (remaining <= 0) snapshotsByDevice.delete(device)
+        else snapshotsByDevice.set(device, remaining)
+      }
+      return
+    }
+
     if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/stream`) {
       // Body validation identical to invoke: one JSON object naming the
       // method and carrying object args.
@@ -2619,6 +2927,10 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         return
       }
       const decision = decideStream(namespace, method, args, isAccessible)
+      const streamKnownCursor =
+        namespace === 'session' && method === 'follow' && isValidKnownCursor(body.knownCursor)
+          ? body.knownCursor
+          : undefined
       if (!decision.allow) {
         // Refusals are plain JSON: the NDJSON protocol only starts once the
         // stream is allowed, so a 403 here is the same shape invoke answers.
@@ -2726,12 +3038,35 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
          * synthesized frames neither interleaves the pump's write/drain
          * cycles nor grows the buffer unboundedly.
          */
+        const clientAcceptsGzip = acceptsZrGzip(req)
         let writeChain: Promise<void> = Promise.resolve()
         const writeLine = (value: unknown, tail = false): Promise<void> => {
-          const run = writeChain.then(() => {
+          const run = writeChain.then(async () => {
+            if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
+            const lineText = JSON.stringify(value)
+            let outBytes = Buffer.from(`${lineText}\n`, 'utf8')
+            // Compression MUST run serially inside writeChain so a slow gzip
+            // of a large snapshot never gets overtaken by a small event or end tail.
+            if (
+              clientAcceptsGzip &&
+              !tail &&
+              outBytes.byteLength - 1 >= ZR_GZIP_MIN_BYTES &&
+              isPlainObject(value) &&
+              value.type === 'frame'
+            ) {
+              try {
+                const gzBuf = await gzipAsync(outBytes.subarray(0, outBytes.byteLength - 1), { level: 1 })
+                const wrapped = `${JSON.stringify({ type: 'gz', b64: gzBuf.toString('base64') })}\n`
+                if (wrapped.length < outBytes.byteLength) {
+                  outBytes = Buffer.from(wrapped, 'utf8')
+                }
+              } catch {
+                // Fall back to uncompressed line on unexpected zlib failure.
+              }
+            }
             if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
             return new Promise<void>((resolve) => {
-              if (res.write(Buffer.from(`${JSON.stringify(value)}\n`, 'utf8'))) {
+              if (res.write(outBytes)) {
                 resolve()
                 return
               }
@@ -3061,13 +3396,24 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
                       options.getPeer,
                     ),
                   )
+            let isFirstFrame = true
             for await (const frame of iterable) {
               if (finished || clientGone) break
               if (namespace === 'job' && method === 'list') rememberJobs(ownerSessionIdOf(args), frame)
               applyToState?.(frame)
               const filtered = filterFrame(frame)
               if (filtered === null) continue
-              await writeLine({ type: 'frame', frame: filtered })
+              let outFrame = filtered
+              if (isFirstFrame) {
+                isFirstFrame = false
+                if (streamKnownCursor !== undefined) {
+                  const evaluated = evaluateKnownCursor(filtered, streamKnownCursor)
+                  if (evaluated.mode !== 'full') {
+                    outFrame = { type: 'snapshot-sync', ...evaluated }
+                  }
+                }
+              }
+              await writeLine({ type: 'frame', frame: outFrame })
             }
             closeWith({ type: 'end' })
           }
