@@ -1,39 +1,85 @@
 /**
- * Rewrite the version strings embedded in both READMEs to match package.json.
+ * Rewrite the version strings embedded in both READMEs to match package.json,
+ * and synchronize root `package.json#gatewayVersion` from
+ * `gateway-server/package.json#version` when the gateway subpackage is present.
  *
- * Runs from the `version` npm lifecycle script, which fires AFTER the version
- * bump and BEFORE the release commit — so `npm version patch` carries the
- * refreshed README into the same commit instead of leaving the badge stuck on
- * whatever it said at 1.0.0 (it sat there through 1.0.1 and 1.0.2).
- *
- * Every target is required: an unmatched marker exits non-zero rather than
- * quietly succeeding, because a silent no-op is exactly the failure this
- * script exists to prevent. Idempotent — running it when nothing changed is a
- * no-op with exit 0.
- *
- * Also usable standalone: `node scripts/sync-doc-version.mjs [--check]`.
- * `--check` reports drift without writing, for CI.
- *
- * The README's top badge row went all-dynamic (npm version / downloads /
- * workflow status — no hardcoded version left to drift), so the only
- * version-bearing marker left is the profile dependency example.
+ * Runs before `build` and during `npm version` (before the release commit),
+ * and runs with `--check` at the end of `pnpm test` to fail loudly on drift.
  */
 
-import { readFileSync, writeFileSync } from 'node:fs'
+import { spawnSync } from 'node:child_process'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-const root = join(dirname(fileURLToPath(import.meta.url)), '..')
-const version = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')).version
+const root = process.env.ZR_SYNC_ROOT || join(dirname(fileURLToPath(import.meta.url)), '..')
+const rootPkgPath = join(root, 'package.json')
+const rootPkgRaw = readFileSync(rootPkgPath, 'utf8')
+const rootPkg = JSON.parse(rootPkgRaw)
+const version = rootPkg.version
 const checkOnly = process.argv.includes('--check')
 
-/**
- * Each target names the file, what it looks for, and what it becomes. Both
- * READMEs carry the same marker, and both are required: a missing one means
- * the docs moved and this script has to be updated, which is the whole point
- * of failing loudly. (Until the badge row went all-dynamic there were two
- * more — a hardcoded release badge and its alt text; both are gone.)
- */
+const missing = []
+const drifted = []
+
+// 1. Sync / verify root package.json#gatewayVersion <-> gateway-server/package.json#version
+const gatewayPkgPath = join(root, 'gateway-server', 'package.json')
+let nextRootPkgRaw = null
+
+if (existsSync(gatewayPkgPath)) {
+  const gatewayPkg = JSON.parse(readFileSync(gatewayPkgPath, 'utf8'))
+  const gwVersion = typeof gatewayPkg.version === 'string' ? gatewayPkg.version.trim() : ''
+  if (!gwVersion) {
+    missing.push('gateway-server/package.json: version field is missing or empty')
+  } else {
+    if (rootPkg.gatewayVersion !== gwVersion) {
+      drifted.push(`package.json: gatewayVersion (${rootPkg.gatewayVersion ?? '<missing>'}) -> ${gwVersion}`)
+      const updated = {}
+      let inserted = false
+      for (const [k, v] of Object.entries(rootPkg)) {
+        if (k === 'gatewayVersion') {
+          updated[k] = gwVersion
+          inserted = true
+        } else {
+          updated[k] = v
+          if (k === 'version' && !('gatewayVersion' in rootPkg)) {
+            updated.gatewayVersion = gwVersion
+            inserted = true
+          }
+        }
+      }
+      if (!inserted) updated.gatewayVersion = gwVersion
+      const trailingNl = rootPkgRaw.endsWith('\n') ? '\n' : ''
+      nextRootPkgRaw = JSON.stringify(updated, null, 2) + trailingNl
+    }
+
+    // Warn in non-check mode if gateway-v<ver> already exists locally and gateway-server/src has unreleased commits
+    if (!checkOnly) {
+      const inRepo = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: root, encoding: 'utf8' })
+      if (inRepo.status === 0) {
+        const tagName = `gateway-v${gwVersion}`
+        const tagCheck = spawnSync('git', ['rev-parse', '--verify', '--quiet', `refs/tags/${tagName}`], {
+          cwd: root,
+          encoding: 'utf8',
+        })
+        if (tagCheck.status === 0) {
+          const revCount = spawnSync('git', ['rev-list', '--count', `${tagName}..HEAD`, '--', 'gateway-server/src'], {
+            cwd: root,
+            encoding: 'utf8',
+          })
+          const count = Number.parseInt((revCount.stdout || '').trim(), 10)
+          if (revCount.status === 0 && Number.isFinite(count) && count > 0) {
+            console.warn(
+              `\x1b[33msync-doc-version: WARNING — gateway-server/src has ${count} commit(s) since tag ${tagName}, but gateway-server/package.json#version is still ${gwVersion}. Consider bumping gateway-server version.\x1b[0m`,
+            )
+          }
+        }
+      }
+    }
+  }
+}
+
+// 2. Sync / verify README dependency markers
 const targets = ['README.md', 'README.zh-CN.md'].flatMap((file) => [
   {
     file,
@@ -44,8 +90,6 @@ const targets = ['README.md', 'README.zh-CN.md'].flatMap((file) => [
 ])
 
 const edits = new Map()
-const missing = []
-const drifted = []
 
 for (const target of targets) {
   const path = join(root, target.file)
@@ -66,16 +110,17 @@ if (missing.length > 0) {
 
 if (checkOnly) {
   if (drifted.length === 0) {
-    console.log(`sync-doc-version: docs already at ${version}`)
+    console.log(`sync-doc-version: docs & gatewayVersion already at ${version} / ${rootPkg.gatewayVersion ?? 'n/a'}`)
     process.exit(0)
   }
-  console.error(`sync-doc-version: docs are out of date (package.json is ${version}):\n  ${drifted.join('\n  ')}`)
+  console.error(`sync-doc-version: out of date (plugin ${version}):\n  ${drifted.join('\n  ')}`)
   process.exit(1)
 }
 
+if (nextRootPkgRaw !== null) writeFileSync(rootPkgPath, nextRootPkgRaw)
 for (const [file, content] of edits) writeFileSync(join(root, file), content)
 console.log(
   drifted.length === 0
-    ? `sync-doc-version: docs already at ${version}`
+    ? `sync-doc-version: docs & gatewayVersion already at ${version} / ${rootPkg.gatewayVersion ?? 'n/a'}`
     : `sync-doc-version: synced to ${version}\n  ${drifted.join('\n  ')}`,
 )

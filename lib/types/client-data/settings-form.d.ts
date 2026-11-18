@@ -343,6 +343,19 @@ export interface PeerStatusView {
     sync: PeerSyncReadinessView | undefined;
     /** Persisted post-admission revocation notice shown until dismissed or re-admitted. */
     revokedNotice?: PeerRevokedNoticeView | undefined;
+    /** T6: sanitized bidirectional version sync evaluation from /client/peer/status. */
+    versionSync?: PeerVersionSyncView | undefined;
+}
+export interface PeerVersionSyncView {
+    pluginVersion: string;
+    gatewayVersion: string | null;
+    recommendedGatewayVersion: string;
+    wireCompatLevel: number;
+    gatewayOutdated: boolean;
+    pluginOutdated: boolean;
+    newerPluginVersion: string | null;
+    inferredLegacyGateway: boolean;
+    gatewayConsoleUrl: string | null;
 }
 export interface PeerRevokedNoticeView {
     deviceName: string;
@@ -1052,4 +1065,22 @@ export declare class ZenRemoteSettingsForm {
     private project;
     private publish;
 }
+export declare function versionDismissKey(kind: 'gateway' | 'plugin', consoleOrigin: string, targetVersion: string): string;
+export interface PeerVersionPromptPlan {
+    showGateway: boolean;
+    showPlugin: boolean;
+    gatewayVersion: string | null;
+    gatewayTarget: string;
+    gatewayDismissKey: string | null;
+    pluginVersion: string;
+    pluginTarget: string | null;
+    pluginDismissKey: string | null;
+    consoleUrl: string | null;
+    inferredLegacyGateway: boolean;
+}
+export declare function shouldShowPeerVersionPrompt(view: PeerStatusView | undefined, isDismissed: (key: string) => boolean): PeerVersionPromptPlan;
+export declare function shouldShowLegacyGatewayModal(view: PeerStatusView | undefined, options: {
+    sessionDismissed: boolean;
+    permanentDismissed: boolean;
+}): boolean;
 //# sourceMappingURL=settings-form.d.ts.map

@@ -52,6 +52,7 @@ import {
   deriveSettingsView,
   normalizePairingCode,
   shouldReloadAfterClientActivation,
+  shouldShowPeerVersionPrompt,
   type PeerStatusView,
 } from '../../client-data/settings-form.ts'
 import { qrMatrix } from '../../client-data/qr.ts'
@@ -206,6 +207,7 @@ function peerStateCopy(state: string, t: GatewayWizardProps['t'], deniedReason?:
     case 'offline': return t('wizard.peer.offline')
     case 'mismatch': return t('wizard.peer.mismatch')
     case 'identity-error': return t('wizard.peer.identityError')
+    case 'incompatible': return t('wizard.peer.incompatible')
     case 'paused': return t('wizard.peer.revoked')
     case 'revoked': {
       if (deniedReason === 'join key rejected') return t('wizard.peer.deniedBadKey')
@@ -326,6 +328,21 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
   const [desktopPairing, setDesktopPairing] = useState<{ code: string; expiresAt: number } | undefined>()
   const [desktopPairBusy, setDesktopPairBusy] = useState(false)
   const [desktopCopied, setDesktopCopied] = useState(false)
+  const [, setVersionDismissTick] = useState(0)
+  const isVersionDismissed = (key: string): boolean => {
+    try {
+      return typeof localStorage !== 'undefined' && localStorage.getItem(key) === '1'
+    } catch {
+      return false
+    }
+  }
+  const dismissVersionKey = (key: string | null): void => {
+    if (key === null) return
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.setItem(key, '1')
+    } catch { /* ignore */ }
+    setVersionDismissTick((n) => n + 1)
+  }
   const [startResult, setStartResult] = useState<WizardVerifyStart | undefined>()
   const [probingUrl, setProbingUrl] = useState(false)
   const [webPairRequested, setWebPairRequested] = useState(false)
@@ -1922,6 +1939,67 @@ export function GatewayWizard(props: GatewayWizardProps): ReactNode {
                 ) : null}
               </div>
             </div>
+
+            {peerView?.gatewayState === 'incompatible' ? (
+              <p className="zr-wizard-notice" data-tone="error" style={{ marginTop: 8 }}>
+                {t('wizard.peer.incompatibleHint')}
+              </p>
+            ) : null}
+
+            {(() => {
+              const peerVersionPrompt = shouldShowPeerVersionPrompt(peerView, isVersionDismissed)
+              if (!peerVersionPrompt.showGateway && !peerVersionPrompt.showPlugin) return null
+              return (
+                <div className="zr-wizard-versionStack">
+                  {peerVersionPrompt.showGateway && peerVersionPrompt.gatewayDismissKey !== null ? (
+                    <div className="zr-wizard-versionPill" data-zen-remote="version-pill">
+                      <span>
+                        {peerVersionPrompt.inferredLegacyGateway
+                          ? t('wizard.peer.versionGatewayLegacyBanner', {
+                              current: peerVersionPrompt.gatewayVersion ?? '0.1.0',
+                              recommended: peerVersionPrompt.gatewayTarget,
+                            })
+                          : t('wizard.peer.versionGatewayBanner', {
+                              current: peerVersionPrompt.gatewayVersion ?? '—',
+                              recommended: peerVersionPrompt.gatewayTarget,
+                            })}
+                      </span>
+                      <div className="zr-wizard-row">
+                        {peerVersionPrompt.consoleUrl !== null ? (
+                          <a
+                            className="zr-wizard-linkBtn"
+                            href={peerVersionPrompt.consoleUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                          >
+                            {t('wizard.peer.versionOpenConsole')}
+                          </a>
+                        ) : null}
+                        <button
+                          type="button"
+                          className="zr-wizard-linkBtn"
+                          onClick={() => dismissVersionKey(peerVersionPrompt.gatewayDismissKey)}
+                        >
+                          {t('wizard.peer.versionDismiss')}
+                        </button>
+                      </div>
+                    </div>
+                  ) : null}
+                  {peerVersionPrompt.showPlugin && peerVersionPrompt.pluginTarget !== null && peerVersionPrompt.pluginDismissKey !== null ? (
+                    <div className="zr-wizard-versionPill" data-zen-remote="version-pill">
+                      <span>{t('wizard.peer.versionPluginBanner', { latest: peerVersionPrompt.pluginTarget })}</span>
+                      <button
+                        type="button"
+                        className="zr-wizard-linkBtn"
+                        onClick={() => dismissVersionKey(peerVersionPrompt.pluginDismissKey)}
+                      >
+                        {t('wizard.peer.versionDismiss')}
+                      </button>
+                    </div>
+                  ) : null}
+                </div>
+              )
+            })()}
 
             <div className="zr-wizard-footer">
               <div className="zr-wizard-row">

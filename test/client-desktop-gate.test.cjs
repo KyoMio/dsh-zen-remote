@@ -149,6 +149,7 @@ test('apply order guard: registerSettingsPage, registerRemoteShareUi, registerRe
     'registerRemoteShareUi(ctx, RemoteHeaderIcon, RemoteShareMenuItem)',
     'registerRemoteStatusUi(ctx, RemoteStatusIcon, RemoteComposerBanner)',
     'installRemoteSessionGuard(ctx)',
+    'mountLegacyGatewayUpgradePrompt(ctx)',
   ]) {
     const at = source.indexOf(call)
     assert.ok(at !== -1 && at < gateAt, `${call} must run before the desktop gate`)
@@ -317,4 +318,171 @@ test('T53 & CP5: better-sidebar rules stay out of compat.css.ts; RemoteHeaderIco
   }
   const headerIcon = readFileSync(join(ROOT, 'src', 'client', 'RemoteHeaderIcon.tsx'), 'utf8')
   assert.ok(headerIcon.includes('subscribeIfNotPhoneShell(shares, phoneShell'))
+})
+
+test('T7 mountLegacyGatewayUpgradePrompt: host/via-gateway silent, 0.2.0+ silent, 0.1.0 mounts modal and cleans up on dismiss', async (t) => {
+  const { mountLegacyGatewayUpgradePrompt } = await import('../src/client/effects/legacy-gateway-prompt.ts')
+  const { ctx, calls } = fakeCtx()
+
+  const appended = []
+  const createdButtons = []
+  const fakeDoc = {
+    head: { appendChild: (el) => { appended.push(el); el.removed = false; el.remove = () => { el.removed = true } } },
+    body: { appendChild: (el) => { appended.push(el); el.removed = false; el.remove = () => { el.removed = true } } },
+    createElement: (tag) => {
+      const listeners = {}
+      const attrs = new Map()
+      const el = {
+        tagName: tag.toUpperCase(),
+        className: '',
+        dataset: {},
+        style: {},
+        textContent: '',
+        innerHTML: '',
+        open: false,
+        children: [],
+        appendChild: (child) => { el.children.push(child) },
+        setAttribute: (k, v) => attrs.set(k, v),
+        getAttribute: (k) => attrs.get(k) ?? null,
+        addEventListener: (ev, fn) => { (listeners[ev] ??= []).push(fn) },
+        dispatchEvent: (ev) => { for (const fn of listeners[ev.type] ?? []) fn(ev) },
+        querySelector: () => null,
+        showModal: () => { el.open = true },
+        close: () => { el.open = false; for (const fn of listeners['close'] ?? []) fn() },
+        remove: () => { el.removed = true },
+      }
+      if (tag === 'button') createdButtons.push(el)
+      return el
+    },
+  }
+  const sessionMem = new Map()
+  const localMem = new Map()
+  const fakeSession = { getItem: (k) => sessionMem.get(k) ?? null, setItem: (k, v) => sessionMem.set(k, v) }
+  const fakeLocal = { getItem: (k) => localMem.get(k) ?? null, setItem: (k, v) => localMem.set(k, v) }
+
+  // 1. host role makes zero fetch calls and mounts zero DOM
+  let fetchCount = 0
+  mountLegacyGatewayUpgradePrompt(ctx, {
+    probeRole: async () => 'host',
+    fetchImpl: async () => { fetchCount += 1; throw new Error('must not fetch') },
+    doc: fakeDoc,
+    sessionStore: fakeSession,
+    localStore: fakeLocal,
+    isViaGateway: () => false,
+  })
+  const hostEffect = calls.effects.at(-1)
+  const disposeHost = hostEffect.producer()
+  await new Promise((r) => setImmediate(r))
+  assert.equal(fetchCount, 0)
+  assert.equal(appended.length, 0)
+  disposeHost?.()
+
+  // 2. peer + 0.2.0 gateway mounts zero modal DOM
+  const calls2 = fakeCtx()
+  mountLegacyGatewayUpgradePrompt(calls2.ctx, {
+    probeRole: async () => 'peer',
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        configured: true,
+        nodeId: 'abcd1234',
+        gatewayState: 'authorized',
+        peers: [],
+        versionSync: {
+          pluginVersion: '2.5.1',
+          gatewayVersion: '0.2.0',
+          recommendedGatewayVersion: '0.3.0',
+          wireCompatLevel: 1,
+          gatewayOutdated: true,
+          pluginOutdated: false,
+          newerPluginVersion: null,
+          inferredLegacyGateway: false,
+          gatewayConsoleUrl: 'https://gw.example.com:19393',
+        },
+      }),
+    }),
+    doc: fakeDoc,
+    sessionStore: fakeSession,
+    localStore: fakeLocal,
+    isViaGateway: () => false,
+  })
+  const disposeModern = calls2.ctx.calls.effects.at(-1).producer()
+  await new Promise((r) => setImmediate(r))
+  await new Promise((r) => setImmediate(r))
+  assert.equal(appended.length, 0)
+  disposeModern?.()
+
+  // 3. peer + 0.1.0 legacy gateway mounts <dialog data-zen-remote="legacy-gateway-modal"> + style
+  const calls3 = fakeCtx()
+  mountLegacyGatewayUpgradePrompt(calls3.ctx, {
+    probeRole: async () => 'peer',
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        configured: true,
+        nodeId: 'abcd1234',
+        gatewayState: 'authorized',
+        peers: [],
+        versionSync: {
+          pluginVersion: '2.5.1',
+          gatewayVersion: '0.1.0',
+          recommendedGatewayVersion: '0.2.0',
+          wireCompatLevel: 1,
+          gatewayOutdated: true,
+          pluginOutdated: false,
+          newerPluginVersion: null,
+          inferredLegacyGateway: true,
+          gatewayConsoleUrl: 'https://gw.example.com:19393',
+        },
+      }),
+    }),
+    doc: fakeDoc,
+    sessionStore: fakeSession,
+    localStore: fakeLocal,
+    isViaGateway: () => false,
+  })
+  const disposeLegacy = calls3.ctx.calls.effects.at(-1).producer()
+  await new Promise((r) => setImmediate(r))
+  await new Promise((r) => setImmediate(r))
+  const dialog = appended.find((el) => el.tagName === 'DIALOG')
+  const style = appended.find((el) => el.tagName === 'STYLE')
+  assert.notEqual(dialog, undefined)
+  assert.notEqual(style, undefined)
+  assert.equal(dialog.dataset.zenRemote, 'legacy-gateway-modal')
+  // Fix 2A: primary style sits on copy button (index 0), NOT on never-show button
+  assert.equal(createdButtons.length, 3)
+  assert.equal(createdButtons[0].className, 'zr-lgw-primary')
+  assert.equal(createdButtons[1].className, '')
+  assert.equal(createdButtons[2].className, '')
+  disposeLegacy?.()
+  assert.equal(dialog.removed, true)
+  assert.equal(style.removed, true)
+
+  // Fix 2B: default isViaGateway detects documentElement[data-lan-device] and skips fetch
+  const prevDoc = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  Object.defineProperty(globalThis, 'document', {
+    configurable: true,
+    value: {
+      documentElement: { hasAttribute: (name) => name === 'data-lan-device' },
+    },
+  })
+  t.after(() => {
+    if (prevDoc === undefined) delete globalThis.document
+    else Object.defineProperty(globalThis, 'document', prevDoc)
+  })
+  let viaFetchCount = 0
+  const callsVia = fakeCtx()
+  mountLegacyGatewayUpgradePrompt(callsVia.ctx, {
+    probeRole: async () => 'peer',
+    fetchImpl: async () => { viaFetchCount += 1; throw new Error('must not fetch on via-gateway') },
+    doc: fakeDoc,
+    sessionStore: fakeSession,
+    localStore: fakeLocal,
+  })
+  const disposeVia = callsVia.ctx.calls.effects.at(-1).producer()
+  await new Promise((r) => setImmediate(r))
+  assert.equal(viaFetchCount, 0)
+  disposeVia?.()
 })

@@ -525,6 +525,20 @@ export interface PeerStatusView {
   sync: PeerSyncReadinessView | undefined
   /** Persisted post-admission revocation notice shown until dismissed or re-admitted. */
   revokedNotice?: PeerRevokedNoticeView | undefined
+  /** T6: sanitized bidirectional version sync evaluation from /client/peer/status. */
+  versionSync?: PeerVersionSyncView | undefined
+}
+
+export interface PeerVersionSyncView {
+  pluginVersion: string
+  gatewayVersion: string | null
+  recommendedGatewayVersion: string
+  wireCompatLevel: number
+  gatewayOutdated: boolean
+  pluginOutdated: boolean
+  newerPluginVersion: string | null
+  inferredLegacyGateway: boolean
+  gatewayConsoleUrl: string | null
 }
 
 export interface PeerRevokedNoticeView {
@@ -655,6 +669,48 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
           revokedAt: noticeRevokedAt,
         }
       : undefined
+  const vsRaw = safe.versionSync !== null && typeof safe.versionSync === 'object' && !Array.isArray(safe.versionSync)
+    ? (safe.versionSync as Record<string, unknown>)
+    : undefined
+  const nullableStr = (v: unknown): string | null | undefined =>
+    v === null ? null : typeof v === 'string' ? v : undefined
+  const parseConsoleUrl = (v: unknown): string | null => {
+    if (typeof v !== 'string' || v.trim() === '') return null
+    try {
+      const parsed = new URL(v.trim())
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null
+      return parsed.origin
+    } catch {
+      return null
+    }
+  }
+  let versionSync: PeerVersionSyncView | undefined
+  if (
+    vsRaw !== undefined &&
+    typeof vsRaw.pluginVersion === 'string' &&
+    typeof vsRaw.recommendedGatewayVersion === 'string' &&
+    typeof vsRaw.wireCompatLevel === 'number' &&
+    Number.isSafeInteger(vsRaw.wireCompatLevel) &&
+    typeof vsRaw.gatewayOutdated === 'boolean' &&
+    typeof vsRaw.pluginOutdated === 'boolean' &&
+    typeof vsRaw.inferredLegacyGateway === 'boolean'
+  ) {
+    const gatewayVersion = nullableStr(vsRaw.gatewayVersion)
+    const newerPluginVersion = nullableStr(vsRaw.newerPluginVersion)
+    if (gatewayVersion !== undefined && newerPluginVersion !== undefined) {
+      versionSync = {
+        pluginVersion: vsRaw.pluginVersion,
+        gatewayVersion,
+        recommendedGatewayVersion: vsRaw.recommendedGatewayVersion,
+        wireCompatLevel: vsRaw.wireCompatLevel,
+        gatewayOutdated: vsRaw.gatewayOutdated,
+        pluginOutdated: vsRaw.pluginOutdated,
+        newerPluginVersion,
+        inferredLegacyGateway: vsRaw.inferredLegacyGateway,
+        gatewayConsoleUrl: parseConsoleUrl(vsRaw.gatewayConsoleUrl),
+      }
+    }
+  }
   return {
     configured: safe.configured === true,
     nodeId: asStringSet(safe.nodeId),
@@ -671,6 +727,7 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
     peers,
     sync,
     ...(revokedNotice !== undefined ? { revokedNotice } : {}),
+    ...(versionSync !== undefined ? { versionSync } : {}),
   }
 }
 
@@ -1926,4 +1983,158 @@ export class ZenRemoteSettingsForm {
     this.cache = this.project()
     for (const listener of this.listeners) listener()
   }
+}
+
+interface ClientParsedSemver {
+  major: number
+  minor: number
+  patch: number
+  prerelease: readonly string[]
+  normalized: string
+}
+
+function parseClientSemver(raw: string | null | undefined): ClientParsedSemver | null {
+  if (typeof raw !== 'string') return null
+  const trimmed = raw.trim().replace(/^v/i, '').split('+')[0] ?? ''
+  const [corePart = '', prePart] = trimmed.split('-', 2)
+  const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(corePart)
+  if (match === null) return null
+  const prerelease = prePart !== undefined && prePart !== '' ? prePart.split('.') : []
+  const core = `${Number(match[1])}.${Number(match[2])}.${Number(match[3])}`
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease,
+    normalized: prerelease.length > 0 ? `${core}-${prerelease.join('.')}` : core,
+  }
+}
+
+function compareClientSemver(a: string | null | undefined, b: string | null | undefined): number {
+  const pa = parseClientSemver(a)
+  const pb = parseClientSemver(b)
+  if (pa === null || pb === null) return 0
+  if (pa.major !== pb.major) return pa.major < pb.major ? -1 : 1
+  if (pa.minor !== pb.minor) return pa.minor < pb.minor ? -1 : 1
+  if (pa.patch !== pb.patch) return pa.patch < pb.patch ? -1 : 1
+  if (pa.prerelease.length === 0 && pb.prerelease.length === 0) return 0
+  if (pa.prerelease.length === 0) return 1
+  if (pb.prerelease.length === 0) return -1
+  const len = Math.max(pa.prerelease.length, pb.prerelease.length)
+  for (let i = 0; i < len; i += 1) {
+    const segA = pa.prerelease[i]
+    const segB = pb.prerelease[i]
+    if (segA === undefined) return -1
+    if (segB === undefined) return 1
+    const numA = /^\d+$/.test(segA) ? Number(segA) : null
+    const numB = /^\d+$/.test(segB) ? Number(segB) : null
+    if (numA !== null && numB !== null) {
+      if (numA !== numB) return numA < numB ? -1 : 1
+    } else if (numA !== null || numB !== null) {
+      return numA !== null ? -1 : 1
+    } else if (segA !== segB) {
+      return segA < segB ? -1 : 1
+    }
+  }
+  return 0
+}
+
+function sanitizeClientOrigin(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string' || raw.trim() === '') return null
+  try {
+    const url = new URL(raw.trim())
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
+    if (!url.hostname || url.origin === 'null') return null
+    return url.origin
+  } catch {
+    return null
+  }
+}
+
+export function versionDismissKey(
+  kind: 'gateway' | 'plugin',
+  consoleOrigin: string,
+  targetVersion: string,
+): string {
+  const originPart = sanitizeClientOrigin(consoleOrigin) ?? 'global'
+  const versionPart = parseClientSemver(targetVersion)?.normalized ?? targetVersion.trim()
+  return `zr:version-dismiss:${kind}:${originPart}:${versionPart}`
+}
+
+export interface PeerVersionPromptPlan {
+  showGateway: boolean
+  showPlugin: boolean
+  gatewayVersion: string | null
+  gatewayTarget: string
+  gatewayDismissKey: string | null
+  pluginVersion: string
+  pluginTarget: string | null
+  pluginDismissKey: string | null
+  consoleUrl: string | null
+  inferredLegacyGateway: boolean
+}
+
+export function shouldShowPeerVersionPrompt(
+  view: PeerStatusView | undefined,
+  isDismissed: (key: string) => boolean,
+): PeerVersionPromptPlan {
+  const vs = view?.versionSync
+  const consoleUrl = vs?.gatewayConsoleUrl ?? null
+  if (view?.configured !== true || view.gatewayState === 'incompatible' || vs === undefined) {
+    return {
+      showGateway: false,
+      showPlugin: false,
+      gatewayVersion: vs?.gatewayVersion ?? null,
+      gatewayTarget: vs?.recommendedGatewayVersion ?? '',
+      gatewayDismissKey: null,
+      pluginVersion: vs?.pluginVersion ?? '',
+      pluginTarget: vs?.newerPluginVersion ?? null,
+      pluginDismissKey: null,
+      consoleUrl,
+      inferredLegacyGateway: vs?.inferredLegacyGateway === true,
+    }
+  }
+
+  const gatewayTarget = parseClientSemver(vs.recommendedGatewayVersion)?.normalized ?? vs.recommendedGatewayVersion
+  const gatewayDismissKey =
+    vs.gatewayOutdated && gatewayTarget !== ''
+      ? versionDismissKey('gateway', consoleUrl ?? '', gatewayTarget)
+      : null
+  const showGateway = gatewayDismissKey !== null && !isDismissed(gatewayDismissKey)
+
+  const pluginTarget =
+    vs.newerPluginVersion !== null
+      ? (parseClientSemver(vs.newerPluginVersion)?.normalized ?? vs.newerPluginVersion)
+      : null
+  const pluginDismissKey =
+    vs.pluginOutdated && pluginTarget !== null && pluginTarget !== ''
+      ? versionDismissKey('plugin', consoleUrl ?? '', pluginTarget)
+      : null
+  const showPlugin = pluginDismissKey !== null && !isDismissed(pluginDismissKey)
+
+  return {
+    showGateway,
+    showPlugin,
+    gatewayVersion: vs.gatewayVersion,
+    gatewayTarget,
+    gatewayDismissKey,
+    pluginVersion: vs.pluginVersion,
+    pluginTarget,
+    pluginDismissKey,
+    consoleUrl,
+    inferredLegacyGateway: vs.inferredLegacyGateway,
+  }
+}
+
+export function shouldShowLegacyGatewayModal(
+  view: PeerStatusView | undefined,
+  options: { sessionDismissed: boolean; permanentDismissed: boolean },
+): boolean {
+  if (options.sessionDismissed || options.permanentDismissed) return false
+  if (view === undefined || !view.configured || view.gatewayState !== 'authorized') return false
+  const vs = view.versionSync
+  if (vs === undefined) return false
+  if (vs.inferredLegacyGateway) return true
+  if (vs.gatewayVersion === null) return true
+  return parseClientSemver(vs.gatewayVersion) !== null && compareClientSemver(vs.gatewayVersion, '0.2.0') < 0
 }

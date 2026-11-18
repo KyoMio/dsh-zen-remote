@@ -251,4 +251,35 @@ export const SETTINGS_CSS = `
   gap: 8px;
   padding: 12px 0;
 }
+[data-zen-remote="settings"] .zr-settings-version-pill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--dsw-alias-state-warning-primary, #b45309);
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+body[data-ds-dark-theme] [data-zen-remote="settings"] .zr-settings-version-pill {
+  color: var(--dsw-alias-state-warning-primary, #fbbf24);
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.4);
+}
+[data-zen-remote="settings"] .zr-settings-version-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+[data-zen-remote="settings"] .zr-settings-version-link {
+  font-size: 12px;
+  font-weight: 500;
+  color: inherit;
+  text-decoration: underline;
+}
 `

@@ -23,6 +23,7 @@
     "src/session-history-cache.ts",
     "src/peer/crypto.ts",
     "src/peer/wire.ts",
+    "src/peer/version-sync.ts",
     "src/peer/arq.ts",
     "src/peer/punch.ts",
     "src/peer/mux.ts",

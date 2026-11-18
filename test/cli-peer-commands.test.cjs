@@ -2742,3 +2742,75 @@ test('PAS-4c: peer leave prints offline note on gatewaySynced:false and keeps --
     cleanup(home)
   }
 })
+
+test('T6 status: prints gentle version sync hints for gateway/plugin outdated and incompatible states', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('t6-status-version-sync')
+  let handle
+  try {
+    const peerBody = {
+      configured: true,
+      nodeId: 'abcd1234',
+      gatewayState: 'authorized',
+      networkId: '0123456789abcdef',
+      gatewayOrigin: 'https://gw.example.com:19393',
+      maxPeers: 8,
+      maxServers: 8,
+      mountedCount: 0,
+      limitReached: false,
+      peers: [],
+      versionSync: {
+        pluginVersion: '2.5.1',
+        gatewayVersion: '0.1.0',
+        recommendedGatewayVersion: '0.2.0',
+        wireCompatLevel: 1,
+        gatewayOutdated: true,
+        pluginOutdated: true,
+        newerPluginVersion: '2.6.0',
+        inferredLegacyGateway: true,
+        gatewayConsoleUrl: 'https://gw.example.com:19393',
+      },
+    }
+    const { handle: h } = await startIpcServer(home, {
+      role: 'peer',
+      client: { [ROUTES.peerStatus]: { body: peerBody } },
+    })
+    handle = h
+    const ipc = mods.createCliIpcClient(handle.socketPath)
+
+    const zh = makeCtx(mods, { argv: ['status'], ipc, lang: 'zh' })
+    assert.equal(await mods.runStatusCommand(zh), 0)
+    assert.match(zh.stdout.text(), /0\.2\.0/u)
+    assert.match(zh.stdout.text(), /2\.6\.0/u)
+
+    const en = makeCtx(mods, { argv: ['status'], ipc, lang: 'en' })
+    assert.equal(await mods.runStatusCommand(en), 0)
+    assert.match(en.stdout.text(), /0\.2\.0/u)
+    assert.match(en.stdout.text(), /2\.6\.0/u)
+
+    await handle.close()
+    handle = undefined
+
+    const incompatBody = {
+      ...peerBody,
+      gatewayState: 'incompatible',
+      versionSync: {
+        ...peerBody.versionSync,
+        gatewayOutdated: true,
+        inferredLegacyGateway: false,
+        gatewayVersion: '0.1.0',
+      },
+    }
+    const incompatSrv = await startIpcServer(home, {
+      role: 'peer',
+      client: { [ROUTES.peerStatus]: { body: incompatBody } },
+    })
+    handle = incompatSrv.handle
+    const incompatZh = makeCtx(mods, { argv: ['status'], ipc: mods.createCliIpcClient(handle.socketPath), lang: 'zh' })
+    assert.equal(await mods.runStatusCommand(incompatZh), 0)
+    assert.match(incompatZh.stdout.text(), /版本不兼容|不兼容/u)
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})

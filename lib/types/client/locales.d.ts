@@ -658,6 +658,21 @@ export declare const zh: {
     readonly 'settings.peer.title': "网络与设备互通";
     readonly 'settings.peer.subtitle': "作为节点端与其他电脑互挂会话；下方保留手机 / 浏览器接入的配置";
     readonly 'settings.peer.notConfigured': "尚未加入设备网络——可直接在下方粘贴邀请链接或输入中继网关地址（由网关侧手动审批）加入";
+    readonly 'wizard.peer.incompatible': "版本不兼容";
+    readonly 'wizard.peer.incompatibleHint': "网关与当前插件协议版本不兼容，请同步升级网关容器与 DSH 插件后再重新接入。";
+    readonly 'wizard.peer.versionGatewayBanner': "网关 {current} · 建议更新（推荐 {recommended}）";
+    readonly 'wizard.peer.versionGatewayLegacyBanner': "当前网关似乎仍在 {current}（无自动更新），建议升级到 {recommended}";
+    readonly 'wizard.peer.versionPluginBanner': "网内设备已使用插件 {latest}，建议升级本机插件";
+    readonly 'wizard.peer.versionOpenConsole': "打开网关后台";
+    readonly 'wizard.peer.versionDismiss': "忽略此版本";
+    readonly 'legacyGatewayModal.title': "检测到旧版自建网关（0.1.0）";
+    readonly 'legacyGatewayModal.body': "当前连接的网关仍停留在不支持容器内自动更新的初版镜像。升级到新版本后，后续更新可在后台一键或空闲自动完成，无需每次重建容器。";
+    readonly 'legacyGatewayModal.commandLabel': "在部署网关的机器执行以下升级命令：";
+    readonly 'legacyGatewayModal.copy': "复制命令";
+    readonly 'legacyGatewayModal.copied': "已复制";
+    readonly 'legacyGatewayModal.openConsole': "打开网关后台";
+    readonly 'legacyGatewayModal.remindLater': "稍后提醒";
+    readonly 'legacyGatewayModal.neverShow': "不再提示";
 };
 /** English dictionary, key-identical to the Chinese source of truth. */
 export declare const en: Record<MobileNavKey, string>;

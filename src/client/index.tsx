@@ -45,6 +45,7 @@ import { installRemoteApiFetch } from './remote-fetch.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
 import { installModelGroupSide } from './effects/model-group-side.ts'
 import { installRemoteWorkspaceVisibility } from './effects/remote-workspace-visibility.ts'
+import { mountLegacyGatewayUpgradePrompt } from './effects/legacy-gateway-prompt.ts'
 import { DeliverableDownload, DocumentDownload } from './RemoteFileDownload.tsx'
 import { createSaveRemoteFile } from './remote-file-save.ts'
 
@@ -183,6 +184,7 @@ export function apply(ctx: ClientContext): void {
   // 内的子客户端 / 节点端同样生效；新建会话选工作区菜单（role="menu"）
   // 不受影响，仍可见全部工作区。
   installRemoteWorkspaceVisibility(ctx)
+  mountLegacyGatewayUpgradePrompt(ctx)
 
   // 2.2.6 远程会话产物下载：子客户端最常见的诉求是「把服务端工作区里刚产出的
   // 文件拿到本机」。DSH 官方的产物卡片只有预览，打开类动作（present.open /

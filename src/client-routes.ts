@@ -36,6 +36,7 @@ import type { LogRingEntry } from './log-ring.js'
 import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js'
 import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js'
 import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js'
+import { sanitizeConsoleOrigin } from './peer/version-sync.js'
 import {
   assembleInviteUri,
   buildKeylessInviteUri,
@@ -711,11 +712,19 @@ function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Re
     rttMs: peer.rttMs,
     directRttMs: peer.directRttMs,
     directDemoted: peer.directDemoted,
+    ...(peer.pluginVersion !== undefined ? { pluginVersion: peer.pluginVersion } : {}),
   }))
   const gatewayOrigin = options.getPeerNetworkOrigin?.()
   const maxServers = effectiveMaxServers(options.pool, options)
   const mountedCount = status.peers.filter((peer) => peer.mounted).length
   const sync = peerSyncBodyOf(status, options.pool)
+  const versionSync =
+    status.versionSync !== undefined
+      ? {
+          ...status.versionSync,
+          gatewayConsoleUrl: sanitizeConsoleOrigin(gatewayOrigin ?? ''),
+        }
+      : undefined
   return {
     configured: status.networkId !== null,
     nodeId: status.nodeId,
@@ -732,6 +741,7 @@ function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Re
     limitReached: mountedCount >= maxServers,
     peers,
     ...(sync !== undefined ? { sync } : {}),
+    ...(versionSync !== undefined ? { versionSync } : {}),
   }
 }
 

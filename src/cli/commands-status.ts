@@ -378,6 +378,27 @@ export function renderPeerSection(t: CliTranslator, peer: ServerRow | null): str
       mounted: row.mounted === true ? t('peer.mounted.yes') : t('peer.mounted.no'),
     }))
   }
+  const vs = plainOf(peer.versionSync)
+  if (vs !== null) {
+    const gatewayVer = typeof vs.gatewayVersion === 'string' && vs.gatewayVersion !== '' ? vs.gatewayVersion : '—'
+    const recommendedVer = typeof vs.recommendedGatewayVersion === 'string' && vs.recommendedGatewayVersion !== '' ? vs.recommendedGatewayVersion : '—'
+    const consoleUrl = typeof vs.gatewayConsoleUrl === 'string' && vs.gatewayConsoleUrl !== '' ? vs.gatewayConsoleUrl : '—'
+    if (peer.gatewayState === 'incompatible') {
+      lines.push(`  ${t('peer.status.versionIncompatibleHint', { gateway: gatewayVer, recommended: recommendedVer })}`)
+    } else if (vs.gatewayOutdated === true) {
+      lines.push(
+        vs.inferredLegacyGateway === true
+          ? `  ${t('peer.status.legacyGatewayHint', { recommended: recommendedVer, consoleUrl })}`
+          : `  ${t('peer.status.gatewayOutdatedHint', { current: gatewayVer, recommended: recommendedVer })}`,
+      )
+    }
+    if (vs.pluginOutdated === true && typeof vs.newerPluginVersion === 'string' && vs.newerPluginVersion !== '') {
+      const currentPlugin = typeof vs.pluginVersion === 'string' && vs.pluginVersion !== '' ? vs.pluginVersion : '—'
+      lines.push(`  ${t('peer.status.pluginOutdatedHint', { current: currentPlugin, latest: vs.newerPluginVersion })}`)
+    }
+  } else if (peer.gatewayState === 'incompatible') {
+    lines.push(`  ${t('peer.status.versionIncompatibleHint', { gateway: '—', recommended: '—' })}`)
+  }
   return lines
 }
 

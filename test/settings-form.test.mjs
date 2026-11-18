@@ -1201,3 +1201,49 @@ test('hideInactiveRemoteWorkspaces defaults to true in client mode and writes fa
   assert.equal(landed, true)
   assert.deepEqual(savedOps, [{ op: 'set', path: ['hideInactiveRemoteWorkspaces'], value: false }])
 })
+
+test('T6 derivePeerStatusView: parses versionSync tolerantly and ignores absent/malformed blocks', () => {
+  const withoutVersionSync = derivePeerStatusView({
+    configured: true,
+    nodeId: 'aaaa1111',
+    gatewayState: 'authorized',
+    peers: [],
+  })
+  assert.equal(withoutVersionSync.versionSync, undefined)
+
+  const withVersionSync = derivePeerStatusView({
+    configured: true,
+    nodeId: 'aaaa1111',
+    gatewayState: 'authorized',
+    peers: [],
+    versionSync: {
+      pluginVersion: '2.5.1',
+      gatewayVersion: '0.1.0',
+      recommendedGatewayVersion: '0.2.0',
+      wireCompatLevel: 1,
+      gatewayOutdated: true,
+      pluginOutdated: true,
+      newerPluginVersion: '2.6.0',
+      inferredLegacyGateway: true,
+      gatewayConsoleUrl: 'https://gw.example.com:19393',
+    },
+  })
+  assert.deepEqual(withVersionSync.versionSync, {
+    pluginVersion: '2.5.1',
+    gatewayVersion: '0.1.0',
+    recommendedGatewayVersion: '0.2.0',
+    wireCompatLevel: 1,
+    gatewayOutdated: true,
+    pluginOutdated: true,
+    newerPluginVersion: '2.6.0',
+    inferredLegacyGateway: true,
+    gatewayConsoleUrl: 'https://gw.example.com:19393',
+  })
+
+  for (const junk of [null, 'bad', [], 42, { gatewayOutdated: 'yes' }]) {
+    assert.equal(
+      derivePeerStatusView({ configured: true, peers: [], versionSync: junk }).versionSync,
+      undefined,
+    )
+  }
+})

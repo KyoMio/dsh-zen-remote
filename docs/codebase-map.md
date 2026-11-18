@@ -43,14 +43,15 @@
 | `src/merge-streams.ts` | 三条全局流/列表的本地 + 远程合并状态机（侧边栏远程分组） |
 | `src/fingerprint.ts` | DSH 接口指纹：规范化描述符 → 分组 JSON Schema 哈希，供握手比对 |
 | `src/restart-fields.ts` / `restart-watcher.ts` | 需重启字段的指纹监测，变化即重载插件行 |
-| `src/client/**` → `lib/client.js` | 浏览器半边（经 `dsh.client` 发现）：app 外壳、slot、样式、设置区块（`settings/`）、远程部件（`remote-*` / `Remote*`） |
+| `src/client/**` → `lib/client.js` | 浏览器半边（经 `dsh.client` 发现）：app 外壳、slot、样式、设置区块（`settings/`）、远程部件（`remote-*` / `Remote*`）、`effects/legacy-gateway-prompt.ts`（桌面门前挂载的旧版 `0.1.0` 网关一次性引导弹窗） |
+| `src/peer/version-sync.ts` → `lib/peer/version-sync.js` | 零依赖纯逻辑双向版本同步判定（semver 比较、旧 `0.1.0` 网关推断、脱敏 `sanitizeConsoleOrigin`、`versionDismissKey`），供 `PeerEngine` 与 `/client/peer/status` 共享 |
 | `src/client-data/current-session.ts` + `src/client/current-session-report.ts` | 当前会话信号浏览器上报（T62）：拦截层读不到浏览器 localStorage，由浏览器端解析宿主选择存储、变化时 POST `client/current-session`；纯函数（解析 + 变化判定）与上报循环分居 |
 | `src/client-data/remote-group-expansion.ts` + `src/client/remote-group-expansion.ts` | 服务端分组展开记忆与恢复（T64）：宿主 retainAccountKeys 每次加载清掉 zr~ 分组记录，浏览器端镜像进自己存储、按记录（默认展开）点击行恢复；纯函数与 keeper 循环分居 |
 | `lan-gate.mjs` | 网关子插件入口（host 角色加载）：只 spawn + 生命周期，共享密钥与 `LAN_GATE_TARGET_PROTOCOL` 经它进子进程，并消费监听端口回调 |
 | `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，stdlib + `web-push`）：设备角色、标记头与共享密钥、desktop-client 只放行中继前缀、`0o600` 原子写盘与 `.corrupt.*` 备份、900s 上传超时放宽、`https:` 上游与 `<DSH_HOME>/lan-gate-runtime.json` 实际端口探测 |
 | `dsh-push.mjs` | 推送子插件（与网关一起加载）：回合结束推送 + `push_notify` 工具；动态从 `lan-gate-runtime.json` 读实际端口并校验 `pid` 存活 |
 | `bin/zen-remote.mjs` + `src/cli/**` → `lib/cli/` | CLI `dsh-zen-remote`：插件进程内 0600 IPC socket 服务端与客户端、防遮蔽配置写入（`config-writer.ts`）、双语 i18n（`args.ts` / `i18n.ts`）、`status`/`host *`/`client *`/`peer *` 子命令、`setup` 三步向导与角色切换联动（`command-setup.ts`）、多 profile 安装与 DSH 自动拉起（`bootstrap.ts`）；全部经 IPC 驱动插件进程，CLI 绝不 spawn caddy / cloudflared |
-| `gateway-server/` | 独立中继网关与 Web 控制台子包——不进发布包、独立三件套与流水线，细则见 AGENTS.md 硬约束与 `gateway-server/README.md`：虚拟网络管理、五态成员准入（`pending`/`authorized`/`paused`/`mismatch`/`revoked`）、双端口 UDP STUN 协调与零知识 E2EE 中转（网关无私钥只路由密文帧）、Docker 交付 |
+| `gateway-server/` | 独立中继网关与 Web 控制台子包——不进发布包、独立三件套与流水线，细则见 AGENTS.md 硬约束与 `gateway-server/README.md`：虚拟网络管理、五态成员准入（`pending`/`authorized`/`paused`/`mismatch`/`revoked`）、双端口 UDP STUN 协调、零知识 E2EE 中转（网关无私钥只路由密文帧）、PID-1 热更新守护（`src/bootstrap.ts`）与版本检查/校验解包/空闲调度模块（`src/update/{archive,version,update-manager}.ts`）、Docker 交付 |
 | `pwa/**` | manifest / service worker / 注入脚本 / 手势 / 壳级 CSS / 图标（CSS 分工铁律见 AGENTS.md） |
 | `test/*.test.cjs` + `test/*.test.mjs` + `test/helpers/*.cjs` | 主仓统一 `node:test` 测试集（分层归属与铁律见 AGENTS.md 测试规范） |
 | `scripts/run-tests.mjs` | 自适应并发测试运行器：按 `ZR_TEST_CONCURRENCY`（默认 `min(availableParallelism(), 6)`）驱动 `node --test` |

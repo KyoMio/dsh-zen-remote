@@ -506,6 +506,8 @@ zr-net://<host>[:port]/<networkId>[?tls=0|1][#<joinKey>]
 
 先备份网关数据库与 `master.key`，升级独立网关，再逐台升级节点。新网关接受 `blocked` 路径及未知延迟 `null`；旧网关可能丢弃这些遥测行，不能因控制台缺边就断言业务链路不存在。混合版本也可能无法原地恢复暂停连接，应完成双方升级后再验收恢复行为。
 
+节点与自建网关之间在 `/peer/v1/ws` 握手期间交换轻量版本元数据（`hello` 携带节点 `pluginVersion` 与 `wireCompatLevel`；网关在 `welcome` 与 `peer-joined` 广播自身 `gatewayVersion`、`wireCompatLevel`、`wireCompatRange`、`recommendedPluginVersion` 及每个成员的 `pluginVersion`，缺省字段的老版本网关按 `0.1.0` 推断）。只有真正跨越不兼容线协议时网关才会以 `version-incompatible:*` 拒绝入网并停止重连退避；兼容前提下的版本滞后通过 `/_dsh/zen-remote/client/peer/status` 的脱敏 `versionSync`（附带剥离路径、`networkId` 与 `#joinKey` 后的 `gatewayConsoleUrl`）温和引导：仅当检测到无自更新能力的旧版 `0.1.0` 网关时在 `peer` 桌面与浏览器端弹出一次性引导弹窗（支持稍后提醒与不再提示），对已支持热更新的 `0.2.0+` 网关在对话页保持零打扰，只在设置页、向导与 `dsh-zen-remote status` 输出可按目标版本忽略的温和提醒。
+
 节点间与网关控制面统一使用带双方身份绑定的 `zr-peer-hs-v2` 握手协议（不向旧无绑定证明降级）；`HELLO` 握手信封与网关 WS 控制面认证统一采用 `±5 分钟` 时钟容忍窗，节点与网关之间需保持系统时钟偏差在 5 分钟以内。
 
 控制台未知延迟显示 `—`，实测 0 才显示 `0 ms`；至少一端身份阻断会显示已阻断。控制台拓扑与设备行**严格按双向直连归并**：只有双侧链路均上报直连时才计为直连并显示延迟区间；若一侧已切中转或尚未上报而另一侧仍为直连，统一显示「经网关中转」（延迟 `—`），且全直连设备绝不同时显示「正在中转」。历史 API 字段名 `liveRelayKbps` / `relayKbps` 保留，但数值单位均为 **1024 字节/秒**，界面沿用 `KB/s`。

@@ -402,6 +402,10 @@ const ZH: Readonly<Record<string, string>> = {
   'host.ingress.lanPickQuestion': '检测到多个内网 / Tailscale 地址，请选择要使用的访问地址：',
   'host.ingress.lanPickCustom': '手动输入其他局域网 / Tailscale 地址',
   'host.ingress.verifyLanProbeWarn': '第 2 盏：公开地址可达 —— 本机自检受限（虚拟网卡 / 路由隔离），已直接生成配对码供外部设备连接验证',
+  'peer.status.versionIncompatibleHint': '提示：当前网关（{gateway}）与插件协议版本不兼容，请同步升级双方组件（推荐网关 {recommended} 或更高版本）。',
+  'peer.status.legacyGatewayHint': '提示：当前自建网关似乎仍在旧版（未开启自动更新），推荐升级到 {recommended}（容器内执行 docker compose pull && docker compose up -d，控制台：{consoleUrl}）。',
+  'peer.status.gatewayOutdatedHint': '提示：当前网关版本 {current} 低于推荐版本 {recommended}，可在网关管理控制台点击一键更新或开启自动更新。',
+  'peer.status.pluginOutdatedHint': '提示：网内已有设备使用插件 {latest}（本机 {current}），建议更新本机插件。',
 }
 
 const EN: Readonly<Record<string, string>> = {
@@ -792,6 +796,10 @@ const EN: Readonly<Record<string, string>> = {
   'host.ingress.lanPickQuestion': 'Multiple LAN / Tailscale addresses detected — pick the address to use:',
   'host.ingress.lanPickCustom': 'Enter another LAN / Tailscale address manually',
   'host.ingress.verifyLanProbeWarn': 'Light 2: public address reachable — local self-probe skipped (virtual interface / routing isolation); pairing code minted for direct device verification',
+  'peer.status.versionIncompatibleHint': 'Note: gateway ({gateway}) and plugin wire compatibility differ — upgrade gateway and plugin (gateway {recommended}+ recommended).',
+  'peer.status.legacyGatewayHint': 'Note: this self-hosted gateway appears to be on a legacy build without self-update; upgrade to {recommended} (docker compose pull && docker compose up -d, console: {consoleUrl}).',
+  'peer.status.gatewayOutdatedHint': 'Note: gateway {current} is older than recommended {recommended}; update from the gateway admin console.',
+  'peer.status.pluginOutdatedHint': 'Note: newer plugin {latest} is available/active on peers (local {current}); consider updating this plugin.',
 }
 
 const DICTIONARIES: Readonly<Record<CliLang, Readonly<Record<string, string>>>> = { zh: ZH, en: EN }

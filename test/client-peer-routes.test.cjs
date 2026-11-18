@@ -1212,3 +1212,58 @@ test('PS-4a peer join mode=advanced: assembles invite server-side and returns ty
     await closeServer(server)
   }
 })
+
+test('T6 status versionSync: exposes sanitized gatewayConsoleUrl without networkId or joinKey', async () => {
+  const { engine } = makePeerEngine({
+    status: {
+      nodeId: 'abcd1234',
+      gatewayState: 'authorized',
+      networkId: '0123456789abcdef',
+      maxPeers: 8,
+      natType: 'cone',
+      peers: [
+        { nodeId: 'aaaa1111', name: '书房电脑', state: 'eligible', path: 'lan', rttMs: 3, mounted: true, pluginVersion: '2.6.0' },
+      ],
+      versionSync: {
+        pluginVersion: '2.5.1',
+        gatewayVersion: '0.1.0',
+        recommendedGatewayVersion: '0.2.0',
+        wireCompatLevel: 1,
+        gatewayOutdated: true,
+        pluginOutdated: true,
+        newerPluginVersion: '2.6.0',
+        inferredLegacyGateway: true,
+      },
+    },
+  })
+  const { server, port } = await startClientServer(
+    makeRow(),
+    {
+      getPeerEngine: () => engine,
+      getPeerNetworkOrigin: () => 'https://admin:topsecret@gw.example.com:19393/some-path?x=1#super-secret-join-key',
+    },
+  )
+  try {
+    const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(res.status, 200)
+    const parsed = JSON.parse(res.body)
+    const vsSerialized = JSON.stringify(parsed.versionSync)
+    assert.ok(!vsSerialized.includes('super-secret-join-key'), 'joinKey must never leak in versionSync')
+    assert.ok(!vsSerialized.includes('topsecret'), 'userinfo must never leak in versionSync')
+    assert.ok(!vsSerialized.includes('some-path'), 'path/query must never leak in gatewayConsoleUrl')
+    assert.deepEqual(parsed.versionSync, {
+      pluginVersion: '2.5.1',
+      gatewayVersion: '0.1.0',
+      recommendedGatewayVersion: '0.2.0',
+      wireCompatLevel: 1,
+      gatewayOutdated: true,
+      pluginOutdated: true,
+      newerPluginVersion: '2.6.0',
+      inferredLegacyGateway: true,
+      gatewayConsoleUrl: 'https://gw.example.com:19393',
+    })
+    assert.equal(parsed.peers[0].pluginVersion, '2.6.0')
+  } finally {
+    await closeServer(server)
+  }
+})

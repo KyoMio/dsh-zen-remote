@@ -695,6 +695,21 @@ export const zh = {
   'settings.peer.title': '网络与设备互通',
   'settings.peer.subtitle': '作为节点端与其他电脑互挂会话；下方保留手机 / 浏览器接入的配置',
   'settings.peer.notConfigured': '尚未加入设备网络——可直接在下方粘贴邀请链接或输入中继网关地址（由网关侧手动审批）加入',
+  'wizard.peer.incompatible': '版本不兼容',
+  'wizard.peer.incompatibleHint': '网关与当前插件协议版本不兼容，请同步升级网关容器与 DSH 插件后再重新接入。',
+  'wizard.peer.versionGatewayBanner': '网关 {current} · 建议更新（推荐 {recommended}）',
+  'wizard.peer.versionGatewayLegacyBanner': '当前网关似乎仍在 {current}（无自动更新），建议升级到 {recommended}',
+  'wizard.peer.versionPluginBanner': '网内设备已使用插件 {latest}，建议升级本机插件',
+  'wizard.peer.versionOpenConsole': '打开网关后台',
+  'wizard.peer.versionDismiss': '忽略此版本',
+  'legacyGatewayModal.title': '检测到旧版自建网关（0.1.0）',
+  'legacyGatewayModal.body': '当前连接的网关仍停留在不支持容器内自动更新的初版镜像。升级到新版本后，后续更新可在后台一键或空闲自动完成，无需每次重建容器。',
+  'legacyGatewayModal.commandLabel': '在部署网关的机器执行以下升级命令：',
+  'legacyGatewayModal.copy': '复制命令',
+  'legacyGatewayModal.copied': '已复制',
+  'legacyGatewayModal.openConsole': '打开网关后台',
+  'legacyGatewayModal.remindLater': '稍后提醒',
+  'legacyGatewayModal.neverShow': '不再提示',
 } as const
 
 /** English dictionary, key-identical to the Chinese source of truth. */
@@ -1387,6 +1402,21 @@ export const en: Record<MobileNavKey, string> = {
   'settings.peer.title': 'Network & device mesh',
   'settings.peer.subtitle': 'As a peer node this machine shares sessions with the other computers; the phone / browser access settings stay below',
   'settings.peer.notConfigured': 'No device network joined yet — paste an invite link or enter the relay gateway address below to request approval',
+  'wizard.peer.incompatible': 'Incompatible version',
+  'wizard.peer.incompatibleHint': 'The gateway and this plugin use incompatible wire versions. Upgrade both the gateway container and plugin before rejoining.',
+  'wizard.peer.versionGatewayBanner': 'Gateway {current} · update recommended ({recommended})',
+  'wizard.peer.versionGatewayLegacyBanner': 'Gateway appears to be on {current} without self-update — upgrade to {recommended}',
+  'wizard.peer.versionPluginBanner': 'Peers in this network are on plugin {latest} — consider updating this plugin',
+  'wizard.peer.versionOpenConsole': 'Open gateway console',
+  'wizard.peer.versionDismiss': 'Dismiss this version',
+  'legacyGatewayModal.title': 'Legacy self-hosted gateway detected (0.1.0)',
+  'legacyGatewayModal.body': 'The gateway you are connected to does not support in-container hot-updates yet. After upgrading to a newer image, future gateway updates can run automatically while idle.',
+  'legacyGatewayModal.commandLabel': 'Run this upgrade command on your gateway host:',
+  'legacyGatewayModal.copy': 'Copy command',
+  'legacyGatewayModal.copied': 'Copied',
+  'legacyGatewayModal.openConsole': 'Open gateway console',
+  'legacyGatewayModal.remindLater': 'Remind me later',
+  'legacyGatewayModal.neverShow': 'Don\u2019t show again',
 }
 
 /** Key domain of the `mobileNav` namespace (zh is the source of truth). */

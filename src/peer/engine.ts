@@ -44,6 +44,13 @@ import { PeerMux } from './mux.js'
 import type { PeerPath } from './mux.js'
 import { decodeFrameHeader, PeerFrameType } from './wire.js'
 import {
+  evaluatePeerVersionSync,
+  maxSemver,
+  parseSemver,
+  PEER_WIRE_COMPAT_LEVEL,
+} from './version-sync.js'
+import type { PeerVersionSyncEvaluation } from './version-sync.js'
+import {
   readPeerNetwork,
   readPeerRevokedNotice,
   repinPeerKey,
@@ -64,6 +71,7 @@ export type PeerGatewayState =
   | 'mismatch'
   | 'paused'
   | 'revoked'
+  | 'incompatible'
   | 'offline'
 
 export type PeerMemberState = 'eligible' | 'identity-mismatch' | 'disabled'
@@ -81,6 +89,8 @@ export interface PeerEnginePeerStatus {
   directRttMs: number | null
   /** T5：RTT 超上限被降级到中转（首样本被拒或直连中持续超标），恢复后回 false。 */
   directDemoted: boolean
+  /** T2：该对端在 welcome.peers / peer-joined 上报的插件版本号，缺省或旧端为 null。 */
+  pluginVersion: string | null
 }
 
 export interface PeerEngineStatus {
@@ -98,6 +108,8 @@ export interface PeerEngineStatus {
   /** T4：`directCapMs` 的来源——`gateway` = 网关 welcome/network-updated 下发；
    *  `default` = 网关没说过话时的本地值（options 注入或回落 300）。 */
   directCapSource: 'gateway' | 'default'
+  /** T2/T6：与网关及同网对端的版本协调状态。 */
+  versionSync: PeerVersionSyncEvaluation
 }
 
 export interface PeerEnginePunchTimings {
@@ -157,6 +169,10 @@ export interface PeerEngineOptions {
    *  会话在「当前样本与 EWMA 双双超限」时才降级回中转；0 = 不限制（保留
    *  旧行为）。 */
   directMaxRttMs?: () => number
+  /** 运行时读取的本机插件版本号（由 src/index.ts 从根 package.json#version 注入）。 */
+  pluginVersion?: () => string
+  /** 运行时读取的期望网关版本号（由 src/index.ts 从根 package.json#gatewayVersion 注入）。 */
+  recommendedGatewayVersion?: () => string
 }
 
 export interface PeerEngineLeaveResult {
@@ -214,6 +230,8 @@ interface MemberRec {
   /** 最近一次下发给 PeerMux/ARQ 的发送窗口与初始 RTO（防抖用）。 */
   lastArqWindow: number | null
   lastArqRtoMs: number | null
+  /** 对端在 welcome.peers / peer-joined 携带的插件版本号。 */
+  pluginVersion: string | null
 }
 
 const realClock = {
@@ -343,6 +361,10 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   let punchSocket: DgramSocket | undefined
   let mux: PeerMux | null = null
   let pathReportTimer: unknown = null
+  let hasReceivedWelcome = false
+  let gatewayVersionFromGateway: string | null = null
+  let recommendedPluginVersionFromGateway: string | null = null
+  let gatewayWireCompatLevel: number | null = null
   /** 挂载顺序即公告顺序；每项是 pool entryId（= 对端 nodeId）。 */
   const members = new Map<string, MemberRec>()
 
@@ -471,6 +493,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     lanEndpoints?: string[] | null
     reflexiveEndpoint?: string | null
     connSeq?: number | null
+    pluginVersion?: string | null
     startPunch: boolean
     deferMount?: boolean
   }): void => {
@@ -509,10 +532,14 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         reanchoredAtSelfLanEpoch: selfLanReanchorEpoch,
         lastArqWindow: null,
         lastArqRtoMs: null,
+        pluginVersion: null,
       }
       members.set(nodeId, member)
     }
     if (typeof info.name === 'string' && info.name.trim() !== '') member.name = info.name.trim()
+    if ('pluginVersion' in info && info.pluginVersion !== undefined) {
+      member.pluginVersion = parseSemver(info.pluginVersion)?.normalized ?? null
+    }
     member.lastLanEndpoints = Array.isArray(info.lanEndpoints) ? info.lanEndpoints.filter((e) => typeof e === 'string') : member.lastLanEndpoints
     if ('reflexiveEndpoint' in info && info.reflexiveEndpoint !== undefined) {
       member.lastReflexive = typeof info.reflexiveEndpoint === 'string' && info.reflexiveEndpoint !== ''
@@ -725,6 +752,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       const challengeHex = message['challengeHex']
       if (net === undefined || typeof challengeHex !== 'string' || !/^(?:[0-9a-f]{2})+$/i.test(challengeHex)) return
       const timestamp = clock.now()
+      const selfPluginVer = parseSemver(options.pluginVersion?.())?.normalized
+      const recGwVer = parseSemver(options.recommendedGatewayVersion?.())?.normalized
       sendControl({
         type: 'auth',
         networkId: net.networkId,
@@ -738,6 +767,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         // PAS-3：仅当网关曾放行入网（everAdmitted: true）时标定自动重连，
         // 让网关在离线被移除/拒绝时彻底阻断旧口令自动复活。
         reconnect: net.everAdmitted === true,
+        wireCompatLevel: PEER_WIRE_COMPAT_LEVEL,
+        ...(selfPluginVer !== undefined ? { pluginVersion: selfPluginVer } : {}),
+        ...(recGwVer !== undefined ? { recommendedGatewayVersion: recGwVer } : {}),
         timestamp,
         signatureHex: signGatewayChallenge({
           privateKeyHex: identity.privateKeyHex,
@@ -764,6 +796,13 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       wsAttempt = 0
       clearAuthDeadline()
       deniedReason = null
+      hasReceivedWelcome = true
+      gatewayVersionFromGateway = parseSemver(message['gatewayVersion'])?.normalized ?? null
+      recommendedPluginVersionFromGateway = parseSemver(message['recommendedPluginVersion'])?.normalized ?? null
+      gatewayWireCompatLevel =
+        typeof message['wireCompatLevel'] === 'number' && Number.isInteger(message['wireCompatLevel'])
+          ? (message['wireCompatLevel'] as number)
+          : null
       const announcedCap = message['maxPeers']
       const validCap =
         typeof announcedCap === 'number' && Number.isSafeInteger(announcedCap) && announcedCap >= 2
@@ -811,6 +850,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
             lanEndpoints: Array.isArray(peer.lanEndpoints) ? (peer.lanEndpoints as string[]) : null,
             reflexiveEndpoint: typeof peer.reflexiveEndpoint === 'string' ? peer.reflexiveEndpoint : null,
             connSeq: parseConnSeq(peer.connSeq),
+            pluginVersion: parseSemver(peer.pluginVersion)?.normalized ?? null,
             startPunch: true,
             deferMount: true,
           })
@@ -847,6 +887,17 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       // authorized 闸之前处理，否则挂在 connecting/pending 的连接会把拒绝
       // 静默吞掉，永远停在旧状态；同时卸载全部已挂载的远端工作区。
       const reason = typeof message['reason'] === 'string' ? message['reason'] : ''
+      if (reason.startsWith('version-incompatible:')) {
+        deniedReason = reason
+        wsReconnectable = false
+        gatewayState = 'incompatible'
+        const gwVer = parseSemver(message['gatewayVersion'])?.normalized ?? null
+        if (gwVer !== null) gatewayVersionFromGateway = gwVer
+        for (const existingId of [...members.keys()]) memberGone(existingId)
+        log(`peer engine: gateway version incompatible (${reason}) — stopping reconnect`)
+        try { ws?.close() } catch { /* dying */ }
+        return
+      }
       if (reason.includes('paused')) {
         deniedReason = reason !== '' ? reason : null
         wsReconnectable = false
@@ -916,6 +967,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         lanEndpoints: Array.isArray(message['lanEndpoints']) ? (message['lanEndpoints'] as string[]) : null,
         reflexiveEndpoint: typeof message['reflexiveEndpoint'] === 'string' ? message['reflexiveEndpoint'] : null,
         connSeq: parseConnSeq(message['connSeq']),
+        pluginVersion: parseSemver(message['pluginVersion'])?.normalized ?? null,
         startPunch: true,
       })
       return
@@ -952,6 +1004,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         lanEndpoints: Array.isArray(message['lanEndpoints']) ? (message['lanEndpoints'] as string[]) : null,
         reflexiveEndpoint: typeof message['reflexiveEndpoint'] === 'string' ? message['reflexiveEndpoint'] : null,
         connSeq: parseConnSeq(message['connSeq']),
+        pluginVersion: parseSemver(message['pluginVersion'])?.normalized ?? null,
         startPunch: true,
       })
       return
@@ -1417,6 +1470,10 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     natType = null
     maxPeers = null
     deniedReason = null
+    hasReceivedWelcome = false
+    gatewayVersionFromGateway = null
+    recommendedPluginVersionFromGateway = null
+    gatewayWireCompatLevel = null
   }
 
   return {
@@ -1602,7 +1659,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
 
     status() {
       const peers: PeerEnginePeerStatus[] = []
+      const peerVersions: Array<string | null> = []
       for (const member of members.values()) {
+        peerVersions.push(member.pluginVersion)
         peers.push({
           nodeId: member.nodeId,
           name: member.name,
@@ -1613,8 +1672,53 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           directRttMs:
             member.directSmoothedRtt === null ? null : Math.round(member.directSmoothedRtt),
           directDemoted: member.directDemoted,
+          pluginVersion: member.pluginVersion,
         })
       }
+      const selfPluginVersion = parseSemver(options.pluginVersion?.())?.normalized ?? (options.pluginVersion?.() ?? '')
+      const recommendedGatewayVersion =
+        parseSemver(options.recommendedGatewayVersion?.())?.normalized ?? (options.recommendedGatewayVersion?.() ?? '')
+      const maxPeerPluginVersion = maxSemver(...peerVersions)
+      const versionSync: PeerVersionSyncEvaluation =
+        hasReceivedWelcome || gatewayVersionFromGateway !== null
+          ? evaluatePeerVersionSync({
+              pluginVersion: selfPluginVersion,
+              recommendedGatewayVersion,
+              gatewayVersion: gatewayVersionFromGateway,
+              recommendedPluginVersion: recommendedPluginVersionFromGateway,
+              maxPeerPluginVersion,
+              gatewayWireCompatLevel,
+            })
+          : {
+              pluginVersion: selfPluginVersion,
+              gatewayVersion: null,
+              recommendedGatewayVersion,
+              wireCompatLevel: gatewayWireCompatLevel ?? PEER_WIRE_COMPAT_LEVEL,
+              gatewayOutdated: false,
+              pluginOutdated:
+                parseSemver(selfPluginVersion) !== null &&
+                maxSemver(recommendedPluginVersionFromGateway, maxPeerPluginVersion) !== null &&
+                evaluatePeerVersionSync({
+                  pluginVersion: selfPluginVersion,
+                  recommendedGatewayVersion,
+                  gatewayVersion: recommendedGatewayVersion || '0.0.0',
+                  recommendedPluginVersion: recommendedPluginVersionFromGateway,
+                  maxPeerPluginVersion,
+                  gatewayWireCompatLevel,
+                }).pluginOutdated,
+              newerPluginVersion:
+                parseSemver(selfPluginVersion) !== null
+                  ? evaluatePeerVersionSync({
+                      pluginVersion: selfPluginVersion,
+                      recommendedGatewayVersion,
+                      gatewayVersion: recommendedGatewayVersion || '0.0.0',
+                      recommendedPluginVersion: recommendedPluginVersionFromGateway,
+                      maxPeerPluginVersion,
+                      gatewayWireCompatLevel,
+                    }).newerPluginVersion
+                  : null,
+              inferredLegacyGateway: false,
+            }
       return {
         nodeId: identity.nodeId,
         gatewayState,
@@ -1626,6 +1730,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         peers,
         directCapMs: directCap(),
         directCapSource: capFromGateway === null ? 'default' : 'gateway',
+        versionSync,
       }
     },
 

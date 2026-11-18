@@ -68,28 +68,41 @@ node --experimental-sqlite --test gateway-server/test/<file>    # 网关单文�
 2. **防膨胀**：新功能或修 bug 优先追加进已有领域测试文件，禁按工单号（`t0xx-*`）或单条 CSS 规则拆独立小文件；单文件超 ~2,000 行且子域正交才拆，共享夹具下沉 `test/helpers/`。
 3. **铁律**：轮询 / 退避 / 宽限期走 `t.mock.timers`、注入 `clock` 或 20–150ms 短超时，禁秒级真实 sleep；`Promise.race` 的定时器在 `finally` 清 `clearTimeout`；子进程、端口、监听器、全局 mock 一律挂 `t.after` 清理，只读网关测试文件级共享子进程；端口一律传 `0`，模拟连接重置用 `test/util.cjs` 的 `startResetServer()`，禁 `freePort()`/`deadPort()` TOCTOU；背压测试用可控 Mock `ServerResponse` 或注入小阈值，禁灌几十 MiB 赌内核缓冲；异步到达用有界 `waitFor` 轮询，禁给真实时钟设 `<100ms` 上界；禁锁死源码变量名、缩进、精确调用次数的正则断言；临时文件与测试 `HOME` 一律 `os.tmpdir()` + `t.after` 回收，严禁写 `.scratch/`、禁 `process.chdir()`。
 
-## 发版
+## 版本管理与发版
 
-全部由 tag 驱动，本地只做一步（发版前先把 CHANGELOG「未发布」标题改成版本号 + 日期，做成**独立的 `docs(changelog)` 提交**——`npm version` 要求完全干净树，「随 version commit 一起提交」的旧写法作废）：
+### 版本单一事实源与兼容规则
 
-```sh
-npm version patch      # 改 package.json + 同步两份 README 徽章 + 建 commit 和 v* tag
-git push --follow-tags # 推 tag 才是真正触发器
-```
+- **双轨独立版本、禁源码硬编码**：主插件版本唯一在根 `package.json#version`，自建网关版本独立维护在 `gateway-server/package.json#version`。根 `package.json#gatewayVersion`（插件握手上报的推荐网关版本）**不手改**，由 `scripts/sync-doc-version.mjs` 在 `pnpm build` / `npm version` 时自动从 `gateway-server/package.json#version` 同步，并由 `pnpm test` 末尾的 `--check` 强校验（无 `gateway-server/` 的已发布包自动跳过）；网关侧推荐插件版本由运行时动态取 GitHub Releases 最新 `v*` 与在线节点最高 `pluginVersion` 的较大值。源码严禁写死期望网关版或插件版（仅保留历史初版兜底 `'0.1.0'`、旧版弹窗阈值 `< '0.2.0'` 与线协议兼容代次整数）。
+- **何时升网关版本**：只改主插件、网关无实质改动时，**不动** `gateway-server/package.json#version`（避免插件发小补丁时误弹催更提示）；改了 `gateway-server/src` 需用户跟进升级时，**先升 `gateway-server/package.json#version`，再跑 `pnpm build` 将新 `gatewayVersion` 同步进根 `package.json`**（若 `gateway-v<ver>` tag 已存在且 `gateway-server/src` 有新提交，`sync-doc-version.mjs` 会打黄字告警防漏升）。
+- **何时升热更新兼容纪元 / 线协议代次**：
+  - 纯 TS / Web 控制台改动保持 `CURRENT_BASE_COMPAT_EPOCH` 不变，容器直接经 `/data/releases` 秒级热更新（`15s` 健康确认，超时自动回滚）；**只有改动原生依赖、`Dockerfile` 系统层、`gateway-server/src/bootstrap.ts` 守护契约或提高 Node 主版本下限时**，才递增 `gateway-server/src/update/update-manager.ts` 的 `CURRENT_BASE_COMPAT_EPOCH`（或调高 `gateway-server/scripts/pack-release.mjs` 的 `minNodeMajor`），让旧容器自动拒收热包并提示 `docker compose pull && docker compose up -d`。
+  - **破坏性协议变更**：仅当握手或帧格式无法向后兼容时，才同步上调 `src/peer/version-sync.ts` 的 `PEER_WIRE_COMPAT_LEVEL` 与 `gateway-server/src/update/version.ts` 的 `GATEWAY_WIRE_COMPAT_LEVEL`（及允许区间），触发 `incompatible` 停连提示。
+
+### 发版流程（双端同改时：先发网关、再发主包）
+
+1. **网关子包发版（`gateway-v*`）**：升好 `gateway-server/package.json#version`、跑通网关三件套并提交推送后，打匹配 tag 推送：
+   ```sh
+   git tag gateway-v0.2.0 && git push origin gateway-v0.2.0
+   ```
+   `gateway-docker.yml` 会校验 tag 与 `gateway-server/package.json#version` 一致，构建多架构镜像（`:<ver>`、`:<major.minor>`、`:latest`）推 Docker Hub（配 `DOCKERHUB_USERNAME`/`TOKEN` secrets），随后调 `gateway-server/scripts/pack-release.mjs` 打包 `zen-remote-gateway-bundle.tar.gz` 上传至同名 GitHub Release（由 GitHub 自动生成官方 `sha256` 摘要供容器热更新核验）。日常改动由 `gateway-ci.yml` 独立守护，与主包流水线零跨包依赖。
+
+2. **主插件发版（`v*`）**：全部由 tag 驱动，确认根 `package.json#gatewayVersion` 已随 `pnpm build` 同步入库后，先把 `CHANGELOG.md`「未发布」标题改成版本号 + 日期做成**独立的 `docs(changelog)` 提交**（`npm version` 要求完全干净树，「随 version commit 一起提交」的旧写法作废）：
+   ```sh
+   npm version patch      # 跑 sync-doc-version.mjs 同步两份 README 徽章与 gatewayVersion + 建 commit 和 v* tag
+   git push --follow-tags # 推 tag 才是真正触发器
+   ```
 
 - CHANGELOG 只记用户可感知的变化，未发布段落攒待发内容；GitHub Release 正文**就是** CHANGELOG 该版本段（workflow 用同一条 awk 提取，缺段在 npm 发布前被守卫挡下），其下附与上一 tag 的 compare 链接（不用 `--generate-notes`：无法与 `--notes-file` 共存，正文来源要可预测）。
 - `publish.yml` 链：装依赖 → `pnpm build` → **`git diff --exit-code -- lib`**（入库产物必须与重建一致）→ `pnpm verify` → `pnpm test` → tag 与版本一致性 → `pnpm publish`（Trusted Publishing，OIDC 无令牌）→ 建 GitHub Release（刻意排 npm 后：宣告的是「已发出去」；可重入；`fetch-depth: 0`）。
 - 人工配置仅一处：npmjs 包设置登记可信发布者 `KyoMio/dsh-zen-remote` + 文件名 `publish.yml`；Release 用自带 `GITHUB_TOKEN`，job `permissions` 的 `contents` 须 `write`。
-- README 版本徽章由 `scripts/sync-doc-version.mjs` 挂在 `version` 生命周期改写；`pnpm test` 的 `--check` 在漏同步时挂掉；锚点变了改脚本（找不到标记直接非零退出，不默默通过）。
-
-网关子包独立发版：版本独立于主包，推 `gateway-v*` tag 触发 `gateway-docker.yml` 构建多架构镜像推 Docker Hub（配 `DOCKERHUB_USERNAME`/`TOKEN` secrets）；日常改动由 `gateway-ci.yml` 独立守护，与主包流水线零跨包依赖。
+- README 版本徽章与 `gatewayVersion` 由 `scripts/sync-doc-version.mjs` 挂在 `build` 与 `version` 生命周期改写；`pnpm test` 的 `--check` 在漏同步时挂掉；锚点变了改脚本（找不到标记直接非零退出，不默默通过）。
 
 **发版踩坑（2026-09~11 三次事故复盘）**：
 
-- `npm version` 要求完全干净树；未跟踪的 `gateway-server/` 挡道时写进 `.git/info/exclude`（本地忽略，不动仓库）。
+- `npm version` 要求完全干净树；未跟踪的本地草稿或临时目录挡道时写进 `.git/info/exclude`（本地忽略，不动仓库；`gateway-server/` 已纳入版本库，切勿整体忽略）。
 - 本地重建 `lib/` 提交前核对 `lib/types/client/nav-store.d.ts` 是否被翻转（类型引用随本地 node_modules 形态变化：软链解析为 dsh-client-ui-slots，CI 全新 install 解析为 dsh-client-store，CI-canonical 是后者）；核对产物用 git worktree 全新 frozen install，不拿主检出当基准。
 - 剥离功能 / 吸收 PR 后必查 `lib/` 残留：`git diff --exit-code -- lib` 对死产物全盲，用 `git ls-files lib/` 对照 `src/`（或逐标识符 grep）找 stale 产物显式 `git rm`。
-- 已推送未发布的 tag 可删远端重打（`git push origin :refs/tags/vX` 再在修复提交上重打重推），流水线自动重跑；未曾发布的版本重指 tag 才干净。
+- 已推送未发布的 tag 可删远端重打（`git push origin :refs/tags/vX` 再在修复提交上重打重推；网关同理 `:refs/tags/gateway-vX`），流水线自动重跑；未曾发布的版本重指 tag 才干净。
 - `pnpm publish` 成功后 registry CDN 有几分钟传播延迟：`npm view`/tarball 404 是负缓存假象，用 dist-tags 端点 + cache-bust GET 判真伪，别急着重发。
 - 本地全绿 ≠ CI 绿（CI Node 24）：测试文件里 `await import()` ESM 时，所有 `require()` 放文件顶部且排在 import() 之前（Node 24 报 `ERR_REQUIRE_ESM_RACE_CONDITION`）；断言先 `waitFor` 再按 namespace/method 查。发版失败看 `gh run view --log-failed`。
 

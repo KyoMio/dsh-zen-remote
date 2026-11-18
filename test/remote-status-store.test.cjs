@@ -415,3 +415,33 @@ test('MS-6: switching remote A to remote B re-judges the bridge stamp without a 
   for (const listener of currentListeners) listener()
   assert.equal(attrs.get(BRIDGE_STAMP_ATTRIBUTE), '1')
 })
+
+test('T7 chat silence: RemoteStatusIcon and RemoteComposerBanner never alter state on gatewayOutdated/pluginOutdated', async () => {
+  const { bannerText, describeRemoteStatus } = await importStore()
+  const t = (key) => key
+  const onlineView = {
+    state: 'online',
+    versionMismatch: false,
+    serverName: 'study-pc',
+    closed: {},
+    servers: {
+      aaaa1111: {
+        state: 'online',
+        versionMismatch: false,
+        serverName: 'study-pc',
+        closed: {},
+      },
+    },
+  }
+  const desc = describeRemoteStatus(onlineView, t, 'zr~aaaa1111~s1')
+  assert.equal(desc.state, 'online')
+  assert.equal(bannerText(onlineView, 'zr~aaaa1111~s1', t), undefined)
+
+  // Only true incompatible uses the existing disconnect state
+  const incompatDesc = describeRemoteStatus(
+    { state: 'incompatible', versionMismatch: false, serverName: 's', closed: {} },
+    t,
+    'zr~aaaa1111~s1',
+  )
+  assert.equal(incompatDesc.state, 'offline')
+})

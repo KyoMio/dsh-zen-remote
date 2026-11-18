@@ -27,9 +27,10 @@
 import type { Socket as DgramSocket } from 'node:dgram';
 import type { PeerIdentityKeyPair } from './crypto.js';
 import type { PeerNatType } from './punch.js';
+import type { PeerVersionSyncEvaluation } from './version-sync.js';
 import type { PeerRevokedNotice } from '../state-store.js';
 import type { RelayPool } from '../relay-pool.js';
-export type PeerGatewayState = 'unconfigured' | 'connecting' | 'pending-approval' | 'authorized' | 'mismatch' | 'paused' | 'revoked' | 'offline';
+export type PeerGatewayState = 'unconfigured' | 'connecting' | 'pending-approval' | 'authorized' | 'mismatch' | 'paused' | 'revoked' | 'incompatible' | 'offline';
 export type PeerMemberState = 'eligible' | 'identity-mismatch' | 'disabled';
 export type PeerMemberPath = 'lan' | 'p2p' | 'relay' | 'blocked' | 'none';
 export interface PeerEnginePeerStatus {
@@ -44,6 +45,8 @@ export interface PeerEnginePeerStatus {
     directRttMs: number | null;
     /** T5：RTT 超上限被降级到中转（首样本被拒或直连中持续超标），恢复后回 false。 */
     directDemoted: boolean;
+    /** T2：该对端在 welcome.peers / peer-joined 上报的插件版本号，缺省或旧端为 null。 */
+    pluginVersion: string | null;
 }
 export interface PeerEngineStatus {
     nodeId: string;
@@ -60,6 +63,8 @@ export interface PeerEngineStatus {
     /** T4：`directCapMs` 的来源——`gateway` = 网关 welcome/network-updated 下发；
      *  `default` = 网关没说过话时的本地值（options 注入或回落 300）。 */
     directCapSource: 'gateway' | 'default';
+    /** T2/T6：与网关及同网对端的版本协调状态。 */
+    versionSync: PeerVersionSyncEvaluation;
 }
 export interface PeerEnginePunchTimings {
     punchIntervalMs?: number;
@@ -124,6 +129,10 @@ export interface PeerEngineOptions {
      *  会话在「当前样本与 EWMA 双双超限」时才降级回中转；0 = 不限制（保留
      *  旧行为）。 */
     directMaxRttMs?: () => number;
+    /** 运行时读取的本机插件版本号（由 src/index.ts 从根 package.json#version 注入）。 */
+    pluginVersion?: () => string;
+    /** 运行时读取的期望网关版本号（由 src/index.ts 从根 package.json#gatewayVersion 注入）。 */
+    recommendedGatewayVersion?: () => string;
 }
 export interface PeerEngineLeaveResult {
     ok: true;

@@ -23,6 +23,15 @@ const {
   writePeerNetwork,
   writePeerRevokedNotice,
 } = require('../lib/state-store.js')
+const {
+  PEER_WIRE_COMPAT_LEVEL,
+  INFERRED_LEGACY_GATEWAY_VERSION,
+  parseSemver,
+  compareSemver,
+  evaluatePeerVersionSync,
+  sanitizeConsoleOrigin,
+  versionDismissKey,
+} = require('../lib/peer/version-sync.js')
 
 const INDEX_URL = pathToFileURL(path.join(__dirname, '..', 'lib', 'index.js')).href
 const NET_ID = '0123456789abcdef'
@@ -1794,4 +1803,177 @@ test('T2: onPeerRelayDemoted syncs member state, restores relay ARQ profile, and
   holdBDataFrames = false
   for (const f of heldDataFrames.splice(0)) muxB.handleGatewayFrame(f)
   assert.equal(await (await afterDemoteUpload).text(), 'ok-from-b')
+})
+
+test('T1 version-sync: parseSemver, compareSemver (with prerelease), evaluatePeerVersionSync, and sanitizeConsoleOrigin', () => {
+  assert.equal(PEER_WIRE_COMPAT_LEVEL, 1)
+  assert.equal(INFERRED_LEGACY_GATEWAY_VERSION, '0.1.0')
+
+  // Invalid semver rejected by parseSemver
+  assert.equal(parseSemver(null), null)
+  assert.equal(parseSemver(''), null)
+  assert.equal(parseSemver('1.2'), null)
+  assert.equal(parseSemver('01.2.3'), null)
+  assert.equal(parseSemver('1.2.3.4'), null)
+  assert.equal(parseSemver('not-a-version'), null)
+
+  // Valid semver & prerelease ordering
+  assert.equal(compareSemver('0.1.0', '0.2.0'), -1)
+  assert.equal(compareSemver('0.2.0', '0.1.0'), 1)
+  assert.equal(compareSemver('0.2.0', '0.2.0'), 0)
+  assert.equal(compareSemver('1.0.0-alpha', '1.0.0-alpha.1'), -1)
+  assert.equal(compareSemver('1.0.0-alpha.1', '1.0.0-1'), 1)
+  assert.equal(compareSemver('1.0.0-1', '1.0.0-alpha'), -1)
+  assert.equal(compareSemver('1.0.0-alpha.1', '1.0.0-alpha.beta'), -1)
+  assert.equal(compareSemver('1.0.0-beta', '1.0.0'), -1)
+  assert.equal(compareSemver('2.5.1+build.9', '2.5.1'), 0)
+
+  // Missing gatewayVersion infers legacy 0.1.0 and sets gatewayOutdated
+  const legacySync = evaluatePeerVersionSync({
+    pluginVersion: '2.5.1',
+    recommendedGatewayVersion: '0.2.0',
+    gatewayVersion: null,
+    recommendedPluginVersion: null,
+    maxPeerPluginVersion: null,
+    gatewayWireCompatLevel: null,
+  })
+  assert.equal(legacySync.gatewayVersion, '0.1.0')
+  assert.equal(legacySync.inferredLegacyGateway, true)
+  assert.equal(legacySync.gatewayOutdated, true)
+  assert.equal(legacySync.pluginOutdated, false)
+  assert.equal(legacySync.newerPluginVersion, null)
+  assert.equal(legacySync.wireCompatLevel, 1)
+
+  // Plugin patch bump does NOT falsely trigger gatewayOutdated when gateway matches recommendedGatewayVersion
+  const patchPluginSync = evaluatePeerVersionSync({
+    pluginVersion: '2.5.2',
+    recommendedGatewayVersion: '0.2.0',
+    gatewayVersion: '0.2.0',
+    recommendedPluginVersion: '2.5.1',
+    maxPeerPluginVersion: '2.5.2',
+    gatewayWireCompatLevel: 1,
+  })
+  assert.equal(patchPluginSync.gatewayVersion, '0.2.0')
+  assert.equal(patchPluginSync.inferredLegacyGateway, false)
+  assert.equal(patchPluginSync.gatewayOutdated, false)
+  assert.equal(patchPluginSync.pluginOutdated, false)
+  assert.equal(patchPluginSync.newerPluginVersion, null)
+
+  // Higher peer or recommended plugin version triggers pluginOutdated and picks max
+  const newerPeerSync = evaluatePeerVersionSync({
+    pluginVersion: '2.5.1',
+    recommendedGatewayVersion: '0.2.0',
+    gatewayVersion: '0.2.0',
+    recommendedPluginVersion: '2.5.2',
+    maxPeerPluginVersion: '2.6.0',
+    gatewayWireCompatLevel: 1,
+  })
+  assert.equal(newerPeerSync.pluginOutdated, true)
+  assert.equal(newerPeerSync.newerPluginVersion, '2.6.0')
+  assert.equal(newerPeerSync.gatewayOutdated, false)
+
+  // sanitizeConsoleOrigin strips path, query, credentials, and #joinKey; rejects non-http(s)
+  assert.equal(
+    sanitizeConsoleOrigin('https://user:pass@gw.example.com:8443/networks/abc?foo=1#superSecretJoinKey'),
+    'https://gw.example.com:8443',
+  )
+  assert.equal(sanitizeConsoleOrigin('http://192.168.1.50:19393/#key'), 'http://192.168.1.50:19393')
+  assert.equal(sanitizeConsoleOrigin('javascript:alert(1)'), null)
+  assert.equal(sanitizeConsoleOrigin('data:text/html,hi'), null)
+  assert.equal(sanitizeConsoleOrigin('ws://127.0.0.1:19393'), null)
+  assert.equal(sanitizeConsoleOrigin('not a url'), null)
+
+  // versionDismissKey scopes by kind, sanitized origin, and target version
+  const k1 = versionDismissKey('gateway', 'https://gw.example.com/path#joinKey', '0.2.0')
+  const k2 = versionDismissKey('gateway', 'https://gw.example.com', '0.3.0')
+  assert.notEqual(k1, k2)
+  assert.ok(!k1.includes('joinKey'))
+})
+
+test('T2 ws-version-handshake: legacy 0.1.0 inference, peer-joined pluginOutdated, and version-incompatible stops reconnect', async (t) => {
+  const gateway = await startFakeWsGateway()
+  t.after(() => gateway.close())
+
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-t2-engine-'))
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }))
+  const stateFile = path.join(home, 'zen-remote-state.json')
+  const identity = ensurePeerIdentity(stateFile)
+  const networkId = randomHex(8)
+  writePeerNetwork(stateFile, {
+    gatewayWsUrl: `ws://127.0.0.1:${gateway.port}`,
+    gatewayHttpOrigin: `http://127.0.0.1:${gateway.port}`,
+    networkId,
+    joinedAt: 1,
+  })
+
+  // 1. Legacy gateway welcome omits gatewayVersion -> inferred 0.1.0 & gatewayOutdated=true
+  gateway.welcome = authorizedWelcome()
+  const mounted = new Map()
+  const engine = createPeerEngine({
+    stateFile,
+    identity,
+    pluginVersion: () => '2.5.1',
+    recommendedGatewayVersion: () => '0.2.0',
+    relayPool: {
+      maxServers: () => 8,
+      mountVirtual: (entry) => mounted.set(entry.id, entry),
+      unmountVirtual: (id) => mounted.delete(id),
+      updateVirtualName: () => {},
+      reconnect: () => {},
+    },
+    relayHandler: () => undefined,
+    relaySecret: () => 'test',
+    serverName: () => 't2-node',
+    udpProbe: null,
+    wsReconnectBaseMs: 30,
+  })
+  t.after(() => engine.stop())
+  engine.resumeFromState()
+  await waitFor(() => engine.status().gatewayState === 'authorized', 'legacy gateway authorized')
+  const legacyStatus = engine.status()
+  assert.equal(legacyStatus.versionSync.gatewayVersion, '0.1.0')
+  assert.equal(legacyStatus.versionSync.inferredLegacyGateway, true)
+  assert.equal(legacyStatus.versionSync.gatewayOutdated, true)
+  assert.equal(legacyStatus.versionSync.pluginOutdated, false)
+
+  // 2. Upgraded gateway sends gatewayVersion 0.2.0 + peer-joined sends pluginVersion 2.6.0
+  gateway.welcome = authorizedWelcome({
+    gatewayVersion: '0.2.0',
+    recommendedPluginVersion: null,
+    wireCompatLevel: 1,
+  })
+  gateway.dropCurrentConnection()
+  await waitFor(() => engine.status().versionSync.gatewayVersion === '0.2.0', 'new gateway version seen')
+  assert.equal(engine.status().versionSync.inferredLegacyGateway, false)
+  assert.equal(engine.status().versionSync.gatewayOutdated, false)
+
+  const peerId = generatePeerIdentity()
+  gateway.send({
+    type: 'peer-joined',
+    nodeId: peerId.nodeId,
+    publicKeyHex: peerId.publicKeyHex,
+    name: 'newer-peer',
+    lanEndpoints: [],
+    reflexiveEndpoint: null,
+    pluginVersion: '2.6.0',
+    connSeq: 1,
+  })
+  await waitFor(() => engine.status().peers.length === 1, 'peer-joined recorded')
+  const afterJoin = engine.status()
+  assert.equal(afterJoin.peers[0].pluginVersion, '2.6.0')
+  assert.equal(afterJoin.versionSync.pluginOutdated, true)
+  assert.equal(afterJoin.versionSync.newerPluginVersion, '2.6.0')
+
+  // 3. version-incompatible:* sets gatewayState='incompatible' and disables reconnect
+  const upgradesBefore = gateway.upgradeCount()
+  gateway.send({
+    type: 'denied',
+    reason: 'version-incompatible:plugin-too-old',
+    gatewayVersion: '0.5.0',
+  })
+  await waitFor(() => engine.status().gatewayState === 'incompatible', 'gatewayState incompatible')
+  assert.equal(engine.status().deniedReason, 'version-incompatible:plugin-too-old')
+  assert.equal(engine.status().peers.length, 0)
+  await sleep(100)
+  assert.equal(gateway.upgradeCount(), upgradesBefore, 'version-incompatible must not auto-reconnect')
 })

@@ -1028,4 +1028,29 @@ export const WIZARD_CSS = `
   padding-top: 8px;
   border-top: 1px solid var(--dsw-alias-border-l2);
 }
+[data-zen-remote="wizard"] .zr-wizard-versionStack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+[data-zen-remote="wizard"] .zr-wizard-versionPill {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--dsw-alias-state-warning-primary, #b45309);
+  background: rgba(245, 158, 11, 0.1);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+body[data-ds-dark-theme] [data-zen-remote="wizard"] .zr-wizard-versionPill {
+  color: var(--dsw-alias-state-warning-primary, #fbbf24);
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(245, 158, 11, 0.4);
+}
 `

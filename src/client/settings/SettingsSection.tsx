@@ -70,6 +70,7 @@ import {
   localOpsAllowed,
   normalizePairingCode,
   shouldReloadAfterClientActivation,
+  shouldShowPeerVersionPrompt,
   type PeerStatusDeviceView,
   type PeerStatusView,
 } from '../../client-data/settings-form.ts'
@@ -308,6 +309,7 @@ function peerStateCopyOf(state: string, t: SectionT, deniedReason?: string): str
     case 'offline': return t('wizard.peer.offline')
     case 'mismatch': return t('wizard.peer.mismatch')
     case 'identity-error': return t('wizard.peer.identityError')
+    case 'incompatible': return t('wizard.peer.incompatible')
     case 'paused': return t('wizard.peer.revoked')
     case 'revoked': {
       if (deniedReason === 'join key rejected') return t('wizard.peer.deniedBadKey')
@@ -601,6 +603,21 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
   const [peerJoinBusy, setPeerJoinBusy] = useState(false)
   const [peerJoinFail, setPeerJoinFail] = useState<string | null>(null)
   const [peerLeaveNote, setPeerLeaveNote] = useState<string | undefined>()
+  const [, setVersionDismissTick] = useState(0)
+  const isVersionDismissed = (key: string): boolean => {
+    try {
+      return typeof localStorage !== 'undefined' && localStorage.getItem(key) === '1'
+    } catch {
+      return false
+    }
+  }
+  const dismissVersionKey = (key: string | null): void => {
+    if (key === null) return
+    try {
+      if (typeof localStorage !== 'undefined') localStorage.setItem(key, '1')
+    } catch { /* ignore */ }
+    setVersionDismissTick((n) => n + 1)
+  }
   // One latest-wins ticket stream dedicated to the peer poll.
   const peerStatusTicket = useMemo(createLatestGate, [])
   const loadPeerStatus = useCallback(() => {
@@ -635,6 +652,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
         maxPeers: peerView.maxPeers,
       })
     : undefined
+  const peerVersionPrompt = shouldShowPeerVersionPrompt(peerView, isVersionDismissed)
 
   // PG-9: one network-device management action — toggle-mount or trust —
   // then the poll repaints the section either way.
@@ -1534,7 +1552,7 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   <span
                     className="zr-settings-badge"
                     data-live={peerView.gatewayState === 'authorized' ? 'true' : undefined}
-                    data-invalid={peerView.gatewayState === 'mismatch' || peerView.gatewayState === 'revoked' || peerView.gatewayState === 'paused' ? 'true' : undefined}
+                    data-invalid={peerView.gatewayState === 'mismatch' || peerView.gatewayState === 'revoked' || peerView.gatewayState === 'paused' || peerView.gatewayState === 'incompatible' ? 'true' : undefined}
                   >
                     {peerStateCopyOf(peerView.gatewayState, t, peerView.deniedReason)}
                   </span>
@@ -1543,6 +1561,59 @@ function SettingsSectionPage({ config, shares, t }: SettingsSectionProps) {
                   {t('wizard.overview.peerNodeLabel')} · {peerView.nodeId !== '' ? peerView.nodeId : '—'}
                   {peerView.networkId !== undefined ? ` · ${peerView.networkId}` : ''}
                 </p>
+                {peerView.gatewayState === 'incompatible' && (
+                  <p className="zr-settings-hint" data-invalid="true" style={{ paddingTop: 4 }}>
+                    {t('wizard.peer.incompatibleHint')}
+                  </p>
+                )}
+                {peerVersionPrompt.showGateway && peerVersionPrompt.gatewayDismissKey !== null && (
+                  <div className="zr-settings-version-pill" data-zen-remote="version-pill">
+                    <span>
+                      {peerVersionPrompt.inferredLegacyGateway
+                        ? t('wizard.peer.versionGatewayLegacyBanner', {
+                            current: peerVersionPrompt.gatewayVersion ?? '0.1.0',
+                            recommended: peerVersionPrompt.gatewayTarget,
+                          })
+                        : t('wizard.peer.versionGatewayBanner', {
+                            current: peerVersionPrompt.gatewayVersion ?? '—',
+                            recommended: peerVersionPrompt.gatewayTarget,
+                          })}
+                    </span>
+                    <div className="zr-settings-version-actions">
+                      {peerVersionPrompt.consoleUrl !== null && (
+                        <a
+                          className="zr-settings-version-link"
+                          href={peerVersionPrompt.consoleUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                        >
+                          {t('wizard.peer.versionOpenConsole')}
+                        </a>
+                      )}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => dismissVersionKey(peerVersionPrompt.gatewayDismissKey)}
+                      >
+                        {t('wizard.peer.versionDismiss')}
+                      </Button>
+                    </div>
+                  </div>
+                )}
+                {peerVersionPrompt.showPlugin && peerVersionPrompt.pluginTarget !== null && peerVersionPrompt.pluginDismissKey !== null && (
+                  <div className="zr-settings-version-pill" data-zen-remote="version-pill">
+                    <span>{t('wizard.peer.versionPluginBanner', { latest: peerVersionPrompt.pluginTarget })}</span>
+                    <div className="zr-settings-version-actions">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => dismissVersionKey(peerVersionPrompt.pluginDismissKey)}
+                      >
+                        {t('wizard.peer.versionDismiss')}
+                      </Button>
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="zr-settings-field">

@@ -629,3 +629,99 @@ test('QR encoder produces decodable RS + BCH symbols across versions', () => {
 
   assert.equal(qrMatrix('x'.repeat(107)), null)
 })
+
+test('T7 pure helpers: shouldShowLegacyGatewayModal / shouldShowPeerVersionPrompt / versionDismissKey', async () => {
+  const {
+    derivePeerStatusView,
+    versionDismissKey,
+    shouldShowPeerVersionPrompt,
+    shouldShowLegacyGatewayModal,
+  } = await import('../src/client-data/settings-form.ts')
+
+  assert.equal(
+    versionDismissKey('gateway', 'https://gw.example.com:19393/path#secret', 'v0.2.0'),
+    'zr:version-dismiss:gateway:https://gw.example.com:19393:0.2.0',
+  )
+  assert.equal(
+    versionDismissKey('plugin', '', '2.6.0'),
+    'zr:version-dismiss:plugin:global:2.6.0',
+  )
+
+  const legacyView = derivePeerStatusView({
+    configured: true,
+    nodeId: 'abcd1234',
+    gatewayState: 'authorized',
+    peers: [],
+    versionSync: {
+      pluginVersion: '2.5.1',
+      gatewayVersion: '0.1.0',
+      recommendedGatewayVersion: '0.2.0',
+      wireCompatLevel: 1,
+      gatewayOutdated: true,
+      pluginOutdated: false,
+      newerPluginVersion: null,
+      inferredLegacyGateway: true,
+      gatewayConsoleUrl: 'https://gw.example.com:19393',
+    },
+  })
+  assert.equal(
+    shouldShowLegacyGatewayModal(legacyView, { sessionDismissed: false, permanentDismissed: false }),
+    true,
+  )
+  assert.equal(
+    shouldShowLegacyGatewayModal(legacyView, { sessionDismissed: true, permanentDismissed: false }),
+    false,
+  )
+  assert.equal(
+    shouldShowLegacyGatewayModal(legacyView, { sessionDismissed: false, permanentDismissed: true }),
+    false,
+  )
+  assert.equal(
+    shouldShowLegacyGatewayModal(
+      { ...legacyView, gatewayState: 'connecting' },
+      { sessionDismissed: false, permanentDismissed: false },
+    ),
+    false,
+  )
+
+  const modernOutdatedView = derivePeerStatusView({
+    configured: true,
+    nodeId: 'abcd1234',
+    gatewayState: 'authorized',
+    peers: [],
+    versionSync: {
+      pluginVersion: '2.5.1',
+      gatewayVersion: '0.2.0',
+      recommendedGatewayVersion: '0.3.0',
+      wireCompatLevel: 1,
+      gatewayOutdated: true,
+      pluginOutdated: true,
+      newerPluginVersion: '2.6.0',
+      inferredLegacyGateway: false,
+      gatewayConsoleUrl: 'https://gw.example.com:19393',
+    },
+  })
+  // >= 0.2.0 must NEVER trigger the legacy modal!
+  assert.equal(
+    shouldShowLegacyGatewayModal(modernOutdatedView, { sessionDismissed: false, permanentDismissed: false }),
+    false,
+  )
+
+  // Gentle peer version prompt in settings / wizard respects per-version dismiss key
+  const dismissed = new Set()
+  const firstPrompt = shouldShowPeerVersionPrompt(modernOutdatedView, (k) => dismissed.has(k))
+  assert.equal(firstPrompt.showGateway, true)
+  assert.equal(firstPrompt.showPlugin, true)
+  assert.equal(firstPrompt.gatewayTarget, '0.3.0')
+  assert.equal(firstPrompt.pluginTarget, '2.6.0')
+  dismissed.add(firstPrompt.gatewayDismissKey)
+  const afterGwDismiss = shouldShowPeerVersionPrompt(modernOutdatedView, (k) => dismissed.has(k))
+  assert.equal(afterGwDismiss.showGateway, false)
+  assert.equal(afterGwDismiss.showPlugin, true)
+})
+
+test('T7 locales symmetry: all keys in zh and en match identically', () => {
+  const zhKeys = Object.keys(zh).sort()
+  const enKeys = Object.keys(en).sort()
+  assert.deepEqual(enKeys, zhKeys)
+})

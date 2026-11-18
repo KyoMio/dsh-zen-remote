@@ -129,10 +129,15 @@ export const UPLOAD_ROUTE = '/_dsh/mobile-nav/upload'
  * stamps it. Unreadable file degrades to `'unknown'`, never throws.
  */
 let pluginVersion = 'unknown'
+let recommendedGatewayVersion = ''
 try {
-  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version?: unknown }
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as {
+    version?: unknown
+    gatewayVersion?: unknown
+  }
   if (typeof pkg?.version === 'string' && pkg.version !== '') pluginVersion = pkg.version
-} catch { /* keep 'unknown' */ }
+  if (typeof pkg?.gatewayVersion === 'string' && pkg.gatewayVersion !== '') recommendedGatewayVersion = pkg.gatewayVersion
+} catch { /* keep defaults */ }
 
 /**
  * The one piece of cordis the typert interception needs at RUNTIME: the
@@ -1694,6 +1699,8 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           relayHandler: () => servingRelayHandler,
           relaySecret: () => servingRelaySecret ?? '',
           serverName: () => resolveConfig(config, readFileConfig(), process.env).values.serverName,
+          pluginVersion: () => pluginVersion,
+          recommendedGatewayVersion: () => recommendedGatewayVersion,
           // T4 peer-network-switch: the direct-path RTT cap's only production
           // source is the gateway's own word (welcome / network-updated →
           // peerNetwork.peerDirectMaxRttMsFromGateway). `options.directMaxRttMs`
