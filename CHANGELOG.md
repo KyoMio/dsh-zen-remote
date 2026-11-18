@@ -4,6 +4,12 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 未发布
+
+### 兼容
+
+- **适配 DSH 0.2.2-rc.5**：会话等远程指纹与 0.2.2-rc.4 / rc.3 / rc.2 相同（仍为 `r:c3b0734019c7`，27 个端点）。允许清单未改。官方专题变更是交付组合不再固定 `web.searchProvider`，DeepSeek 模型会话默认改用旧版 Messages 搜索，不影响远程会话面。范围仍覆盖 npm `latest`（0.2.2-rc.1）。
+
 ## 2.5.1（2026-11-18）
 
 ### 新增
