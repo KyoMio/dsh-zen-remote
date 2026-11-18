@@ -891,7 +891,9 @@ async function buildRttPair(t, { cap, rttCap }) {
     punch: {
       keepAliveMs: KEEPALIVE_MS,
       keepAliveLostFrames: 3,
+      reprobeInitialDelaysMs: [5_000, 15_000],
       reprobeIntervalMs: 800,
+      fastConfirmDelayMs: 0,
     },
   })
   const mgrB = new PeerPunchManager({
@@ -901,6 +903,7 @@ async function buildRttPair(t, { cap, rttCap }) {
     clock,
     keepAliveMs: KEEPALIVE_MS,
     keepAliveLostFrames: 3,
+    reprobeInitialDelaysMs: [5_000, 15_000],
     reprobeIntervalMs: 800,
   })
   await mgrB.ready()
@@ -1996,4 +1999,161 @@ test('T2 ws-version-handshake: legacy 0.1.0 inference, peer-joined pluginOutdate
   assert.equal(engine.status().peers.length, 0)
   await sleep(100)
   assert.equal(gateway.upgradeCount(), upgradesBefore, 'version-incompatible must not auto-reconnect')
+})
+
+test('fast 200ms follow-up RTT probe promotes under cap=300 without waiting 5s keepalive, and 6s grace absorbs asymmetric peer keepalive skew', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-fast-promote-'))
+  const clock = manualClock(Date.now())
+  const stateFileA = path.join(home, 'a-state.json')
+  const identityA = ensurePeerIdentity(stateFileA)
+  const identityB = generatePeerIdentity()
+  const socketA = await openUdp()
+  const socketB = await openUdp()
+  const gateB = makeGate(socketB)
+  gateB.dropFirstPing = false
+  gateB.pongDelayMs = 10
+
+  const wsSockets = []
+  let onBinaryFromEngine = null
+  const server = http.createServer()
+  server.on('upgrade', (req, socket) => {
+    wsSockets.push(socket)
+    socket.on('error', () => {})
+    let buf = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      for (;;) {
+        const parsed = readClientFrame(buf)
+        if (!parsed) break
+        buf = parsed.rest
+        if (parsed.opcode === 8) { socket.end(); return }
+        if (parsed.opcode === 9) {
+          socket.write(Buffer.concat([Buffer.from([0x8a, parsed.payload.length]), parsed.payload]))
+          continue
+        }
+        if (parsed.opcode === 2) {
+          onBinaryFromEngine?.(Buffer.from(parsed.payload))
+          continue
+        }
+        if (parsed.opcode !== 1) continue
+        let msg
+        try { msg = JSON.parse(parsed.payload.toString('utf8')) } catch { continue }
+        if (msg?.type === 'auth') {
+          socket.write(wsFrame({
+            type: 'welcome', status: 'authorized', connSeq: 1, maxPeers: 8,
+            peers: [{
+              nodeId: identityB.nodeId,
+              publicKeyHex: identityB.publicKeyHex,
+              name: 'peer-B',
+              lanEndpoints: [`127.0.0.1:${socketB.address().port}`],
+              reflexiveEndpoint: null,
+              connSeq: 1,
+            }],
+          }))
+        }
+      }
+    })
+    const accept = createHash('sha1').update(String(req.headers['sec-websocket-key']) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    socket.write(Buffer.concat([
+      Buffer.from(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`),
+      wsFrame({ type: 'challenge', challengeHex: 'a1b2c3d4e5f60718' }),
+    ]))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+
+  const sendWsBinaryToEngine = (bytes) => {
+    const payload = Buffer.from(bytes)
+    let hdr
+    if (payload.length < 126) hdr = Buffer.from([0x82, payload.length])
+    else {
+      hdr = Buffer.alloc(4)
+      hdr[0] = 0x82; hdr[1] = 126; hdr.writeUInt16BE(payload.length, 2)
+    }
+    for (const s of wsSockets) if (!s.destroyed) s.write(Buffer.concat([hdr, payload]))
+  }
+
+  let muxB = null
+  const engine = createPeerEngine({
+    stateFile: stateFileA,
+    identity: identityA,
+    relayPool: {
+      maxServers: () => 8,
+      mountVirtual: (input) => ({ entryId: input.entryId, serverId: input.serverId, serverName: input.serverName, displayName: input.serverName }),
+      unmountVirtual: () => true,
+      updateVirtualName: () => true,
+      reconnect: () => Promise.resolve(true),
+    },
+    relayHandler: () => async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.end('ok-from-a')
+    },
+    relaySecret: () => 'test',
+    serverName: () => 'node-A',
+    udpSocket: socketA,
+    udpProbe: null,
+    clock,
+    directMaxRttMs: () => 300,
+    punch: { keepAliveMs: 5_000, keepAliveLostFrames: 3 },
+  })
+  const mgrB = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: identityB,
+    socket: gateB,
+    clock,
+    keepAliveMs: 5_000,
+    keepAliveLostFrames: 3,
+    onEncryptedFrame: (header, plaintext) => {
+      muxB?.handleOpenedFrame(header, plaintext)
+    },
+  })
+  await mgrB.ready()
+  muxB = new PeerMux({
+    networkId: NET_ID,
+    identity: identityB,
+    clock,
+    sendGatewayBinary: (bytes) => sendWsBinaryToEngine(bytes),
+    relayHandler: () => undefined,
+    relaySecret: () => 'test',
+  })
+  muxB.ensureSession(identityA.nodeId, identityA.publicKeyHex, 'node-A')
+  onBinaryFromEngine = (bytes) => muxB.handleGatewayFrame(bytes)
+
+  writePeerNetwork(stateFileA, {
+    gatewayWsUrl: `ws://127.0.0.1:${port}`,
+    gatewayHttpOrigin: `http://127.0.0.1:${port}`,
+    networkId: NET_ID,
+    joinedAt: 1,
+  })
+  t.after(async () => {
+    mgrB.close(); muxB.close(); engine.stop()
+    for (const s of wsSockets) s.destroy()
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(home, { recursive: true, force: true })
+  })
+
+  engine.resumeFromState()
+  await waitFor(() => wsSockets.length >= 1, 'engine ws connected')
+  mgrB.beginPunch({ peerNodeId: identityA.nodeId, peerPublicKeyHex: identityA.publicKeyHex, lanEndpoints: [`127.0.0.1:${socketA.address().port}`] })
+  muxB.enableRelayPath(identityA.nodeId)
+  await waitFor(() => muxB.sessionPath(identityA.nodeId) !== 'none', 'muxB WS relay ready')
+  await waitFor(() => mgrB.peerState(identityA.nodeId)?.state === 'direct', 'both punch managers direct')
+
+  // Even if initiator's immediate PING hit the cipher-derivation race, two 220ms virtual ticks (<500ms << 5000ms keepalive) complete both RTT samples and promote to lan
+  clock.advance(220)
+  await sleep(30)
+  clock.advance(220)
+  await waitFor(() => engine.status().peers[0]?.path === 'lan', 'promoted within <500ms virtual time via fast follow-up probe')
+
+  // Peer stays on WS for 2500ms (> old 400ms, < new 6000ms cap-aware grace): must absorb WS traffic without bouncing back to relay
+  clock.advance(2_500)
+  const ac = new AbortController()
+  const guard = setTimeout(() => ac.abort(new Error('skew-ws fetch timed out')), 2_000)
+  try {
+    const res = await muxB.createFetchForPeer(identityA.nodeId)('http://peer/skew-ws', { signal: ac.signal })
+    assert.equal(await res.text(), 'ok-from-a')
+  } finally {
+    clearTimeout(guard)
+  }
+  assert.equal(engine.status().peers[0]?.path, 'lan', '6s grace absorbs asymmetric peer keepalive skew without demoting')
 })

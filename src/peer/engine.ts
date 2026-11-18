@@ -1388,6 +1388,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       identity,
       socket: punchSocket,
       clock,
+      reprobeInitialDelaysMs: [3_000, 8_000],
+      reprobeIntervalMs: 25_000,
+      fastConfirmDelayMs: 200,
       ...(options.punch ?? {}),
       onDirectReady,
       onPunchFallback,
@@ -1413,6 +1416,10 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       relayHandler: options.relayHandler,
       relaySecret: options.relaySecret,
       clock,
+      directPromoteGraceMs: () =>
+        directCap() > 0
+          ? Math.max(6_000, (options.punch?.keepAliveMs ?? 5_000) + 1_000)
+          : 400,
       onPathChanged: (peerNodeId, path) => {
         if (path === 'ws' || path === 'udp') {
           void options.relayPool.reconnect?.(peerNodeId)

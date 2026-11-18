@@ -169,6 +169,10 @@ export interface PeerPunchOptions {
     keepAliveMs?: number;
     /** Silent keepalive cycles that declare the direct path lost (spec: 3). */
     keepAliveLostFrames?: number;
+    /** Optional delay (ms) after the initial handshake PONG before firing one
+     *  follow-up probe PING so 2-sample RTT promotion completes in ~300ms
+     *  instead of waiting a full 5s keepalive cycle. Disabled when omitted/0. */
+    fastConfirmDelayMs?: number;
     onDirectReady?: (peerNodeId: string, info: DirectReadyInfo) => void;
     onPunchFallback?: (peerNodeId: string) => void;
     onDirectLost?: (peerNodeId: string) => void;

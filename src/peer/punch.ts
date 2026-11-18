@@ -459,6 +459,10 @@ export interface PeerPunchOptions {
   keepAliveMs?: number
   /** Silent keepalive cycles that declare the direct path lost (spec: 3). */
   keepAliveLostFrames?: number
+  /** Optional delay (ms) after the initial handshake PONG before firing one
+   *  follow-up probe PING so 2-sample RTT promotion completes in ~300ms
+   *  instead of waiting a full 5s keepalive cycle. Disabled when omitted/0. */
+  fastConfirmDelayMs?: number
   onDirectReady?: (peerNodeId: string, info: DirectReadyInfo) => void
   onPunchFallback?: (peerNodeId: string) => void
   onDirectLost?: (peerNodeId: string) => void
@@ -500,6 +504,8 @@ interface PunchSession {
   lastPingCountsForMiss: boolean
   /** Consecutive keepalive ticks that fired while a PING was outstanding. */
   missedPings: number
+  /** Whether one fast post-handshake follow-up RTT probe PING is pending after the initial PONG. */
+  fastConfirmPending: boolean
   /** Silent reprobe retries armed for this session (drives the 5s/15s/60s backoff). */
   reprobeAttempts: number
   lastSeen: number
@@ -553,6 +559,9 @@ export class PeerPunchManager {
     }
     knob(options.keepAliveMs, 5000, 'keepAliveMs')
     knob(options.keepAliveLostFrames, 3, 'keepAliveLostFrames')
+    if (options.fastConfirmDelayMs !== undefined && options.fastConfirmDelayMs !== 0) {
+      knob(options.fastConfirmDelayMs, 200, 'fastConfirmDelayMs')
+    }
     this.clock = options.clock ?? realClock
     this.readInterfaces = options.interfaces
       ?? (() => os.networkInterfaces() as unknown as Record<string, ReadonlyArray<LanInterfaceInfo> | undefined>)
@@ -764,6 +773,7 @@ export class PeerPunchManager {
       lastPingPayload: null,
       lastPingCountsForMiss: true,
       missedPings: 0,
+      fastConfirmPending: false,
       reprobeAttempts: 0,
       lastSeen: this.clock.now(),
       timers: new Set(),
@@ -944,6 +954,7 @@ export class PeerPunchManager {
    * old one never counts.
    */
   private sendPing(session: PunchSession, countsForMiss = true): void {
+    if (countsForMiss) session.fastConfirmPending = false
     if (session.lastPingSentAt !== null && session.lastPingCountsForMiss) {
       session.missedPings += 1
       try {
@@ -1136,7 +1147,18 @@ export class PeerPunchManager {
     // via onOpenedFrame) — ONE immediate encrypted PING measures the
     // session RTT inside the first round trip, no keepalive wait (T4).
     // Does not count toward missedPings if lost in the cipher derivation race.
+    const fastDelay = this.options.fastConfirmDelayMs ?? 0
+    session.fastConfirmPending = fastDelay > 0
     this.sendPing(session, false)
+    if (fastDelay > 0) {
+      // If the immediate PING above arrived at the responder before our HELLO-ACK
+      // (cipher-derivation race), retry once at +fastDelay while fastConfirmPending
+      // is still unconsumed so the initiator promotes in ~450ms instead of 10s.
+      this.armTimer(session, () => {
+        if (this.closed || session.state !== 'direct' || !session.fastConfirmPending) return
+        this.sendPing(session, false)
+      }, fastDelay)
+    }
   }
 
   private onOpenedFrame(
@@ -1186,6 +1208,16 @@ export class PeerPunchManager {
           this.options.onRttSample?.(session.peerNodeId, session.rttMs)
         } catch {
           // A listener bug must never wound the state machine.
+        }
+        if (session.fastConfirmPending) {
+          session.fastConfirmPending = false
+          const fastDelay = this.options.fastConfirmDelayMs ?? 0
+          if (fastDelay > 0 && session.state === 'direct') {
+            this.armTimer(session, () => {
+              if (this.closed || session.state !== 'direct' || session.lastPingSentAt !== null) return
+              this.sendPing(session, false)
+            }, fastDelay)
+          }
         }
       }
       return

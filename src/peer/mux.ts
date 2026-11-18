@@ -168,7 +168,7 @@ export interface PeerMuxOptions {
   /** 对端率先切入 WS 中转（收到新 WS 帧或 hello）时通知上层同步降级直连状态。 */
   onPeerRelayDemoted?: (nodeId: string) => void
   /** 刚切上 UDP 直连时吸收对端错峰晋升 WS 帧的宽限期（ms，默认 400）。 */
-  directPromoteGraceMs?: number
+  directPromoteGraceMs?: number | (() => number)
   log?: (line: string) => void
   /** 逐请求噪声通道（T3）：inbound request / body 生命周期行量太大，
    * 走它而不是 `log`，由 logLevel=debug 时才落环。 */
@@ -416,7 +416,8 @@ export class PeerMux {
     if (opened.header.seq > session.lastInboundWsSeq) {
       session.lastInboundWsSeq = opened.header.seq
     }
-    const graceMs = this.options.directPromoteGraceMs ?? DEFAULT_DIRECT_PROMOTE_GRACE_MS
+    const rawGrace = this.options.directPromoteGraceMs
+    const graceMs = typeof rawGrace === 'function' ? rawGrace() : (rawGrace ?? DEFAULT_DIRECT_PROMOTE_GRACE_MS)
     if (session.path === 'udp' && opened.header.seq > session.wsSeqAtDirectPromote) {
       if (!session.peerConfirmedDirect && (this.clock.now() - session.directPromotedAt) < graceMs) {
         session.wsSeqAtDirectPromote = session.lastInboundWsSeq
