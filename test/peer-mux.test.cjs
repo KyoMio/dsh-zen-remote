@@ -653,6 +653,10 @@ test('T1: PeerMux in udp auto-demotes to ws on newer encrypted WS frame, ignores
   assert.equal(A.sessionPath(b.nodeId), 'udp')
   assert.deepEqual(aDemoted, [])
 
+  // Exchange one warm UDP request so both sides have confirmed peer direct readiness
+  assert.equal(await (await B.createFetchForPeer(a.nodeId)('http://peer/confirm-udp')).text(), 'ok-via-ws')
+  await immediate()
+
   // Now B demotes to WS while A's UDP is dead; B sends request over WS (seq > wsSeqAtDirectPromote)
   dropUdpFromAToB = true
   const udpCountBefore = aUdpSent.length
@@ -666,6 +670,77 @@ test('T1: PeerMux in udp auto-demotes to ws on newer encrypted WS frame, ignores
   assert.ok(aPathChanges.some((e) => e.nodeId === b.nodeId && e.path === 'ws'))
   assert.equal(aUdpSent.length, udpCountBefore, 'A must not send any frame back over dead UDP after symmetric demotion')
   assert.ok(aWsSent.length > wsCountBefore, 'A must reply over WS')
+})
+
+test('staggered direct promotion absorbs pre-promotion WS frames within grace window before peer confirms UDP', async (t) => {
+  const clock = makeFakeClock(5_000_000)
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const aDemoted = []
+  let dropUdpFromAToB = false
+
+  let A, B
+  A = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: a,
+    clock,
+    directPromoteGraceMs: 1_500,
+    sendGatewayBinary: (bytes) => {
+      setImmediate(() => B.handleGatewayFrame(bytes))
+    },
+    relayHandler: () => async (_req, res) => { res.end('ok-from-a') },
+    relaySecret: () => 'test-secret',
+    onPeerRelayDemoted: (nodeId) => aDemoted.push(nodeId),
+  })
+  B = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: b,
+    clock,
+    directPromoteGraceMs: 1_500,
+    sendGatewayBinary: (bytes) => {
+      setImmediate(() => A.handleGatewayFrame(bytes))
+    },
+    relayHandler: () => async (_req, res) => { res.end('ok-from-b') },
+    relaySecret: () => 'test-secret',
+  })
+  t.after(() => { A.close(); B.close() })
+
+  A.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+  B.ensureSession(a.nodeId, a.publicKeyHex, 'A')
+  A.enableRelayPath(b.nodeId)
+  B.enableRelayPath(a.nodeId)
+  assert.equal(await (await A.createFetchForPeer(b.nodeId)('http://peer/warm-ws')).text(), 'ok-from-b')
+
+  // Staggered promotion: A promotes to UDP 30ms before B (still on WS)
+  A.setDirectPath(b.nodeId, (frameType, streamId, payload, ack) => {
+    if (!dropUdpFromAToB) {
+      setImmediate(() => B.handleOpenedFrame({ srcNodeId: a.nodeId, frameType, streamId, ack }, payload))
+    }
+  })
+  clock.advance(30)
+
+  // B is still on WS during the 30ms RTT skew and sends a fresh WS request -> A must deliver it and stay on UDP
+  assert.equal(B.sessionPath(a.nodeId), 'ws')
+  const skewRes = await responseWithin(B.createFetchForPeer(a.nodeId)('http://peer/during-skew'))
+  assert.equal(await skewRes.text(), 'ok-from-a')
+  assert.equal(A.sessionPath(b.nodeId), 'udp', 'staggered WS frame within grace window must not demote A')
+  assert.deepEqual(aDemoted, [])
+
+  // Now B also promotes to UDP and sends an encrypted UDP request (peerConfirmedDirect = true)
+  B.setDirectPath(a.nodeId, (frameType, streamId, payload, ack) => {
+    setImmediate(() => A.handleOpenedFrame({ srcNodeId: b.nodeId, frameType, streamId, ack }, payload))
+  })
+  const directRes = await responseWithin(B.createFetchForPeer(a.nodeId)('http://peer/now-direct'))
+  assert.equal(await directRes.text(), 'ok-from-a')
+  assert.equal(A.sessionPath(b.nodeId), 'udp')
+
+  // Later, even well within grace window, if B actually falls back to WS, A demotes immediately
+  dropUdpFromAToB = true
+  B.setRelayPath(a.nodeId)
+  const fallbackRes = await responseWithin(B.createFetchForPeer(a.nodeId)('http://peer/post-direct-fallback'))
+  assert.equal(await fallbackRes.text(), 'ok-from-a')
+  assert.equal(A.sessionPath(b.nodeId), 'ws')
+  assert.deepEqual(aDemoted, [b.nodeId])
 })
 
 test('T1: setRelayPath from udp to ws flushes inflight immediately, and enableRelayPath resets path to none when ciphers===null', () => {

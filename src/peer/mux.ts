@@ -70,6 +70,8 @@ const HELLO_RETRY_MS = 400
 const HELLO_RETRY_MAX = 6
 /** dispatchFrame 无密码器按需自愈拉起 beginHello 的最小冷却间隔（ms）。 */
 const AUTO_HELLO_COOLDOWN_MS = 2_000
+/** 刚切上 UDP 直连时吸收对端半个 RTT 错峰晋升 WS 帧的宽限期（ms）。 */
+const DEFAULT_DIRECT_PROMOTE_GRACE_MS = 400
 const BODY_HIGH_WATER_BYTES = 64 * 1024
 const ADMISSION_CHUNK_BYTES = 16 * 1024
 const MAX_META_BYTES = 65_536
@@ -136,6 +138,10 @@ interface MuxSession {
   lastInboundWsSeq: bigint
   /** 最近一次切上 UDP 直连时记录的 lastInboundWsSeq（过滤切路前在途旧 WS 帧）。 */
   wsSeqAtDirectPromote: bigint
+  /** 最近一次调用 setDirectPath 切上 UDP 的时间戳（ms）。 */
+  directPromotedAt: number
+  /** 本次切上 UDP 后是否已收到对端发来的解密 UDP 帧（确认双方均已切换直连）。 */
+  peerConfirmedDirect: boolean
   arq: PeerArqSession
   punchSender: PunchFrameSender | null
   streams: Map<number, MuxStream>
@@ -161,6 +167,8 @@ export interface PeerMuxOptions {
   onPathChanged?: (nodeId: string, path: PeerPath) => void
   /** 对端率先切入 WS 中转（收到新 WS 帧或 hello）时通知上层同步降级直连状态。 */
   onPeerRelayDemoted?: (nodeId: string) => void
+  /** 刚切上 UDP 直连时吸收对端错峰晋升 WS 帧的宽限期（ms，默认 400）。 */
+  directPromoteGraceMs?: number
   log?: (line: string) => void
   /** 逐请求噪声通道（T3）：inbound request / body 生命周期行量太大，
    * 走它而不是 `log`，由 logLevel=debug 时才落环。 */
@@ -216,6 +224,8 @@ export class PeerMux {
       envelopeSeq: 0n,
       lastInboundWsSeq: -1n,
       wsSeqAtDirectPromote: -1n,
+      directPromotedAt: -Infinity,
+      peerConfirmedDirect: false,
       arq: new PeerArqSession({
         sendFrame: (frameType, streamId, payload, ack) => this.dispatchFrame(session, frameType, streamId, payload, ack),
         onStreamData: (streamId, chunk, final) => this.onStreamData(session, streamId, chunk, final),
@@ -271,6 +281,8 @@ export class PeerMux {
     session.peerEphPubHex = null
     session.seq = 0n
     session.envelopeSeq = 0n
+    session.directPromotedAt = -Infinity
+    session.peerConfirmedDirect = false
     session.punchSender = null
     this.sessions.delete(session.nodeId)
     if (session.path !== 'none') {
@@ -346,6 +358,8 @@ export class PeerMux {
     if (!session || session.closed || this.closed) return
     session.punchSender = sender
     session.wsSeqAtDirectPromote = session.lastInboundWsSeq
+    session.directPromotedAt = this.clock.now()
+    session.peerConfirmedDirect = false
     const before = session.path
     session.path = 'udp'
     if (before === 'none') session.arq.flushInflight()
@@ -373,6 +387,7 @@ export class PeerMux {
   handleOpenedFrame(header: PeerFrameHeader, plaintext: Uint8Array): void {
     const session = this.sessions.get(header.srcNodeId)
     if (!session || session.closed) return
+    if (session.path === 'udp') session.peerConfirmedDirect = true
     try {
       session.arq.handleFrame(header.frameType, header.streamId, plaintext, header.ack)
     } catch {
@@ -401,11 +416,17 @@ export class PeerMux {
     if (opened.header.seq > session.lastInboundWsSeq) {
       session.lastInboundWsSeq = opened.header.seq
     }
+    const graceMs = this.options.directPromoteGraceMs ?? DEFAULT_DIRECT_PROMOTE_GRACE_MS
     if (session.path === 'udp' && opened.header.seq > session.wsSeqAtDirectPromote) {
-      session.path = 'ws'
-      session.arq.flushInflight()
-      this.options.onPathChanged?.(session.nodeId, 'ws')
-      this.options.onPeerRelayDemoted?.(session.nodeId)
+      if (!session.peerConfirmedDirect && (this.clock.now() - session.directPromotedAt) < graceMs) {
+        session.wsSeqAtDirectPromote = session.lastInboundWsSeq
+      } else {
+        session.path = 'ws'
+        session.peerConfirmedDirect = false
+        session.arq.flushInflight()
+        this.options.onPathChanged?.(session.nodeId, 'ws')
+        this.options.onPeerRelayDemoted?.(session.nodeId)
+      }
     }
     try {
       session.arq.handleFrame(opened.header.frameType, opened.header.streamId, opened.plaintext, opened.header.ack)

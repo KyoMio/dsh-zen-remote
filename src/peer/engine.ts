@@ -232,6 +232,8 @@ interface MemberRec {
   lastArqRtoMs: number | null
   /** 对端在 welcome.peers / peer-joined 携带的插件版本号。 */
   pluginVersion: string | null
+  /** 对端触发中转跟切后的晋升抑制截止时间（ms），防止 10s 反复切直连抖动。 */
+  peerRelayHoldUntil: number
 }
 
 const realClock = {
@@ -475,6 +477,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directMissedPings = 0
     member.lastArqWindow = null
     member.lastArqRtoMs = null
+    member.peerRelayHoldUntil = 0
     if (resetMux) {
       mux?.enableRelayPath(member.nodeId)
     } else {
@@ -533,6 +536,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         lastArqWindow: null,
         lastArqRtoMs: null,
         pluginVersion: null,
+        peerRelayHoldUntil: 0,
       }
       members.set(nodeId, member)
     }
@@ -1198,6 +1202,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directMissedPings = 0
     member.lastArqWindow = null
     member.lastArqRtoMs = null
+    member.peerRelayHoldUntil = 0
     if (directCap() <= 0) {
       // 上限关闭：与旧行为一致，打通即直连。
       member.path = info.mode
@@ -1302,7 +1307,12 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     }
     // 未激活（首样本期或已降级）统一口径：连续 DIRECT_PROMOTE_STREAK 个
     // 样本 ≤ cap×0.7 才升直连；超 cap 的样本记降级并把 streak 归零，
-    // 介于阈值与 cap 之间的只重置 streak。
+    // 介于阈值与 cap 之间的只重置 streak。若刚因对端切回中转触发冷却，
+    // 抑止重新晋升直连。
+    if (clock.now() < member.peerRelayHoldUntil) {
+      member.directGoodStreak = 0
+      return
+    }
     if (rtt <= cap * DIRECT_PROMOTE_RATIO) {
       member.directGoodStreak += 1
       if (member.directGoodStreak >= DIRECT_PROMOTE_STREAK) promoteDirect(member)
@@ -1331,6 +1341,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directDemoted = false
     member.directActive = false
     member.directMissedPings = 0
+    member.peerRelayHoldUntil = 0
     schedulePathReport()
   }
 
@@ -1384,6 +1395,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       onRttSample,
       onPingUnanswered,
       onEncryptedFrame: (header, plaintext) => {
+        const m = members.get(header.srcNodeId.toLowerCase())
+        if (m !== undefined) m.peerRelayHoldUntil = 0
         mux?.handleOpenedFrame(header, plaintext)
       },
     })
@@ -1413,8 +1426,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         member.directActive = false
         member.directDemoted = true
         member.directGoodStreak = 0
+        member.peerRelayHoldUntil = clock.now() + 30_000
         applyArqProfile(member, 'relay', true)
-        punch?.demoteSessionToRelay(peerNodeId)
         schedulePathReport()
         log(`peer engine: peer ${member.nodeId} demoted to relay — syncing local path`)
       },

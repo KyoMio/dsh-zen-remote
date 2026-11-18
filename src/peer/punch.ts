@@ -730,35 +730,6 @@ export class PeerPunchManager {
     this.sessions.delete(nodeId)
   }
 
-  /**
-   * Demote a direct or punching session to idle relay mode when the peer
-   * unilaterally switched to WS relay (does not emit `onDirectLost`).
-   */
-  demoteSessionToRelay(peerNodeId: string): void {
-    if (this.closed) return
-    const session = this.sessions.get(peerNodeId.toLowerCase())
-    if (!session) return
-    if (session.state === 'idle') {
-      session.ciphers = null
-      session.peerEphPubHex = null
-      session.derivedPair = null
-      return
-    }
-    this.clearSessionTimers(session)
-    session.state = 'idle'
-    session.awaitingAck = false
-    session.peerEphPubHex = null
-    session.derivedPair = null
-    session.ciphers = null
-    session.rttMs = null
-    session.lastPingSentAt = null
-    session.lastPingPayload = null
-    session.lastPingCountsForMiss = true
-    session.missedPings = 0
-    session.reprobeAttempts = 0
-    this.scheduleReprobe(session)
-  }
-
   /** Stop everything: per-peer timers cleared, sessions dropped, socket closed. */
   close(): void {
     if (this.closed) return

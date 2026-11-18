@@ -54,6 +54,8 @@ export interface PeerMuxOptions {
     onPathChanged?: (nodeId: string, path: PeerPath) => void;
     /** 对端率先切入 WS 中转（收到新 WS 帧或 hello）时通知上层同步降级直连状态。 */
     onPeerRelayDemoted?: (nodeId: string) => void;
+    /** 刚切上 UDP 直连时吸收对端错峰晋升 WS 帧的宽限期（ms，默认 400）。 */
+    directPromoteGraceMs?: number;
     log?: (line: string) => void;
     /** 逐请求噪声通道（T3）：inbound request / body 生命周期行量太大，
      * 走它而不是 `log`，由 logLevel=debug 时才落环。 */

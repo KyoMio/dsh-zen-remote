@@ -1849,30 +1849,6 @@ test('revoking a peer drops ciphers and prevents late handshake resurrection', (
   }
 })
 
-test('T2: demoteSessionToRelay clears direct state and timers without firing onDirectLost', async () => {
-  let lostCalls = 0
-  const pair = await establishPair({
-    onDirectLost: () => { lostCalls += 1 },
-  })
-  try {
-    const { mgrA, B, clockA } = pair
-    assert.equal(mgrA.peerState(B.nodeId).state, 'direct')
-    assert.ok(mgrA.sessionCiphers(B.nodeId))
-
-    mgrA.demoteSessionToRelay(B.nodeId)
-    assert.equal(mgrA.peerState(B.nodeId).state, 'idle')
-    assert.equal(mgrA.sessionCiphers(B.nodeId), null)
-    assert.equal(lostCalls, 0, 'demoteSessionToRelay must not fire onDirectLost')
-
-    // Advancing through normal keepalive loss window must not fire onDirectLost
-    clockA.advance(16_000)
-    assert.equal(lostCalls, 0)
-  } finally {
-    await closeManager({ mgr: pair.mgrA, socket: pair.sockA })
-    await closeManager({ mgr: pair.mgrB, socket: pair.sockB })
-  }
-})
-
 test('T2: onHello from non-candidate mapped port adds bounded candidate and converges after first HELLO drop without 15s stall', () => {
   const clock = manualClock()
   const local = generatePeerIdentity()

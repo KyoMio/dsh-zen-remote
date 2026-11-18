@@ -1548,7 +1548,7 @@ function makeP2pNatSocket(realSocket, clock) {
   return wrapper
 }
 
-test('T2: onPeerRelayDemoted syncs member state, restores relay ARQ profile, and stops UDP keepalive; resetPeerForReanchor(false) restores relay ARQ profile', async (t) => {
+test('T2: onPeerRelayDemoted syncs member state, restores relay ARQ profile, and preserves UDP ciphers; resetPeerForReanchor(false) restores relay ARQ profile', async (t) => {
 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-t2-engine-'))
   const clock = manualClock(Date.now())
@@ -1712,6 +1712,7 @@ test('T2: onPeerRelayDemoted syncs member state, restores relay ARQ profile, and
   muxB.enableRelayPath(identityA.nodeId)
   await waitFor(() => muxB.sessionPath(identityA.nodeId) !== 'none' && muxB.sessions.get(identityA.nodeId)?.ciphers !== null, 'muxB WS ciphers ready')
   muxB.setDirectPath(identityA.nodeId, mgrB.frameSenderFor(identityA.nodeId))
+  clock.advance(500)
 
   // Part 1: resetPeerForReanchor(..., false) must restore relay ARQ window=64 (not leave p2p window=16)
   for (const s of wsSockets) {
@@ -1771,8 +1772,13 @@ test('T2: onPeerRelayDemoted syncs member state, restores relay ARQ profile, and
       }))
     }
   }
-  await waitFor(() => engine.status().peers[0]?.path === 'p2p', 're-promoted to p2p')
+  await waitFor(
+    () => engine.status().peers[0]?.path === 'p2p' && mgrB2.peerState(identityA.nodeId)?.state === 'direct',
+    'both sides promoted to direct p2p',
+  )
   muxB.setDirectPath(identityA.nodeId, mgrB2.frameSenderFor(identityA.nodeId))
+  // Advance past the 400ms direct promotion grace window so B's subsequent WS fallback is treated as genuine
+  clock.advance(500)
 
   // B unilaterally switches to WS and sends request while A's UDP is dead
   gateB2.dropAll = true
@@ -1786,11 +1792,11 @@ test('T2: onPeerRelayDemoted syncs member state, restores relay ARQ profile, and
   assert.equal(peerAfter.directDemoted, true)
   assert.equal(peerAfter.rttMs, null)
 
-  // UDP keepalive must have stopped on A
+  // UDP keepalive & ciphers on A must stay alive (never wiping ciphers into a blackhole)
   const pingsBefore = natSocketA.pingSends.length
-  clock.advance(KEEPALIVE_MS * 2)
+  clock.advance(KEEPALIVE_MS)
   await sleep(10)
-  assert.equal(natSocketA.pingSends.length, pingsBefore, 'demoteSessionToRelay must stop direct keepalive PINGs')
+  assert.ok(natSocketA.pingSends.length > pingsBefore, 'onPeerRelayDemoted must preserve UDP session & keepalive')
 
   // ARQ window must also be restored to 64 (not stuck at p2p's 16)
   engineRelayFrames.length = 0
@@ -1803,6 +1809,20 @@ test('T2: onPeerRelayDemoted syncs member state, restores relay ARQ profile, and
   holdBDataFrames = false
   for (const f of heldDataFrames.splice(0)) muxB.handleGatewayFrame(f)
   assert.equal(await (await afterDemoteUpload).text(), 'ok-from-b')
+
+  // Late UDP frames from B must still decrypt cleanly on A without blackholing
+  gateB2.dropAll = false
+  dropBInboundFromA = false
+  muxB.setDirectPath(identityA.nodeId, mgrB2.frameSenderFor(identityA.nodeId))
+  const ac = new AbortController()
+  const guard = setTimeout(() => ac.abort(new Error('late UDP request timed out')), 2_000)
+  try {
+    const lateUdpRes = await muxB.createFetchForPeer(identityA.nodeId)('http://peer/late-udp-after-demote', { signal: ac.signal })
+    assert.equal(await lateUdpRes.text(), 'ok-from-a')
+  } finally {
+    clearTimeout(guard)
+  }
+  assert.equal(engine.status().peers[0]?.path, 'relay', 'A keeps replying over WS without blackholing inbound UDP')
 })
 
 test('T1 version-sync: parseSemver, compareSemver (with prerelease), evaluatePeerVersionSync, and sanitizeConsoleOrigin', () => {
