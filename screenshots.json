@@ -1,7 +1,10 @@
 [
+  "docs/images/wizard-overview.png",
+  "docs/images/gateway-console.png",
+  "docs/images/peer-devices-modal.png",
   "docs/images/client-sidebar.png",
-  "assets/session.png",
+  "docs/images/wizard-step1-role-path.png",
+  "docs/images/wizard-step2-peer-join.png",
   "assets/home.png",
-  "docs/images/host-pairing.png",
-  "docs/images/client-settings.png"
+  "assets/session.png"
 ]
