@@ -4,7 +4,7 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
-## 未发布
+## 2.5.3（2026-11-18）
 
 ### 修复
 
