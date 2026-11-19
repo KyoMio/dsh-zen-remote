@@ -89,9 +89,14 @@ const FORWARDABLE_ACTIONS: ReadonlySet<string> = new Set(['set-role', 'set-kind'
 /** The share-toggle verbs POST shares understands (T33a). */
 const SHARE_ACTIONS: ReadonlySet<string> = new Set(['share', 'unshare', 'unshare-all'])
 
-/** Longest wait for one session/projections call (titles, share existence).
+/** Longest wait for one session/projections or session/list call.
  * A hung typert gateway must not hold a route open forever. */
 const PROJECTION_TIMEOUT_MS = 5000
+
+/** Maximum concurrent cold-session title fallback lookups (`session/projections`)
+ * per admin handler instance — strictly below DSH's 5-slot cold observation LRU
+ * so missing summaries never thrash the host cache. */
+const MAX_TITLE_FALLBACK_CONCURRENCY = 3
 
 /** Fixed test-push copy — Chinese by default, English for `lang: 'en'`
  * (`'auto'` has no requester signal here, so it falls to Chinese). */
@@ -386,6 +391,16 @@ type ProjectionOutcome =
   | { kind: 'no-session' }
   | { kind: 'values'; values: Record<string, unknown> }
 
+/** Read the typert gateway lazily per call, treating a throwing lookup as
+ * an unavailable composition rather than a route failure. */
+function typertGatewayOf(options: AdminHandlerOptions): RelayGateway | undefined {
+  try {
+    return options.typert?.()
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * One call to the typert gateway's `session/projections`, under the per-call
  * timeout. Every failure mode the route can survive is a VALUE here — only
@@ -397,12 +412,7 @@ type ProjectionOutcome =
  * invocation is actually STOPPED, not merely abandoned by the waiter.
  */
 async function projectionOf(options: AdminHandlerOptions, sessionId: string): Promise<ProjectionOutcome> {
-  let gateway: RelayGateway | undefined
-  try {
-    gateway = options.typert?.()
-  } catch {
-    return { kind: 'no-gateway' }
-  }
+  const gateway = typertGatewayOf(options)
   if (gateway === undefined) return { kind: 'no-gateway' }
   const value = await gateway.invoke(withPeer({
     namespace: 'session',
@@ -416,6 +426,31 @@ async function projectionOf(options: AdminHandlerOptions, sessionId: string): Pr
     kind: 'values',
     values: values !== null && typeof values === 'object' ? (values as Record<string, unknown>) : {},
   }
+}
+
+/**
+ * Parse a `session/list` response into a `sessionId -> title` map.
+ * Explicit `null` values (unnamed sessions before their first `session/title`
+ * event) are stored in the map so callers preserve `null` without falling back
+ * to a cold `session/projections` read; missing entries or invalid shapes are
+ * omitted (or return `undefined` to trigger full fallback).
+ */
+function extractSummaryTitles(result: unknown): Map<string, string | null> | undefined {
+  if (result === null || typeof result !== 'object') return undefined
+  const items = (result as { items?: unknown }).items
+  if (!Array.isArray(items)) return undefined
+  const titles = new Map<string, string | null>()
+  for (const item of items) {
+    if (item === null || typeof item !== 'object') continue
+    const sessionId = (item as { sessionId?: unknown }).sessionId
+    if (typeof sessionId !== 'string' || sessionId === '') continue
+    const values = (item as { projections?: { values?: unknown } }).projections?.values
+    if (values === null || typeof values !== 'object' || Array.isArray(values)) continue
+    if (!Object.prototype.hasOwnProperty.call(values, 'title')) continue
+    const title = (values as { title?: unknown }).title
+    if (typeof title === 'string' || title === null) titles.set(sessionId, title)
+  }
+  return titles
 }
 
 /**
@@ -510,11 +545,102 @@ async function isSubagentSession(
   return projectionValues.subagent !== null && typeof projectionValues.subagent === 'object'
 }
 
-/** GET shares: the table verbatim, plus the derived fields the settings page
- * renders — the idle countdown (busy reads `Infinity` from the store, `null`
- * on the wire), the current viewer count, and the session titles, fetched
- * concurrently so one slow or failing lookup delays nobody else. */
-async function respondShares(options: AdminHandlerOptions, res: ServerResponse): Promise<void> {
+/** Per-handler coordinator for shares title lookups: coalesces concurrent
+ * `session/list` summary calls, deduplicates per-session fallback lookups, and
+ * bounds concurrent `session/projections` calls with a FIFO semaphore. */
+interface SharesTitleCoordinator {
+  getSummaryTitles: () => Promise<Map<string, string | null> | undefined>
+  fallbackTitleOf: (sessionId: string) => Promise<string | null>
+  invalidateSummaryList: () => void
+}
+
+/** Build one handler-scoped title coordinator (never shared across handler
+ * instances). Shared queries use internal `AbortSignal.timeout` rather than
+ * any caller's socket signal so one client closing never cancels peers. */
+function createSharesTitleCoordinator(options: AdminHandlerOptions): SharesTitleCoordinator {
+  let inFlightSummaryList: Promise<Map<string, string | null> | undefined> | undefined
+  const inFlightFallbackTitles = new Map<string, Promise<string | null>>()
+  let activeFallbacks = 0
+  const fallbackWaiters: Array<() => void> = []
+
+  function acquireFallbackSlot(): Promise<void> {
+    if (activeFallbacks < MAX_TITLE_FALLBACK_CONCURRENCY) {
+      activeFallbacks += 1
+      return Promise.resolve()
+    }
+    return new Promise<void>((resolve) => {
+      fallbackWaiters.push(resolve)
+    })
+  }
+
+  function releaseFallbackSlot(): void {
+    const next = fallbackWaiters.shift()
+    if (next !== undefined) {
+      // Transfer slot ownership directly to the next waiter without decrementing
+      // `activeFallbacks`, preventing same-tick arrivals from stealing a 4th slot.
+      next()
+      return
+    }
+    activeFallbacks = Math.max(0, activeFallbacks - 1)
+  }
+
+  function getSummaryTitles(): Promise<Map<string, string | null> | undefined> {
+    if (inFlightSummaryList !== undefined) return inFlightSummaryList
+    const gateway = typertGatewayOf(options)
+    if (gateway === undefined) return Promise.resolve(undefined)
+    let settled = false
+    let current: Promise<Map<string, string | null> | undefined> | undefined
+    current = (async () => {
+      try {
+        const result = await gateway.invoke(withPeer({
+          namespace: 'session',
+          method: 'list',
+          args: { _request: {} },
+          signal: AbortSignal.timeout(options.projectionTimeoutMs ?? PROJECTION_TIMEOUT_MS),
+        }, options.getPeer))
+        return extractSummaryTitles(result)
+      } catch {
+        return undefined
+      } finally {
+        settled = true
+        if (current !== undefined && inFlightSummaryList === current) inFlightSummaryList = undefined
+      }
+    })()
+    if (!settled) inFlightSummaryList = current
+    return current
+  }
+
+  function fallbackTitleOf(sessionId: string): Promise<string | null> {
+    const existing = inFlightFallbackTitles.get(sessionId)
+    if (existing !== undefined) return existing
+    const task = (async () => {
+      await acquireFallbackSlot()
+      try {
+        return await titleOf(options, sessionId)
+      } finally {
+        inFlightFallbackTitles.delete(sessionId)
+        releaseFallbackSlot()
+      }
+    })()
+    inFlightFallbackTitles.set(sessionId, task)
+    return task
+  }
+
+  function invalidateSummaryList(): void {
+    inFlightSummaryList = undefined
+  }
+
+  return { getSummaryTitles, fallbackTitleOf, invalidateSummaryList }
+}
+
+/** GET shares: the table verbatim (read fresh per request), plus derived fields
+ * and session titles resolved summary-first via `session/list` with a
+ * concurrency-bounded per-session `session/projections` fallback for misses. */
+async function respondShares(
+  options: AdminHandlerOptions,
+  coordinator: SharesTitleCoordinator,
+  res: ServerResponse,
+): Promise<void> {
   const store = options.store as ShareStore
   const viewerCount = options.viewerCount ?? (() => 0)
   const shares = store.list().map((entry) => {
@@ -529,9 +655,24 @@ async function respondShares(options: AdminHandlerOptions, res: ServerResponse):
       title: null as string | null,
     }
   })
-  await Promise.all(shares.map(async (row) => {
-    row.title = await titleOf(options, row.sessionId)
-  }))
+  if (shares.length === 0 || typertGatewayOf(options) === undefined) {
+    responseJson(res, 200, { ok: true, shares })
+    return
+  }
+  const summaryTitles = await coordinator.getSummaryTitles()
+  const missingRows: typeof shares = []
+  for (const row of shares) {
+    if (summaryTitles?.has(row.sessionId)) {
+      row.title = summaryTitles.get(row.sessionId) ?? null
+    } else {
+      missingRows.push(row)
+    }
+  }
+  if (missingRows.length > 0) {
+    await Promise.all(missingRows.map(async (row) => {
+      row.title = await coordinator.fallbackTitleOf(row.sessionId)
+    }))
+  }
   responseJson(res, 200, { ok: true, shares })
 }
 
@@ -541,6 +682,7 @@ async function respondShares(options: AdminHandlerOptions, res: ServerResponse):
  * {@link ADMIN_ROUTE_PREFIX} and never throws.
  */
 export function createAdminHandler(options: AdminHandlerOptions): AdminHandler {
+  const sharesCoordinator = createSharesTitleCoordinator(options)
   return async (req, res) => {
     // Wall 1 first: DSH's own admission (webServer routes skip /api auth).
     const admission = options.admit(req)
@@ -572,7 +714,7 @@ export function createAdminHandler(options: AdminHandlerOptions): AdminHandler {
           return
         }
         if (method === 'GET') {
-          await respondShares(options, res)
+          await respondShares(options, sharesCoordinator, res)
           return
         }
         if (method === 'POST') {
@@ -600,6 +742,7 @@ export function createAdminHandler(options: AdminHandlerOptions): AdminHandler {
           const store: ShareStore = options.store
           if (action === 'unshare-all') {
             for (const entry of store.list()) store.unshare(entry.sessionId, 'manual')
+            sharesCoordinator.invalidateSummaryList()
             responseJson(res, 200, { ok: true })
             return
           }
@@ -626,10 +769,12 @@ export function createAdminHandler(options: AdminHandlerOptions): AdminHandler {
             // A session whose agent is mid-turn must not look idle: the same
             // restore a restart runs, scoped to whatever runs right now.
             restoreBusy(store, options.listAgents ?? (() => []))
+            sharesCoordinator.invalidateSummaryList()
             responseJson(res, 200, { ok: true })
             return
           }
           store.unshare(sessionId, 'manual')
+          sharesCoordinator.invalidateSummaryList()
           responseJson(res, 200, { ok: true })
           return
         }

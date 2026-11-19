@@ -606,3 +606,256 @@ test('T9: dsh-push honors lan-gate-runtime.json port, rejects NaN approval grace
   await new Promise((r) => setTimeout(r, 60))
   assert.strictEqual(received.length, 1, 'push must reach actual listening port from lan-gate-runtime.json')
 })
+
+// ---- Issue #61 T3: push-event-snapshot-avoidance --------------------------
+
+function makePushTestCtx(t, options = {}) {
+  const listeners = new Map()
+  const cleanups = []
+  const sent = []
+  const prevFetch = global.fetch
+  global.fetch = async (url, opts) => {
+    sent.push(JSON.parse(opts.body))
+    return { ok: true, status: 200, json: async () => ({ ok: true, sent: 1 }) }
+  }
+  t.after(() => {
+    for (const stop of cleanups) {
+      try { stop() } catch { /* ignore */ }
+    }
+    global.fetch = prevFetch
+  })
+  const services = options.services || {}
+  const ctx = {
+    on: (ev, cb) => { listeners.set(ev, cb); return () => {} },
+    inject: () => {},
+    effect: (fn) => {
+      const stop = fn()
+      if (typeof stop === 'function') cleanups.push(stop)
+      return stop
+    },
+    ...(options.withReflect === false ? {} : { reflect: { get: (name) => services[name] } }),
+  }
+  return { ctx, listeners, sent }
+}
+
+test('T3 push: pushTurnEnd:false with pushSessionName:true makes 0 snapshotEvents() calls', async (t) => {
+  const mod = await freshImport()
+  const { ctx, listeners, sent } = makePushTestCtx(t)
+  mod.apply(ctx, { pushEnabled: true, pushTurnEnd: false, pushSummary: true, pushSessionName: true, pushTool: false })
+
+  let snapshotCalls = 0
+  const session = {
+    id: 's-off',
+    header: {},
+    snapshotEvents: () => { snapshotCalls += 1; return [] },
+  }
+  listeners.get('agent/turn-stopping')({ turn: 1, agent: { session } })
+  await Promise.resolve()
+  assert.strictEqual(snapshotCalls, 0)
+  assert.strictEqual(sent.length, 0)
+})
+
+test('T3 push: subagent turn-end and debounce window short-circuit with 0 snapshotEvents() calls', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_700_000_000_000 })
+  const mod = await freshImport()
+  const { ctx, listeners, sent } = makePushTestCtx(t)
+  mod.apply(ctx, {
+    pushEnabled: true,
+    pushTurnEnd: true,
+    pushDebounceMs: 15000,
+    pushSummary: true,
+    pushSessionName: true,
+    pushTool: false,
+    lang: 'zh',
+  })
+
+  const onTurnEnd = listeners.get('agent/turn-stopping')
+  let subCalls = 0
+  onTurnEnd({
+    turn: 1,
+    agent: {
+      session: {
+        id: 's-sub',
+        header: { delegationDepth: 1 },
+        snapshotEvents: () => { subCalls += 1; return [] },
+      },
+    },
+  })
+  assert.strictEqual(subCalls, 0)
+  assert.strictEqual(sent.length, 0)
+
+  // First top-level turn-end sends and arms debounce clock.
+  let topCalls = 0
+  const topSession = {
+    id: 's-top',
+    header: {},
+    snapshotEvents: () => {
+      topCalls += 1
+      return [{ type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '完成' }] } } }]
+    },
+  }
+  onTurnEnd({ turn: 1, agent: { session: topSession } })
+  await Promise.resolve()
+  assert.strictEqual(topCalls, 1)
+  assert.strictEqual(sent.length, 1)
+
+  // Second turn-end inside debounce window must short-circuit BEFORE snapshotEvents().
+  t.mock.timers.tick(5000)
+  onTurnEnd({ turn: 2, agent: { session: topSession } })
+  await Promise.resolve()
+  assert.strictEqual(topCalls, 1, 'debounced turn-end must not call snapshotEvents()')
+  assert.strictEqual(sent.length, 1)
+})
+
+test('T3 push: pushTurnEnd:true, pushSummary:false with cached title makes 0 snapshotEvents() calls', async (t) => {
+  const mod = await freshImport()
+  const { ctx, listeners, sent } = makePushTestCtx(t)
+  mod.apply(ctx, {
+    pushEnabled: true,
+    pushTurnEnd: true,
+    pushDebounceMs: 0,
+    pushSummary: false,
+    pushSessionName: true,
+    pushTool: false,
+    lang: 'zh',
+  })
+
+  let snapshotCalls = 0
+  const session = {
+    id: 's-cached',
+    header: {},
+    snapshotEvents: () => { snapshotCalls += 1; return [] },
+  }
+  listeners.get('session/event')(session, { type: 'session/title', data: { title: '缓存标题' } })
+  listeners.get('agent/turn-stopping')({ turn: 1, agent: { session } })
+  await Promise.resolve()
+  assert.strictEqual(snapshotCalls, 0)
+  assert.strictEqual(sent.length, 1)
+  assert.strictEqual(sent[0].body, '来源会话：缓存标题\n智能体已完成当前回合')
+})
+
+test('T3 push: ctx.reflect.get("sessionProjections") resolves title or explicit null with 0 snapshotEvents() calls', async (t) => {
+  const mod = await freshImport()
+  const projCalls = []
+  const sessionProjections = {
+    cachedSnapshot: (session, keys) => {
+      projCalls.push(['cachedSnapshot', session.id, keys])
+      if (session.id === 's-proj-hit') return { asOfSeq: 1, values: { title: '投影标题' } }
+      return undefined
+    },
+    snapshot: (session, keys) => {
+      projCalls.push(['snapshot', session.id, keys])
+      if (session.id === 's-proj-null') return { asOfSeq: 1, values: { title: null } }
+      return { asOfSeq: 1, values: {} }
+    },
+  }
+  const { ctx, listeners, sent } = makePushTestCtx(t, { services: { sessionProjections } })
+  mod.apply(ctx, {
+    pushEnabled: true,
+    pushTurnEnd: true,
+    pushDebounceMs: 0,
+    pushSummary: false,
+    pushSessionName: true,
+    pushTool: false,
+    lang: 'zh',
+  })
+
+  let snapshotCalls = 0
+  const hitSession = { id: 's-proj-hit', header: {}, snapshotEvents: () => { snapshotCalls += 1; return [] } }
+  const nullSession = { id: 's-proj-null', header: {}, snapshotEvents: () => { snapshotCalls += 1; return [] } }
+
+  listeners.get('agent/turn-stopping')({ turn: 1, agent: { session: hitSession } })
+  listeners.get('agent/turn-stopping')({ turn: 1, agent: { session: nullSession } })
+  await Promise.resolve()
+
+  assert.strictEqual(snapshotCalls, 0)
+  assert.strictEqual(sent.length, 2)
+  assert.strictEqual(sent[0].body, '来源会话：投影标题\n智能体已完成当前回合')
+  assert.strictEqual(sent[1].body, '智能体已完成当前回合')
+  assert.deepStrictEqual(projCalls, [
+    ['cachedSnapshot', 's-proj-hit', ['title']],
+    ['cachedSnapshot', 's-proj-null', ['title']],
+    ['snapshot', 's-proj-null', ['title']],
+  ])
+})
+
+test('T3 push: negative title cache avoids repeated snapshotEvents(); blank title never erases cached title', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1_700_000_000_000 })
+  process.env.DSH_PUSH_APPROVAL_GRACE_MS = '50'
+  t.after(() => { delete process.env.DSH_PUSH_APPROVAL_GRACE_MS })
+
+  const mod = await freshImport()
+  const { ctx, listeners, sent } = makePushTestCtx(t, { withReflect: false })
+  mod.apply(ctx, {
+    pushEnabled: true,
+    pushTurnEnd: false,
+    pushSummary: false,
+    pushSessionName: true,
+    pushTool: false,
+    lang: 'zh',
+  })
+
+  let snapshotCalls = 0
+  const session = {
+    id: 's-neg',
+    snapshotEvents: () => {
+      snapshotCalls += 1
+      return [{ type: 'assistant/message', data: { turn: 1 } }]
+    },
+  }
+  const onEvent = listeners.get('session/event')
+  // First question scans once and negative-caches ''.
+  onEvent(session, { type: 'tool/call', data: { name: 'ask_user_question', arguments: '{"questions":[{"question":"q1?"}]}' } })
+  // Second question + approval hit negative cache -> 0 additional snapshotEvents() calls.
+  onEvent(session, { type: 'tool/call', data: { name: 'ask_user_question', arguments: '{"questions":[{"question":"q2?"}]}' } })
+  onEvent(session, { type: 'approval/asked', data: { id: 'a1', toolName: 'bash' } })
+  t.mock.timers.tick(50)
+  await Promise.resolve()
+
+  assert.strictEqual(snapshotCalls, 1, 'untitled session should only scan event log once via negative cache')
+  assert.strictEqual(sent.length, 3)
+  assert.strictEqual(sent[0].body, '智能体提了一个问题，正在等你回答')
+
+  // Non-empty session/title refreshes cache; blank session/title must NOT erase it.
+  onEvent(session, { type: 'session/title', data: { title: '新标题' } })
+  onEvent(session, { type: 'session/title', data: { title: '   \n  ' } })
+  onEvent(session, { type: 'tool/call', data: { name: 'ask_user_question', arguments: '{"questions":[{"question":"q3?"}]}' } })
+  await Promise.resolve()
+
+  assert.strictEqual(snapshotCalls, 1)
+  assert.strictEqual(sent.length, 4)
+  assert.strictEqual(sent[3].body, '来源会话：新标题\n智能体提了一个问题，正在等你回答')
+})
+
+test('T3 push: pushSummary:true + pushSessionName:true with cache/projection miss copies snapshotEvents() only once', async (t) => {
+  const mod = await freshImport()
+  const { ctx, listeners, sent } = makePushTestCtx(t, { withReflect: false })
+  mod.apply(ctx, {
+    pushEnabled: true,
+    pushTurnEnd: true,
+    pushDebounceMs: 0,
+    pushSummary: true,
+    pushSessionName: true,
+    pushTool: false,
+    lang: 'zh',
+  })
+
+  let snapshotCalls = 0
+  const session = {
+    id: 's-both',
+    header: {},
+    snapshotEvents: () => {
+      snapshotCalls += 1
+      return [
+        { type: 'session/title', data: { title: '双开会话' } },
+        { type: 'assistant/message', data: { turn: 2, message: { content: [{ type: 'text', text: '全部完成' }] } } },
+      ]
+    },
+  }
+  listeners.get('agent/turn-stopping')({ turn: 2, agent: { session } })
+  await Promise.resolve()
+
+  assert.strictEqual(snapshotCalls, 1)
+  assert.strictEqual(sent.length, 1)
+  assert.strictEqual(sent[0].body, '来源会话：双开会话\n全部完成')
+})

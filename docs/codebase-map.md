@@ -10,7 +10,7 @@
 | `src/index.ts` → `lib/index.js` | 主入口（插件行 `dsh-zen-remote`）：读 `role`，host 就 `ctx.plugin()` 加载网关与推送子插件，并挂 host 路由（附件上传 / 客户端配置 / 分享导出 / 管理 / 子客户端 / 中继）；也是 `src/adapters/` 的唯一接线点 |
 | `src/config.ts` | 配置模型：四层回退（env > 插件行 > `lan-gate.config.json` > 默认值）、loader 的 `Config` schema（全 volatile）、`resolveRole`（`host` / `client` / `peer`，非精确串降级 host）、`servesRole`（host+peer）/ `connectsRole`（client+peer）两个角色闸 |
 | `src/http.ts` | host 路由共用 JSON 响应封装与同源 POST 门（桌面端无 Origin 头的放行语义见 AGENTS.md 硬约束） |
-| `src/admin-routes.ts` | 设置页管理后端 `/_dsh/zen-remote/admin/*`：代调网关本机 API（配对 / 设备 / 测试推送）+ 共享开关 |
+| `src/admin-routes.ts` | 设置页管理后端 `/_dsh/zen-remote/admin/*`：代调网关本机 API（配对 / 设备 / 测试推送）+ 共享开关；`GET /admin/shares` 走单次冷安全 `session/list`（`{ _request: {} }`）摘要优先（保留显式 `null`）与处理器实例级两级单飞 + 上限 3 FIFO 回退池，`POST` 变更即时失效在飞列表 |
 | `src/client-routes.ts` | 子客户端路由 `/_dsh/zen-remote/client/*`：remote-status（三角色都挂，host 只应答这一条、其余 404）、配对代理、设置页诊断、plain-HTTP 转发 `client/http/*`（改动摘要 / diff）、`debug-report`（脱敏诊断报告，via 墙先于分派，CU-3） |
 | `src/client-pairing.ts` | 子客户端配对纯逻辑：服务端地址归一化（http 仅限内网段）、claim/探针结果分类 |
 | `src/state-store.ts` | 主进程三合一状态存储（MS-1）：`~/.dsh/zen-remote-state.json`（0600、tmp+rename 原子写）承载 `serverId`、共享表、已配对服务端（上限 `maxServers` 默认 8）与一次性迁移；PG-2 起另承载 peer 三块：`peerIdentity`（自证明 Ed25519，读时校验 nodeId=hash(key)，坏块丢弃重建）、`peerNetwork`、`pinnedPeers`（TOFU 锚定，`verifyOrPinPeerKey` 绝不自动覆盖、`repinPeerKey` 仅显式调用换锚） |
@@ -18,7 +18,7 @@
 | `src/activity.ts` | 会话活动统计 + 闲置休眠扫描（`idleHours`，运行中/等待中不计时） |
 | `src/share-ops.ts` | `agent/created` 的自动共享 / 分叉跟随 / busy 恢复 |
 | `src/share-export.ts` | 分享图路由 `GET /_dsh/mobile-nav/share-export`（完整日志折叠人类转写） |
-| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream（含 `knownCursor` 增量 `snapshot-sync` 与 `writeChain` 串行 gzip 封装）/ `v1/session-snapshot`（冷安全单帧快照与增量，并发上限 2）/ event-result / `v1/http`（plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ `v1/upload`（附件字节转宿主暂存）/ unshare |
+| `src/relay-server.ts` | 服务端中继路由 `/_dsh/zen-remote/relay/*`：ping / handshake / invoke / NDJSON stream（含 `knownCursor` 增量 `snapshot-sync` 与 `writeChain` 串行 gzip 封装）/ `v1/session-snapshot`（冷安全单帧快照与增量，每设备上限 2 / 跨设备全局上限 3）/ event-result / `v1/http`（plain-HTTP 直通，进程内交宿主 `/api` 共享 handler）/ `v1/upload`（附件字节转宿主暂存）/ unshare |
 | `src/relay-access.ts` | 中继按方法登记访问控制表（服务端那张）；`v1/http` 按路由登记表也在这里 |
 | `src/upload-limits.ts` | 单一载荷上限真相源：`MAX_UPLOAD_BYTES`（500 MiB）、`DEFAULT_MAX_UPLOAD_BYTES`（20 MiB，手机端附件默认上限）、`MAX_INVOKE_BODY_BYTES`（72 MiB，容纳 50 MiB base64 内联图片）、`MAX_FILE_MEDIA_BYTES`（20 MiB，单次转发媒体上限） |
 | `src/relay-filter.ts` | 全局流与列表的输出过滤（`workspace/follow` / `session/control` / `session/list` / @ 引用候选行） |
@@ -49,7 +49,7 @@
 | `src/client-data/remote-group-expansion.ts` + `src/client/remote-group-expansion.ts` | 服务端分组展开记忆与恢复（T64）：宿主 retainAccountKeys 每次加载清掉 zr~ 分组记录，浏览器端镜像进自己存储、按记录（默认展开）点击行恢复；纯函数与 keeper 循环分居 |
 | `lan-gate.mjs` | 网关子插件入口（host 角色加载）：只 spawn + 生命周期，共享密钥与 `LAN_GATE_TARGET_PROTOCOL` 经它进子进程，并消费监听端口回调 |
 | `lib/lan-gate-server.cjs` | 网关本体（独立 Node 子进程，stdlib + `web-push`）：设备角色、标记头与共享密钥、desktop-client 只放行中继前缀、`0o600` 原子写盘与 `.corrupt.*` 备份、900s 上传超时放宽、`https:` 上游与 `<DSH_HOME>/lan-gate-runtime.json` 实际端口探测 |
-| `dsh-push.mjs` | 推送子插件（与网关一起加载）：回合结束推送 + `push_notify` 工具；动态从 `lan-gate-runtime.json` 读实际端口并校验 `pid` 存活 |
+| `dsh-push.mjs` | 推送子插件（与网关一起加载）：回合结束推送 + `push_notify` 工具；动态从 `lan-gate-runtime.json` 读实际端口并校验 `pid` 存活；`onTurnEnd` 前置短路资格/去抖，`resolveSessionName` 优先经 `ctx.reflect.get('sessionProjections')` 直读并支持 `''` 负缓存（仅非空 `session/title` 覆写），开摘要时与 `turnSummary` 复用单次 `evs` |
 | `bin/zen-remote.mjs` + `src/cli/**` → `lib/cli/` | CLI `dsh-zen-remote`：插件进程内 0600 IPC socket 服务端与客户端、防遮蔽配置写入（`config-writer.ts`）、双语 i18n（`args.ts` / `i18n.ts`）、`status`/`host *`/`client *`/`peer *` 子命令、`setup` 三步向导与角色切换联动（`command-setup.ts`）、多 profile 安装与 DSH 自动拉起（`bootstrap.ts`）；全部经 IPC 驱动插件进程，CLI 绝不 spawn caddy / cloudflared |
 | `gateway-server/` | 独立中继网关与 Web 控制台子包——不进发布包、独立三件套与流水线，细则见 AGENTS.md 硬约束与 `gateway-server/README.md`：虚拟网络管理、五态成员准入（`pending`/`authorized`/`paused`/`mismatch`/`revoked`）、双端口 UDP STUN 协调、零知识 E2EE 中转（网关无私钥只路由密文帧）、PID-1 热更新守护（`src/bootstrap.ts`）与版本检查/校验解包/空闲调度模块（`src/update/{archive,version,update-manager}.ts`）、Docker 交付 |
 | `pwa/**` | manifest / service worker / 注入脚本 / 手势 / 壳级 CSS / 图标（CSS 分工铁律见 AGENTS.md） |

@@ -142,12 +142,43 @@ async function sendPush(title, body, gatewayPort) {
 const SUMMARY_MAX = 120
 const clip = (s) => String(s).replace(/\s+/g, ' ').trim().slice(0, SUMMARY_MAX)
 
-// Session-name cap for the push body's prefix line (P55-1): a session title
+// Session-title cap for the push body's prefix line (P55-1): a session title
 // is a one-line context hint on a lock screen, not the whole story — shorter
 // than the summary cap on purpose. clipTitle shares clip's whitespace
 // collapsing but keeps its own bound.
 const SESSION_TITLE_MAX = 40
 const clipTitle = (s) => String(s).replace(/\s+/g, ' ').trim().slice(0, SESSION_TITLE_MAX)
+
+// Read a live session's title directly from DSH's `sessionProjections` service
+// via Cordis reflection (no inject dependency), avoiding full `snapshotEvents()`
+// copies. Returns `{ hit: true, title }` whenever `values` explicitly owns a
+// `title` key (including explicit `null` -> ''), or `{ hit: false, title: '' }`.
+function titleFromProjections(ctx, session) {
+  try {
+    const projections = ctx && ctx.reflect && typeof ctx.reflect.get === 'function'
+      ? ctx.reflect.get('sessionProjections')
+      : undefined
+    if (!projections || !session) return { hit: false, title: '' }
+    const readValues = (proj) => (proj && proj.values && typeof proj.values === 'object' ? proj.values : undefined)
+    let values = typeof projections.cachedSnapshot === 'function'
+      ? readValues(projections.cachedSnapshot(session, ['title']))
+      : undefined
+    if (!values || !Object.prototype.hasOwnProperty.call(values, 'title')) {
+      values = typeof projections.snapshot === 'function'
+        ? readValues(projections.snapshot(session, ['title']))
+        : undefined
+    }
+    if (!values || !Object.prototype.hasOwnProperty.call(values, 'title')) {
+      return { hit: false, title: '' }
+    }
+    return {
+      hit: true,
+      title: typeof values.title === 'string' ? clipTitle(values.title) : ''
+    }
+  } catch {
+    return { hit: false, title: '' }
+  }
+}
 
 // The display name of a session, from its append-only event log: the LAST
 // `session/title` event, whitespace-collapsed and clipped. Blank titles are
@@ -514,13 +545,13 @@ export function apply(ctx, config) {
     lang
   }
 
-  // Session-title cache (P55-1): sessionId -> clipped title. Warm from the
-  // `session/title` feed the moment a rename lands, so the approval and
-  // question legs never re-walk the whole event log per fire.
+  // Session-title cache (P55-1): sessionId -> clipped title (or '' negative
+  // cache for untitled sessions). Warm from `session/title` or on first read
+  // so approval/question/turn-end legs never re-walk the event log.
   const MAX_TITLE_CACHE = 500
   const titlesBySession = new Map()
   const cacheSessionTitle = (sessionId, title) => {
-    if (!sessionId || !title) return
+    if (!sessionId || typeof title !== 'string') return
     if (titlesBySession.has(sessionId)) titlesBySession.delete(sessionId)
     else if (titlesBySession.size >= MAX_TITLE_CACHE) {
       const oldest = titlesBySession.keys().next().value
@@ -528,12 +559,19 @@ export function apply(ctx, config) {
     }
     titlesBySession.set(sessionId, title)
   }
-  const resolveSessionName = (session) => {
+  const resolveSessionName = (session, preloadedEvents) => {
     if (!cfg.includeSessionName || !session) return ''
-    const cached = session.id ? titlesBySession.get(session.id) : undefined
-    if (cached) return cached
-    const extracted = sessionTitle(sessionEvents(session))
-    if (extracted && session.id) cacheSessionTitle(session.id, extracted)
+    if (session.id && titlesBySession.has(session.id)) {
+      return titlesBySession.get(session.id) ?? ''
+    }
+    const fromProj = titleFromProjections(ctx, session)
+    if (fromProj.hit) {
+      if (session.id) cacheSessionTitle(session.id, fromProj.title)
+      return fromProj.title
+    }
+    const evs = Array.isArray(preloadedEvents) ? preloadedEvents : sessionEvents(session)
+    const extracted = sessionTitle(evs)
+    if (session.id) cacheSessionTitle(session.id, extracted)
     return extracted
   }
 
@@ -557,6 +595,7 @@ export function apply(ctx, config) {
 
   // --- Turn-end leg (opt-in) -----------------------------------------------
   const onTurnEnd = (payload) => {
+    if (!cfg.turnEndEnabled) return
     const session = payload && payload.agent && payload.agent.session
     const header = session && session.header
     // An ABSENT delegationDepth on a PRESENT header means top level, and the
@@ -566,14 +605,16 @@ export function apply(ctx, config) {
     // letting subagent turn ends back in. Turn-end is the low-value leg, so
     // when the session cannot be identified, stay quiet.
     if (!header) return
-    // One event-log walk serves both the summary and the session name
-    // (P55-1); neither leg on means the log is never read at all.
-    const evs = (cfg.includeSummary || cfg.includeSessionName) ? sessionEvents(session) : []
+    if ((header.delegationDepth ?? 0) !== 0) return
+    if (Date.now() - lastSent < cfg.debounceMs) return
+    // Only snapshot events once when summary is enabled; resolveSessionName
+    // reuses `evs` on cache/projection miss so both legs share one log read.
+    const evs = cfg.includeSummary ? sessionEvents(session) : undefined
     fire({
       kind: 'turn-end',
-      delegationDepth: header && header.delegationDepth,
+      delegationDepth: header.delegationDepth,
       summary: cfg.includeSummary ? turnSummary(evs, payload && payload.turn, lang) : '',
-      sessionName: cfg.includeSessionName ? (titlesBySession.get(session.id) || sessionTitle(evs)) : ''
+      sessionName: resolveSessionName(session, evs)
     })
   }
   for (const event of events) {
@@ -599,9 +640,11 @@ export function apply(ctx, config) {
     ctx.on('session/event', (_session, event) => {
       if (!event || !event.data) return
       // P55-1: warm the title cache the moment a rename lands, so a later
-      // approval/question push names the session it came from.
+      // approval/question push names the session it came from. Blank titles
+      // never overwrite an existing non-empty cached title.
       if (event.type === 'session/title' && typeof event.data.title === 'string' && _session && _session.id) {
-        cacheSessionTitle(_session.id, clipTitle(event.data.title))
+        const clipped = clipTitle(event.data.title)
+        if (clipped !== '') cacheSessionTitle(_session.id, clipped)
       }
       if (event.type === 'approval/asked') {
         const id = event.data.id

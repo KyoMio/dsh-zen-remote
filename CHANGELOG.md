@@ -4,6 +4,14 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 未发布
+
+### 修复
+
+- **消除共享列表后台轮询冷读全量日志引发的主线程堆暴涨与标题丢失**（[#61](https://github.com/KyoMio/dsh-zen-remote/issues/61)）：`GET /_dsh/zen-remote/admin/shares` 改用单次冷安全 `session/list` 投影摘要获取会话标题并原样保留未命名会话的显式 `null`，仅对摘要缺失条目走处理器实例级两级合并与上限 `3` 的并发回退池（隔离单个调用方断连并在 `POST` 变更共享表后立即失效在飞列表），不再逐条击穿 DSH 5 槽冷会话缓存。
+- **限制 `/v1/session-snapshot` 跨设备全局并发上限为 3**：在单设备并发上限 `2` 之外新增跨设备全局上限 `3`（超限回 `429 too-many-snapshots` 由对端预热调度器延后重排），避免多端组网同时上线或重连集体预热冷会话时叠加击穿 5 槽冷会话缓存。
+- **消除长会话推送通知的无效及重复全量事件日志拷贝**：`dsh-push.mjs` 的 `onTurnEnd` 在读取事件日志前先判定开关、顶层会话与防抖窗口；会话名解析优先通过 `sessionProjections` 投影直读并支持无标题会话负缓存（不擦除已有非空标题），开启摘要时与正文摘要复用同一次事件快照。
+
 ## 2.5.2（2026-11-18）
 
 ### 新增

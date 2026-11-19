@@ -100,6 +100,7 @@ function startAdminServer(options) {
 }
 
 function closeServer(server) {
+  server.closeAllConnections?.()
   return new Promise((resolve) => server.close(() => resolve()))
 }
 
@@ -411,25 +412,66 @@ function makeShareParts(overrides = {}) {
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
   const invokes = []
   const released = []
+  let inFlightProjections = 0
+  let maxInFlightProjections = 0
+  let syncListThrown = false
   const typert = {
-    invoke: async (call) => {
+    invoke: (call) => {
       invokes.push(call)
-      if (overrides.hang) {
-        return new Promise((_, reject) => {
-          call.signal?.addEventListener('abort', () => reject(call.signal.reason))
-        })
+      if (call.namespace === 'session' && call.method === 'list' && overrides.syncListErrorOnce && !syncListThrown) {
+        syncListThrown = true
+        throw overrides.syncListErrorOnce
       }
-      if (overrides.projection === null) return null
-      if (overrides.failTitles !== undefined && overrides.failTitles.includes(call.args.request.sessionId)) {
-        throw new Error('projection blew up')
-      }
-      return {
-        asOfSeq: 1,
-        values: {
-          title: `title of ${call.args.request.sessionId}`,
-          ...(overrides.subagentIdentity === undefined ? {} : { subagent: overrides.subagentIdentity }),
-        },
-      }
+      return (async () => {
+        if (overrides.hang) {
+          return new Promise((_, reject) => {
+            call.signal?.addEventListener('abort', () => reject(call.signal.reason))
+          })
+        }
+        if (call.namespace === 'session' && call.method === 'list') {
+          if (overrides.onList) return await overrides.onList(call, store)
+          if (overrides.listError) throw overrides.listError
+          if ('listRaw' in overrides) return overrides.listRaw
+          if (overrides.sessionListItems !== undefined) {
+            const items = typeof overrides.sessionListItems === 'function'
+              ? overrides.sessionListItems(store)
+              : overrides.sessionListItems
+            return { items }
+          }
+          const failSet = new Set(overrides.failTitles ?? [])
+          return {
+            items: store.list()
+              .filter((entry) => !failSet.has(entry.sessionId))
+              .map((entry) => ({
+                sessionId: entry.sessionId,
+                projections: {
+                  values: {
+                    title: `title of ${entry.sessionId}`,
+                  },
+                },
+              })),
+          }
+        }
+        inFlightProjections += 1
+        if (inFlightProjections > maxInFlightProjections) maxInFlightProjections = inFlightProjections
+        try {
+          if (overrides.onProjection) return await overrides.onProjection(call)
+          if (overrides.projection === null) return null
+          const sessionId = call.args.request.sessionId
+          if (overrides.failTitles !== undefined && overrides.failTitles.includes(sessionId)) {
+            throw new Error('projection blew up')
+          }
+          return {
+            asOfSeq: 1,
+            values: {
+              title: `title of ${sessionId}`,
+              ...(overrides.subagentIdentity === undefined ? {} : { subagent: overrides.subagentIdentity }),
+            },
+          }
+        } finally {
+          inFlightProjections -= 1
+        }
+      })()
     },
   }
   const sessionQuery = overrides.sessionHeaders === undefined ? undefined : {
@@ -451,13 +493,22 @@ function makeShareParts(overrides = {}) {
     gatewayBase: `http://127.0.0.1:${gwPort}`,
     getConfig: () => ({ values: { role: 'host', port: gwPort, lang: 'zh' }, sources: {} }),
     store,
-    typert: overrides.noTypert ? () => undefined : () => typert,
+    typert: overrides.typertThrows
+      ? () => { throw new Error('typert lookup blew up') }
+      : overrides.noTypert ? () => undefined : () => typert,
     listAgents: () => (overrides.roster !== undefined ? overrides.roster : []),
     ...(sessionQuery !== undefined ? { sessionQuery: () => sessionQuery } : {}),
     ...(overrides.viewerCount !== undefined ? { viewerCount: overrides.viewerCount } : {}),
     ...(overrides.projectionTimeoutMs !== undefined ? { projectionTimeoutMs: overrides.projectionTimeoutMs } : {}),
   }
-  return { store, invokes, released, options }
+  return {
+    store,
+    invokes,
+    released,
+    options,
+    get maxInFlightProjections() { return maxInFlightProjections },
+    cleanup() { fs.rmSync(home, { recursive: true, force: true }) },
+  }
 }
 
 async function startShareServer(options) {
@@ -491,18 +542,15 @@ test('GET shares lists every row with derived fields; busy Infinity serializes a
     assert.equal(idle.title, 'title of s-idle')
     assert.equal(busy.busy, true)
     assert.equal(busy.remainingMs, null, 'busy means Infinity in the table, null on the wire')
-    // The titles really came through session/projections with the wire shape
-    // the typert gateway speaks. (Order-insensitive: the listing order is
-    // sharedAt-ascending and both rows may share a millisecond.)
+    // Primary path (Issue #61): a single session/list summary call with
+    // `{ _request: {} }` and zero cold-read session/projections calls.
     assert.deepEqual(
-      parts.invokes.map((c) => ({ namespace: c.namespace, method: c.method, sessionId: c.args.request.sessionId })).sort((a, b) => (a.sessionId < b.sessionId ? -1 : 1)),
-      [
-        { namespace: 'session', method: 'projections', sessionId: 's-busy' },
-        { namespace: 'session', method: 'projections', sessionId: 's-idle' },
-      ],
+      parts.invokes.map((c) => ({ namespace: c.namespace, method: c.method, args: c.args })),
+      [{ namespace: 'session', method: 'list', args: { _request: {} } }],
     )
   } finally {
     await closeServer(server)
+    parts.cleanup()
   }
 })
 
@@ -778,6 +826,467 @@ test('without a store the shares routes answer 404 like any unknown admin path',
     const post = await request(port, { method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: sameOrigin(port), body: { action: 'share', sessionId: 's' } })
     assert.equal(post.status, 404)
   } finally { await closeServer(server) }
+})
+
+function defer() {
+  let resolve
+  let reject
+  const promise = new Promise((res, rej) => { resolve = res; reject = rej })
+  return { promise, resolve, reject }
+}
+
+async function waitFor(predicate, timeoutMs = 1500) {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('waitFor timed out')
+    await new Promise((r) => setTimeout(r, 5))
+  }
+}
+
+test('GET shares (Issue #61 case 1): 10+ shared sessions use single session/list and zero session/projections', async (t) => {
+  const parts = makeShareParts({ viewerCount: (id) => (id === 's-0' ? 4 : 0) })
+  t.after(() => parts.cleanup())
+  for (let i = 0; i < 12; i += 1) parts.store.share(`s-${i}`)
+  parts.store.setBusy('s-0', true)
+  const { server, port } = await startShareServer(parts.options)
+  t.after(() => closeServer(server))
+
+  const res = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(res.status, 200)
+  const body = JSON.parse(res.body)
+  assert.equal(body.shares.length, 12)
+  assert.equal(body.shares.find((s) => s.sessionId === 's-0').busy, true)
+  assert.equal(body.shares.find((s) => s.sessionId === 's-0').remainingMs, null)
+  assert.equal(body.shares.find((s) => s.sessionId === 's-0').viewers, 4)
+  for (let i = 0; i < 12; i += 1) {
+    assert.equal(body.shares.find((s) => s.sessionId === `s-${i}`).title, `title of s-${i}`)
+  }
+  const listCalls = parts.invokes.filter((c) => c.namespace === 'session' && c.method === 'list')
+  const projCalls = parts.invokes.filter((c) => c.namespace === 'session' && c.method === 'projections')
+  assert.equal(listCalls.length, 1)
+  assert.deepEqual(listCalls[0].args, { _request: {} })
+  assert.equal(projCalls.length, 0)
+})
+
+test('GET shares (Issue #61 case 2): explicit title: null in session/list is preserved with zero projection fallbacks', async (t) => {
+  const parts = makeShareParts({
+    sessionListItems: [
+      { sessionId: 's-unnamed', projections: { values: { title: null } } },
+      { sessionId: 's-named', projections: { values: { title: 'Named Session' } } },
+    ],
+  })
+  t.after(() => parts.cleanup())
+  parts.store.share('s-unnamed')
+  parts.store.share('s-named')
+  const { server, port } = await startShareServer(parts.options)
+  t.after(() => closeServer(server))
+
+  const res = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(res.status, 200)
+  const body = JSON.parse(res.body)
+  assert.equal(body.shares.find((s) => s.sessionId === 's-unnamed').title, null)
+  assert.equal(body.shares.find((s) => s.sessionId === 's-named').title, 'Named Session')
+  assert.equal(parts.invokes.filter((c) => c.namespace === 'session' && c.method === 'list').length, 1)
+  assert.equal(parts.invokes.filter((c) => c.namespace === 'session' && c.method === 'projections').length, 0)
+})
+
+test('GET shares (Issue #61 case 3): partial missing summaries fall back only for missing rows with concurrency <= 3', async (t) => {
+  const missingIds = new Set()
+  const items = []
+  for (let i = 0; i < 20; i += 1) {
+    items.push({ sessionId: `s-hit-${i}`, projections: { values: { title: `hit ${i}` } } })
+  }
+  items.push({ sessionId: 's-null-0', projections: { values: { title: null } } })
+  items.push({ sessionId: 's-null-1', projections: { values: { title: null } } })
+  for (let i = 0; i < 4; i += 1) {
+    const id = `s-no-proj-${i}`
+    missingIds.add(id)
+    items.push({ sessionId: id })
+  }
+  for (let i = 0; i < 4; i += 1) {
+    const id = `s-no-key-${i}`
+    missingIds.add(id)
+    items.push({ sessionId: id, projections: { values: {} } })
+  }
+  for (let i = 0; i < 4; i += 1) {
+    missingIds.add(`s-absent-${i}`)
+  }
+
+  const parts = makeShareParts({
+    sessionListItems: items,
+    onProjection: async (call) => {
+      await new Promise((r) => setTimeout(r, 15))
+      return { asOfSeq: 1, values: { title: `fallback ${call.args.request.sessionId}` } }
+    },
+  })
+  t.after(() => parts.cleanup())
+  for (const item of items) parts.store.share(item.sessionId)
+  for (let i = 0; i < 4; i += 1) parts.store.share(`s-absent-${i}`)
+
+  const { server, port } = await startShareServer(parts.options)
+  t.after(() => closeServer(server))
+
+  const res = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(res.status, 200)
+  const body = JSON.parse(res.body)
+  assert.equal(body.shares.length, 34)
+  assert.equal(body.shares.find((s) => s.sessionId === 's-hit-5').title, 'hit 5')
+  assert.equal(body.shares.find((s) => s.sessionId === 's-null-0').title, null)
+  assert.equal(body.shares.find((s) => s.sessionId === 's-absent-2').title, 'fallback s-absent-2')
+
+  const projCalls = parts.invokes.filter((c) => c.namespace === 'session' && c.method === 'projections')
+  const calledIds = projCalls.map((c) => c.args.request.sessionId).sort()
+  assert.deepEqual(calledIds, [...missingIds].sort())
+  assert.ok(parts.maxInFlightProjections >= 1 && parts.maxInFlightProjections <= 3, `expected max concurrency in [1,3], got ${parts.maxInFlightProjections}`)
+})
+
+test('GET shares (Issue #61 case 4): session/list error or invalid shape degrades to capped fallback without failing listing', async (t) => {
+  const errParts = makeShareParts({
+    listError: new Error('unsupported'),
+    failTitles: ['s-3'],
+    onProjection: async (call) => {
+      await new Promise((r) => setTimeout(r, 15))
+      if (call.args.request.sessionId === 's-3') throw new Error('boom')
+      return { asOfSeq: 1, values: { title: `fb-${call.args.request.sessionId}` } }
+    },
+  })
+  t.after(() => errParts.cleanup())
+  for (let i = 0; i < 7; i += 1) errParts.store.share(`s-${i}`)
+  const errSrv = await startShareServer(errParts.options)
+  t.after(() => closeServer(errSrv.server))
+
+  const res1 = await request(errSrv.port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(res1.status, 200)
+  const body1 = JSON.parse(res1.body)
+  assert.equal(body1.shares.find((s) => s.sessionId === 's-3').title, null)
+  assert.equal(body1.shares.find((s) => s.sessionId === 's-0').title, 'fb-s-0')
+  assert.ok(errParts.maxInFlightProjections <= 3, `got ${errParts.maxInFlightProjections}`)
+
+  const badParts = makeShareParts({
+    listRaw: {},
+    projectionTimeoutMs: 30,
+    onProjection: (call) => {
+      if (call.args.request.sessionId === 's-hang') {
+        return new Promise((_, reject) => {
+          call.signal?.addEventListener('abort', () => reject(call.signal.reason))
+        })
+      }
+      return new Promise((r) => setTimeout(() => r({ asOfSeq: 1, values: { title: `ok-${call.args.request.sessionId}` } }), 10))
+    },
+  })
+  t.after(() => badParts.cleanup())
+  badParts.store.share('s-hang')
+  for (let i = 0; i < 5; i += 1) badParts.store.share(`s-b-${i}`)
+  const badSrv = await startShareServer(badParts.options)
+  t.after(() => closeServer(badSrv.server))
+
+  const res2 = await request(badSrv.port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(res2.status, 200)
+  const body2 = JSON.parse(res2.body)
+  assert.equal(body2.shares.find((s) => s.sessionId === 's-hang').title, null)
+  assert.equal(body2.shares.find((s) => s.sessionId === 's-b-0').title, 'ok-s-b-0')
+  assert.ok(badParts.maxInFlightProjections <= 3, `got ${badParts.maxInFlightProjections}`)
+
+  // Synchronous throw on first session/list must not poison inFlightSummaryList for the next GET.
+  const syncParts = makeShareParts({ syncListErrorOnce: new Error('sync boom') })
+  t.after(() => syncParts.cleanup())
+  syncParts.store.share('s-sync-1')
+  const syncSrv = await startShareServer(syncParts.options)
+  t.after(() => closeServer(syncSrv.server))
+
+  const syncFirst = await request(syncSrv.port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(syncFirst.status, 200)
+  assert.equal(JSON.parse(syncFirst.body).shares[0].title, 'title of s-sync-1')
+
+  const syncSecond = await request(syncSrv.port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(syncSecond.status, 200)
+  assert.equal(JSON.parse(syncSecond.body).shares[0].title, 'title of s-sync-1')
+  const syncListCalls = syncParts.invokes.filter((c) => c.namespace === 'session' && c.method === 'list')
+  const syncProjCalls = syncParts.invokes.filter((c) => c.namespace === 'session' && c.method === 'projections')
+  assert.equal(syncListCalls.length, 2, 'second GET must re-invoke session/list instead of reusing settled error')
+  assert.equal(syncProjCalls.length, 1, 'only the first failed GET fell back to session/projections')
+})
+
+test('GET shares (Issue #61 case 5): empty table and throwing typert short-circuit with zero invokes', async (t) => {
+  const emptyParts = makeShareParts()
+  t.after(() => emptyParts.cleanup())
+  const emptySrv = await startShareServer(emptyParts.options)
+  t.after(() => closeServer(emptySrv.server))
+
+  const r1 = await request(emptySrv.port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(r1.status, 200)
+  assert.deepEqual(JSON.parse(r1.body), { ok: true, shares: [] })
+  assert.equal(emptyParts.invokes.length, 0)
+
+  const throwParts = makeShareParts({ typertThrows: true })
+  t.after(() => throwParts.cleanup())
+  throwParts.store.share('s-1')
+  const throwSrv = await startShareServer(throwParts.options)
+  t.after(() => closeServer(throwSrv.server))
+
+  const r2 = await request(throwSrv.port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(r2.status, 200)
+  assert.equal(JSON.parse(r2.body).shares[0].title, null)
+  assert.equal(throwParts.invokes.length, 0)
+})
+
+test('GET shares (Issue #61 case 6): concurrent GETs coalesce session/list, dedup fallback sessionIds, and cap pool <= 3', async (t) => {
+  const listGate = defer()
+  t.after(() => listGate.resolve())
+  let listEntered = 0
+  const parts = makeShareParts({
+    onList: async () => {
+      listEntered += 1
+      await listGate.promise
+      return {
+        items: [{ sessionId: 's-hit', projections: { values: { title: 'Hit' } } }],
+      }
+    },
+    onProjection: async (call) => {
+      await new Promise((r) => setTimeout(r, 20))
+      return { asOfSeq: 1, values: { title: `fb-${call.args.request.sessionId}` } }
+    },
+  })
+  t.after(() => parts.cleanup())
+  parts.store.share('s-hit')
+  for (let i = 0; i < 6; i += 1) parts.store.share(`s-miss-${i}`)
+  const { server, port } = await startShareServer(parts.options)
+  t.after(() => closeServer(server))
+
+  const reqs = Array.from({ length: 4 }, () => request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE }))
+  await waitFor(() => listEntered === 1)
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(parts.invokes.filter((c) => c.namespace === 'session' && c.method === 'list').length, 1)
+
+  listGate.resolve()
+  const responses = await Promise.all(reqs)
+  for (const res of responses) {
+    assert.equal(res.status, 200)
+    const body = JSON.parse(res.body)
+    assert.equal(body.shares.find((s) => s.sessionId === 's-hit').title, 'Hit')
+    assert.equal(body.shares.find((s) => s.sessionId === 's-miss-0').title, 'fb-s-miss-0')
+  }
+  assert.equal(parts.invokes.filter((c) => c.namespace === 'session' && c.method === 'list').length, 1)
+  const projCalls = parts.invokes.filter((c) => c.namespace === 'session' && c.method === 'projections')
+  assert.equal(projCalls.length, 6, 'each missing sessionId falls back only once across all 4 concurrent GETs')
+  assert.ok(parts.maxInFlightProjections <= 3, `expected max concurrency <= 3, got ${parts.maxInFlightProjections}`)
+
+  // Cross-request shared 3-slot semaphore across DISJOINT missing sessionIds.
+  const projGates = new Map()
+  const enteredIds = []
+  t.after(() => { for (const g of projGates.values()) g.resolve() })
+  const crossParts = makeShareParts({
+    sessionListItems: [],
+    onProjection: async (call) => {
+      const id = call.args.request.sessionId
+      enteredIds.push(id)
+      const gate = projGates.get(id)
+      if (gate) await gate.promise
+      return { asOfSeq: 1, values: { title: `cross-${id}` } }
+    },
+  })
+  t.after(() => crossParts.cleanup())
+  for (const id of ['s-a1', 's-a2', 's-a3', 's-b1', 's-b2']) projGates.set(id, defer())
+  crossParts.store.share('s-a1')
+  crossParts.store.share('s-a2')
+  crossParts.store.share('s-a3')
+  const crossSrv = await startShareServer(crossParts.options)
+  t.after(() => closeServer(crossSrv.server))
+
+  const getA = request(crossSrv.port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  await waitFor(() => enteredIds.length === 3)
+  assert.equal(crossParts.maxInFlightProjections, 3)
+
+  // Add disjoint missing sessions and fire a concurrent GET B while all 3 pool slots are occupied.
+  crossParts.store.share('s-b1')
+  crossParts.store.share('s-b2')
+  const getB = request(crossSrv.port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  await waitFor(() => crossParts.invokes.filter((c) => c.namespace === 'session' && c.method === 'list').length === 2)
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(enteredIds.length, 3, 'GET B missing sessionIds must queue behind GET A on the shared 3-slot pool')
+  assert.equal(crossParts.maxInFlightProjections, 3)
+
+  // Release one slot from GET A -> exactly one of GET B's items enters, still <= 3 in flight.
+  projGates.get('s-a1').resolve()
+  await waitFor(() => enteredIds.length === 4)
+  assert.equal(crossParts.maxInFlightProjections, 3)
+
+  for (const id of ['s-a2', 's-a3', 's-b1', 's-b2']) projGates.get(id).resolve()
+  const [resA, resB] = await Promise.all([getA, getB])
+  assert.equal(resA.status, 200)
+  assert.equal(resB.status, 200)
+  const bodyB = JSON.parse(resB.body)
+  assert.equal(bodyB.shares.find((s) => s.sessionId === 's-b1').title, 'cross-s-b1')
+  assert.equal(bodyB.shares.find((s) => s.sessionId === 's-b2').title, 'cross-s-b2')
+  assert.equal(crossParts.maxInFlightProjections, 3)
+})
+
+test('GET shares (Issue #61 case 7): POST share/unshare/unshare-all invalidates in-flight session/list and reflects live store', async (t) => {
+  const gate1 = defer()
+  const gate3 = defer()
+  const gate5 = defer()
+  t.after(() => { gate1.resolve(); gate3.resolve(); gate5.resolve() })
+  let listCount = 0
+  const parts = makeShareParts({
+    onList: async () => {
+      listCount += 1
+      if (listCount === 1) {
+        await gate1.promise
+        return { items: [{ sessionId: 's-1', projections: { values: { title: 'Title 1' } } }] }
+      }
+      if (listCount === 2) {
+        return {
+          items: [
+            { sessionId: 's-1', projections: { values: { title: 'Title 1' } } },
+            { sessionId: 's-new', projections: { values: { title: 'New Title' } } },
+          ],
+        }
+      }
+      if (listCount === 3) {
+        await gate3.promise
+        return { items: [{ sessionId: 's-1', projections: { values: { title: 'Stale' } } }] }
+      }
+      if (listCount === 4) {
+        return { items: [{ sessionId: 's-new', projections: { values: { title: 'Fresh After Unshare' } } }] }
+      }
+      if (listCount === 5) {
+        await gate5.promise
+        return { items: [{ sessionId: 's-new', projections: { values: { title: 'Stale Before Unshare All' } } }] }
+      }
+      return { items: [{ sessionId: 's-after-all', projections: { values: { title: 'Fresh After Unshare All' } } }] }
+    },
+  })
+  t.after(() => parts.cleanup())
+  parts.store.share('s-1')
+  const { server, port } = await startShareServer(parts.options)
+  t.after(() => closeServer(server))
+
+  // 1) GET #1 hangs on gate1 -> POST share(s-new) -> GET #2 immediately resolves with fresh list.
+  const get1Promise = request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  await waitFor(() => listCount === 1)
+
+  const postShare = await request(port, {
+    method: 'POST',
+    path: admin.ADMIN_SHARES_ROUTE,
+    headers: sameOrigin(port),
+    body: { action: 'share', sessionId: 's-new' },
+  })
+  assert.equal(postShare.status, 200)
+
+  const get2Res = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(get2Res.status, 200)
+  assert.equal(listCount, 2, 'GET #2 started a new session/list after POST share invalidated the in-flight one')
+  const body2 = JSON.parse(get2Res.body)
+  assert.equal(body2.shares.find((s) => s.sessionId === 's-new').title, 'New Title')
+
+  gate1.resolve()
+  const get1Res = await get1Promise
+  assert.equal(get1Res.status, 200)
+
+  // 2) GET #3 hangs on gate3 -> POST unshare(s-1) -> GET #4 immediately resolves without s-1.
+  const get3Promise = request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  await waitFor(() => listCount === 3)
+
+  const postUnshare = await request(port, {
+    method: 'POST',
+    path: admin.ADMIN_SHARES_ROUTE,
+    headers: sameOrigin(port),
+    body: { action: 'unshare', sessionId: 's-1' },
+  })
+  assert.equal(postUnshare.status, 200)
+
+  const get4Res = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(get4Res.status, 200)
+  assert.equal(listCount, 4)
+  const body4 = JSON.parse(get4Res.body)
+  assert.deepEqual(body4.shares.map((s) => s.sessionId), ['s-new'])
+  assert.equal(body4.shares[0].title, 'Fresh After Unshare')
+
+  gate3.resolve()
+  const get3Res = await get3Promise
+  assert.equal(get3Res.status, 200)
+
+  // 3) GET #5 hangs on gate5 -> POST unshare-all -> share s-after-all directly in store -> GET #6 starts a fresh list.
+  const get5Promise = request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  await waitFor(() => listCount === 5)
+
+  const postUnshareAll = await request(port, {
+    method: 'POST',
+    path: admin.ADMIN_SHARES_ROUTE,
+    headers: sameOrigin(port),
+    body: { action: 'unshare-all' },
+  })
+  assert.equal(postUnshareAll.status, 200)
+
+  parts.store.share('s-after-all')
+  const get6Res = await request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  assert.equal(get6Res.status, 200)
+  assert.equal(listCount, 6, 'GET #6 started a new session/list after POST unshare-all invalidated the in-flight one')
+  const body6 = JSON.parse(get6Res.body)
+  assert.deepEqual(body6.shares.map((s) => s.sessionId), ['s-after-all'])
+  assert.equal(body6.shares[0].title, 'Fresh After Unshare All')
+
+  gate5.resolve()
+  const get5Res = await get5Promise
+  assert.equal(get5Res.status, 200)
+})
+
+test('GET shares (Issue #61 case 8): aborting one concurrent GET does not cancel shared queries for peers', async (t) => {
+  const listGate = defer()
+  const projGate = defer()
+  t.after(() => { listGate.resolve(); projGate.resolve() })
+  let listEntered = 0
+  let projEntered = 0
+  const parts = makeShareParts({
+    onList: async (call) => {
+      listEntered += 1
+      await listGate.promise
+      assert.equal(call.signal?.aborted, false)
+      return { items: [{ sessionId: 's-hit', projections: { values: { title: 'Hit' } } }] }
+    },
+    onProjection: async (call) => {
+      projEntered += 1
+      await projGate.promise
+      assert.equal(call.signal?.aborted, false)
+      return { asOfSeq: 1, values: { title: 'Fallback OK' } }
+    },
+  })
+  t.after(() => parts.cleanup())
+  parts.store.share('s-hit')
+  parts.store.share('s-miss')
+  const { server, port } = await startShareServer(parts.options)
+  t.after(() => closeServer(server))
+
+  // Disconnect first client while session/list is in flight.
+  const rawReq1 = http.request({ host: '127.0.0.1', port, method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  rawReq1.on('error', () => { /* expected ECONNRESET after destroy */ })
+  t.after(() => rawReq1.destroy())
+  rawReq1.end()
+  await waitFor(() => listEntered === 1)
+
+  const peerGet = request(port, { method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  await new Promise((r) => setTimeout(r, 15))
+  rawReq1.destroy()
+  await new Promise((r) => setTimeout(r, 15))
+
+  listGate.resolve()
+  await waitFor(() => projEntered === 1)
+
+  // Also disconnect a second raw client while fallback session/projections is in flight.
+  const rawReq2 = http.request({ host: '127.0.0.1', port, method: 'GET', path: admin.ADMIN_SHARES_ROUTE })
+  rawReq2.on('error', () => { /* expected ECONNRESET after destroy */ })
+  t.after(() => rawReq2.destroy())
+  rawReq2.end()
+  await new Promise((r) => setTimeout(r, 15))
+  rawReq2.destroy()
+  await new Promise((r) => setTimeout(r, 15))
+
+  projGate.resolve()
+  const peerRes = await peerGet
+  assert.equal(peerRes.status, 200)
+  const body = JSON.parse(peerRes.body)
+  assert.equal(body.shares.find((s) => s.sessionId === 's-hit').title, 'Hit')
+  assert.equal(body.shares.find((s) => s.sessionId === 's-miss').title, 'Fallback OK')
 })
 
 // ---- PB-5: the plugin bridge listing -------------------------------------------

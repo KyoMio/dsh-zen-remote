@@ -147,6 +147,11 @@ const MAX_PLUGIN_REQUESTS_PER_DEVICE = 8
 /** Concurrent cold-safe `/v1/session-snapshot` calls allowed per device (T3). */
 const MAX_SNAPSHOTS_PER_DEVICE = 2
 
+/** Cross-device global concurrency cap for `/v1/session-snapshot` (Issue #61):
+ * kept strictly below DSH `SessionObservationReader`'s 5-slot cold cache so
+ * multi-peer reconnect prewarming never thrashes cold session logs. */
+const MAX_SNAPSHOTS_GLOBAL = 3
+
 /** Most recent forwarded waterfall events remembered per `$zr/events`
  * subscription (T32-fix): the registry is only an ownership record, so this
  * bounds a pathological burst the same way the job cache does — past the
@@ -1238,6 +1243,9 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
 
   /** Cold-safe `/v1/session-snapshot` calls currently in flight per device. */
   const snapshotsByDevice = new Map<string, number>()
+
+  /** Total cold-safe `/v1/session-snapshot` calls currently in flight across all devices. */
+  let activeSnapshotsTotal = 0
 
   /**
    * The device NAME this process last saw per device id (T59): every relay
@@ -2843,11 +2851,12 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
       }
 
       const device = headerValue(req, 'x-zen-remote-device') ?? ''
-      if ((snapshotsByDevice.get(device) ?? 0) >= MAX_SNAPSHOTS_PER_DEVICE) {
+      if ((snapshotsByDevice.get(device) ?? 0) >= MAX_SNAPSHOTS_PER_DEVICE || activeSnapshotsTotal >= MAX_SNAPSHOTS_GLOBAL) {
         responseJson(res, 429, { ok: false, error: { code: 'too-many-snapshots' } })
         return
       }
       snapshotsByDevice.set(device, (snapshotsByDevice.get(device) ?? 0) + 1)
+      activeSnapshotsTotal += 1
 
       const hangUp = new AbortController()
       const onClientGone = (): void => {
@@ -2914,6 +2923,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         const remaining = (snapshotsByDevice.get(device) ?? 1) - 1
         if (remaining <= 0) snapshotsByDevice.delete(device)
         else snapshotsByDevice.set(device, remaining)
+        activeSnapshotsTotal = Math.max(0, activeSnapshotsTotal - 1)
       }
       return
     }

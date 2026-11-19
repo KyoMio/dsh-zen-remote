@@ -2350,3 +2350,105 @@ test('T3 /v1/session-snapshot: cold-safe single-next+return, post-await share re
     assert.deepEqual(await badFirst.json(), { ok: false, error: { code: 'internal' } })
   } finally { await server.stop() }
 })
+
+test('T2 /v1/session-snapshot: cross-device global cap = 3 and finally release on completion/error/non-snapshot', async (t) => {
+  const parts = makeParts('t2-session-snapshot-global-cap')
+  parts.store.share('S-a')
+  const snapshotPayload = (id, cursor) => ({
+    type: 'snapshot',
+    header: { id },
+    cursor,
+    records: [],
+    hasMore: false,
+    projections: { asOfSeq: cursor, values: {} },
+    assistantStream: { revision: 0 },
+  })
+  const gates = []
+  t.after(() => {
+    for (const g of gates) g.resolve({ done: true, value: undefined })
+  })
+  parts.gateway.stream = async () => ({
+    [Symbol.asyncIterator]() {
+      return {
+        next: () => new Promise((resolve, reject) => {
+          gates.push({ resolve, reject })
+        }),
+        async return() { return { done: true, value: undefined } },
+      }
+    },
+  })
+
+  const devA = { ...AUTH, 'x-zen-remote-device': 'dev-A' }
+  const devB = { ...AUTH, 'x-zen-remote-device': 'dev-B' }
+  const devC = { ...AUTH, 'x-zen-remote-device': 'dev-C' }
+  const server = await startServer(parts.handler)
+  t.after(() => server.stop())
+
+  // 1) Occupy all 3 global slots across dev-A (2) + dev-B (1).
+  const pA1 = server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, devA))
+  const pA2 = server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, devA))
+  const pB1 = server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, devB))
+  await new Promise((r) => {
+    const check = () => (gates.length >= 3 ? r() : setTimeout(check, 5))
+    check()
+  })
+
+  // 2) dev-B (count 1 < 2) and dev-C (count 0 < 2) must BOTH get 429 due to global cap = 3.
+  const rejectedB = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', {
+    ...post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, devB),
+    signal: AbortSignal.timeout(150),
+  })
+  assert.equal(rejectedB.status, 429)
+  assert.deepEqual(await rejectedB.json(), { ok: false, error: { code: 'too-many-snapshots' } })
+
+  const rejectedC = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', {
+    ...post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, devC),
+    signal: AbortSignal.timeout(150),
+  })
+  assert.equal(rejectedC.status, 429)
+  assert.deepEqual(await rejectedC.json(), { ok: false, error: { code: 'too-many-snapshots' } })
+  assert.equal(gates.length, 3)
+
+  // 3) Release one slot via normal completion -> dev-C is admitted as slot #3 again.
+  gates[0].resolve({ done: false, value: snapshotPayload('S-a', 1) })
+  assert.equal((await pA1).status, 200)
+
+  const pC2 = server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, devC))
+  await new Promise((r) => {
+    const check = () => (gates.length >= 4 ? r() : setTimeout(check, 5))
+    check()
+  })
+
+  const rejectedB2 = await server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', {
+    ...post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, devB),
+    signal: AbortSignal.timeout(150),
+  })
+  assert.equal(rejectedB2.status, 429)
+  assert.deepEqual(await rejectedB2.json(), { ok: false, error: { code: 'too-many-snapshots' } })
+
+  // 4) Release remaining 3 slots via stream error, non-snapshot first frame, and normal completion.
+  gates[1].reject(new Error('stream boom'))
+  assert.equal((await pA2).status, 502)
+
+  gates[2].resolve({ done: false, value: { type: 'not-a-snapshot' } })
+  assert.equal((await pB1).status, 502)
+
+  gates[3].resolve({ done: false, value: snapshotPayload('S-a', 2) })
+  assert.equal((await pC2).status, 200)
+
+  // 5) All 3 global slots are released -> 3 fresh concurrent requests across devices all succeed.
+  const f1 = server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, devA))
+  const f2 = server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, devB))
+  const f3 = server.fetch('/_dsh/zen-remote/relay/v1/session-snapshot', post('/s', { address: { kind: 'session', sessionId: 'S-a' } }, devC))
+  await new Promise((r) => {
+    const check = () => (gates.length >= 7 ? r() : setTimeout(check, 5))
+    check()
+  })
+  gates[4].resolve({ done: false, value: snapshotPayload('S-a', 3) })
+  gates[5].resolve({ done: false, value: snapshotPayload('S-a', 3) })
+  gates[6].resolve({ done: false, value: snapshotPayload('S-a', 3) })
+  const [r1, r2, r3] = await Promise.all([f1, f2, f3])
+  assert.equal(r1.status, 200)
+  assert.equal(r2.status, 200)
+  assert.equal(r3.status, 200)
+})
