@@ -63,6 +63,8 @@ export declare const ARQ_DEFAULT_WINDOW = 64;
 export declare const ARQ_DEFAULT_RTO_MS = 120;
 /** RTO exponential backoff ceiling. */
 export declare const ARQ_DEFAULT_RTO_MAX_MS = 1000;
+/** Default elapsed time without ACK/SACK progress before suspecting a stalled path. */
+export declare const DEFAULT_STALL_SUSPECT_MS = 3500;
 /**
  * Injectable clock so tests can drive RTO/window timing deterministically.
  * Defaults to the real event loop.
@@ -97,6 +99,10 @@ export interface PeerArqOptions {
     maxSessionBytes?: number;
     /** The peer sent RST for this stream; all state for it is gone. */
     onStreamReset?: (streamId: number) => void;
+    /** Invoked once per stall episode when inflight DATA gets no ACK/SACK within `stallSuspectMs`. */
+    onStallSuspected?: (streamId: number) => void;
+    /** Threshold in ms without ACK/SACK before suspecting a stall (0 disables). Default 3500. */
+    stallSuspectMs?: number;
     clock?: ArqClock;
     chunkSize?: number;
     windowSize?: number;
@@ -128,6 +134,8 @@ export declare class PeerArqSession {
     private closed;
     private readonly onStreamClosed;
     private readonly onAdmissionClosed;
+    private readonly onStallSuspected;
+    private readonly stallSuspectMs;
     private admissionClosed;
     private readonly retryTimeoutMs;
     private readonly terminalTtlMs;

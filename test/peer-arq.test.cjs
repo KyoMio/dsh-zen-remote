@@ -1133,3 +1133,196 @@ test('backpressure SACKs keep inflight stream alive past retryTimeoutMs up to 3x
     session.closeAll()
   }
 })
+
+// -- 13. T2: zero-SACK stall detection and onRto re-entry guard ---------------------
+
+test('T2.1: zero-SACK stall triggers onStallSuspected exactly once on first RTO >= stallSuspectMs without storming', async () => {
+  assert.throws(() => new PeerArqSession({ sendFrame: () => {}, stallSuspectMs: -1 }), RangeError)
+  assert.throws(() => new PeerArqSession({ sendFrame: () => {}, stallSuspectMs: 1.5 }), RangeError)
+
+  const stalled = []
+  const { session, sent, clock } = makeSession({
+    chunkSize: 100,
+    stallSuspectMs: 1_000,
+    onStallSuspected: (streamId) => stalled.push({ streamId, at: clock.now() }),
+  })
+  const p = session.write(7, Buffer.alloc(200, 0x11)) // 2 fragments
+  p.catch(() => {})
+  assert.equal(sent.length, 2)
+
+  // RTO schedule: 120, +240=360, +480=840 (< 1000ms) -> 0 stall reports
+  clock.advance(840)
+  assert.deepEqual(stalled, [], 'no stall report before stallSuspectMs')
+
+  // Next RTO at 840 + 960 = 1800ms >= 1000ms -> exactly 1 report across both fragments
+  clock.advance(960)
+  assert.deepEqual(stalled, [{ streamId: 7, at: 1800 }], 'exactly one stall report on first RTO past stallSuspectMs')
+
+  // Subsequent RTOs at 2800, 3800, 4800 must not storm
+  clock.advance(3_000)
+  assert.equal(stalled.length, 1, 'no repeat stall storm on subsequent RTOs')
+
+  // stallSuspectMs: 0 disables stall detection
+  const disabledStalled = []
+  const disabled = makeSession({
+    chunkSize: 100,
+    stallSuspectMs: 0,
+    onStallSuspected: (streamId) => disabledStalled.push(streamId),
+  })
+  disabled.session.write(1, Buffer.alloc(100, 0x22)).catch(() => {})
+  disabled.clock.advance(10_000)
+  assert.deepEqual(disabledStalled, [], 'stallSuspectMs=0 disables stall detection')
+
+  session.closeAll()
+  disabled.session.closeAll()
+  assert.equal(clock.pendingCount(), 0)
+  assert.equal(disabled.clock.pendingCount(), 0)
+})
+
+test('T2.2: idle stream for 10s after draining inflight does not false-trigger on next write RTO', async () => {
+  const stalled = []
+  const { session, clock } = makeSession({
+    chunkSize: 100,
+    stallSuspectMs: 3_500,
+    onStallSuspected: (streamId) => stalled.push({ streamId, at: clock.now() }),
+  })
+  const p1 = session.write(3, Buffer.alloc(50, 0xaa))
+  session.handleFrame(PeerFrameType.ACK, 3, Buffer.alloc(0), 1)
+  await p1
+  assert.equal(session.inflightTotal(), 0)
+
+  // Keep stream open and idle for 10s
+  clock.advance(10_000)
+  assert.deepEqual(stalled, [])
+
+  // Second write drops once and hits 120ms RTO -> must NOT false-report due to old stream timestamps
+  const p2 = session.write(3, Buffer.alloc(50, 0xbb))
+  p2.catch(() => {})
+  clock.advance(120)
+  assert.deepEqual(stalled, [], '120ms RTO after 10s idle must not false-report stall')
+
+  // Only after the second write itself stalls >= 3500ms does it report (at 10000 + 3800 = 13800)
+  clock.advance(3_680)
+  assert.deepEqual(stalled, [{ streamId: 3, at: 13_800 }])
+
+  session.handleFrame(PeerFrameType.ACK, 3, Buffer.alloc(0), 2)
+  await p2
+  session.closeAll()
+  assert.equal(clock.pendingCount(), 0)
+})
+
+test('T2.3: receiver backpressure zero-advancing SACKs prevent false stall detection past 5s', async () => {
+  const stalled = []
+  const { session, clock } = makeSession({
+    chunkSize: 100,
+    onStallSuspected: (streamId) => stalled.push({ streamId, at: clock.now() }),
+  })
+  const p = session.write(5, Buffer.alloc(200, 0xcc))
+  assert.equal(session.inflightTotal(), 2)
+
+  // Peer repeatedly sends zero-advancing SACK (ack === tx.cumulative === 0) for 5s
+  for (let t = 0; t < 5_000; t += 500) {
+    clock.advance(500)
+    session.handleFrame(PeerFrameType.SACK, 5, emptyBitmap(), 0)
+  }
+  assert.deepEqual(stalled, [], 'zero-advancing backpressure SACK at ack=0 prevents stall report')
+
+  // Advance cumulative to 1, then send zero-advancing SACK at ack=1 for another 5s
+  session.handleFrame(PeerFrameType.SACK, 5, emptyBitmap(), 1)
+  for (let t = 0; t < 5_000; t += 500) {
+    clock.advance(500)
+    session.handleFrame(PeerFrameType.SACK, 5, emptyBitmap(), 1)
+  }
+  assert.deepEqual(stalled, [], 'zero-advancing SACK at ack=1 prevents stall report')
+
+  // Once SACKs stop arriving for >= 3500ms, the next RTO reports stall
+  clock.advance(4_000)
+  assert.equal(stalled.length, 1)
+  assert.equal(stalled[0].streamId, 5)
+
+  session.handleFrame(PeerFrameType.ACK, 5, Buffer.alloc(0), 2)
+  await p
+  session.closeAll()
+  assert.equal(clock.pendingCount(), 0)
+})
+
+test('T2.4: synchronous flushInflight() inside onStallSuspected neither double-sends DATA nor leaks timers', async () => {
+  const stalled = []
+  let sentDuringCallback = 0
+  let sentAfterStallRto = 0
+  let sessionRef
+  const { session, sent, clock } = makeSession({
+    chunkSize: 100,
+    stallSuspectMs: 1_000,
+    onStallSuspected: (streamId) => {
+      stalled.push({ streamId, at: clock.now() })
+      const before = sent.length
+      sessionRef.flushInflight()
+      sentDuringCallback = sent.length - before
+    },
+  })
+  sessionRef = session
+
+  const p = session.write(9, Buffer.alloc(200, 0xdd)) // 2 fragments: seq 0, 1
+  // Advance up to t=1799 (RTOs at 120, 360, 840 already happened: 2 initial + 3*2 retransmits = 8 frames)
+  clock.advance(1_799)
+  assert.equal(stalled.length, 0)
+  const sentBeforeStallTick = sent.length
+
+  // Advance 1ms to t=1800: frag 0 onRto triggers onStallSuspected -> flushInflight() sends seq 0 and seq 1 once each.
+  // Re-entry guard must return early so frag 0 does NOT send a second DATA or overwrite frag.timer.
+  // frag 1's timer was cleared & re-armed to +120ms by flushInflight(), so frag 1 does NOT fire at t=1800 either.
+  clock.advance(1)
+  sentAfterStallRto = sent.length - sentBeforeStallTick
+  assert.equal(stalled.length, 1)
+  assert.equal(sentDuringCallback, 2, 'flushInflight sent each inflight fragment once')
+  assert.equal(sentAfterStallRto, 2, 'onRto did not double-send DATA after synchronous flushInflight')
+
+  // Verify frag.rto was reset to 120ms and no leaked timer remains from old backoff:
+  // Nothing fires before t = 1800 + 120 = 1920
+  clock.advance(119)
+  assert.equal(sent.length, sentBeforeStallTick + 2, 'no stray timer before reset 120ms RTO')
+  clock.advance(1)
+  assert.equal(sent.length, sentBeforeStallTick + 4, 'reset 120ms RTO fires cleanly for both fragments')
+
+  // Complete stream and confirm zero pending timers
+  session.handleFrame(PeerFrameType.ACK, 9, Buffer.alloc(0), 2)
+  await p
+  assert.equal(clock.pendingCount(), 0, 'zero pending timers after stream completion')
+
+  // Also test synchronous reset() inside onStallSuspected and throwing listener safety
+  const resetStalled = []
+  let resetRef
+  const r = makeSession({
+    chunkSize: 100,
+    stallSuspectMs: 1_000,
+    onStallSuspected: (streamId) => {
+      resetStalled.push(streamId)
+      resetRef.reset(streamId)
+    },
+  })
+  resetRef = r.session
+  const rp = r.session.write(1, Buffer.alloc(100, 0xee))
+  rp.catch(() => {})
+  r.clock.advance(1_800)
+  assert.deepEqual(resetStalled, [1])
+  assert.equal(r.session.inflightTotal(), 0)
+  r.session.handleFrame(PeerFrameType.RST, 1, Buffer.from([2]), 0)
+  assert.equal(r.clock.pendingCount(), 0, 'zero pending timers after synchronous reset in callback')
+
+  const throwing = makeSession({
+    chunkSize: 100,
+    stallSuspectMs: 1_000,
+    onStallSuspected: () => { throw new Error('boom') },
+  })
+  const tp = throwing.session.write(1, Buffer.alloc(100, 0xff))
+  throwing.clock.advance(1_800)
+  assert.ok(throwing.sent.length > 4, 'listener error does not break ARQ retransmission')
+  throwing.session.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), 1)
+  await tp
+  assert.equal(throwing.clock.pendingCount(), 0)
+
+  session.closeAll()
+  r.session.closeAll()
+  throwing.session.closeAll()
+})

@@ -66,6 +66,8 @@ export const ARQ_DEFAULT_WINDOW = 64
 export const ARQ_DEFAULT_RTO_MS = 120
 /** RTO exponential backoff ceiling. */
 export const ARQ_DEFAULT_RTO_MAX_MS = 1000
+/** Default elapsed time without ACK/SACK progress before suspecting a stalled path. */
+export const DEFAULT_STALL_SUSPECT_MS = 3_500
 
 /** SACK bitmap depth: 64 window bits, 8 bytes, bit i = cumAck + i. */
 const SACK_BITMAP_BYTES = 8
@@ -115,6 +117,10 @@ export interface PeerArqOptions {
   maxSessionBytes?: number
   /** The peer sent RST for this stream; all state for it is gone. */
   onStreamReset?: (streamId: number) => void
+  /** Invoked once per stall episode when inflight DATA gets no ACK/SACK within `stallSuspectMs`. */
+  onStallSuspected?: (streamId: number) => void
+  /** Threshold in ms without ACK/SACK before suspecting a stall (0 disables). Default 3500. */
+  stallSuspectMs?: number
   clock?: ArqClock
   chunkSize?: number
   windowSize?: number
@@ -157,6 +163,9 @@ interface TxStream {
   cumulative: number
   lastProgressAt: number
   progressTimer: unknown
+  inflightSince: number | null
+  lastAckOrSackAt: number
+  stallReported: boolean
   pendingBytes: number
   pendingWrites: number
 }
@@ -243,6 +252,8 @@ export class PeerArqSession {
   private closed = false
   private readonly onStreamClosed: PeerArqOptions['onStreamClosed']
   private readonly onAdmissionClosed: PeerArqOptions['onAdmissionClosed']
+  private readonly onStallSuspected: PeerArqOptions['onStallSuspected']
+  private readonly stallSuspectMs: number
   private admissionClosed = false
   private readonly retryTimeoutMs: number
   private readonly terminalTtlMs: number
@@ -284,6 +295,12 @@ export class PeerArqSession {
     this.onStreamReset = options.onStreamReset
     this.onStreamClosed = options.onStreamClosed
     this.onAdmissionClosed = options.onAdmissionClosed
+    this.onStallSuspected = options.onStallSuspected
+    const stallSuspectMs = options.stallSuspectMs ?? DEFAULT_STALL_SUSPECT_MS
+    if (!Number.isSafeInteger(stallSuspectMs) || stallSuspectMs < 0) {
+      throw new RangeError('stallSuspectMs must be a non-negative integer')
+    }
+    this.stallSuspectMs = stallSuspectMs
     this.retryTimeoutMs = options.retryTimeoutMs ?? 30_000
     this.terminalTtlMs = options.terminalTtlMs ?? 60_000
     this.maxStreams = options.maxStreams ?? 128
@@ -511,6 +528,12 @@ export class PeerArqSession {
   flushInflight(): void {
     if (this.closed) return
     for (const [streamId, tx] of this.txStreams) {
+      if (tx.inflight.size > 0) {
+        const now = this.clock.now()
+        tx.inflightSince = now
+        tx.lastAckOrSackAt = now
+        tx.stallReported = false
+      }
       for (const [seq, frag] of tx.inflight) {
         this.clock.clearTimeout(frag.timer)
         frag.rto = this.rtoMs
@@ -664,7 +687,22 @@ export class PeerArqSession {
   private ensureTx(streamId: number): TxStream {
     let tx = this.txStreams.get(streamId)
     if (!tx) {
-      tx = { nextSeq: 0, queue: [], inflight: new Map(), finQueued: false, finPromise: null, finAcked: false, cumulative: 0, lastProgressAt: this.clock.now(), progressTimer: null, pendingBytes: 0, pendingWrites: 0 }
+      tx = {
+        nextSeq: 0,
+        queue: [],
+        inflight: new Map(),
+        finQueued: false,
+        finPromise: null,
+        finAcked: false,
+        cumulative: 0,
+        lastProgressAt: this.clock.now(),
+        progressTimer: null,
+        inflightSince: null,
+        lastAckOrSackAt: this.clock.now(),
+        stallReported: false,
+        pendingBytes: 0,
+        pendingWrites: 0,
+      }
       this.txStreams.set(streamId, tx)
     }
     return tx
@@ -691,7 +729,14 @@ export class PeerArqSession {
         timer: null,
       }
       frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
+      const wasEmpty = tx.inflight.size === 0
       tx.inflight.set(seq, frag)
+      if (wasEmpty) {
+        const now = this.clock.now()
+        tx.inflightSince = now
+        tx.lastAckOrSackAt = now
+        tx.stallReported = false
+      }
       if (tx.progressTimer === null) {
         tx.lastProgressAt = this.clock.now()
         this.armProgress(streamId, tx)
@@ -705,6 +750,25 @@ export class PeerArqSession {
     const tx = this.txStreams.get(streamId)
     const frag = tx?.inflight.get(seq)
     if (!tx || !frag) return
+    const now = this.clock.now()
+    if (
+      !tx.stallReported &&
+      this.onStallSuspected !== undefined &&
+      this.stallSuspectMs > 0 &&
+      tx.inflightSince !== null &&
+      now - tx.inflightSince >= this.stallSuspectMs &&
+      now - tx.lastAckOrSackAt >= this.stallSuspectMs
+    ) {
+      tx.stallReported = true
+      try {
+        this.onStallSuspected(streamId)
+      } catch {
+        // Listener error must never break ARQ retransmissions.
+      }
+      if (this.closed || this.txStreams.get(streamId) !== tx || !tx.inflight.has(seq) || !tx.stallReported) {
+        return
+      }
+    }
     frag.rto = Math.min(frag.rto * 2, this.rtoMaxMs)
     frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
     this.trySendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
@@ -808,6 +872,8 @@ export class PeerArqSession {
       ack <= tx.nextSeq &&
       (tx.inflight.size > 0 || tx.queue.length > 0)
     ) {
+      tx.lastAckOrSackAt = this.clock.now()
+      tx.stallReported = false
       const remaining = tx.lastProgressAt + 3 * this.retryTimeoutMs - this.clock.now()
       if (remaining > 0) {
         this.armProgress(streamId, tx, Math.min(this.retryTimeoutMs, remaining))
@@ -818,7 +884,9 @@ export class PeerArqSession {
   private applyCumulative(streamId: number, ack: number): void {
     if (ack <= 0) return
     const tx = this.txStreams.get(streamId)
-    if (!tx || ack > tx.nextSeq) return
+    if (!tx || ack < tx.cumulative || ack > tx.nextSeq) return
+    tx.lastAckOrSackAt = this.clock.now()
+    tx.stallReported = false
     if (ack > tx.cumulative) {
       tx.cumulative = ack
       tx.lastProgressAt = this.clock.now()
@@ -836,6 +904,10 @@ export class PeerArqSession {
       this.clock.clearTimeout(tx.progressTimer)
       tx.progressTimer = null
     }
+    if (tx.inflight.size === 0) {
+      tx.inflightSince = null
+      tx.stallReported = false
+    }
     this.maybeClose(streamId)
   }
 
@@ -847,6 +919,10 @@ export class PeerArqSession {
     tx.inflight.delete(seq)
     this.settle(tx, frag)
     this.pump(streamId, tx)
+    if (tx.inflight.size === 0) {
+      tx.inflightSince = null
+      tx.stallReported = false
+    }
   }
 
   private settle(tx: TxStream, frag: TxFragment): void {
