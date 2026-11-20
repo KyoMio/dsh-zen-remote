@@ -2133,11 +2133,12 @@ test('fast 200ms follow-up RTT probe promotes under cap=300 without waiting 5s k
   })
 
   engine.resumeFromState()
-  await waitFor(() => wsSockets.length >= 1, 'engine ws connected')
+  await waitFor(() => wsSockets.length >= 1 && engine.status().gatewayState === 'authorized', 'engine ws connected')
   mgrB.beginPunch({ peerNodeId: identityA.nodeId, peerPublicKeyHex: identityA.publicKeyHex, lanEndpoints: [`127.0.0.1:${socketA.address().port}`] })
   muxB.enableRelayPath(identityA.nodeId)
   await waitFor(() => muxB.sessionPath(identityA.nodeId) !== 'none', 'muxB WS relay ready')
   await waitFor(() => mgrB.peerState(identityA.nodeId)?.state === 'direct', 'both punch managers direct')
+  await sleep(30)
 
   // Even if initiator's immediate PING hit the cipher-derivation race, two 220ms virtual ticks (<500ms << 5000ms keepalive) complete both RTT samples and promote to lan
   clock.advance(220)
@@ -2156,4 +2157,394 @@ test('fast 200ms follow-up RTT probe promotes under cap=300 without waiting 5s k
     clearTimeout(guard)
   }
   assert.equal(engine.status().peers[0]?.path, 'lan', '6s grace absorbs asymmetric peer keepalive skew without demoting')
+})
+
+function makeControllableUdp(realSocket, shouldDropSend) {
+  return {
+    send(buf, offset, length, port, host, cb) {
+      if (typeof length === 'string') {
+        cb = port; host = length; port = offset; offset = 0; length = buf.length
+      }
+      const slice = buf.subarray(offset, offset + length)
+      const hdr = decodeFrameHeader(slice)
+      if (shouldDropSend(slice, hdr)) {
+        if (typeof cb === 'function') cb()
+        return
+      }
+      realSocket.send(buf, offset, length, port, host, cb)
+    },
+    on: (...args) => realSocket.on(...args),
+    once: (...args) => realSocket.once(...args),
+    removeListener: (...args) => realSocket.removeListener(...args),
+    address: () => realSocket.address(),
+    unref: () => realSocket.unref(),
+    ref: () => realSocket.ref(),
+    bind: (...args) => realSocket.bind(...args),
+    close: () => realSocket.close(),
+  }
+}
+
+async function buildDualEnginePair(t, { directCap = 300, bHandlerReadyInitially = true, relayHandlerWaitMs } = {}) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-t5-dual-'))
+  const clock = manualClock(Date.now())
+  const logsA = []
+  const logsB = []
+  const stateFileA = path.join(home, 'a-state.json')
+  const stateFileB = path.join(home, 'b-state.json')
+  const identityA = ensurePeerIdentity(stateFileA)
+  const identityB = ensurePeerIdentity(stateFileB)
+  const rawSocketA = await openUdp()
+  const rawSocketB = await openUdp()
+
+  const netFilter = {
+    dropAtoB: false,
+    dropBtoA: false,
+    dropBtoAPongs: false,
+    dropUdpData: false,
+  }
+
+  const udpA = makeControllableUdp(rawSocketA, (_slice, hdr) => {
+    if (netFilter.dropAtoB) return true
+    if (netFilter.dropUdpData && hdr && hdr.frameType === PeerFrameType.DATA) return true
+    return false
+  })
+  const udpB = makeControllableUdp(rawSocketB, (_slice, hdr) => {
+    if (netFilter.dropBtoA) return true
+    if (netFilter.dropBtoAPongs && hdr && hdr.frameType === PeerFrameType.PONG) return true
+    if (netFilter.dropUdpData && hdr && hdr.frameType === PeerFrameType.DATA) return true
+    return false
+  })
+
+  const wsSockets = new Set()
+  const wsByNode = new Map()
+  const writeWsBinary = (socket, bytes) => {
+    if (!socket || socket.destroyed) return
+    const payload = Buffer.from(bytes)
+    let hdr
+    if (payload.length < 126) hdr = Buffer.from([0x82, payload.length])
+    else {
+      hdr = Buffer.alloc(4)
+      hdr[0] = 0x82; hdr[1] = 126; hdr.writeUInt16BE(payload.length, 2)
+    }
+    socket.write(Buffer.concat([hdr, payload]))
+  }
+
+  const server = http.createServer()
+  server.on('upgrade', (req, socket) => {
+    wsSockets.add(socket)
+    socket.on('error', () => {})
+    let buf = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      for (;;) {
+        const parsed = readClientFrame(buf)
+        if (!parsed) break
+        buf = parsed.rest
+        if (parsed.opcode === 8) { socket.end(); return }
+        if (parsed.opcode === 9) {
+          socket.write(Buffer.concat([Buffer.from([0x8a, parsed.payload.length]), parsed.payload]))
+          continue
+        }
+        if (parsed.opcode === 2) {
+          const hdr = decodeFrameHeader(parsed.payload)
+          if (hdr) {
+            const dst = wsByNode.get(hdr.dstNodeId.toLowerCase())
+            writeWsBinary(dst, parsed.payload)
+          }
+          continue
+        }
+        if (parsed.opcode !== 1) continue
+        let msg
+        try { msg = JSON.parse(parsed.payload.toString('utf8')) } catch { continue }
+        if (msg?.type === 'auth' && typeof msg.nodeId === 'string') {
+          const nid = msg.nodeId.toLowerCase()
+          wsByNode.set(nid, socket)
+          const other = nid === identityA.nodeId
+            ? {
+                nodeId: identityB.nodeId,
+                publicKeyHex: identityB.publicKeyHex,
+                name: 'node-B',
+                lanEndpoints: [endpointOf(rawSocketB)],
+                reflexiveEndpoint: null,
+                connSeq: 1,
+                pluginVersion: '2.5.3',
+              }
+            : {
+                nodeId: identityA.nodeId,
+                publicKeyHex: identityA.publicKeyHex,
+                name: 'node-A',
+                lanEndpoints: [endpointOf(rawSocketA)],
+                reflexiveEndpoint: null,
+                connSeq: 1,
+                pluginVersion: '2.5.3',
+              }
+          socket.write(wsFrame({
+            type: 'welcome',
+            status: 'authorized',
+            connSeq: 1,
+            maxPeers: 8,
+            peerDirectMaxRttMs: directCap,
+            gatewayVersion: '0.2.0',
+            wireCompatLevel: 1,
+            peers: [other],
+          }))
+        }
+      }
+    })
+    const accept = createHash('sha1').update(String(req.headers['sec-websocket-key']) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    socket.write(Buffer.concat([
+      Buffer.from(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`),
+      wsFrame({ type: 'challenge', challengeHex: 'a1b2c3d4e5f60718' }),
+    ]))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+
+  let fetchAtoB = null
+  let fetchBtoA = null
+  const defaultHandlerA = async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    res.end('ok-from-a')
+  }
+  const defaultHandlerB = async (req, res) => {
+    for await (const _ of req) { /* drain */ }
+    res.end('ok-from-b')
+  }
+  let activeHandlerB = bHandlerReadyInitially ? defaultHandlerB : undefined
+
+  const engineA = createPeerEngine({
+    stateFile: stateFileA,
+    identity: identityA,
+    pluginVersion: () => '2.5.3',
+    recommendedGatewayVersion: () => '0.2.0',
+    relayPool: {
+      maxServers: () => 8,
+      mountVirtual: (input) => { fetchAtoB = input.fetchImpl; return { entryId: input.entryId, serverId: input.serverId, serverName: input.serverName, displayName: input.serverName } },
+      unmountVirtual: () => true,
+      updateVirtualName: () => true,
+      reconnect: () => Promise.resolve(true),
+    },
+    relayHandler: () => defaultHandlerA,
+    relaySecret: () => 'test',
+    serverName: () => 'node-A',
+    udpSocket: udpA,
+    udpProbe: null,
+    clock,
+    log: (line) => logsA.push(line),
+    directMaxRttMs: () => directCap,
+    ...(relayHandlerWaitMs !== undefined ? { relayHandlerWaitMs } : {}),
+    punch: { keepAliveMs: 5_000, keepAliveLostFrames: 3 },
+  })
+
+  const engineB = createPeerEngine({
+    stateFile: stateFileB,
+    identity: identityB,
+    pluginVersion: () => '2.5.3',
+    recommendedGatewayVersion: () => '0.2.0',
+    relayPool: {
+      maxServers: () => 8,
+      mountVirtual: (input) => { fetchBtoA = input.fetchImpl; return { entryId: input.entryId, serverId: input.serverId, serverName: input.serverName, displayName: input.serverName } },
+      unmountVirtual: () => true,
+      updateVirtualName: () => true,
+      reconnect: () => Promise.resolve(true),
+    },
+    relayHandler: () => activeHandlerB,
+    relaySecret: () => 'test',
+    serverName: () => 'node-B',
+    udpSocket: udpB,
+    udpProbe: null,
+    clock,
+    log: (line) => logsB.push(line),
+    directMaxRttMs: () => directCap,
+    ...(relayHandlerWaitMs !== undefined ? { relayHandlerWaitMs } : {}),
+    punch: { keepAliveMs: 5_000, keepAliveLostFrames: 3 },
+  })
+
+  for (const sf of [stateFileA, stateFileB]) {
+    writePeerNetwork(sf, {
+      gatewayWsUrl: `ws://127.0.0.1:${port}`,
+      gatewayHttpOrigin: `http://127.0.0.1:${port}`,
+      networkId: NET_ID,
+      joinedAt: 1,
+    })
+  }
+
+  t.after(async () => {
+    const cA = waitClose(rawSocketA)
+    const cB = waitClose(rawSocketB)
+    engineA.stop()
+    engineB.stop()
+    await Promise.all([cA, cB])
+    for (const s of wsSockets) s.destroy()
+    await new Promise((resolve) => server.close(resolve))
+    fs.rmSync(home, { recursive: true, force: true })
+  })
+
+  engineA.resumeFromState()
+  engineB.resumeFromState()
+  await waitFor(() => wsByNode.size === 2, 'both engines connected to gateway')
+
+  const stepClock = async (totalMs, stepMs = 100) => {
+    for (let left = totalMs; left > 0; left -= stepMs) {
+      clock.advance(Math.min(stepMs, left))
+      await sleep(3)
+    }
+  }
+
+  const sendControlTo = (nodeId, msg) => {
+    const s = wsByNode.get(nodeId.toLowerCase())
+    if (s && !s.destroyed) s.write(wsFrame(msg))
+  }
+
+  return {
+    clock,
+    stepClock,
+    engineA,
+    engineB,
+    identityA,
+    identityB,
+    rawSocketA,
+    rawSocketB,
+    netFilter,
+    logsA,
+    logsB,
+    sendControlTo,
+    getFetchAtoB: () => fetchAtoB,
+    getFetchBtoA: () => fetchBtoA,
+    enableHandlerB: () => { activeHandlerB = defaultHandlerB },
+  }
+}
+
+test('T5: punch-coordinate preserves pluginVersion, re-anchor suppresses demote beacon, and 0-byte UDP unlock + triggerFastProbe converges asymmetric 30s hold in <1s', async (t) => {
+  const env = await buildDualEnginePair(t, { directCap: 300 })
+
+  // Both engines converge to direct 'lan' within < 600ms virtual time
+  await env.stepClock(500, 100)
+  await waitFor(
+    () => env.engineA.status().peers[0]?.path === 'lan' && env.engineB.status().peers[0]?.path === 'lan',
+    'initial dual direct promotion',
+  )
+  assert.equal(env.engineA.status().peers[0].pluginVersion, '2.5.3')
+  assert.equal(env.engineB.status().peers[0].pluginVersion, '2.5.3')
+
+  // Case 3a: punch-coordinate omitting pluginVersion must preserve existing '2.5.3'
+  env.sendControlTo(env.identityA.nodeId, {
+    type: 'punch-coordinate',
+    peerNodeId: env.identityB.nodeId,
+    publicKeyHex: env.identityB.publicKeyHex,
+    lanEndpoints: [endpointOf(env.rawSocketB), '127.0.0.1:19999'],
+    reflexiveEndpoint: null,
+    connSeq: 1,
+  })
+  await sleep(20)
+  assert.equal(env.engineA.status().peers[0].pluginVersion, '2.5.3', 'missing pluginVersion on punch-coordinate must not wipe version')
+
+  // Case 3b: endpoint removal triggers resetPeerForReanchor(..., false) which must NOT send WS demote beacon to B
+  env.sendControlTo(env.identityA.nodeId, {
+    type: 'punch-coordinate',
+    peerNodeId: env.identityB.nodeId,
+    publicKeyHex: env.identityB.publicKeyHex,
+    lanEndpoints: [endpointOf(env.rawSocketB)],
+    reflexiveEndpoint: null,
+    connSeq: 1,
+  })
+  await waitFor(() => env.logsA.some((l) => l.includes('re-anchored') && l.includes('endpoints changed')), 'A re-anchored')
+  await sleep(30)
+  assert.equal(env.engineB.status().peers[0].directDemoted, false, 're-anchor on A must not send WS demote beacon that marks B demoted')
+  assert.equal(env.logsB.some((l) => l.includes('demoted to relay')), false, 'B must not receive peer relay demotion from A re-anchor')
+  // Both sides immediately re-promote within <500ms without a 30s peerRelayHoldUntil cooldown
+  await env.stepClock(450, 100)
+  await waitFor(
+    () => env.engineA.status().peers[0]?.path === 'lan' && env.engineB.status().peers[0]?.path === 'lan',
+    'both A and B re-promote in <500ms after re-anchor without 30s hold',
+  )
+
+  // Advance to t=5400ms (just before the 5000ms keepalive tick at t=5500ms after the t=500ms re-anchor)
+  await env.stepClock(4_450, 200)
+  await waitFor(
+    () => env.engineA.status().peers[0]?.path === 'lan' && env.engineB.status().peers[0]?.path === 'lan',
+    'both back on lan before asymmetric demotion',
+  )
+
+  // Case 1: Induce active demotion on A (drop B->A PONGs for 1 cycle -> ~3s pingRetry demotes A and sends WS beacon to B)
+  env.netFilter.dropBtoAPongs = true
+  await env.stepClock(3_300, 150)
+  await waitFor(
+    () => env.engineA.status().peers[0]?.path === 'relay' && env.engineB.status().peers[0]?.path === 'relay',
+    'A demoted and B synced to relay with 30s hold',
+  )
+  assert.equal(env.engineB.status().peers[0].directDemoted, true)
+
+  // Restore UDP and advance to the next keepalive tick for A (t=10500ms) + <600ms fast convergence, with ZERO application HTTP traffic
+  env.netFilter.dropBtoAPongs = false
+  await env.stepClock(2_400, 100)
+  // Within <1s after A's keepalive tick: A fast-probes to promote -> sends 0-byte UDP (ACK, streamId=0) -> unlocks B's 30s hold -> B fast-probes to promote
+  await waitFor(
+    () => env.engineA.status().peers[0]?.path === 'lan' && env.engineB.status().peers[0]?.path === 'lan',
+    'both A and B converge back to lan within <1s without waiting out 30s peerRelayHoldUntil',
+  )
+  assert.equal(env.engineA.status().peers[0].directDemoted, false)
+  assert.equal(env.engineB.status().peers[0].directDemoted, false)
+})
+
+test('T5: one-way UDP blackhole and Ping-ok/Data-blackhole both demote symmetrically in ~3-4s via WS demote beacon and recover bidirectional HTTP', async (t) => {
+  // Part (a): One-way UDP loss (B -> A dropped while A -> B still reaches B)
+  {
+    const env = await buildDualEnginePair(t, { directCap: 300 })
+    await env.stepClock(500, 100)
+    await waitFor(
+      () => env.engineA.status().peers[0]?.path === 'lan' && env.engineB.status().peers[0]?.path === 'lan',
+      'both promoted to lan',
+    )
+
+    // Advance to just before the 5000ms keepalive tick, then blackhole B -> A UDP
+    await env.stepClock(4_400, 200)
+    env.netFilter.dropBtoA = true
+
+    // Advance 3_300ms (t=5000 tick -> +1500ms retry miss#1 -> +1500ms miss#2 at t=8000, ~3.0s after tick)
+    await env.stepClock(3_300, 150)
+    await waitFor(
+      () => env.engineA.status().peers[0]?.path === 'relay' && env.engineB.status().peers[0]?.path === 'relay',
+      'both A and B demote to relay within ~3s of keepalive tick despite one-way A->B UDP keeping B lastSeen fresh',
+    )
+
+    const resA = await env.getFetchAtoB()('http://peer/after-oneway-a')
+    assert.equal(await resA.text(), 'ok-from-b')
+    const resB = await env.getFetchBtoA()('http://peer/after-oneway-b')
+    assert.equal(await resB.text(), 'ok-from-a')
+  }
+
+  // Part (b): Small PING/PONG pass, but DATA frames are blackholed on UDP + cold-start relayHandlerWaitMs
+  {
+    const env = await buildDualEnginePair(t, { directCap: 300, bHandlerReadyInitially: false })
+    await env.stepClock(500, 100)
+    await waitFor(
+      () => env.engineA.status().peers[0]?.path === 'lan' && env.engineB.status().peers[0]?.path === 'lan',
+      'both promoted to lan',
+    )
+
+    // Cold-start request arrives while B's relayHandler is still undefined, then B mounts handler 150ms later
+    const coldReq = env.getFetchAtoB()('http://peer/cold-start')
+    await env.stepClock(150, 50)
+    env.enableHandlerB()
+    await env.stepClock(100, 50)
+    const coldRes = await coldReq
+    assert.equal(coldRes.status, 200, 'engine default relayHandlerWaitMs=3000 waits for cold-start handler instead of returning 503')
+    assert.equal(await coldRes.text(), 'ok-from-b')
+
+    // Now drop only UDP DATA frames (PING/PONG continue passing)
+    env.netFilter.dropUdpData = true
+    const stalledReq = env.getFetchAtoB()('http://peer/data-blackhole')
+    // Advance ~3.9s for ARQ zero-SACK stall detection (stallSuspectMs=3500, RTO step at 3720ms)
+    await env.stepClock(3_900, 100)
+    await waitFor(
+      () => env.engineA.status().peers[0]?.path === 'relay' && env.engineB.status().peers[0]?.path === 'relay',
+      'ARQ stall on A demotes both A and B to relay within ~3.8s',
+    )
+    assert.ok(env.logsA.some((l) => l.includes('direct arq stalled')), 'A logged direct arq stalled')
+    assert.equal(await (await stalledReq).text(), 'ok-from-b', 'in-flight stalled request transparently flushes over WS')
+
+    const reverseRes = await env.getFetchBtoA()('http://peer/reverse-after-stall')
+    assert.equal(await reverseRes.text(), 'ok-from-a')
+  }
 })

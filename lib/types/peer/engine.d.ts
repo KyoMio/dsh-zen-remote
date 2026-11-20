@@ -74,6 +74,8 @@ export interface PeerEnginePunchTimings {
     reprobeInitialDelaysMs?: readonly [number, number];
     keepAliveMs?: number;
     keepAliveLostFrames?: number;
+    fastConfirmDelayMs?: number;
+    pingRetryDelayMs?: number;
 }
 export interface PeerEngineOptions {
     /** `zen-remote-state.json`——身份、成员资格、TOFU 锚都在这里。 */
@@ -133,6 +135,8 @@ export interface PeerEngineOptions {
     pluginVersion?: () => string;
     /** 运行时读取的期望网关版本号（由 src/index.ts 从根 package.json#gatewayVersion 注入）。 */
     recommendedGatewayVersion?: () => string;
+    /** 冷启动时 relayHandler 未就绪的等待窗口（ms，传给 PeerMux 默认 3000）。 */
+    relayHandlerWaitMs?: number;
 }
 export interface PeerEngineLeaveResult {
     ok: true;

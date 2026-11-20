@@ -120,6 +120,8 @@ export interface PeerEnginePunchTimings {
   reprobeInitialDelaysMs?: readonly [number, number]
   keepAliveMs?: number
   keepAliveLostFrames?: number
+  fastConfirmDelayMs?: number
+  pingRetryDelayMs?: number
 }
 
 export interface PeerEngineOptions {
@@ -173,6 +175,8 @@ export interface PeerEngineOptions {
   pluginVersion?: () => string
   /** 运行时读取的期望网关版本号（由 src/index.ts 从根 package.json#gatewayVersion 注入）。 */
   recommendedGatewayVersion?: () => string
+  /** 冷启动时 relayHandler 未就绪的等待窗口（ms，传给 PeerMux 默认 3000）。 */
+  relayHandlerWaitMs?: number
 }
 
 export interface PeerEngineLeaveResult {
@@ -482,7 +486,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       mux?.enableRelayPath(member.nodeId)
     } else {
       applyArqProfile(member, 'relay', true)
-      mux?.setRelayPath(member.nodeId)
+      mux?.setRelayPath(member.nodeId, false)
     }
     log(`peer engine: re-anchored ${member.nodeId} (${reason})`)
     schedulePathReport()
@@ -1001,6 +1005,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     }
     if (type === 'punch-coordinate') {
       if (typeof message['peerNodeId'] !== 'string' || typeof message['publicKeyHex'] !== 'string') return
+      const ver = parseSemver(message['pluginVersion'])?.normalized
       announcePeer({
         nodeId: message['peerNodeId'] as string,
         publicKeyHex: message['publicKeyHex'] as string,
@@ -1008,7 +1013,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         lanEndpoints: Array.isArray(message['lanEndpoints']) ? (message['lanEndpoints'] as string[]) : null,
         reflexiveEndpoint: typeof message['reflexiveEndpoint'] === 'string' ? message['reflexiveEndpoint'] : null,
         connSeq: parseConnSeq(message['connSeq']),
-        pluginVersion: parseSemver(message['pluginVersion'])?.normalized ?? null,
+        ...(ver !== undefined ? { pluginVersion: ver } : {}),
         startPunch: true,
       })
       return
@@ -1246,7 +1251,13 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     if (mux === null || punch === null) return
     const mode = member.directMode ?? 'p2p'
     applyArqProfile(member, mode, true)
-    mux.setDirectPath(member.nodeId, punch.frameSenderFor(member.nodeId))
+    const sender = punch.frameSenderFor(member.nodeId)
+    mux.setDirectPath(member.nodeId, sender)
+    try {
+      sender(PeerFrameType.ACK, 0, Buffer.alloc(0), 0)
+    } catch {
+      // Transient send failure; subsequent traffic or keepalive will follow.
+    }
     member.path = mode
     member.directActive = true
     member.directDemoted = false
@@ -1258,7 +1269,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   /** 降级回中转的单一出口：超上限样本与连 miss 都走这里。 */
   const demoteDirect = (member: MemberRec, why: string): void => {
     applyArqProfile(member, 'relay', true)
-    mux?.setRelayPath(member.nodeId)
+    mux?.setRelayPath(member.nodeId, true)
     member.path = 'relay'
     member.directActive = false
     member.directDemoted = true
@@ -1315,7 +1326,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     }
     if (rtt <= cap * DIRECT_PROMOTE_RATIO) {
       member.directGoodStreak += 1
-      if (member.directGoodStreak >= DIRECT_PROMOTE_STREAK) promoteDirect(member)
+      if (member.directGoodStreak >= DIRECT_PROMOTE_STREAK) {
+        promoteDirect(member)
+      } else {
+        punch?.triggerFastProbe(member.nodeId, false)
+      }
       return
     }
     member.directGoodStreak = 0
@@ -1333,7 +1348,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     log(`peer engine: direct lost ${nodeId} — relaying`)
     member.path = 'relay'
     applyArqProfile(member, 'relay', true)
-    mux?.setRelayPath(nodeId)
+    mux?.setRelayPath(nodeId, true)
     // T5：旧会话的测量与降级状态一起作废，重打通后重走首样本判定。
     member.directMode = null
     member.directSmoothedRtt = null
@@ -1383,6 +1398,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       socket.bind({ port: 0, address: '0.0.0.0' }, () => {})
       punchSocket = socket
     }
+    const fastConfirmDelayMs = options.punch?.fastConfirmDelayMs ?? 200
+    const keepAliveMs = options.punch?.keepAliveMs ?? 5_000
     punch = new PeerPunchManager({
       networkId: net.networkId,
       identity,
@@ -1390,7 +1407,10 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       clock,
       reprobeInitialDelaysMs: [3_000, 8_000],
       reprobeIntervalMs: 25_000,
-      fastConfirmDelayMs: 200,
+      fastConfirmDelayMs,
+      ...(options.punch?.pingRetryDelayMs === undefined && fastConfirmDelayMs > 0
+        ? { pingRetryDelayMs: Math.min(1_500, Math.floor(keepAliveMs * 0.4)) }
+        : {}),
       ...(options.punch ?? {}),
       onDirectReady,
       onPunchFallback,
@@ -1401,6 +1421,16 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         const m = members.get(header.srcNodeId.toLowerCase())
         if (m !== undefined) m.peerRelayHoldUntil = 0
         mux?.handleOpenedFrame(header, plaintext)
+        if (m !== undefined) {
+          const cap = directCap()
+          if (
+            cap > 0 &&
+            !m.directActive &&
+            (m.directSmoothedRtt === null || m.directSmoothedRtt <= cap * DIRECT_PROMOTE_RATIO)
+          ) {
+            punch?.triggerFastProbe(m.nodeId, true)
+          }
+        }
       },
     })
     return punch
@@ -1416,10 +1446,18 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       relayHandler: options.relayHandler,
       relaySecret: options.relaySecret,
       clock,
+      relayHandlerWaitMs: options.relayHandlerWaitMs ?? 3_000,
       directPromoteGraceMs: () =>
         directCap() > 0
           ? Math.max(6_000, (options.punch?.keepAliveMs ?? 5_000) + 1_000)
           : 400,
+      onDirectStalled: (peerNodeId) => {
+        if (stopped) return
+        const m = members.get(peerNodeId.toLowerCase())
+        if (m !== undefined && m.state === 'eligible' && m.directActive) {
+          demoteDirect(m, 'direct arq stalled')
+        }
+      },
       onPathChanged: (peerNodeId, path) => {
         if (path === 'ws' || path === 'udp') {
           void options.relayPool.reconnect?.(peerNodeId)
