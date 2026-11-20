@@ -490,9 +490,9 @@ zr-net://<host>[:port]/<networkId>[?tls=0|1][#<joinKey>]
 2. **`p2p` UDP 打洞直连**：网关双 UDP 端口（主口 + 辅口，见网关部署文档）交换打洞坐标后直连；
 3. **`relay` 网关密文中转**：1000ms 打洞窗口内直连未就绪时自动降级，流量改走网关 WebSocket——内容仍是端到端密文，网关无法解读。
 
-后台静默重探默认按 `3s → 8s → 25s` 递增退避，打通后经首包 + `200ms` 快速复检通过延迟上限（若启用）即自动切回直连；已有直连按最后有效收包时间加 15 秒判定丢失，再回切中转（连续 2 个未获回应的 PING 也会触发降级）。控制面 WebSocket 内置 `10s` Ping / `15s` Pong 心跳保活以清理半开断网连接；当本机重连控制面、本机局域网接口变化或对端网关连接纪元（`connSeq`）推进时，两端对称重置会话状态并立即以中转接管再重新打洞锚定，同时由 `mux` 层自动重拉握手、并在 `p2p` 路径启用有界滑动窗与基于 RTT 的自适应 RTO（`16` 窗 / `120–1000ms`）以防大载荷丢包抖动。恢复仍需要可用的网关与对端，不能把这些默认计时理解成任意断网都能无损恢复的保证。
+后台静默重探默认按 `3s → 8s → 25s` 递增退避，打通后经首包 + `200ms` 快速复检通过延迟上限（若启用）即自动切回直连；已有直连按最后有效收包时间加 15 秒（`onDirectLost` 唯一拆会话判据）判定丢失，再回切中转（连续 2 个未获回应的 PING 也会触发降级）。保活层维护容量为 2 的在途 `pendingPings` 环（新 5s 保活周期清空上一轮过期槽位以拒绝陈旧 PONG，同周期 `+200ms` 快速确认与周期内补发则保留前槽以兼容偶发高延迟 PONG），并默认开启周期内短超时补发（`pingRetryDelayMs = 1500ms`，在 `+1.5s` 与 `+3.0s` 连续 2 次未获应答即于 `~3s` 快速触发 `demoteDirect`，而不提前销毁 15s `PunchSession`）；数据面 ARQ 在已有 RTO 定时器上检测有在途分片且连续 `stallSuspectMs`（默认 `3.5s`）零有效 ACK/SACK 的停滞流（兼容长流空闲与接收端背压零推进 SACK，回调同步 `flushInflight()` 具备重入早退保护），按 `10s` 冷却通知引擎主动降级，解决「小包 PING 通但大包 DATA 黑洞」与单向断流。主动故障降级（`setRelayPath(nodeId, true)`）无论 `arq.inflightTotal()` 是否为 0 均立即经网关发送 1 帧密封 WS `PING(streamId=0)` 降级信标，对端收到后 `0ms` 跳过晋升宽限期与乱序排空窗同步切回中转（重锚 `resetPeerForReanchor` 传 `sendDemoteBeacon = false` 不发信标，避免互锁 30s 冷却）；晋升直连并收到首帧 UDP 后的 `500ms` 乱序排空窗（`WS_REORDER_GRACE_MS`）内吸收晋升前在途旧 WS 普通帧（超 `500ms` 的普通帧仍兼容旧端触发降级），宽限期内迟到或同钥重放的 `HELLO` 仅回 `ACK` 不踢直连，换钥成功后自动重置入站 WS 序号计数；一侧升直连（`promoteDirect`）时立即发 1 帧 0 字节 UDP `ACK(streamId=0)` 解锁帧清零对端 `peerRelayHoldUntil` 30s 冷却锁，并配合 5s 冷却门控的 `triggerFastProbe` 在 `~300–500ms` 内完成双边对称追平（`punch-coordinate` 缺省 `pluginVersion` 时保留既有对端版本号）。冷启动期间 `PeerMux` 按 `relayHandlerWaitMs`（引擎默认 `3000ms`、`50ms` 轮询，独立 `PeerMux` 默认 `0`）等待宿主中继路由挂载就绪后再透传，消除启动瞬时 `503 relay-unavailable` 退避。控制面 WebSocket 内置 `10s` Ping / `15s` Pong 心跳保活以清理半开断网连接；当本机重连控制面、本机局域网接口变化或对端网关连接纪元（`connSeq`）推进时，两端对称重置会话状态并立即以中转接管再重新打洞锚定，同时由 `mux` 层自动重拉握手、并在 `p2p` 路径启用有界滑动窗与基于 RTT 的自适应 RTO（`16` 窗 / `120–1000ms`）以防大载荷丢包抖动。恢复仍需要可用的网关与对端，不能把这些默认计时理解成任意断网都能无损恢复的保证。
 
-普通已知长度的 peer 上传额外保留 20 秒恢复预算（中继降级窗口 `15s` 无收包/`2` 次未应答 PING、网关对端背压放行控制帧）。隔离正常功能验证已覆盖直连→中转、中转→直连的上传中热切，接收端字节数与 SHA256 一致、业务转发一次；不代表未知长度流、任意文件大小或所有真实 NAT 环境均已验收。`peer` 角色下 `/_dsh/zen-remote/client/*` 除 `remote-status` 外的全部管理与配对接口若携带 `x-zen-remote-via` 网关转发标记一律返 `403 via-gateway`。
+普通已知长度的 peer 上传与 `RelayClient` 全调用路径（除既有的 `invoke` / `openStream` / `fetchSessionSnapshot` 外，含 `connect`、`postEventResult`、`unshare`、`http`、`pluginRequest`、`pluginTunnelOpen`、`pluginTunnelSend` 与 `streamLines` 上行共 8 处路径）均叠加 `peerRecoveryMarginMs`（默认 20 秒）恢复预算，仅 `probeHealth()` 保持 `<= 8s` 封顶以免阻塞连接池巡检（中继降级窗口 `~3–4s` 短超时/停滞降级与 `15s` 无收包兜底、网关对端背压放行控制帧）。隔离正常功能验证已覆盖直连→中转、中转→直连的上传中热切，接收端字节数与 SHA256 一致、业务转发一次；不代表未知长度流、任意文件大小或所有真实 NAT 环境均已验收。`peer` 角色下 `/_dsh/zen-remote/client/*` 除 `remote-status` 外的全部管理与配对接口若携带 `x-zen-remote-via` 网关转发标记一律返 `403 via-gateway`。
 
 ### 入网就绪与暂停
 
@@ -599,7 +599,7 @@ npm test   # 起 mock 上游，跑 gateway/auth/push 三组测试：反代与注
 
 ## 🩺 排障：先要诊断包，再要截图
 
-反馈问题（GitHub issue）时，先在**出问题那台机器**的插件设置页最底部点「导出诊断信息」，把下载的 JSON 直接附上——它包含版本、角色、配置形态（不含地址与令牌）、全部拦截/改道诊断计数、上传改道探针（`installedVia` 能看出 fetch-route 是经 inject 还是兜底装的）、近 300 条插件事件日志（只记事件码与 id 形态，不含对话内容），并经过两层脱敏（绝对路径只留叶子、URL 主机名降级为地址类型、token 形态串打码）。主服务端与子客户端各导一份效果最好。远程设备经网关**拿不到**这份报告（via 墙拒绝）——它只能在本机导出。
+反馈问题（GitHub issue）时，先在**出问题那台机器**的插件设置页最底部点「导出诊断信息」，把下载的 JSON 直接附上——它包含版本、角色、配置形态（不含地址与令牌）、全部拦截/改道诊断计数、上传改道探针（`installedVia` 能看出 fetch-route 是经 inject 还是兜底装的）、近 300 条插件事件日志（只记事件码与 id 形态，不含对话内容；子客户端插件路由与 WebSocket 升级拒绝日志按 `(kind, plugin, reason)` 以 5 分钟窗口节流 `info` 输出并附带前窗抑制次数，窗口内重复拒绝改走 `debug` 通道且 `diagnostics().refused` / `refusalsByReason` 仍逐次精确累加，防止高频轮询洗空 300 条 `logRing`），并经过两层脱敏（绝对路径只留叶子、URL 主机名降级为地址类型、token 形态串打码）。主服务端与子客户端各导一份效果最好。远程设备经网关**拿不到**这份报告（via 墙拒绝）——它只能在本机导出。
 
 ---
 
