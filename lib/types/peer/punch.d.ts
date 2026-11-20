@@ -173,6 +173,11 @@ export interface PeerPunchOptions {
      *  follow-up probe PING so 2-sample RTT promotion completes in ~300ms
      *  instead of waiting a full 5s keepalive cycle. Disabled when omitted/0. */
     fastConfirmDelayMs?: number;
+    /** Optional intra-cycle keepalive retry delay (ms). When > 0 (clamped below
+     *  `keepAliveMs / 2`), an unanswered periodic PING reports a fast miss and
+     *  sends one intra-cycle retry PING while preserving the original entry in the
+     *  2-slot `pendingPings` ring. Disabled when omitted/0. */
+    pingRetryDelayMs?: number;
     onDirectReady?: (peerNodeId: string, info: DirectReadyInfo) => void;
     onPunchFallback?: (peerNodeId: string) => void;
     onDirectLost?: (peerNodeId: string) => void;
@@ -204,6 +209,7 @@ export declare class PeerPunchManager {
     private readonly socket;
     private readonly ownsSocket;
     private readonly readInterfaces;
+    private readonly pingRetryDelayMs;
     private readonly sessions;
     private lanEndpointList;
     private closed;
@@ -252,11 +258,19 @@ export declare class PeerPunchManager {
     } | null;
     /** Revoke gateway/local admission and discard all UDP state for this peer. */
     dropPeer(peerNodeId: string): void;
+    /**
+     * Trigger an out-of-band RTT probe PING for an already-direct peer when
+     * `fastConfirmDelayMs > 0`, no PING is currently in flight, and the 5s
+     * per-peer cooldown has elapsed.
+     */
+    triggerFastProbe(peerNodeId: string, withFollowUp?: boolean): boolean;
+    private isLiveDirectSession;
     /** Stop everything: per-peer timers cleared, sessions dropped, socket closed. */
     close(): void;
     private createSession;
     private armTimer;
     private clearSessionTimers;
+    private clearPingRetryTimer;
     private clearDirectRetryTimer;
     private startDirectChallengeRetry;
     private addCandidate;
@@ -271,12 +285,14 @@ export declare class PeerPunchManager {
     private onPunchWindowExpired;
     private scheduleReprobe;
     private startKeepalive;
+    private recordMissedPing;
+    private armPingRetry;
     /**
-     * Fire one keepalive PING with a fresh random payload. If the PREVIOUS
-     * PING is still unanswered and counted (`countsForMiss`), we count one
-     * consecutive miss and report it (the engine uses ≥2 misses as an over-cap
-     * signal) — then overwrite the outstanding payload so a late PONG for the
-     * old one never counts.
+     * Fire one keepalive PING with a fresh random payload. When `preservePrevious`
+     * is false (e.g. a new periodic tick), any uncounted `countsForMiss` entry
+     * from the previous cycle counts once and the 2-slot ring is cleared so stale
+     * PONGs from superseded cycles never match. Intra-cycle retries preserve the
+     * prior slot (capping at 2 entries) so delayed valid PONGs still sample RTT.
      */
     private sendPing;
     private sendHellos;

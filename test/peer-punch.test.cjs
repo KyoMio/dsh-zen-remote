@@ -2054,3 +2054,446 @@ test('T2: direct-state peer re-handshakes cleanly on new ephemeral key from new 
     mgrB.close()
   }
 })
+
+// -- peer-asymmetric-convergence T1: dual-slot pendingPings, pingRetryDelayMs, triggerFastProbe --
+
+function scriptedFakePair(hooksA = {}, hooksB = {}) {
+  const clockA = manualClock()
+  const clockB = manualClock()
+  const A = generatePeerIdentity()
+  const B = generatePeerIdentity()
+  const sockA = new FakeDatagram()
+  const sockB = new FakeDatagram()
+  const aAddr = { address: '127.0.0.1', port: 55601 }
+  const bAddr = { address: '127.0.0.1', port: 55602 }
+  sockA.address = () => aAddr
+  sockB.address = () => bAddr
+
+  const aQueue = []
+  const bQueue = []
+  const aPings = []
+  let dropBtoAEncrypted = false
+  let bCiphers = null
+
+  sockA.send = (bytes, port, host) => {
+    const buf = Buffer.from(bytes)
+    const header = decodeFrameHeader(buf)
+    if (header && header.frameType === PeerFrameType.PING) aPings.push(buf)
+    aQueue.push({ bytes: buf, port, host })
+  }
+  sockB.send = (bytes, port, host) => {
+    const buf = Buffer.from(bytes)
+    const header = decodeFrameHeader(buf)
+    if (dropBtoAEncrypted && header) return
+    bQueue.push({ bytes: buf, port, host })
+  }
+
+  const mgrA = new PeerPunchManager({
+    networkId: SEC_NET,
+    identity: A,
+    socket: sockA,
+    clock: clockA,
+    ...hooksA,
+  })
+  const mgrB = new PeerPunchManager({
+    networkId: SEC_NET,
+    identity: B,
+    socket: sockB,
+    clock: clockB,
+    ...hooksB,
+  })
+
+  const flush = () => {
+    for (let guard = 0; guard < 100 && (aQueue.length || bQueue.length); guard++) {
+      while (bQueue.length) {
+        const pkt = bQueue.shift()
+        if (pkt.port === aAddr.port) mgrA.handlePacket(pkt.bytes, bAddr)
+      }
+      while (aQueue.length) {
+        const pkt = aQueue.shift()
+        if (pkt.port === bAddr.port) mgrB.handlePacket(pkt.bytes, aAddr)
+      }
+    }
+  }
+
+  const establish = () => {
+    mgrB.beginPunch({ peerNodeId: A.nodeId, peerPublicKeyHex: A.publicKeyHex, lanEndpoints: [] })
+    mgrA.beginPunch({ peerNodeId: B.nodeId, peerPublicKeyHex: B.publicKeyHex, lanEndpoints: [`127.0.0.1:${bAddr.port}`] })
+    flush()
+    bCiphers = mgrB.sessionCiphers(A.nodeId)
+    assert.ok(bCiphers, 'B derived session ciphers')
+  }
+
+  let seq = 10_000n
+  const injectFromB = (frameType, payload) => {
+    const frame = packEncryptedFrame(
+      { frameType, srcNodeId: B.nodeId, dstNodeId: A.nodeId, streamId: 0, seq: seq++, ack: 0 },
+      payload,
+      bCiphers,
+    )
+    mgrA.handlePacket(frame, bAddr)
+  }
+
+  const pingPayloadAt = (index) => {
+    const opened = unpackEncryptedFrame(aPings.at(index), bCiphers)
+    assert.ok(opened, `PING at ${index} decrypts under B ciphers`)
+    return opened.plaintext
+  }
+
+  return {
+    A,
+    B,
+    clockA,
+    clockB,
+    mgrA,
+    mgrB,
+    aPings,
+    flush,
+    establish,
+    injectFromB,
+    pingPayloadAt,
+    setDropBtoAEncrypted: (v) => { dropBtoAEncrypted = v },
+  }
+}
+
+test('T1: fastConfirm +200ms retry keeps pendingPings[0] so 205ms first PONG samples rttMs=205 and sends follow-up', () => {
+  const samples = []
+  const unanswered = []
+  const env = scriptedFakePair({
+    fastConfirmDelayMs: 200,
+    onRttSample: (_id, rtt) => samples.push(rtt),
+    onPingUnanswered: (id) => unanswered.push(id),
+  })
+  try {
+    env.setDropBtoAEncrypted(true)
+    env.establish()
+    assert.equal(env.aPings.length, 1, 'completeDirect sent immediate PING #1 at t=0')
+    const ping1Payload = env.pingPayloadAt(0)
+
+    // +200ms retry sends immediate PING #2 without overwriting PING #1.
+    env.clockA.advance(200)
+    assert.equal(env.aPings.length, 2, '+200ms fastConfirm retry sent PING #2')
+
+    // First PING's PONG arrives at t=205ms -> matches pendingPings[0] and reports rttMs === 205.
+    env.clockA.advance(5)
+    env.injectFromB(PeerFrameType.PONG, ping1Payload)
+    assert.deepEqual(samples, [205], '205ms PONG for PING #1 must still match and measure rttMs=205')
+    assert.equal(env.mgrA.sessionRttMs(env.B.nodeId), 205)
+
+    // fastConfirmPending was consumed at t=205ms, scheduling one follow-up PING at +200ms (t=405ms).
+    env.clockA.advance(199)
+    assert.equal(env.aPings.length, 2, 'follow-up PING waits full 200ms after PONG')
+    env.clockA.advance(1)
+    assert.equal(env.aPings.length, 3, 'follow-up PING fires at t=405ms')
+
+    env.clockA.advance(15)
+    env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(2))
+    assert.deepEqual(samples, [205, 15])
+    assert.deepEqual(unanswered, [], 'fastConfirm probes never count toward missedPings')
+  } finally {
+    env.mgrA.close()
+    env.mgrB.close()
+  }
+})
+
+test('T1: pingRetryDelayMs=1500 emits 2 fast misses (~3s) without tick duplicate or premature onDirectLost', () => {
+  const unanswered = []
+  const lost = []
+  const env = scriptedFakePair({
+    keepAliveMs: 5_000,
+    keepAliveLostFrames: 3,
+    pingRetryDelayMs: 1_500,
+    onPingUnanswered: (id) => unanswered.push({ id, at: env.clockA.now() }),
+    onDirectLost: (id) => lost.push({ id, at: env.clockA.now() }),
+  })
+  try {
+    env.setDropBtoAEncrypted(true)
+    env.establish()
+    // Answer the immediate PING at t=0 so pendingPings starts clean and lastSeen=0.
+    env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(0))
+    const basePings = env.aPings.length
+
+    env.clockA.advance(5_000) // t=5000: keepalive PING #1
+    assert.equal(env.aPings.length, basePings + 1)
+    assert.equal(unanswered.length, 0)
+    assert.equal(lost.length, 0)
+
+    env.clockA.advance(1_499) // t=6499
+    assert.equal(unanswered.length, 0)
+    env.clockA.advance(1) // t=6500: miss #1 + retry PING #2
+    assert.equal(unanswered.length, 1)
+    assert.equal(unanswered[0].at, 6_500)
+    assert.equal(env.aPings.length, basePings + 2)
+    assert.equal(lost.length, 0)
+
+    env.clockA.advance(1_499) // t=7999
+    assert.equal(unanswered.length, 1)
+    env.clockA.advance(1) // t=8000: miss #2, stop retrying
+    assert.equal(unanswered.length, 2)
+    assert.equal(unanswered[1].at, 8_000)
+    assert.equal(env.aPings.length, basePings + 2)
+    assert.equal(lost.length, 0)
+
+    // t=10000 tick MUST NOT double-count already-counted misses.
+    env.clockA.advance(2_000)
+    assert.equal(unanswered.length, 2, 'tick at t=10000 must not duplicate counted misses')
+    assert.equal(env.aPings.length, basePings + 3, 'tick at t=10000 sends PING #3')
+    assert.equal(lost.length, 0)
+
+    // t=11500: miss #3 (equals keepAliveLostFrames=3) — STILL must not trigger onDirectLost!
+    env.clockA.advance(1_500)
+    assert.equal(unanswered.length, 3)
+    assert.equal(lost.length, 0, 'missedPings >= keepAliveLostFrames must never trigger onDirectLost early')
+
+    env.clockA.advance(1_500) // t=13000: miss #4
+    assert.equal(unanswered.length, 4)
+    assert.equal(lost.length, 0)
+
+    env.clockA.advance(1_999) // t=14999
+    assert.equal(lost.length, 0)
+    env.clockA.advance(1) // t=15000: exact loss deadline
+    assert.deepEqual(lost, [{ id: env.B.nodeId, at: 15_000 }])
+  } finally {
+    env.mgrA.close()
+    env.mgrB.close()
+  }
+})
+
+test('T1: pingRetryDelayMs=1500 recovers on 1.6s delayed PONG for PING #1 and cancels second miss', () => {
+  const samples = []
+  const unanswered = []
+  const env = scriptedFakePair({
+    keepAliveMs: 5_000,
+    keepAliveLostFrames: 3,
+    pingRetryDelayMs: 1_500,
+    onRttSample: (_id, rtt) => samples.push(rtt),
+    onPingUnanswered: (id) => unanswered.push({ id, at: env.clockA.now() }),
+  })
+  try {
+    env.setDropBtoAEncrypted(true)
+    env.establish()
+    env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(0))
+    samples.length = 0
+
+    env.clockA.advance(5_000) // t=5000: PING #1
+    const ping1Payload = env.pingPayloadAt(-1)
+    env.clockA.advance(1_500) // t=6500: miss #1 + retry PING #2
+    assert.equal(unanswered.length, 1)
+
+    env.clockA.advance(100) // t=6600: delayed PONG for PING #1 arrives (1.6s RTT)
+    env.injectFromB(PeerFrameType.PONG, ping1Payload)
+    assert.deepEqual(samples, [1_600], 'delayed PING #1 PONG matches slot 0 and reports 1600ms RTT')
+    assert.equal(env.mgrA.sessionRttMs(env.B.nodeId), 1_600)
+
+    env.clockA.advance(1_400) // t=8000: retry timer was cancelled, no 2nd miss
+    assert.equal(unanswered.length, 1)
+    env.clockA.advance(2_000) // t=10000: next tick starts clean
+    assert.equal(unanswered.length, 1)
+
+    // Verify missedPings reset: next silent cycle emits misses from clean state.
+    env.clockA.advance(1_500) // t=11500
+    assert.equal(unanswered.length, 2)
+  } finally {
+    env.mgrA.close()
+    env.mgrB.close()
+  }
+})
+
+test('T1: triggerFastProbe enforces fastConfirmDelayMs > 0, pendingPings, and 5s cooldown (withFollowUp true/false)', () => {
+  // Disabled when fastConfirmDelayMs is 0 / omitted.
+  {
+    const env = scriptedFakePair({ fastConfirmDelayMs: 0 })
+    try {
+      env.setDropBtoAEncrypted(true)
+      env.establish()
+      env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(0))
+      assert.equal(env.mgrA.triggerFastProbe(env.B.nodeId), false)
+    } finally {
+      env.mgrA.close()
+      env.mgrB.close()
+    }
+  }
+
+  // Enabled with fastConfirmDelayMs = 200.
+  {
+    const samples = []
+    const env = scriptedFakePair({
+      fastConfirmDelayMs: 200,
+      keepAliveMs: 10_000,
+      onRttSample: (_id, rtt) => samples.push(rtt),
+    })
+    try {
+      env.setDropBtoAEncrypted(true)
+      env.establish()
+      // Cannot trigger while immediate PING is in flight / fastConfirmPending is true.
+      assert.equal(env.mgrA.triggerFastProbe(env.B.nodeId), false)
+      // Answer immediate PING at t=0, wait for follow-up at t=200 and answer it at t=200.
+      env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(0))
+      env.clockA.advance(200)
+      env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(-1))
+      samples.length = 0
+      const pingsBefore = env.aPings.length
+
+      // Unknown peer returns false.
+      assert.equal(env.mgrA.triggerFastProbe('00000000'), false)
+
+      // First trigger at t=200 (lastFastProbeAt was null) succeeds withFollowUp=true: sends 1 frame now.
+      assert.equal(env.mgrA.triggerFastProbe(env.B.nodeId, true), true)
+      assert.equal(env.aPings.length, pingsBefore + 1)
+      // Cooldown / in-flight blocks immediate second call.
+      assert.equal(env.mgrA.triggerFastProbe(env.B.nodeId, true), false)
+
+      // PONG arrives at t=210 -> triggers automatic +200ms follow-up frame at t=410.
+      env.clockA.advance(10)
+      env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(-1))
+      assert.deepEqual(samples, [10])
+      env.clockA.advance(200) // t=410
+      assert.equal(env.aPings.length, pingsBefore + 2, 'withFollowUp=true sends 2nd frame at +fastDelay after PONG')
+      env.clockA.advance(12) // t=422
+      env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(-1))
+      assert.deepEqual(samples, [10, 12])
+
+      // 5s cooldown since t=200: at t=5199 (4999ms elapsed) still returns false.
+      env.clockA.advance(5_199 - env.clockA.now())
+      assert.equal(env.mgrA.triggerFastProbe(env.B.nodeId, false), false)
+
+      // At t=5200 (5000ms elapsed) cooldown lifts; withFollowUp=false schedules 1 frame at +200ms.
+      env.clockA.advance(1)
+      assert.equal(env.mgrA.triggerFastProbe(env.B.nodeId, false), true)
+      assert.equal(env.aPings.length, pingsBefore + 2, 'withFollowUp=false does not send immediately')
+      env.clockA.advance(199)
+      assert.equal(env.aPings.length, pingsBefore + 2)
+      env.clockA.advance(1) // t=5400
+      assert.equal(env.aPings.length, pingsBefore + 3, 'withFollowUp=false sends 1 frame at +fastDelay')
+
+      env.clockA.advance(8)
+      env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(-1))
+      assert.deepEqual(samples, [10, 12, 8])
+      env.clockA.advance(500) // No follow-up frame after PONG when withFollowUp=false.
+      assert.equal(env.aPings.length, pingsBefore + 3)
+    } finally {
+      env.mgrA.close()
+      env.mgrB.close()
+    }
+  }
+})
+
+test('T1: triggerFastProbe works at clock.now()===0 and pingRetryDelayMs validates & clamps below keepAliveMs/2', () => {
+  assert.throws(
+    () => new PeerPunchManager({
+      networkId: SEC_NET,
+      identity: generatePeerIdentity(),
+      socket: new FakeDatagram(),
+      clock: manualClock(),
+      pingRetryDelayMs: -1,
+    }),
+    RangeError,
+  )
+  assert.throws(
+    () => new PeerPunchManager({
+      networkId: SEC_NET,
+      identity: generatePeerIdentity(),
+      socket: new FakeDatagram(),
+      clock: manualClock(),
+      pingRetryDelayMs: 1.5,
+    }),
+    RangeError,
+  )
+
+  // clock.now() === 0 must not falsely trip 5s cooldown against initial lastFastProbeAt=null.
+  {
+    const env = scriptedFakePair({ fastConfirmDelayMs: 200, keepAliveMs: 10_000 })
+    try {
+      env.setDropBtoAEncrypted(true)
+      env.establish()
+      assert.equal(env.clockA.now(), 0)
+      env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(0))
+      assert.equal(env.mgrA.triggerFastProbe(env.B.nodeId, true), true)
+    } finally {
+      env.mgrA.close()
+      env.mgrB.close()
+    }
+  }
+
+  // pingRetryDelayMs >= keepAliveMs / 2 clamps below keepAliveMs / 2 so both retries stay inside one cycle.
+  {
+    const unanswered = []
+    const env = scriptedFakePair({
+      keepAliveMs: 1_000,
+      keepAliveLostFrames: 3,
+      pingRetryDelayMs: 900,
+      onPingUnanswered: () => unanswered.push(env.clockA.now()),
+    })
+    try {
+      env.setDropBtoAEncrypted(true)
+      env.establish()
+      env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(0))
+      env.clockA.advance(1_000) // t=1000: PING #1
+      env.clockA.advance(999) // t=1999: both clamped retries (< 500ms each) finished before t=2000
+      assert.equal(unanswered.length, 2)
+      assert.ok(unanswered[0] < 1_500 && unanswered[1] < 2_000)
+      env.clockA.advance(1) // t=2000: tick must not emit a 3rd miss
+      assert.equal(unanswered.length, 2)
+    } finally {
+      env.mgrA.close()
+      env.mgrB.close()
+    }
+  }
+})
+
+test('T1: fastConfirm retry timer ignores stale fastConfirmPending re-armed by triggerFastProbe; dropPeer inside onPingUnanswered leaks zero timers', () => {
+  // 1. completeDirect's +fastDelay retry must stay bound to initialPing.
+  {
+    const env = scriptedFakePair({ fastConfirmDelayMs: 200, keepAliveMs: 10_000 })
+    try {
+      env.setDropBtoAEncrypted(true)
+      env.establish()
+      // Immediate PING answered at t=10 (< 200ms) -> consumes fastConfirmPending, schedules follow-up at t=210.
+      env.clockA.advance(10)
+      env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(0))
+      // Now triggerFastProbe(true) at t=10 re-arms fastConfirmPending=true and sends probe PING #2.
+      assert.equal(env.mgrA.triggerFastProbe(env.B.nodeId, true), true)
+      assert.equal(env.aPings.length, 2)
+      // At t=200, the stale completeDirect retry timer fires — must NOT emit an extra PING on probe #2.
+      env.clockA.advance(190)
+      assert.equal(env.aPings.length, 2, 'stale completeDirect retry timer must not fire when initialPing is gone')
+    } finally {
+      env.mgrA.close()
+      env.mgrB.close()
+    }
+  }
+
+  // 2. dropPeer() synchronously inside onPingUnanswered (from tick and from armPingRetry) leaks zero timers or extra PINGs.
+  for (const pingRetryDelayMs of [0, 1_500]) {
+    let mgrA
+    const env = scriptedFakePair({
+      keepAliveMs: 5_000,
+      keepAliveLostFrames: 3,
+      pingRetryDelayMs,
+      onPingUnanswered: (id) => {
+        mgrA.dropPeer(id)
+      },
+    })
+    mgrA = env.mgrA
+    try {
+      env.setDropBtoAEncrypted(true)
+      env.establish()
+      env.injectFromB(PeerFrameType.PONG, env.pingPayloadAt(0))
+      const basePings = env.aPings.length
+
+      env.clockA.advance(5_000) // t=5000: sends PING #1
+      assert.equal(env.aPings.length, basePings + 1)
+
+      if (pingRetryDelayMs > 0) {
+        env.clockA.advance(1_500) // t=6500: armPingRetry fires onPingUnanswered -> dropPeer
+      } else {
+        env.clockA.advance(5_000) // t=10000: tick -> sendPing fires onPingUnanswered -> dropPeer
+      }
+      assert.equal(env.aPings.length, basePings + 1, 'no PING sent after synchronous dropPeer in onPingUnanswered')
+      assert.equal(env.clockA.pendingCount(), 0, 'zero leaked timers after synchronous dropPeer in onPingUnanswered')
+    } finally {
+      env.mgrA.close()
+      env.mgrB.close()
+    }
+  }
+})

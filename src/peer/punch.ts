@@ -60,6 +60,7 @@ const NODE_ID_PATTERN = /^[0-9a-f]{8}$/
 const NETWORK_ID_PATTERN = /^[0-9a-fA-F]{16}$/
 const HEX64 = /^[0-9a-fA-F]{64}$/
 const MAX_PUNCH_CANDIDATES = 16
+const FAST_PROBE_COOLDOWN_MS = 5_000
 
 /** STUN 探针控制包的域分隔前缀。 */
 export const STUN_PROBE_DOMAIN = 'zr-stun-probe-v1'
@@ -463,6 +464,11 @@ export interface PeerPunchOptions {
    *  follow-up probe PING so 2-sample RTT promotion completes in ~300ms
    *  instead of waiting a full 5s keepalive cycle. Disabled when omitted/0. */
   fastConfirmDelayMs?: number
+  /** Optional intra-cycle keepalive retry delay (ms). When > 0 (clamped below
+   *  `keepAliveMs / 2`), an unanswered periodic PING reports a fast miss and
+   *  sends one intra-cycle retry PING while preserving the original entry in the
+   *  2-slot `pendingPings` ring. Disabled when omitted/0. */
+  pingRetryDelayMs?: number
   onDirectReady?: (peerNodeId: string, info: DirectReadyInfo) => void
   onPunchFallback?: (peerNodeId: string) => void
   onDirectLost?: (peerNodeId: string) => void
@@ -479,6 +485,13 @@ export interface PeerPunchOptions {
 }
 
 type PunchState = 'punching' | 'direct' | 'idle'
+
+interface PendingPing {
+  payload: Uint8Array
+  sentAt: number
+  countsForMiss: boolean
+  countedMiss: boolean
+}
 
 interface PunchSession {
   peerNodeId: string
@@ -497,12 +510,13 @@ interface PunchSession {
   ciphers: PeerSessionCiphers | null
   rttMs: number | null
   lastHelloSentAt: number | null
-  lastPingSentAt: number | null
-  /** Payload of the PING awaiting its PONG (always paired with lastPingSentAt). */
-  lastPingPayload: Uint8Array | null
-  /** Whether an unanswered in-flight PING counts as a keepalive miss (false for completeDirect's immediate probe). */
-  lastPingCountsForMiss: boolean
-  /** Consecutive keepalive ticks that fired while a PING was outstanding. */
+  /** Up to 2 outstanding PINGs (current cycle + optional retry / fastConfirm probe). */
+  pendingPings: PendingPing[]
+  /** Active intra-cycle PING retry timer when `pingRetryDelayMs > 0`. */
+  pingRetryTimer: unknown | null
+  /** Timestamp of the last `triggerFastProbe` call for 5s cooldown gating (null = never). */
+  lastFastProbeAt: number | null
+  /** Consecutive keepalive misses since the last matching PONG. */
   missedPings: number
   /** Whether one fast post-handshake follow-up RTT probe PING is pending after the initial PONG. */
   fastConfirmPending: boolean
@@ -532,6 +546,7 @@ export class PeerPunchManager {
   private readonly socket: DgramSocket
   private readonly ownsSocket: boolean
   private readonly readInterfaces: () => Record<string, ReadonlyArray<LanInterfaceInfo> | undefined>
+  private readonly pingRetryDelayMs: number
   private readonly sessions = new Map<string, PunchSession>()
   private lanEndpointList: string[] = []
   private closed = false
@@ -557,10 +572,17 @@ export class PeerPunchManager {
       knob(options.reprobeInitialDelaysMs[0], 5_000, 'reprobeInitialDelaysMs[0]')
       knob(options.reprobeInitialDelaysMs[1], 15_000, 'reprobeInitialDelaysMs[1]')
     }
-    knob(options.keepAliveMs, 5000, 'keepAliveMs')
+    const keepAliveMs = knob(options.keepAliveMs, 5000, 'keepAliveMs')
     knob(options.keepAliveLostFrames, 3, 'keepAliveLostFrames')
     if (options.fastConfirmDelayMs !== undefined && options.fastConfirmDelayMs !== 0) {
       knob(options.fastConfirmDelayMs, 200, 'fastConfirmDelayMs')
+    }
+    if (options.pingRetryDelayMs !== undefined && options.pingRetryDelayMs !== 0) {
+      const rawRetry = knob(options.pingRetryDelayMs, 0, 'pingRetryDelayMs')
+      const maxRetry = Math.floor((keepAliveMs - 1) / 2)
+      this.pingRetryDelayMs = maxRetry >= 1 ? Math.min(rawRetry, maxRetry) : 0
+    } else {
+      this.pingRetryDelayMs = 0
     }
     this.clock = options.clock ?? realClock
     this.readInterfaces = options.interfaces
@@ -739,6 +761,45 @@ export class PeerPunchManager {
     this.sessions.delete(nodeId)
   }
 
+  /**
+   * Trigger an out-of-band RTT probe PING for an already-direct peer when
+   * `fastConfirmDelayMs > 0`, no PING is currently in flight, and the 5s
+   * per-peer cooldown has elapsed.
+   */
+  triggerFastProbe(peerNodeId: string, withFollowUp = true): boolean {
+    if (this.closed || typeof peerNodeId !== 'string') return false
+    const fastDelay = this.options.fastConfirmDelayMs ?? 0
+    if (fastDelay <= 0) return false
+    const session = this.sessions.get(peerNodeId.toLowerCase())
+    if (!session || session.state !== 'direct') return false
+    if (session.pendingPings.length > 0 || session.fastConfirmPending) return false
+    const now = this.clock.now()
+    if (session.lastFastProbeAt !== null && (now - session.lastFastProbeAt) < FAST_PROBE_COOLDOWN_MS) {
+      return false
+    }
+    session.lastFastProbeAt = now
+    if (withFollowUp) {
+      session.fastConfirmPending = true
+      this.sendPing(session, false, false)
+      return true
+    }
+    this.armTimer(session, () => {
+      if (
+        !this.isLiveDirectSession(session) ||
+        session.pendingPings.length > 0 ||
+        session.fastConfirmPending
+      ) {
+        return
+      }
+      this.sendPing(session, false, false)
+    }, fastDelay)
+    return true
+  }
+
+  private isLiveDirectSession(session: PunchSession): boolean {
+    return !this.closed && this.sessions.get(session.peerNodeId) === session && session.state === 'direct'
+  }
+
   /** Stop everything: per-peer timers cleared, sessions dropped, socket closed. */
   close(): void {
     if (this.closed) return
@@ -769,9 +830,9 @@ export class PeerPunchManager {
       ciphers: null,
       rttMs: null,
       lastHelloSentAt: null,
-      lastPingSentAt: null,
-      lastPingPayload: null,
-      lastPingCountsForMiss: true,
+      pendingPings: [],
+      pingRetryTimer: null,
+      lastFastProbeAt: null,
       missedPings: 0,
       fastConfirmPending: false,
       reprobeAttempts: 0,
@@ -796,6 +857,15 @@ export class PeerPunchManager {
     for (const handle of session.timers) this.clock.clearTimeout(handle)
     session.timers.clear()
     session.directRetryTimer = null
+    session.pingRetryTimer = null
+  }
+
+  private clearPingRetryTimer(session: PunchSession): void {
+    if (session.pingRetryTimer !== null) {
+      this.clock.clearTimeout(session.pingRetryTimer)
+      session.timers.delete(session.pingRetryTimer)
+      session.pingRetryTimer = null
+    }
   }
 
   private clearDirectRetryTimer(session: PunchSession): void {
@@ -933,43 +1003,83 @@ export class PeerPunchManager {
         return
       }
       session.state = 'idle'
+      this.clearPingRetryTimer(session)
+      session.pendingPings.length = 0
       this.options.onDirectLost?.(session.peerNodeId)
       this.scheduleReprobe(session)
     }
     const initialRemaining = session.lastSeen + lostAfterMs - this.clock.now()
     this.armTimer(session, onLossDeadline, Math.max(1, initialRemaining))
     const tick = (): void => {
-      if (this.closed || session.state !== 'direct') return
-      this.sendPing(session, true)
+      if (!this.isLiveDirectSession(session)) return
+      this.sendPing(session, true, false)
+      if (!this.isLiveDirectSession(session)) return
       this.armTimer(session, tick, this.keepAliveMsOrDefault())
     }
     this.armTimer(session, tick, this.keepAliveMsOrDefault())
   }
 
-  /**
-   * Fire one keepalive PING with a fresh random payload. If the PREVIOUS
-   * PING is still unanswered and counted (`countsForMiss`), we count one
-   * consecutive miss and report it (the engine uses ≥2 misses as an over-cap
-   * signal) — then overwrite the outstanding payload so a late PONG for the
-   * old one never counts.
-   */
-  private sendPing(session: PunchSession, countsForMiss = true): void {
-    if (countsForMiss) session.fastConfirmPending = false
-    if (session.lastPingSentAt !== null && session.lastPingCountsForMiss) {
-      session.missedPings += 1
-      try {
-        this.options.onPingUnanswered?.(session.peerNodeId)
-      } catch {
-        // A listener bug must never wound the state machine.
-      }
-    }
-    session.lastPingPayload = randomBytes(8)
-    session.lastPingSentAt = this.clock.now()
-    session.lastPingCountsForMiss = countsForMiss
+  private recordMissedPing(session: PunchSession): void {
+    session.missedPings += 1
     try {
-      this.sendEncryptedTo(session, PeerFrameType.PING, 0, session.lastPingPayload, 0)
+      this.options.onPingUnanswered?.(session.peerNodeId)
+    } catch {
+      // A listener bug must never wound the state machine.
+    }
+  }
+
+  private armPingRetry(session: PunchSession, entry: PendingPing, retryStage: number): void {
+    this.clearPingRetryTimer(session)
+    if (!this.isLiveDirectSession(session) || this.pingRetryDelayMs <= 0) return
+    const handle = this.clock.setTimeout(() => {
+      session.timers.delete(handle)
+      session.pingRetryTimer = null
+      if (!this.isLiveDirectSession(session)) return
+      if (!session.pendingPings.includes(entry) || entry.countedMiss) return
+      entry.countedMiss = true
+      this.recordMissedPing(session)
+      if (retryStage >= 1) return
+      if (!this.isLiveDirectSession(session)) return
+      this.sendPing(session, true, true, retryStage + 1)
+    }, this.pingRetryDelayMs)
+    session.pingRetryTimer = handle
+    session.timers.add(handle)
+  }
+
+  /**
+   * Fire one keepalive PING with a fresh random payload. When `preservePrevious`
+   * is false (e.g. a new periodic tick), any uncounted `countsForMiss` entry
+   * from the previous cycle counts once and the 2-slot ring is cleared so stale
+   * PONGs from superseded cycles never match. Intra-cycle retries preserve the
+   * prior slot (capping at 2 entries) so delayed valid PONGs still sample RTT.
+   */
+  private sendPing(session: PunchSession, countsForMiss = true, preservePrevious = false, retryStage = 0): void {
+    if (countsForMiss) session.fastConfirmPending = false
+    this.clearPingRetryTimer(session)
+    if (!preservePrevious) {
+      const hasUncountedMiss = session.pendingPings.some((p) => p.countsForMiss && !p.countedMiss)
+      if (hasUncountedMiss) {
+        this.recordMissedPing(session)
+        if (!this.isLiveDirectSession(session)) return
+      }
+      session.pendingPings.length = 0
+    } else if (session.pendingPings.length >= 2) {
+      session.pendingPings.shift()
+    }
+    const entry: PendingPing = {
+      payload: randomBytes(8),
+      sentAt: this.clock.now(),
+      countsForMiss,
+      countedMiss: false,
+    }
+    session.pendingPings.push(entry)
+    try {
+      this.sendEncryptedTo(session, PeerFrameType.PING, 0, entry.payload, 0)
     } catch {
       // Socket closing or transient datagram failure — the loss deadline handles lost links cleanly.
+    }
+    if (countsForMiss && this.pingRetryDelayMs > 0) {
+      this.armPingRetry(session, entry, retryStage)
     }
   }
 
@@ -1128,11 +1238,10 @@ export class PeerPunchManager {
     // stale outstanding PING from a previous epoch is forgotten (otherwise
     // the first keepalive would count a bogus miss).
     session.reprobeAttempts = 0
-    session.lastPingSentAt = null
-    session.lastPingPayload = null
-    session.lastPingCountsForMiss = true
+    session.pendingPings.length = 0
     session.missedPings = 0
-    this.clearSessionTimers(session) // punch rounds / window / pending reprobe all die
+    session.lastFastProbeAt = null
+    this.clearSessionTimers(session) // punch rounds / window / pending reprobe / ping retry all die
     this.startKeepalive(session)
     const endpoint = session.endpoint ?? ''
     this.options.onDirectReady?.(session.peerNodeId, {
@@ -1149,14 +1258,22 @@ export class PeerPunchManager {
     // Does not count toward missedPings if lost in the cipher derivation race.
     const fastDelay = this.options.fastConfirmDelayMs ?? 0
     session.fastConfirmPending = fastDelay > 0
-    this.sendPing(session, false)
+    this.sendPing(session, false, false)
     if (fastDelay > 0) {
+      const initialPing = session.pendingPings[0]
       // If the immediate PING above arrived at the responder before our HELLO-ACK
-      // (cipher-derivation race), retry once at +fastDelay while fastConfirmPending
-      // is still unconsumed so the initiator promotes in ~450ms instead of 10s.
+      // (cipher-derivation race), retry once at +fastDelay while the original
+      // handshake PING is still outstanding and fastConfirmPending is unconsumed.
       this.armTimer(session, () => {
-        if (this.closed || session.state !== 'direct' || !session.fastConfirmPending) return
-        this.sendPing(session, false)
+        if (
+          !this.isLiveDirectSession(session) ||
+          !session.fastConfirmPending ||
+          !initialPing ||
+          !session.pendingPings.includes(initialPing)
+        ) {
+          return
+        }
+        this.sendPing(session, false, true)
       }, fastDelay)
     }
   }
@@ -1189,20 +1306,24 @@ export class PeerPunchManager {
       return
     }
     if (header.frameType === PeerFrameType.PONG) {
-      // Only a PONG echoing the payload of OUR in-flight PING counts as a
-      // sample — a late PONG from a previous epoch (or a duplicate) would
-      // otherwise be scored against the current send time and read
-      // optimistically fast. Mismatched PONGs are ignored silently: they
-      // neither clear the outstanding PING nor feed the RTT estimator.
-      const expected = session.lastPingPayload
-      const matched = session.lastPingSentAt !== null && expected !== null
-        && plaintext.length === expected.length
-        && plaintext.every((byte, index) => byte === expected[index])
+      // Only a PONG echoing one of OUR in-flight PING payloads counts as a
+      // sample — a late PONG from a previous cycle (or a duplicate) is ignored
+      // silently: it neither clears pendingPings nor feeds the RTT estimator.
+      let matched: PendingPing | undefined
+      for (let i = session.pendingPings.length - 1; i >= 0; i--) {
+        const candidate = session.pendingPings[i]
+        if (
+          plaintext.length === candidate.payload.length &&
+          plaintext.every((byte, index) => byte === candidate.payload[index])
+        ) {
+          matched = candidate
+          break
+        }
+      }
       if (matched) {
-        session.rttMs = Math.max(0, this.clock.now() - session.lastPingSentAt!)
-        session.lastPingSentAt = null
-        session.lastPingPayload = null
-        session.lastPingCountsForMiss = true
+        session.rttMs = Math.max(0, this.clock.now() - matched.sentAt)
+        session.pendingPings.length = 0
+        this.clearPingRetryTimer(session)
         session.missedPings = 0
         try {
           this.options.onRttSample?.(session.peerNodeId, session.rttMs)
@@ -1212,10 +1333,10 @@ export class PeerPunchManager {
         if (session.fastConfirmPending) {
           session.fastConfirmPending = false
           const fastDelay = this.options.fastConfirmDelayMs ?? 0
-          if (fastDelay > 0 && session.state === 'direct') {
+          if (fastDelay > 0 && this.isLiveDirectSession(session)) {
             this.armTimer(session, () => {
-              if (this.closed || session.state !== 'direct' || session.lastPingSentAt !== null) return
-              this.sendPing(session, false)
+              if (!this.isLiveDirectSession(session) || session.pendingPings.length > 0) return
+              this.sendPing(session, false, false)
             }, fastDelay)
           }
         }
