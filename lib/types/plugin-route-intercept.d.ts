@@ -184,6 +184,11 @@ export interface InstallPluginRouteInterceptOptions {
     /** Per-request forwards lines (T3): volume is one line per request, so
      * they ride the debug channel and only surface at logLevel=debug. */
     debug?: (format: string, ...args: unknown[]) => void;
+    /** Throttle window (ms) for repeated `plugin route/upgrade refused` `log` lines
+     * keyed by `${kind}:${plugin}:${reason}`; defaults to 5 minutes (`0` disables). */
+    refusalLogWindowMs?: number;
+    /** Clock reader for refusal-log throttling; defaults to `Date.now`. */
+    now?: () => number;
 }
 export interface PluginRouteInterceptHandle {
     /** Restore `match` — ONLY while the instance still holds our wrapper

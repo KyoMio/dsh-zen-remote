@@ -3015,3 +3015,215 @@ test('T3 peerRecoveryMarginMs: covers invoke, openStream headers, and fetchSessi
   await assert.rejects(() => client.fetchSessionSnapshot({ address: { kind: 'session', sessionId: 's-1' } }), (e) => e instanceof RelayError && e.code === 'offline')
   assert.equal(client.state, 'online', 'fetchSessionSnapshot failure must keep client online')
 })
+
+test('T4 peerRecoveryMarginMs: covers all 8 additional paths while probeHealth keeps <= 8_000ms cap without margin', async (t) => {
+  const delayMs = 110
+  const delayed = async (init, makeResponse) => {
+    await new Promise((resolve, reject) => {
+      if (init?.signal?.aborted) {
+        reject(new Error('aborted'))
+        return
+      }
+      const timer = setTimeout(resolve, delayMs)
+      init?.signal?.addEventListener('abort', () => {
+        clearTimeout(timer)
+        reject(new Error('aborted'))
+      }, { once: true })
+    })
+    return makeResponse()
+  }
+
+  let uplinkCompleted = 0
+  let finishStream
+  const makeFetch = () => async (url, init) => {
+    const path = new URL(String(url)).pathname
+    if (path.endsWith('/ping')) {
+      return delayed(init, () => new Response(JSON.stringify({ ok: true }), { status: 200 }))
+    }
+    if (path.endsWith('/v1/handshake')) {
+      return delayed(init, () => new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } }))
+    }
+    if (path.endsWith('/v1/event-result') || path.endsWith('/v1/unshare')) {
+      return delayed(init, () => new Response(JSON.stringify({ ok: true, value: { ok: true } }), { status: 200 }))
+    }
+    if (path.endsWith('/v1/http')) {
+      return delayed(init, () => new Response(JSON.stringify({ ok: true, value: { status: 200, contentType: 'application/json', body: '{"ok":true}' } }), { status: 200 }))
+    }
+    if (path.endsWith('/v1/plugin')) {
+      return delayed(init, () => new Response('{"plugin":true}', { status: 200, headers: { 'content-type': 'application/json' } }))
+    }
+    if (path.endsWith('/v1/plugin-tunnel/open')) {
+      return delayed(init, () => new Response(
+        `${JSON.stringify({ type: 'open', tunnel: 'tun-t4' })}\n${JSON.stringify({ type: 'end' })}\n`,
+        { status: 200, headers: { 'content-type': 'application/x-ndjson' } },
+      ))
+    }
+    if (path.endsWith('/v1/plugin-tunnel/send')) {
+      return delayed(init, () => new Response(JSON.stringify({ ok: true }), { status: 200 }))
+    }
+    if (path.endsWith('/v1/plugin-tunnel/close')) {
+      return new Response(JSON.stringify({ ok: true }), { status: 200 })
+    }
+    if (path.endsWith('/v1/stream')) {
+      const stream = new ReadableStream({
+        start(controller) {
+          controller.enqueue(Buffer.from(`${JSON.stringify({ type: 'uplink', streamId: 'st-t4' })}\n`))
+          finishStream = () => {
+            finishStream = undefined
+            if (init?.signal?.aborted) return
+            controller.enqueue(Buffer.from(`${JSON.stringify({ type: 'frame', frame: { n: 1 } })}\n`))
+            controller.enqueue(Buffer.from(`${JSON.stringify({ type: 'end' })}\n`))
+            controller.close()
+          }
+          init?.signal?.addEventListener('abort', () => {
+            finishStream = undefined
+            try { controller.error(new Error('aborted')) } catch {}
+          }, { once: true })
+        },
+      })
+      return new Response(stream, { status: 200, headers: { 'content-type': 'application/x-ndjson' } })
+    }
+    if (path.endsWith('/v1/stream-uplink')) {
+      return delayed(init, () => {
+        uplinkCompleted += 1
+        queueMicrotask(() => finishStream?.())
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      })
+    }
+    return new Response(JSON.stringify({ ok: false }), { status: 404 })
+  }
+
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t4',
+    requestTimeoutMs: 60,
+    peerRecoveryMarginMs: 160,
+    infoRefreshMs: 0,
+    fetchImpl: makeFetch(),
+  })
+  t.after(() => client.stop())
+
+  // 1. connect()
+  const handshake = await client.connect()
+  assert.equal(handshake.serverId, 'abcd1234')
+  assert.equal(client.state, 'online')
+
+  // 2. postEventResult()
+  assert.deepEqual(await client.postEventResult('evt-1', { approved: true }), { ok: true })
+
+  // 3. unshare()
+  await client.unshare('sess-1')
+
+  // 4. http()
+  const httpRes = await client.http('/api/test', 'a=1')
+  assert.equal(httpRes.status, 200)
+  assert.equal(httpRes.body, '{"ok":true}')
+
+  // 5. pluginRequest() (bodyless and with body)
+  const pluginGet = await client.pluginRequest({ plugin: 'p', version: '1.0.0', digest: 'd', path: '/p', query: '' })
+  assert.equal(pluginGet.status, 200)
+  assert.equal(await pluginGet.text(), '{"plugin":true}')
+  const pluginPost = await client.pluginRequest({
+    plugin: 'p',
+    version: '1.0.0',
+    digest: 'd',
+    path: '/p',
+    query: '',
+    method: 'POST',
+    contentLength: 4,
+    body: new ReadableStream({ start(c) { c.enqueue(Buffer.from('test')); c.close() } }),
+  })
+  assert.equal(pluginPost.status, 200)
+  await pluginPost.text()
+
+  // 6. pluginTunnelOpen()
+  const opened = await client.pluginTunnelOpen({
+    plugin: 'p',
+    version: '1.0.0',
+    digest: 'd',
+    path: '/ws',
+    query: '',
+    wsHeaders: { 'sec-websocket-key': 'k', 'sec-websocket-version': '13' },
+  })
+  assert.equal(opened.tunnel, 'tun-t4')
+  for await (const _chunk of opened.frames) { /* drain */ }
+
+  // 7. pluginTunnelSend()
+  await client.pluginTunnelSend('tun-t4', 0, Buffer.from('hello'))
+
+  // 8. streamLines() uplink (stream stays open until uplink completes 110ms delayed POST)
+  const uplink = (async function* () {
+    yield { type: 'input', data: 'hi' }
+  })()
+  const streamOut = []
+  for await (const frame of client.openStream('terminal', 'attach', {}, undefined, { uplink })) {
+    streamOut.push(frame)
+  }
+  assert.ok(uplinkCompleted >= 1, `expected uplink POST to complete before stream ended, got ${uplinkCompleted}`)
+  assert.deepEqual(streamOut, [{ n: 1 }])
+
+  // 8b. Control: without peerRecoveryMarginMs, streamLines() uplink times out at 60ms < 110ms
+  uplinkCompleted = 0
+  finishStream = undefined
+  const noMarginFetch = makeFetch()
+  const plainClient = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t4-plain',
+    requestTimeoutMs: 60,
+    peerRecoveryMarginMs: 0,
+    infoRefreshMs: 0,
+    fetchImpl: async (url, init) => {
+      if (new URL(String(url)).pathname.endsWith('/v1/handshake')) {
+        return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return noMarginFetch(url, init)
+    },
+  })
+  t.after(() => plainClient.stop())
+  await plainClient.connect()
+  const plainUplink = (async function* () {
+    yield { type: 'input', data: 'hi' }
+  })()
+  await assert.rejects(
+    async () => {
+      for await (const _frame of plainClient.openStream('terminal', 'attach', {}, undefined, { uplink: plainUplink })) {
+        // should abort on uplink request-timeout
+      }
+    },
+    (error) => error instanceof RelayError && error.code === 'request-timeout',
+  )
+  assert.equal(uplinkCompleted, 0, 'uplink without margin must time out before completing')
+
+  // 9a. probeHealth() must NOT include peerRecoveryMarginMs (60ms < 110ms -> false)
+  assert.equal(await client.probeHealth(), false)
+})
+
+test('T4 probeHealth: remains capped at 8_000ms without adding peerRecoveryMarginMs', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  t.after(() => t.mock.timers.reset())
+
+  let capturedSignal
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t4-cap',
+    requestTimeoutMs: 20_000,
+    peerRecoveryMarginMs: 10_000,
+    infoRefreshMs: 0,
+    fetchImpl: async (_url, init) => {
+      capturedSignal = init?.signal
+      return await new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true })
+      })
+    },
+  })
+  t.after(() => client.stop())
+
+  const probing = client.probeHealth()
+  await Promise.resolve()
+  assert.ok(capturedSignal !== undefined)
+  t.mock.timers.tick(7_999)
+  assert.equal(capturedSignal.aborted, false, 'not yet aborted before 8_000ms')
+  t.mock.timers.tick(1)
+  assert.equal(capturedSignal.aborted, true, 'aborted at exact 8_000ms cap')
+  assert.equal(await probing, false)
+})

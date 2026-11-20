@@ -15,8 +15,10 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
+const net = require('node:net')
 const { checkWebServerShape, installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
 const { createBridgeRegistry, normalizeDeclaration } = require('../lib/plugin-bridge.js')
+const { encodeRfc6455Frame } = require('../lib/plugin-tunnel.js')
 const {
   waitFor,
   startResetServer,
@@ -531,4 +533,197 @@ test('PB-4: a refused shape never installs; uninstall restores; a chained-over w
   await host2.stop()
   await relay.stop()
   await host.stop()
+})
+
+function sendRawUpgrade(port, pathWithQuery, after101) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1')
+    const chunks = []
+    let headDone = false
+    const timer = setTimeout(() => {
+      socket.destroy()
+      reject(new Error(`raw upgrade timed out for ${pathWithQuery}`))
+    }, 3000)
+    socket.on('connect', () => {
+      socket.write(
+        `GET ${pathWithQuery} HTTP/1.1\r\n` +
+          `Host: 127.0.0.1:${port}\r\n` +
+          `Upgrade: websocket\r\n` +
+          `Connection: Upgrade\r\n` +
+          `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n` +
+          `Sec-WebSocket-Version: 13\r\n` +
+          `\r\n`,
+      )
+    })
+    socket.on('data', (chunk) => {
+      chunks.push(chunk)
+      if (!headDone && after101 !== undefined) {
+        const buf = Buffer.concat(chunks)
+        if (buf.includes('\r\n\r\n')) {
+          headDone = true
+          after101(socket, buf.toString('utf8'))
+        }
+      }
+    })
+    socket.on('close', () => {
+      clearTimeout(timer)
+      resolve(Buffer.concat(chunks).toString('utf8'))
+    })
+    socket.on('error', (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+  })
+}
+
+test('T4 refusal log throttling: 5-min window per (kind, plugin, reason) keeps diagnostics accurate across route, HTTP 503 upgrade, and post-101 upgrade', async (t) => {
+  const host = await startFakeHost()
+  host.registerLocalPlugin()
+  const relay = await startFakeRelay()
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'test-panel',
+    version: '1.0.0',
+    routes: [
+      { path: '/panel/data', scope: 'session' },
+      { path: '/panel/ws', scope: 'session', upgrade: true },
+      { path: '/panel/ws-json', scope: 'session', upgrade: true, locator: { in: 'json-body', fields: ['sessionId'] } },
+    ],
+  })
+  registry.register({
+    plugin: 'other-panel',
+    version: '1.0.0',
+    routes: [{ path: '/other/data', scope: 'session' }],
+  })
+
+  let fakeNow = 1_000_000
+  const logs = []
+  const debugs = []
+  const handle = installPluginRouteIntercept({
+    webServer: host.raw,
+    registry,
+    relay: fakeRelayClient(relay.__port),
+    getServerId: () => SERVER_ID,
+    getStatus: () => [
+      { plugin: 'test-panel', bridged: false, reason: 'version-mismatch', localVersion: '1.0.0' },
+      { plugin: 'other-panel', bridged: false, reason: 'version-mismatch', localVersion: '1.0.0' },
+    ],
+    now: () => fakeNow,
+    log: (format, ...args) => logs.push({ format, args }),
+    debug: (format, ...args) => debugs.push({ format, args }),
+  })
+  t.after(async () => {
+    handle.uninstall()
+    await relay.stop()
+    await host.stop()
+  })
+
+  const isRefusalLine = (entry) => entry.format.includes('refused for')
+
+  // 1. 10 consecutive route refusals for (test-panel, version-mismatch) within 5 min:
+  //    1 log, 9 debug, diagnostics().refused === 10, refusalsByReason['version-mismatch'] === 10
+  for (let i = 0; i < 10; i += 1) {
+    fakeNow += 1_000
+    const res = await host.get(`/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`)
+    assert.equal(res.status, 503)
+  }
+  assert.equal(logs.filter(isRefusalLine).length, 1, 'only first route refusal logged at info level')
+  assert.equal(debugs.filter(isRefusalLine).length, 9, 'remaining 9 route refusals went to debug')
+  assert.equal(handle.diagnostics().refused, 10)
+  assert.equal(handle.diagnostics().refusalsByReason['version-mismatch'], 10)
+
+  // 2. Different reason on same plugin emits its own first log immediately
+  const wrongMethod = await host.get(`/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`, { method: 'POST' })
+  assert.equal(wrongMethod.status, 503)
+  assert.equal(logs.filter(isRefusalLine).length, 2)
+  assert.equal(handle.diagnostics().refusalsByReason['method-not-bridged'], 1)
+
+  // 3. Different plugin with same reason emits its own first log immediately
+  const otherRes = await host.get(`/other/data?sessionId=${encodeURIComponent(VIRTUAL)}`)
+  assert.equal(otherRes.status, 503)
+  assert.equal(logs.filter(isRefusalLine).length, 3)
+  assert.equal(handle.diagnostics().refusalsByReason['version-mismatch'], 11)
+
+  // 4. Advancing injected time past 5 * 60_000ms restores info logging for (test-panel, version-mismatch)
+  fakeNow += 5 * 60_000 + 1
+  const afterWindow = await host.get(`/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`)
+  assert.equal(afterWindow.status, 503)
+  assert.equal(logs.filter(isRefusalLine).length, 4, 'new window emits info log again')
+  assert.match(logs.filter(isRefusalLine)[3].format, /suppressed %d repeats/)
+  assert.equal(logs.filter(isRefusalLine)[3].args.at(-1), 9)
+  assert.equal(handle.diagnostics().refusalsByReason['version-mismatch'], 12)
+
+  // Immediate repeat in new window is throttled again
+  const repeatInNewWindow = await host.get(`/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`)
+  assert.equal(repeatInNewWindow.status, 503)
+  assert.equal(logs.filter(isRefusalLine).length, 4)
+  assert.equal(debugs.filter(isRefusalLine).length, 10)
+
+  // 5. Upgrade refusal (HTTP 503 via answerUnbridgedSocket): separate 'upgrade' kind key
+  for (let i = 0; i < 4; i += 1) {
+    fakeNow += 1_000
+    const raw = await sendRawUpgrade(host.port, `/panel/ws?sessionId=${encodeURIComponent(VIRTUAL)}`)
+    assert.match(raw, /^HTTP\/1\.1 503/)
+  }
+  assert.equal(logs.filter(isRefusalLine).length, 5, 'first upgrade 503 logged at info even when route key is throttled')
+  assert.equal(debugs.filter(isRefusalLine).length, 13, 'next 3 upgrade 503 refusals went to debug')
+  assert.equal(handle.diagnostics().refusalsByReason['version-mismatch'], 17)
+
+  fakeNow += 5 * 60_000 + 1
+  const upgradeAfterWindow = await sendRawUpgrade(host.port, `/panel/ws?sessionId=${encodeURIComponent(VIRTUAL)}`)
+  assert.match(upgradeAfterWindow, /^HTTP\/1\.1 503/)
+  assert.equal(logs.filter(isRefusalLine).length, 6, 'upgrade 503 logs again after 5 min window')
+
+  // 6. Upgrade refusal (post-101 via refuseAndDie)
+  for (let i = 0; i < 4; i += 1) {
+    fakeNow += 1_000
+    const raw = await sendRawUpgrade(host.port, '/panel/ws-json', (socket) => {
+      socket.write(encodeRfc6455Frame(0x1, Buffer.from('not-json'), true, true))
+    })
+    assert.match(raw, /^HTTP\/1\.1 101/)
+  }
+  assert.equal(logs.filter(isRefusalLine).length, 7, 'first post-101 upgrade refusal logged at info')
+  assert.equal(debugs.filter(isRefusalLine).length, 16, 'next 3 post-101 upgrade refusals went to debug')
+  assert.equal(handle.diagnostics().refusalsByReason['bad-query'], 4)
+
+  fakeNow += 5 * 60_000 + 1
+  await sendRawUpgrade(host.port, '/panel/ws-json', (socket) => {
+    socket.write(encodeRfc6455Frame(0x1, Buffer.from('not-json'), true, true))
+  })
+  assert.equal(logs.filter(isRefusalLine).length, 8, 'post-101 upgrade refusal logs again after 5 min window')
+  assert.equal(handle.diagnostics().refusalsByReason['bad-query'], 5)
+  assert.equal(handle.diagnostics().refused, 24)
+})
+
+test('T4 refusal log throttling: refusalLogWindowMs=0 disables throttling', async (t) => {
+  const host = await startFakeHost()
+  host.registerLocalPlugin()
+  const relay = await startFakeRelay()
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED)
+  const logs = []
+  const debugs = []
+  const handle = installPluginRouteIntercept({
+    webServer: host.raw,
+    registry,
+    relay: fakeRelayClient(relay.__port),
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: false, reason: 'version-mismatch', localVersion: '1.0.0' }],
+    refusalLogWindowMs: 0,
+    log: (format, ...args) => logs.push({ format, args }),
+    debug: (format, ...args) => debugs.push({ format, args }),
+  })
+  t.after(async () => {
+    handle.uninstall()
+    await relay.stop()
+    await host.stop()
+  })
+
+  for (let i = 0; i < 3; i += 1) {
+    const res = await host.get(`/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`)
+    assert.equal(res.status, 503)
+  }
+  assert.equal(logs.filter((entry) => entry.format.includes('refused for')).length, 3)
+  assert.equal(debugs.filter((entry) => entry.format.includes('refused for')).length, 0)
+  assert.equal(handle.diagnostics().refused, 3)
 })

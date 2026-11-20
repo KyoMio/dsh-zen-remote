@@ -1427,7 +1427,9 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       setState('connecting')
       let payload: Record<string, unknown>
       try {
-        payload = await exchange(HANDSHAKE_PATH, '{}', undefined, false, creds)
+        payload = await exchange(HANDSHAKE_PATH, '{}', undefined, false, creds, {
+          timeoutMs: requestTimeoutMs + peerRecoveryMarginMs,
+        })
       } catch (error) {
         // The two walls keep the state the mapping gave them (revoked /
         // incompatible). Every OTHER failure is an answer the contract says
@@ -1705,18 +1707,24 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
 
   async function postEventResult(eventId: string, result: unknown, signal?: AbortSignal): Promise<unknown> {
     const creds = requireCredentials()
-    const payload = await exchange(EVENT_RESULT_PATH, JSON.stringify({ eventId, result }), signal, true, creds)
+    const payload = await exchange(EVENT_RESULT_PATH, JSON.stringify({ eventId, result }), signal, true, creds, {
+      timeoutMs: requestTimeoutMs + peerRecoveryMarginMs,
+    })
     return payload.value
   }
 
   async function unshare(sessionId: string, signal?: AbortSignal): Promise<void> {
     const creds = requireCredentials()
-    await exchange(UNSHARE_PATH, JSON.stringify({ sessionId }), signal, true, creds)
+    await exchange(UNSHARE_PATH, JSON.stringify({ sessionId }), signal, true, creds, {
+      timeoutMs: requestTimeoutMs + peerRecoveryMarginMs,
+    })
   }
 
   async function http(route: string, query: string, signal?: AbortSignal): Promise<RelayHttpResult> {
     const creds = requireCredentials()
-    const payload = await exchange(HTTP_PATH, JSON.stringify({ route, query }), signal, true, creds)
+    const payload = await exchange(HTTP_PATH, JSON.stringify({ route, query }), signal, true, creds, {
+      timeoutMs: requestTimeoutMs + peerRecoveryMarginMs,
+    })
     const value = payload.value
     if (
       !isRecord(value) ||
@@ -1801,8 +1809,8 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     // timeout never moves the connection state.
     const hasBody = request.body !== undefined && request.body !== null
     const headerTimeoutMs = hasBody
-      ? sizeBackedTimeoutMs(requestTimeoutMs, request.contentLength)
-      : requestTimeoutMs
+      ? sizeBackedTimeoutMs(requestTimeoutMs, request.contentLength) + peerRecoveryMarginMs
+      : requestTimeoutMs + peerRecoveryMarginMs
     const timer = setTimeout(() => controller.abort(), headerTimeoutMs)
     if (typeof timer.unref === 'function') timer.unref()
     try {
@@ -1902,11 +1910,12 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       if (signal.aborted) controller.abort()
       else signal.addEventListener('abort', onExternalAbort)
     }
+    const headerTimeoutMs = requestTimeoutMs + peerRecoveryMarginMs
     let headersTimedOut = false
     const headerTimer = setTimeout(() => {
       headersTimedOut = true
       controller.abort()
-    }, requestTimeoutMs)
+    }, headerTimeoutMs)
     if (typeof headerTimer.unref === 'function') headerTimer.unref()
 
     let response: Response
@@ -1933,7 +1942,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       if (signal?.aborted) throw abortedError()
       if (headersTimedOut) {
         noteFailure('request-timeout')
-        throw new RelayError('request-timeout', `no response within ${requestTimeoutMs} ms`)
+        throw new RelayError('request-timeout', `no response within ${headerTimeoutMs} ms`)
       }
       noteFailure('offline')
       setState('offline')
@@ -2078,7 +2087,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       },
       signal,
       true,
-      { timeoutMs: sizeBackedTimeoutMs(requestTimeoutMs, bytes.byteLength), timeoutSetsOffline: false },
+      { timeoutMs: sizeBackedTimeoutMs(requestTimeoutMs, bytes.byteLength) + peerRecoveryMarginMs, timeoutSetsOffline: false },
     )
   }
 
@@ -2188,7 +2197,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
               controller.signal,
               true,
               { url, token },
-              { timeoutSetsOffline: false },
+              { timeoutMs: requestTimeoutMs + peerRecoveryMarginMs, timeoutSetsOffline: false },
             )
           } catch (error) {
             // The refusal (or a transport death that is not the caller's own

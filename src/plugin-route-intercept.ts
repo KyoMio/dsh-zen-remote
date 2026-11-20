@@ -408,6 +408,11 @@ export interface InstallPluginRouteInterceptOptions {
   /** Per-request forwards lines (T3): volume is one line per request, so
    * they ride the debug channel and only surface at logLevel=debug. */
   debug?: (format: string, ...args: unknown[]) => void
+  /** Throttle window (ms) for repeated `plugin route/upgrade refused` `log` lines
+   * keyed by `${kind}:${plugin}:${reason}`; defaults to 5 minutes (`0` disables). */
+  refusalLogWindowMs?: number
+  /** Clock reader for refusal-log throttling; defaults to `Date.now`. */
+  now?: () => number
 }
 
 export interface PluginRouteInterceptHandle {
@@ -419,6 +424,9 @@ export interface PluginRouteInterceptHandle {
 
 /** Longest failure ring kept for the status surface. */
 const MAX_FAILURES = 10
+
+/** Default 5-minute window for throttling identical refusal info logs. */
+const DEFAULT_REFUSAL_LOG_WINDOW_MS = 5 * 60_000
 
 /** What one declared-route hit carries from the match lookup into its
  * surrogate handler. */
@@ -586,6 +594,38 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   let tunnelsClosed = 0
   const refusalsByReason: Record<string, number> = {}
   const recentFailures: PluginRouteFailureRecord[] = []
+  const refusalLogWindowMs =
+    options.refusalLogWindowMs !== undefined && Number.isFinite(options.refusalLogWindowMs) && options.refusalLogWindowMs >= 0
+      ? options.refusalLogWindowMs
+      : DEFAULT_REFUSAL_LOG_WINDOW_MS
+  const now = options.now ?? Date.now
+  const refusalLogGate = new Map<string, { lastLoggedAt: number; suppressed: number }>()
+
+  /** Throttle repeated identical refusal `log` lines over `refusalLogWindowMs`
+   * so high-frequency polling does not wash out the diagnostic ring; repeats
+   * fall back to `debug` while `recordRefusal` still counts every refusal. */
+  const logRefusal = (kind: 'route' | 'upgrade', plugin: string, reason: string): void => {
+    const format = kind === 'route' ? 'plugin route refused for %s: %s' : 'plugin upgrade refused for %s: %s'
+    if (refusalLogWindowMs <= 0) {
+      log?.(format, plugin, reason)
+      return
+    }
+    const ts = now()
+    const key = `${kind}:${plugin}:${reason}`
+    const existing = refusalLogGate.get(key)
+    if (existing === undefined || ts - existing.lastLoggedAt >= refusalLogWindowMs || ts < existing.lastLoggedAt) {
+      const priorSuppressed = existing?.suppressed ?? 0
+      refusalLogGate.set(key, { lastLoggedAt: ts, suppressed: 0 })
+      if (priorSuppressed > 0) {
+        log?.(`${format} (suppressed %d repeats)`, plugin, reason, priorSuppressed)
+      } else {
+        log?.(format, plugin, reason)
+      }
+      return
+    }
+    existing.suppressed += 1
+    debug?.(format, plugin, reason)
+  }
 
   /** The unbridged refusal written straight onto an upgrading socket
    * (PB-10): the WebSocket handshake never happened, so the "response" is
@@ -593,7 +633,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
    * without the local plugin ever seeing the connection. */
   const answerUnbridgedSocket = (socket: Socket, plugin: string, reason: string): void => {
     recordRefusal(plugin, reason)
-    log?.('plugin upgrade refused for %s: %s', plugin, reason)
+    logRefusal('upgrade', plugin, reason)
     const body = Buffer.from(JSON.stringify({ ok: false, error: { code: 'zr-plugin-unbridged', reason, plugin } }), 'utf8')
     try {
       socket.write(
@@ -621,7 +661,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
    * plugin handler never reached. */
   const answerUnbridged = (res: ServerResponse, plugin: string, reason: string): void => {
     recordRefusal(plugin, reason)
-    log?.('plugin route refused for %s: %s', plugin, reason)
+    logRefusal('route', plugin, reason)
     res.setHeader('x-zen-remote', 'unbridged')
     res.setHeader('content-type', 'application/json; charset=utf-8')
     res.writeHead(503)
@@ -1720,7 +1760,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       // status fits anymore — the refusal is recorded and the socket dies.
       const refuseAndDie = (reason: string): void => {
         recordRefusal(plugin, reason)
-        log?.('plugin upgrade refused for %s: %s', plugin, reason)
+        logRefusal('upgrade', plugin, reason)
         destroySocket()
       }
       // The deny wall (the HTTP halves' current-session rule, pre-101 — the
