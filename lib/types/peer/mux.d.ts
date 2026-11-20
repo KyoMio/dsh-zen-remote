@@ -56,6 +56,12 @@ export interface PeerMuxOptions {
     onPeerRelayDemoted?: (nodeId: string) => void;
     /** 刚切上 UDP 直连时吸收对端错峰晋升 WS 帧的宽限期（ms，默认 400）。 */
     directPromoteGraceMs?: number | (() => number);
+    /** 直连路径 ARQ 连续无 SACK 停滞时回调（受 10s 冷却门控）。 */
+    onDirectStalled?: (nodeId: string) => void;
+    /** ARQ 零 SACK 停滞检测阈值（ms，0 禁用，默认 3500）。 */
+    stallSuspectMs?: number;
+    /** 冷启动时 relayHandler 未就绪的等待窗口（ms，默认 0 立即返回 503）。 */
+    relayHandlerWaitMs?: number;
     log?: (line: string) => void;
     /** 逐请求噪声通道（T3）：inbound request / body 生命周期行量太大，
      * 走它而不是 `log`，由 logLevel=debug 时才落环。 */
@@ -73,6 +79,7 @@ export declare class PeerMux {
     /** 对端会话拆建后延续单调递增的 streamId，避免复用对端已退休的 streamId。 */
     private readonly nextStreamIds;
     private closed;
+    private readonly createdAt;
     constructor(options: PeerMuxOptions);
     /** 为一个已通过 TOFU 的对端建立（或复用）mux 会话。 */
     ensureSession(nodeId: string, peerPublicKeyHex: string, peerName: string): void;
@@ -101,8 +108,12 @@ export declare class PeerMux {
     enableRelayPath(nodeId: string): void;
     /** 打洞握手完成：接上打洞层的发送接缝，路径切到 UDP。 */
     setDirectPath(nodeId: string, sender: PunchFrameSender): void;
-    /** 直连路径死亡（keepalive 掉线）：帧改走网关 WS 中转。 */
-    setRelayPath(nodeId: string): void;
+    /**
+     * 直连路径死亡（keepalive 掉线）：帧改走网关 WS 中转。
+     * `sendDemoteBeacon`（默认 true）：已有 WS 密码器时，无论是否有在途分片，
+     * 立即经 WS 发一帧密封 `PING(streamId=0)`，让对端 0ms 同步降级（旧版忽略 streamId 0）。
+     */
+    setRelayPath(nodeId: string, sendDemoteBeacon?: boolean): void;
     /**
      * UDP 路径的一个**已开封**帧（punch 层用它自己的握手密码器开完才交进来）。
      * UDP 路径上的 hello/ack 由 punch 自己消化，永远到不了这里——这里只有
@@ -127,6 +138,10 @@ export declare class PeerMux {
      * mux 用中转握手密码器封口经网关发出；两者都未就绪 → 抛错（上层捕获丢弃）。
      */
     private dispatchFrame;
+    /** 用中转握手密码器封口一帧并经网关 WS 发出（调用方保证 `session.ciphers !== null`）。 */
+    private sendEncryptedWsFrame;
+    /** ARQ 零 SACK 停滞：仅在 UDP 直连满 stallSuspectMs 且过 10s 冷却时上报给 engine。 */
+    private onArqStallSuspected;
     private beginHello;
     private clearHelloTimer;
     /** `28B 头（HELLO, streamId 0）+ v2 握手信封 JSON`，网关原样路由（只读路由头）。 */

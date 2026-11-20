@@ -72,6 +72,14 @@ const HELLO_RETRY_MAX = 6
 const AUTO_HELLO_COOLDOWN_MS = 2_000
 /** 刚切上 UDP 直连时吸收对端半个 RTT 错峰晋升 WS 帧的宽限期（ms）。 */
 const DEFAULT_DIRECT_PROMOTE_GRACE_MS = 400
+/** 收到首个 UDP 帧后继续吸收晋升前在途乱序旧 WS 帧的排空窗口（ms）。 */
+const WS_REORDER_GRACE_MS = 500
+/** ARQ 零 SACK 停滞上报去重冷却时间（ms）。 */
+const DIRECT_STALL_COOLDOWN_MS = 10_000
+/** 默认 ARQ 零 SACK 停滞判定阈值（ms）。 */
+const DEFAULT_STALL_SUSPECT_MS = 3_500
+/** 冷启动等待 relayHandler 就绪的轮询步长（ms）。 */
+const RELAY_HANDLER_POLL_MS = 50
 const BODY_HIGH_WATER_BYTES = 64 * 1024
 const ADMISSION_CHUNK_BYTES = 16 * 1024
 const MAX_META_BYTES = 65_536
@@ -111,6 +119,7 @@ interface MuxStream {
   outboundFinished: boolean
   /** Removed on every terminal path, including completed responses. */
   removeAbortListener: (() => void) | null
+  cancelHandlerWait: (() => void) | null
   bodyReader: ReadableStreamDefaultReader<Uint8Array> | null
   bodySource: ReadableStream<Uint8Array> | null
   /** ServerResponse 的原始捕获字节与增量 HTTP/1.1 解析状态。 */
@@ -142,6 +151,11 @@ interface MuxSession {
   directPromotedAt: number
   /** 本次切上 UDP 后是否已收到对端发来的解密 UDP 帧（确认双方均已切换直连）。 */
   peerConfirmedDirect: boolean
+  /** 本次切上 UDP 后收到首个解密 UDP 帧的时间戳（ms），用于 500ms 乱序排空窗。 */
+  firstDirectRxAt: number | null
+  /** 最近一次向 engine 上报直连 ARQ 停滞的时间戳（ms），用于 10s 冷却门控。 */
+  lastStallReportAt: number | null
+  handlerWaitTimers: Set<unknown>
   arq: PeerArqSession
   punchSender: PunchFrameSender | null
   streams: Map<number, MuxStream>
@@ -169,6 +183,12 @@ export interface PeerMuxOptions {
   onPeerRelayDemoted?: (nodeId: string) => void
   /** 刚切上 UDP 直连时吸收对端错峰晋升 WS 帧的宽限期（ms，默认 400）。 */
   directPromoteGraceMs?: number | (() => number)
+  /** 直连路径 ARQ 连续无 SACK 停滞时回调（受 10s 冷却门控）。 */
+  onDirectStalled?: (nodeId: string) => void
+  /** ARQ 零 SACK 停滞检测阈值（ms，0 禁用，默认 3500）。 */
+  stallSuspectMs?: number
+  /** 冷启动时 relayHandler 未就绪的等待窗口（ms，默认 0 立即返回 503）。 */
+  relayHandlerWaitMs?: number
   log?: (line: string) => void
   /** 逐请求噪声通道（T3）：inbound request / body 生命周期行量太大，
    * 走它而不是 `log`，由 logLevel=debug 时才落环。 */
@@ -194,10 +214,12 @@ export class PeerMux {
   /** 对端会话拆建后延续单调递增的 streamId，避免复用对端已退休的 streamId。 */
   private readonly nextStreamIds = new Map<string, number>()
   private closed = false
+  private readonly createdAt: number
 
   constructor(options: PeerMuxOptions) {
     this.options = options
     this.clock = options.clock ?? realClock
+    this.createdAt = this.clock.now()
   }
 
   // ------------------------------------------------------------ 会话
@@ -226,10 +248,15 @@ export class PeerMux {
       wsSeqAtDirectPromote: -1n,
       directPromotedAt: -Infinity,
       peerConfirmedDirect: false,
+      firstDirectRxAt: null,
+      lastStallReportAt: null,
+      handlerWaitTimers: new Set(),
       arq: new PeerArqSession({
         sendFrame: (frameType, streamId, payload, ack) => this.dispatchFrame(session, frameType, streamId, payload, ack),
         onStreamData: (streamId, chunk, final) => this.onStreamData(session, streamId, chunk, final),
         clock: this.clock,
+        stallSuspectMs: this.options.stallSuspectMs ?? DEFAULT_STALL_SUSPECT_MS,
+        onStallSuspected: () => this.onArqStallSuspected(session),
         onAdmissionClosed: error => this.options.log?.(`mux: ${session.nodeId}: ${error.message}`),
         onStreamClosed: (streamId, error) => {
           const stream = session.streams.get(streamId)
@@ -274,6 +301,8 @@ export class PeerMux {
       this.abortStream(session, stream, new Error(reason))
     }
     session.streams.clear()
+    for (const timer of session.handlerWaitTimers) this.clock.clearTimeout(timer)
+    session.handlerWaitTimers.clear()
     session.arq.closeAll()
     session.ciphers = null
     session.myEph = null
@@ -283,6 +312,8 @@ export class PeerMux {
     session.envelopeSeq = 0n
     session.directPromotedAt = -Infinity
     session.peerConfirmedDirect = false
+    session.firstDirectRxAt = null
+    session.lastStallReportAt = null
     session.punchSender = null
     this.sessions.delete(session.nodeId)
     if (session.path !== 'none') {
@@ -360,20 +391,35 @@ export class PeerMux {
     session.wsSeqAtDirectPromote = session.lastInboundWsSeq
     session.directPromotedAt = this.clock.now()
     session.peerConfirmedDirect = false
+    session.firstDirectRxAt = null
+    session.lastStallReportAt = null
     const before = session.path
     session.path = 'udp'
     if (before === 'none') session.arq.flushInflight()
     if (before !== 'udp') this.options.onPathChanged?.(session.nodeId, 'udp')
   }
 
-  /** 直连路径死亡（keepalive 掉线）：帧改走网关 WS 中转。 */
-  setRelayPath(nodeId: string): void {
+  /**
+   * 直连路径死亡（keepalive 掉线）：帧改走网关 WS 中转。
+   * `sendDemoteBeacon`（默认 true）：已有 WS 密码器时，无论是否有在途分片，
+   * 立即经 WS 发一帧密封 `PING(streamId=0)`，让对端 0ms 同步降级（旧版忽略 streamId 0）。
+   */
+  setRelayPath(nodeId: string, sendDemoteBeacon = true): void {
     const session = this.sessions.get(nodeId.toLowerCase())
     if (!session || session.closed || this.closed) return
     const before = session.path
     session.path = session.ciphers !== null ? 'ws' : 'none'
     if (session.path === 'none') this.beginHello(session)
-    else if (before !== session.path && session.path === 'ws') session.arq.flushInflight()
+    else if (before !== session.path && session.path === 'ws') {
+      if (before === 'udp' && sendDemoteBeacon) {
+        try {
+          this.sendEncryptedWsFrame(session, PeerFrameType.PING, 0, Buffer.alloc(0), 0)
+        } catch {
+          // 信标丢失由对端 keepalive / ARQ 停滞兜底。
+        }
+      }
+      session.arq.flushInflight()
+    }
     if (before !== session.path) this.options.onPathChanged?.(session.nodeId, session.path)
   }
 
@@ -387,7 +433,10 @@ export class PeerMux {
   handleOpenedFrame(header: PeerFrameHeader, plaintext: Uint8Array): void {
     const session = this.sessions.get(header.srcNodeId)
     if (!session || session.closed) return
-    if (session.path === 'udp') session.peerConfirmedDirect = true
+    if (session.path === 'udp') {
+      session.peerConfirmedDirect = true
+      if (session.firstDirectRxAt === null) session.firstDirectRxAt = this.clock.now()
+    }
     try {
       session.arq.handleFrame(header.frameType, header.streamId, plaintext, header.ack)
     } catch {
@@ -419,11 +468,18 @@ export class PeerMux {
     const rawGrace = this.options.directPromoteGraceMs
     const graceMs = typeof rawGrace === 'function' ? rawGrace() : (rawGrace ?? DEFAULT_DIRECT_PROMOTE_GRACE_MS)
     if (session.path === 'udp' && opened.header.seq > session.wsSeqAtDirectPromote) {
-      if (!session.peerConfirmedDirect && (this.clock.now() - session.directPromotedAt) < graceMs) {
+      const now = this.clock.now()
+      const isExplicitDemoteBeacon = opened.header.frameType === PeerFrameType.PING && opened.header.streamId === 0
+      if (
+        !isExplicitDemoteBeacon &&
+        (now - session.directPromotedAt) < graceMs &&
+        (!session.peerConfirmedDirect || (session.firstDirectRxAt !== null && (now - session.firstDirectRxAt) < WS_REORDER_GRACE_MS))
+      ) {
         session.wsSeqAtDirectPromote = session.lastInboundWsSeq
       } else {
         session.path = 'ws'
         session.peerConfirmedDirect = false
+        session.firstDirectRxAt = null
         session.arq.flushInflight()
         this.options.onPathChanged?.(session.nodeId, 'ws')
         this.options.onPeerRelayDemoted?.(session.nodeId)
@@ -588,21 +644,7 @@ export class PeerMux {
       return
     }
     if (session.ciphers !== null) {
-      const seq = session.seq
-      session.seq = seq + 1n
-      const frame = packEncryptedFrame(
-        {
-          frameType,
-          srcNodeId: this.options.identity.nodeId,
-          dstNodeId: session.nodeId,
-          streamId,
-          seq,
-          ack,
-        },
-        payload,
-        session.ciphers,
-      )
-      this.options.sendGatewayBinary?.(frame)
+      this.sendEncryptedWsFrame(session, frameType, streamId, payload, ack)
       return
     }
     if (session.relayRequested && session.path !== 'udp' && session.helloTimer === null) {
@@ -613,6 +655,43 @@ export class PeerMux {
       }
     }
     throw new Error(`no path ready for peer ${session.nodeId}`)
+  }
+
+  /** 用中转握手密码器封口一帧并经网关 WS 发出（调用方保证 `session.ciphers !== null`）。 */
+  private sendEncryptedWsFrame(
+    session: MuxSession,
+    frameType: number,
+    streamId: number,
+    payload: Uint8Array,
+    ack: number,
+  ): void {
+    if (session.ciphers === null) throw new Error(`no ws ciphers for peer ${session.nodeId}`)
+    const seq = session.seq
+    session.seq = seq + 1n
+    const frame = packEncryptedFrame(
+      {
+        frameType,
+        srcNodeId: this.options.identity.nodeId,
+        dstNodeId: session.nodeId,
+        streamId,
+        seq,
+        ack,
+      },
+      payload,
+      session.ciphers,
+    )
+    this.options.sendGatewayBinary?.(frame)
+  }
+
+  /** ARQ 零 SACK 停滞：仅在 UDP 直连满 stallSuspectMs 且过 10s 冷却时上报给 engine。 */
+  private onArqStallSuspected(session: MuxSession): void {
+    if (session.closed || this.closed || session.path !== 'udp') return
+    const stallSuspectMs = this.options.stallSuspectMs ?? DEFAULT_STALL_SUSPECT_MS
+    const now = this.clock.now()
+    if (now - session.directPromotedAt < stallSuspectMs) return
+    if (session.lastStallReportAt !== null && now - session.lastStallReportAt < DIRECT_STALL_COOLDOWN_MS) return
+    session.lastStallReportAt = now
+    this.options.onDirectStalled?.(session.nodeId)
   }
 
   // ---- 网关中转握手（zr-peer-hs-v2 hello/ack 明文信封） ---------------
@@ -716,6 +795,12 @@ export class PeerMux {
       // may replace the working key; keep our DH key stable when unchanged.
       if (session.peerEphPubHex !== parsed.ephPubHex || session.ciphers === null) this.beginHello(session)
       if (session.path === 'udp') {
+        const rawGrace = this.options.directPromoteGraceMs
+        const graceMs = typeof rawGrace === 'function' ? rawGrace() : (rawGrace ?? DEFAULT_DIRECT_PROMOTE_GRACE_MS)
+        const withinGrace = (this.clock.now() - session.directPromotedAt) < graceMs
+        const sameKeyReplay = session.ciphers !== null && session.peerEphPubHex === parsed.ephPubHex
+        const coldStartLate = session.ciphers === null && !session.peerConfirmedDirect
+        if (withinGrace && (sameKeyReplay || coldStartLate)) return
         if (session.ciphers !== null) {
           session.path = 'ws'
           session.arq.flushInflight()
@@ -761,12 +846,19 @@ export class PeerMux {
     session.peerEphPubHex = peerEphPubHex
     session.ciphers = ciphers
     session.nonce = null // consume only after successful derivation
+    // 新钥 = 对端新会话，其 WS seq 从 0 重起：旧序号残留会吞掉后续降级帧。
+    session.lastInboundWsSeq = -1n
+    session.wsSeqAtDirectPromote = -1n
+    session.firstDirectRxAt = null
+    session.peerConfirmedDirect = false
     this.clearHelloTimer(session)
     this.options.log?.(`mux: relay handshake complete for ${session.nodeId} (path=${session.path}, hs=v2)`)
     if (session.path === 'none') {
       session.path = 'ws'
       session.arq.flushInflight()
       this.options.onPathChanged?.(session.nodeId, 'ws')
+    } else if (session.path === 'ws') {
+      session.arq.flushInflight()
     }
   }
 
@@ -878,6 +970,8 @@ export class PeerMux {
     session.streams.delete(stream.streamId)
     stream.removeAbortListener?.()
     stream.removeAbortListener = null
+    stream.cancelHandlerWait?.()
+    stream.cancelHandlerWait = null
     if (stream.bodyReader) {
       void stream.bodyReader.cancel(err).catch(() => {})
       stream.bodyReader.releaseLock()
@@ -997,18 +1091,64 @@ export class PeerMux {
 
     req.on('end', () => this.options.debug?.(`mux: inbound req body ended for ${session.nodeId} stream ${stream.streamId}`))
     req.on('error', (e) => this.options.debug?.(`mux: inbound req error ${String(e)}`))
-    const handler = this.options.relayHandler()
-    if (handler === undefined) {
+    const dispatch = (handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>): void => {
+      void handler(req as never, res).catch(() => {
+        try {
+          if (!res.writableEnded) res.destroy()
+        } catch { /* gone */ }
+      })
+    }
+    const unavailable = (): void => {
       // 服务半边未挂载（无 webServer 的组合）：如实应答并收尾。
       res.writeHead(503, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ ok: false, error: { code: 'relay-unavailable' } }))
+    }
+    const handler = this.options.relayHandler()
+    if (handler !== undefined) {
+      dispatch(handler)
       return
     }
-    void handler(req as never, res).catch(() => {
-      try {
-        if (!res.writableEnded) res.destroy()
-      } catch { /* gone */ }
-    })
+    const waitMs = this.options.relayHandlerWaitMs ?? 0
+    const deadline = this.createdAt + waitMs
+    if (!(waitMs > 0 && this.clock.now() < deadline)) {
+      unavailable()
+      return
+    }
+    // 冷启动：webServer 路由尚未注册，按 50ms 轮询等到就绪或超窗；流/会话/res 销毁都清定时器。
+    let timer: unknown = null
+    const cancel = (): void => {
+      if (timer !== null) {
+        this.clock.clearTimeout(timer)
+        session.handlerWaitTimers.delete(timer)
+        timer = null
+      }
+      stream.cancelHandlerWait = null
+    }
+    stream.cancelHandlerWait = cancel
+    res.once('close', cancel)
+    const poll = (): void => {
+      if (timer !== null) session.handlerWaitTimers.delete(timer)
+      timer = null
+      if (session.closed || this.closed || session.streams.get(stream.streamId) !== stream || res.destroyed) {
+        cancel()
+        return
+      }
+      const ready = this.options.relayHandler()
+      if (ready !== undefined) {
+        cancel()
+        dispatch(ready)
+        return
+      }
+      if (this.clock.now() >= deadline) {
+        cancel()
+        unavailable()
+        return
+      }
+      timer = this.clock.setTimeout(poll, RELAY_HANDLER_POLL_MS)
+      session.handlerWaitTimers.add(timer)
+    }
+    timer = this.clock.setTimeout(poll, RELAY_HANDLER_POLL_MS)
+    session.handlerWaitTimers.add(timer)
   }
 
   /** Decode bounded slices, including partial HTTP chunks; never accumulate a body. */
@@ -1108,6 +1248,7 @@ function newStream(streamId: number, initiator: boolean): MuxStream {
     res: null,
     outboundFinished: false,
     removeAbortListener: null,
+    cancelHandlerWait: null,
     bodyReader: null,
     bodySource: null,
     captureHead: null,
