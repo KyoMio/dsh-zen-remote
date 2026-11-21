@@ -72,6 +72,8 @@ function readStoredLocale(): Locale {
 function authErrorToKey(err: unknown): LocaleKey {
   const code = err instanceof ConsoleApiError ? err.code : '';
   switch (code) {
+    case 'INVALID_REQUEST':
+      return 'error.invalidRequest';
     case 'INVALID_CREDENTIALS':
       return 'error.invalidCredentials';
     case 'ACCOUNT_DISABLED':

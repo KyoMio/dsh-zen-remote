@@ -473,6 +473,8 @@ export function LoginView(props: LoginViewProps) {
               />
             )}
 
+            {otpSection}
+
             <button type="submit" className="btn primary block" disabled={busy}>
               {mode === 'signup' ? t('auth.signup') : t('auth.login')}
             </button>
