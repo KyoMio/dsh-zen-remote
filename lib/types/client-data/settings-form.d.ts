@@ -376,9 +376,15 @@ export interface PeerStatusDeviceView {
     /** The smoothed UDP measurement while a peer is (or was) direct-ready —
      *  null before the first sample. Rides the demoted note. */
     directRttMs: number | null;
-    /** The engine demoted this peer to relay for exceeding the RTT cap. */
+    /** The engine demoted this peer from direct to relay. */
     directDemoted: boolean;
+    /** Why it was demoted; null when not demoted or on an older host. Only
+     *  `rtt-cap` (or null with directDemoted) reads as "over the cap". */
+    directDemoteReason: PeerDirectDemoteReasonView | null;
 }
+export type PeerDirectDemoteReasonView = 'rtt-cap' | 'path-lost' | 'peer-relay';
+/** A demoted row names the measured RTT and the cap only when the cap caused it. */
+export declare function isRttCapDemotion(device: Pick<PeerStatusDeviceView, 'directDemoted' | 'directRttMs' | 'directDemoteReason'>): boolean;
 /** The device row's path word (the wizard module's `PeerDevicePath`). */
 export type PeerDevicePathView = 'lan' | 'p2p' | 'relay' | 'mismatch' | 'offline';
 /**

@@ -23,6 +23,7 @@ import {
   debugExportFileName,
   deriveClientStatusView,
   derivePeerStatusView,
+  isRttCapDemotion,
   deriveSettingsView,
   localOpsAllowed,
   normalizePairingCode,
@@ -1079,6 +1080,9 @@ test('derivePeerStatusView: configured fields, capacity, sync, identityError, re
       { nodeId: 'bbbb2222', name: '旧端', mounted: true, path: 'lan', rttMs: 3 },
       { nodeId: 'cccc3333', name: '怪行', mounted: false, path: 'relay', rttMs: null, directRttMs: 'fast', directDemoted: 1 },
       { nodeId: 'dddd4444', name: '负延迟', mounted: false, path: 'lan', rttMs: 1, directRttMs: -9 },
+      { nodeId: 'eeee5555', name: '断直连', mounted: true, path: 'relay', rttMs: null, directRttMs: 5, directDemoted: true, directDemoteReason: 'path-lost' },
+      { nodeId: 'ffff6666', name: '超上限', mounted: true, path: 'relay', rttMs: null, directRttMs: 900, directDemoted: true, directDemoteReason: 'rtt-cap' },
+      { nodeId: 'abab7777', name: '怪原因', mounted: true, path: 'relay', rttMs: null, directRttMs: 9, directDemoted: true, directDemoteReason: 'bogus' },
     ],
   })
   assert.equal(rttView.peers[0].directDemoted, true)
@@ -1089,6 +1093,14 @@ test('derivePeerStatusView: configured fields, capacity, sync, identityError, re
   assert.equal(rttView.peers[2].directDemoted, false)
   assert.equal(rttView.peers[2].directRttMs, null)
   assert.equal(rttView.peers[3].directRttMs, null)
+  assert.equal(rttView.peers[0].directDemoteReason, null)
+  assert.equal(isRttCapDemotion(rttView.peers[0]), true, 'old host without a reason keeps the cap note')
+  assert.equal(rttView.peers[4].directDemoteReason, 'path-lost')
+  assert.equal(isRttCapDemotion(rttView.peers[4]), false, 'a lost direct path never reads "over the cap"')
+  assert.equal(rttView.peers[5].directDemoteReason, 'rtt-cap')
+  assert.equal(isRttCapDemotion(rttView.peers[5]), true)
+  assert.equal(rttView.peers[6].directDemoteReason, null, 'unknown reasons are dropped')
+  assert.equal(isRttCapDemotion(rttView.peers[1]), false)
 })
 
 test('debugExportFileName stamps host / client / peer roles', () => {

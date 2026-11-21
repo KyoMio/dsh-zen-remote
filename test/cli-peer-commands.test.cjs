@@ -900,6 +900,10 @@ test('peer status: 降级直连标注——超上限走中转的行写明原因�
               { nodeId: 'aa1b2c3d', name: '本机', mounted: true, path: 'lan', rttMs: 3, directRttMs: 3, directDemoted: false },
               { nodeId: 'fc825640', name: 'imac', mounted: false, path: 'relay', rttMs: null, directRttMs: 3454, directDemoted: true },
               { nodeId: 'dd44ee55', name: '备用机', mounted: false, path: 'relay', rttMs: null, directRttMs: null, directDemoted: false },
+              // Lost direct path at a healthy 5ms: must not claim "over the cap".
+              { nodeId: 'b0b0cafe', name: 'lost', mounted: true, path: 'relay', rttMs: null, directRttMs: 5, directDemoted: true, directDemoteReason: 'path-lost' },
+              { nodeId: 'beac0123', name: 'beacon', mounted: true, path: 'relay', rttMs: null, directRttMs: 4, directDemoted: true, directDemoteReason: 'peer-relay' },
+              { nodeId: 'ca9ca9ca', name: 'slow', mounted: true, path: 'relay', rttMs: null, directRttMs: 900, directDemoted: true, directDemoteReason: 'rtt-cap' },
             ],
           },
         }),
@@ -922,6 +926,15 @@ test('peer status: 降级直连标注——超上限走中转的行写明原因�
       const plain = text.split('\n').find((l) => l.includes('dd44ee55'))
       assert.ok(plain !== undefined)
       assert.ok(!plain.includes('直连'), `${lang}: a plain relay row carries no demotion note`)
+      const relayLabel = lang === 'zh' ? '经网关中转' : 'via gateway relay'
+      for (const nodeId of ['b0b0cafe', 'beac0123']) {
+        const row = text.split('\n').find((l) => l.includes(nodeId))
+        assert.ok(row !== undefined)
+        assert.ok(row.includes(relayLabel), `${lang}: ${nodeId} reads plain relay`)
+        assert.doesNotMatch(row, /over the cap|超过上限/u, `${lang}: ${nodeId} is not an RTT-cap demotion`)
+      }
+      const slow = text.split('\n').find((l) => l.includes('ca9ca9ca'))
+      assert.match(slow, lang === 'zh' ? /直连 900ms 超过上限 300ms/u : /direct 900ms over the cap of 300ms/u)
     }
     const json = makeCtx(mods, { argv: ['peer', 'status', '--json'], ipc: mods.createCliIpcClient(handle.socketPath) })
     assert.equal(await mods.runPeerStatusCommand(json), 0)
@@ -929,6 +942,7 @@ test('peer status: 降级直连标注——超上限走中转的行写明原因�
     const imac = parsed.peers.find((row) => row.nodeId === 'fc825640')
     assert.equal(imac.directDemoted, true)
     assert.equal(imac.directRttMs, 3454)
+    assert.equal(parsed.peers.find((row) => row.nodeId === 'b0b0cafe').directDemoteReason, 'path-lost')
     assert.equal(parsed.directCapMs, 300, '--json carries the gateway cap fact (T4)')
     assert.equal(parsed.directCapSource, 'gateway')
     // Old daemon (no directCapMs in the body): the line must NOT invent one —

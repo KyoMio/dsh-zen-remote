@@ -367,7 +367,11 @@ export function renderPeerSection(t: CliTranslator, peer: ServerRow | null): str
     // absent on older daemons — render the suffix only when it is readable.
     const capMs = typeof peer.directCapMs === 'number' && Number.isFinite(peer.directCapMs) ? peer.directCapMs : undefined
     const capSuffix = capMs === undefined ? '' : t('peer.path.capSuffix', { cap: String(capMs) })
-    const path = row.directDemoted === true && directRtt !== undefined
+    // Only an RTT-cap demotion may read "over the cap"; a lost direct path
+    // (or the peer's demote beacon) is plain relay. Old daemons send no reason.
+    const reason = row.directDemoteReason
+    const capDemoted = reason === undefined || reason === null || reason === 'rtt-cap'
+    const path = row.directDemoted === true && directRtt !== undefined && capDemoted
       ? t('peer.path.relayDemoted', { rtt: String(directRtt), cap: capSuffix })
       : peerPathLabelOf(t, row.path)
     lines.push(t('peer.status.deviceLine', {
