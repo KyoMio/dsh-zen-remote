@@ -4,6 +4,12 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 未发布
+
+### 修复
+
+- **修复手机 PWA 的三处体验问题**：短横屏默认收起会话右栏，断网重新打开时显示离线页并重试，配对页只保留一处生成配对码的提示。
+
 ## 2.5.4（2026-11-20）
 
 ### 修复
