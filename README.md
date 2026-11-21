@@ -77,6 +77,8 @@
 
 ## 1. Install
 
+For instructions in Chinese, see [安装](README.zh-CN.md#1-安装).
+
 ### Install from the UI (Recommended, Desktop App &amp; Web UI)
 
 Open **Plugins** in the DSH sidebar → click **Add plugin** → enter `dsh-zen-remote` → click **Enable now** after installation completes, then restart the DSH desktop app (or `dsh web`).
