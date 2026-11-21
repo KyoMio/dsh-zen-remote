@@ -533,13 +533,14 @@ button {
 .login-view {
   min-height: 100vh;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   place-items: center;
   padding: 24px;
   background: var(--bg);
 }
 
 .login-card {
-  width: 320px;
+  width: min(320px, 100%);
   padding: 28px 24px;
   background: var(--surface);
   border: 1px solid var(--line);
@@ -2218,6 +2219,16 @@ html[data-theme='dark'] dialog.modal::backdrop {
   }
 }
 
+@media (pointer: coarse) {
+  html {
+    touch-action: pan-x pan-y;
+  }
+
+  .input {
+    font-size: max(1rem, 16px);
+  }
+}
+
 @media (max-width: 767px) {
   /* 窄屏顶栏只留品牌标识、网络切换器与头像 */
   .topbar {
@@ -2229,6 +2240,18 @@ html[data-theme='dark'] dialog.modal::backdrop {
   .topbar-divider,
   .account-button .account-email {
     display: none;
+  }
+
+  .net-switcher {
+    max-width: 100%;
+  }
+
+  .menu-switcher {
+    width: max(220px, 100%);
+  }
+
+  .topbar-spacer + .switcher-wrap {
+    flex: none;
   }
 
   .overview-grid {
