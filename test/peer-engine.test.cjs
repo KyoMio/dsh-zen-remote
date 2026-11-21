@@ -1013,6 +1013,7 @@ test('RTT cap: single spike vs sustained highs demotion, recovery streak & live 
     const demoted = env.peerOf()
     assert.equal(demoted.path, 'relay')
     assert.equal(demoted.directDemoted, true)
+    assert.equal(demoted.directDemoteReason, 'rtt-cap')
     assert.equal(demoted.rttMs, null)
   }
   {
@@ -1021,6 +1022,7 @@ test('RTT cap: single spike vs sustained highs demotion, recovery streak & live 
     await env.sample(3000)
     assert.equal(env.peerOf().path, 'relay')
     assert.equal(env.peerOf().directDemoted, true)
+    assert.equal(env.peerOf().directDemoteReason, 'rtt-cap')
     assert.ok(env.logs.some((line) => /direct .+ rtt 3000ms over cap 300ms/.test(line)))
     await env.sample(100)
     await env.sample(900) // breaks recovery streak
@@ -1110,6 +1112,9 @@ test('RTT cap: two unanswered PINGs demote; loss wipes flag and re-gates re-esta
   await env.drain(11000)
   assert.equal(env.peerOf().path, 'relay')
   assert.equal(env.peerOf().directDemoted, true)
+  // A healthy-RTT path that stops answering is a lost path, not "over the cap".
+  assert.equal(env.peerOf().directDemoteReason, 'path-lost')
+  assert.equal(env.peerOf().directRttMs, 50)
   assert.ok(env.logs.some((line) => /direct .+ keepalive unanswered ×2 — relaying/.test(line)))
 
   env.gateB.dropPongs = false
@@ -1118,6 +1123,7 @@ test('RTT cap: two unanswered PINGs demote; loss wipes flag and re-gates re-esta
   await env.waitLost()
   assert.equal(env.peerOf().path, 'relay')
   assert.equal(env.peerOf().directDemoted, false)
+  assert.equal(env.peerOf().directDemoteReason, null)
 
   env.gateB.dropAll = false
   env.gateB.pongDelayMs = PONG_DELAY_MS
@@ -1793,6 +1799,7 @@ test('T2: onPeerRelayDemoted syncs member state, restores relay ARQ profile, and
   const peerAfter = engine.status().peers[0]
   assert.equal(peerAfter.path, 'relay')
   assert.equal(peerAfter.directDemoted, true)
+  assert.equal(peerAfter.directDemoteReason, 'peer-relay')
   assert.equal(peerAfter.rttMs, null)
 
   // UDP keepalive & ciphers on A must stay alive (never wiping ciphers into a blackhole)
@@ -2542,6 +2549,7 @@ test('T5: one-way UDP blackhole and Ping-ok/Data-blackhole both demote symmetric
       'ARQ stall on A demotes both A and B to relay within ~3.8s',
     )
     assert.ok(env.logsA.some((l) => l.includes('direct arq stalled')), 'A logged direct arq stalled')
+    assert.equal(env.engineA.status().peers[0].directDemoteReason, 'path-lost', 'an ARQ stall is a lost path, not an RTT-cap demotion')
     assert.equal(await (await stalledReq).text(), 'ok-from-b', 'in-flight stalled request transparently flushes over WS')
 
     const reverseRes = await env.getFetchBtoA()('http://peer/reverse-after-stall')

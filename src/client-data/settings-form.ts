@@ -561,8 +561,21 @@ export interface PeerStatusDeviceView {
   /** The smoothed UDP measurement while a peer is (or was) direct-ready —
    *  null before the first sample. Rides the demoted note. */
   directRttMs: number | null
-  /** The engine demoted this peer to relay for exceeding the RTT cap. */
+  /** The engine demoted this peer from direct to relay. */
   directDemoted: boolean
+  /** Why it was demoted; null when not demoted or on an older host. Only
+   *  `rtt-cap` (or null with directDemoted) reads as "over the cap". */
+  directDemoteReason: PeerDirectDemoteReasonView | null
+}
+
+export type PeerDirectDemoteReasonView = 'rtt-cap' | 'path-lost' | 'peer-relay'
+
+const PEER_DIRECT_DEMOTE_REASONS: readonly string[] = ['rtt-cap', 'path-lost', 'peer-relay']
+
+/** A demoted row names the measured RTT and the cap only when the cap caused it. */
+export function isRttCapDemotion(device: Pick<PeerStatusDeviceView, 'directDemoted' | 'directRttMs' | 'directDemoteReason'>): boolean {
+  return device.directDemoted && device.directRttMs !== null &&
+    (device.directDemoteReason === null || device.directDemoteReason === 'rtt-cap')
 }
 
 /** The device row's path word (the wizard module's `PeerDevicePath`). */
@@ -599,6 +612,10 @@ export function derivePeerStatusView(body: unknown): PeerStatusView {
         rttMs: typeof record.rttMs === 'number' && Number.isFinite(record.rttMs) ? record.rttMs : null,
         directRttMs: typeof record.directRttMs === 'number' && Number.isFinite(record.directRttMs) && record.directRttMs >= 0 ? record.directRttMs : null,
         directDemoted: record.directDemoted === true,
+        directDemoteReason: record.directDemoted === true && typeof record.directDemoteReason === 'string' &&
+          PEER_DIRECT_DEMOTE_REASONS.includes(record.directDemoteReason)
+          ? record.directDemoteReason as PeerDirectDemoteReasonView
+          : null,
       }
     })
     .filter((row): row is PeerStatusDeviceView => row !== undefined)

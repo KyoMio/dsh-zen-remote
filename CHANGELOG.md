@@ -4,6 +4,12 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 未发布
+
+### 修复
+
+- **修复直连中断时中转原因误报为「超过上限」**：直连因保活无响应、ARQ 停滞或对端降级回落中转时，`dsh-zen-remote peer status` 与插件设置页不再显示「直连 5ms 超过上限 300ms」这类错误原因，只有 RTT 真正超过网关上限时才这样标注；`peer status --json` 新增 `directDemoteReason`（`rtt-cap` / `path-lost` / `peer-relay`）。
+
 ## 2.5.4（2026-11-20）
 
 ### 修复
