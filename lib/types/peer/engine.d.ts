@@ -33,6 +33,10 @@ import type { RelayPool } from '../relay-pool.js';
 export type PeerGatewayState = 'unconfigured' | 'connecting' | 'pending-approval' | 'authorized' | 'mismatch' | 'paused' | 'revoked' | 'incompatible' | 'offline';
 export type PeerMemberState = 'eligible' | 'identity-mismatch' | 'disabled';
 export type PeerMemberPath = 'lan' | 'p2p' | 'relay' | 'blocked' | 'none';
+/** Why a direct path sits demoted on relay: smoothed RTT over the gateway cap,
+ *  the direct path itself failing (unanswered keepalives / stalled ARQ), or the
+ *  peer's WS demote beacon. Only `rtt-cap` may be rendered as "over the cap". */
+export type PeerDirectDemoteReason = 'rtt-cap' | 'path-lost' | 'peer-relay';
 export interface PeerEnginePeerStatus {
     nodeId: string;
     name: string;
@@ -43,8 +47,10 @@ export interface PeerEnginePeerStatus {
     /** T5：直连实测 RTT 的 EWMA（α=0.3，四舍五入）；从未测得为 null。
      *  与 `rttMs` 口径不同——它只描述 UDP 链路质量，降级为中转后仍如实上报。 */
     directRttMs: number | null;
-    /** T5：RTT 超上限被降级到中转（首样本被拒或直连中持续超标），恢复后回 false。 */
+    /** T5：直连被降级到中转（RTT 超上限、直连失效或对端降级信标），恢复后回 false。 */
     directDemoted: boolean;
+    /** 降级原因；未降级为 null。只有 `rtt-cap` 才能呈现为「超过上限」。 */
+    directDemoteReason: PeerDirectDemoteReason | null;
     /** T2：该对端在 welcome.peers / peer-joined 上报的插件版本号，缺省或旧端为 null。 */
     pluginVersion: string | null;
 }

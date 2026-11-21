@@ -76,6 +76,10 @@ export type PeerGatewayState =
 
 export type PeerMemberState = 'eligible' | 'identity-mismatch' | 'disabled'
 export type PeerMemberPath = 'lan' | 'p2p' | 'relay' | 'blocked' | 'none'
+/** Why a direct path sits demoted on relay: smoothed RTT over the gateway cap,
+ *  the direct path itself failing (unanswered keepalives / stalled ARQ), or the
+ *  peer's WS demote beacon. Only `rtt-cap` may be rendered as "over the cap". */
+export type PeerDirectDemoteReason = 'rtt-cap' | 'path-lost' | 'peer-relay'
 
 export interface PeerEnginePeerStatus {
   nodeId: string
@@ -87,8 +91,10 @@ export interface PeerEnginePeerStatus {
   /** T5：直连实测 RTT 的 EWMA（α=0.3，四舍五入）；从未测得为 null。
    *  与 `rttMs` 口径不同——它只描述 UDP 链路质量，降级为中转后仍如实上报。 */
   directRttMs: number | null
-  /** T5：RTT 超上限被降级到中转（首样本被拒或直连中持续超标），恢复后回 false。 */
+  /** T5：直连被降级到中转（RTT 超上限、直连失效或对端降级信标），恢复后回 false。 */
   directDemoted: boolean
+  /** 降级原因；未降级为 null。只有 `rtt-cap` 才能呈现为「超过上限」。 */
+  directDemoteReason: PeerDirectDemoteReason | null
   /** T2：该对端在 welcome.peers / peer-joined 上报的插件版本号，缺省或旧端为 null。 */
   pluginVersion: string | null
 }
@@ -219,8 +225,10 @@ interface MemberRec {
   directSmoothedRtt: number | null
   /** 降级后连续 ≤ cap×0.7 的样本计数，满 3 升回直连。 */
   directGoodStreak: number
-  /** RTT 超上限被降级到中转。 */
+  /** 直连被降级到中转。 */
   directDemoted: boolean
+  /** 降级原因，与 directDemoted 同生同灭。 */
+  directDemoteReason: PeerDirectDemoteReason | null
   /** mux 当前是否走 UDP（降级中 keepalive 继续采样但不承载流量）。 */
   directActive: boolean
   /** 连续未回 PING 数；收到匹配样本/丢直连/重锚归零，满 2 按一次超限样本处理。 */
@@ -477,6 +485,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directSmoothedRtt = null
     member.directGoodStreak = 0
     member.directDemoted = false
+    member.directDemoteReason = null
     member.directActive = false
     member.directMissedPings = 0
     member.lastArqWindow = null
@@ -532,6 +541,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         directSmoothedRtt: null,
         directGoodStreak: 0,
         directDemoted: false,
+        directDemoteReason: null,
         directActive: false,
         directMissedPings: 0,
         lastConnSeq: null,
@@ -1203,6 +1213,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directSmoothedRtt = null
     member.directGoodStreak = 0
     member.directDemoted = false
+    member.directDemoteReason = null
     member.directActive = false
     member.directMissedPings = 0
     member.lastArqWindow = null
@@ -1261,18 +1272,20 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.path = mode
     member.directActive = true
     member.directDemoted = false
+    member.directDemoteReason = null
     member.directGoodStreak = 0
     log(`peer engine: direct ${member.nodeId} rtt ok — switching to ${member.path}`)
     schedulePathReport()
   }
 
   /** 降级回中转的单一出口：超上限样本与连 miss 都走这里。 */
-  const demoteDirect = (member: MemberRec, why: string): void => {
+  const demoteDirect = (member: MemberRec, reason: PeerDirectDemoteReason, why: string): void => {
     applyArqProfile(member, 'relay', true)
     mux?.setRelayPath(member.nodeId, true)
     member.path = 'relay'
     member.directActive = false
     member.directDemoted = true
+    member.directDemoteReason = reason
     member.directGoodStreak = 0
     log(`peer engine: direct ${member.nodeId} ${why} — relaying`)
     schedulePathReport()
@@ -1286,7 +1299,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directMissedPings += 1
     if (member.directMissedPings < 2) return
     if (member.directActive) {
-      demoteDirect(member, 'keepalive unanswered ×2')
+      demoteDirect(member, 'path-lost', 'keepalive unanswered ×2')
     } else {
       member.directGoodStreak = 0
     }
@@ -1310,7 +1323,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     }
     if (member.directActive) {
       if (rtt > cap && prevSmoothed !== null && prevSmoothed > cap) {
-        demoteDirect(member, `rtt ${rtt}ms over cap ${cap}ms`)
+        demoteDirect(member, 'rtt-cap', `rtt ${rtt}ms over cap ${cap}ms`)
         return
       }
       if (member.directMode === 'p2p') applyArqProfile(member, 'p2p', false)
@@ -1336,6 +1349,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directGoodStreak = 0
     if (!member.directDemoted && rtt > cap) {
       member.directDemoted = true
+      member.directDemoteReason = 'rtt-cap'
       member.path = 'relay'
       log(`peer engine: direct ${member.nodeId} rtt ${rtt}ms over cap ${cap}ms — relaying`)
       schedulePathReport()
@@ -1354,6 +1368,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directSmoothedRtt = null
     member.directGoodStreak = 0
     member.directDemoted = false
+    member.directDemoteReason = null
     member.directActive = false
     member.directMissedPings = 0
     member.peerRelayHoldUntil = 0
@@ -1455,7 +1470,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         if (stopped) return
         const m = members.get(peerNodeId.toLowerCase())
         if (m !== undefined && m.state === 'eligible' && m.directActive) {
-          demoteDirect(m, 'direct arq stalled')
+          demoteDirect(m, 'path-lost', 'direct arq stalled')
         }
       },
       onPathChanged: (peerNodeId, path) => {
@@ -1470,6 +1485,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         member.path = 'relay'
         member.directActive = false
         member.directDemoted = true
+        member.directDemoteReason = 'peer-relay'
         member.directGoodStreak = 0
         member.peerRelayHoldUntil = clock.now() + 30_000
         applyArqProfile(member, 'relay', true)
@@ -1730,6 +1746,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           directRttMs:
             member.directSmoothedRtt === null ? null : Math.round(member.directSmoothedRtt),
           directDemoted: member.directDemoted,
+          directDemoteReason: member.directDemoted ? member.directDemoteReason : null,
           pluginVersion: member.pluginVersion,
         })
       }

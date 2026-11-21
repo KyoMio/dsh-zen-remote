@@ -71,6 +71,7 @@ import {
   normalizePairingCode,
   shouldReloadAfterClientActivation,
   shouldShowPeerVersionPrompt,
+  isRttCapDemotion,
   type PeerStatusDeviceView,
   type PeerStatusView,
 } from '../../client-data/settings-form.ts'
@@ -344,9 +345,9 @@ function PeerDeviceRow(props: {
           data-live={usable ? 'true' : undefined}
           data-invalid={device.path === 'mismatch' ? 'true' : undefined}
         >
-          {/* A demoted peer names the measured RTT and the cap it crossed
-              (T6); without a measurement the plain relay copy stands. */}
-          {device.directDemoted && device.directRttMs !== null
+          {/* A cap-demoted peer names the measured RTT and the cap it crossed
+              (T6); a lost direct path or no measurement reads plain relay. */}
+          {isRttCapDemotion(device)
             ? t('wizard.peer.devicePathRelayDemoted', { rtt: String(device.directRttMs), cap })
             : peerDevicePathCopyOf(device.path, t)}
         </span>

@@ -712,6 +712,7 @@ function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Re
     rttMs: peer.rttMs,
     directRttMs: peer.directRttMs,
     directDemoted: peer.directDemoted,
+    directDemoteReason: peer.directDemoteReason,
     ...(peer.pluginVersion !== undefined ? { pluginVersion: peer.pluginVersion } : {}),
   }))
   const gatewayOrigin = options.getPeerNetworkOrigin?.()
