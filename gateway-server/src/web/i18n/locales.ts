@@ -24,6 +24,7 @@ export type TranslateFn = (key: LocaleKey, vars?: TranslateVars) => string;
 export const LOCALE_STORAGE_KEY = 'zen-remote-console.locale';
 
 export const ZH = {
+  'error.invalidRequest': '请检查输入内容；需要验证码时，请输入邮件中的 6 位数字验证码',
   'app.title': 'Zen Remote 网关',
   'app.loading': '加载中…',
   'view.networks': '网络管理',
@@ -500,6 +501,7 @@ export const ZH = {
 } as const;
 
 export const EN: Record<LocaleKey, string> = {
+  'error.invalidRequest': 'Please check your input; when verification is required, enter the 6-digit code from your email',
   'app.title': 'Zen Remote Gateway',
   'app.loading': 'Loading…',
   'view.networks': 'Networks',
