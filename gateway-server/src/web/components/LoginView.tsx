@@ -12,7 +12,7 @@
 // 本文件还导出 PasswordField / OtpInput / useResendCooldown 三个小共用件：
 // GC-8 文件白名单只允许改 4 个文件，无法新增共享模块，账号设置弹窗
 // （AccountSettingsModal.tsx）直接从这里 import 同一份实现。
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties, FormEvent } from 'react';
 
 import type { Locale, LocaleKey, TranslateFn } from '../i18n/locales';
@@ -35,7 +35,7 @@ export interface LoginViewProps {
   /** 提交登录 / 注册 / 重置密码；返回是否成功（找回成功由本组件展示 resetDone 并回登录态） */
   onSubmit: (mode: LoginMode, email: string, password: string, otpCode?: string) => Promise<boolean>;
   /** 发送 6 位验证码（POST /auth/send-otp）；失败返回 null（错因已写入 errorKey） */
-  onSendOtp: (purpose: 'signup' | 'reset_password', email: string) => Promise<{ sent: boolean; cooldownSec: number } | null>;
+  onSendOtp: (purpose: 'signup' | 'reset_password', email: string, isCurrent: () => boolean) => Promise<{ sent: boolean; cooldownSec: number } | null>;
   theme: 'light' | 'dark';
   locale: Locale;
   onToggleTheme: () => void;
@@ -209,6 +209,7 @@ export function LoginView(props: LoginViewProps) {
 
   const [otpCode, setOtpCode] = useState('');
   const [codeHint, setCodeHint] = useState<LocaleKey | null>(null);
+  const sendCodeSeq = useRef(0);
   const cooldown = useResendCooldown();
   const [newPassword, setNewPassword] = useState('');
   const [resetDone, setResetDone] = useState(false);
@@ -218,6 +219,7 @@ export function LoginView(props: LoginViewProps) {
 
   /** 切态整理：验证码/倒计时/已发送提示/找回草稿跟着当前态作废（服务端冷却仍兜底） */
   const resetTransients = (): void => {
+    sendCodeSeq.current += 1;
     setOtpCode('');
     setCodeHint(null);
     cooldown.reset();
@@ -248,6 +250,8 @@ export function LoginView(props: LoginViewProps) {
 
   /** 换邮箱 = 换收件地址：旧验证码、已发送提示与冷却一并作废 */
   const handleEmailInput = (value: string): void => {
+    sendCodeSeq.current += 1;
+    onDismissError();
     if (codeHint !== null) setCodeHint(null);
     if (cooldown.seconds > 0) cooldown.reset();
     if (otpCode !== '') setOtpCode('');
@@ -255,7 +259,10 @@ export function LoginView(props: LoginViewProps) {
   };
 
   const handleSendCode = async (): Promise<void> => {
-    const result = await onSendOtp(mode === 'forgot' ? 'reset_password' : 'signup', email);
+    const seq = ++sendCodeSeq.current;
+    const isCurrent = (): boolean => seq === sendCodeSeq.current;
+    const result = await onSendOtp(mode === 'forgot' ? 'reset_password' : 'signup', email, isCurrent);
+    if (!isCurrent()) return;
     if (result !== null) {
       setCodeHint('auth.codeSent');
       cooldown.start(result.cooldownSec);

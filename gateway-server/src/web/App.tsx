@@ -495,13 +495,14 @@ export function App() {
     async (
       purpose: 'signup' | 'reset_password',
       email: string,
+      isCurrent: () => boolean,
     ): Promise<{ sent: boolean; cooldownSec: number } | null> => {
       setAuthBusy(true);
       setAuthError(null);
       try {
         return await client.sendOtp({ email, purpose, locale });
       } catch (err) {
-        setAuthError(authErrorToKey(err));
+        if (isCurrent()) setAuthError(authErrorToKey(err));
         return null;
       } finally {
         setAuthBusy(false);
