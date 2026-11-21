@@ -290,7 +290,7 @@ describe('静态托管：编译后的控制台', () => {
       assert.equal(Number(viewportOptions.get('initial-scale')), 1);
       const maximumScale = viewportOptions.get('maximum-scale');
       assert.ok(maximumScale === undefined || Number(maximumScale) >= 2);
-      assert.notEqual(viewportOptions.get('user-scalable'), 'no');
+      assert.ok(!['no', '0'].includes(viewportOptions.get('user-scalable')));
 
       // HEAD 同样 200 且无响应体
       const head = await fetch(gw.base + '/', { method: 'HEAD' });
