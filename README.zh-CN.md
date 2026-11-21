@@ -77,7 +77,7 @@
 
 ## 1. 安装
 
-英文安装说明见 [Install](README.md#1-install)。
+也可查看[英文安装说明](README.md#1-install)。
 
 ### 界面一键安装（推荐，桌面端 App 与 Web 端通用）
 
