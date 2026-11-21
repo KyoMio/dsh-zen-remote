@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useState } from 'react'
 import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import { IconPanelLeftOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import { NS } from './locales.ts'
+import { collapseInitialLandscapePanels, LANDSCAPE_PHONE_QUERY } from './sidebar-panels.ts'
 
 /** Full props for the shell overlay entry. */
 export interface MobileNavOverlayProps extends PropsRuntime<'shell.overlay'>, PropsLocale<typeof NS> {
@@ -51,6 +52,7 @@ function findFrame(): HTMLElement | null {
 export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
   const mobile = useMedia(MOBILE_QUERY)
   const tablet = useMedia(TABLET_QUERY)
+  const landscapePhone = useMedia(LANDSCAPE_PHONE_QUERY)
   const [open, setOpen] = useState(false)
   const [fabVisible, setFabVisible] = useState(false)
 
@@ -74,6 +76,12 @@ export function MobileNavOverlay({ toggleSidebar, t }: MobileNavOverlayProps) {
       frame.removeAttribute('data-mobile-preview-full')
     }
   }, [mobile])
+
+  useLayoutEffect(() => {
+    if (!landscapePhone || document.documentElement.dataset.lanDevice === 'desktop') return
+    const rightbar = findFrame()?.querySelector<HTMLElement>('[data-rightbar-col]')
+    if (rightbar) return collapseInitialLandscapePanels(rightbar)
+  }, [landscapePhone])
 
   // The floating button is a fallback for surfaces without a session header:
   // phase "active" means the header (and its toggle) is rendered already.

@@ -34,6 +34,7 @@ export declare const OFFICIAL_PANEL = "[data-sidebar-right-panel]";
 export declare const OFFICIAL_PANEL_OPEN = "[data-sidebar-right-panel][data-sidebar-right-open]";
 export declare const OFFICIAL_EXPAND = "[data-sidebar-right-expand]";
 export declare const OFFICIAL_COLLAPSE = "[data-sidebar-right-toggle]";
+export declare const LANDSCAPE_PHONE_QUERY = "(min-width: 768px) and (max-width: 1023px) and (max-height: 500px) and (orientation: landscape) and (pointer: coarse)";
 export declare const BETTER_ROOT = "[data-dsh-better-sidebar]";
 export declare const BETTER_TOGGLE = "[data-dsh-better-sidebar] button[class$=\"_toggleButton\"]";
 export declare const BETTER_PANEL_OPEN = "[data-dsh-better-sidebar] [class$=\"_panel\"]";
@@ -60,4 +61,6 @@ export declare function toggleSidebarTarget(target: SidebarTarget): void;
  * clicking it blind against a closed panel would REOPEN it).
  */
 export declare function closeOpenSidebar(): boolean;
+/** Start with the chat on a short landscape screen; leave later tool opens alone. */
+export declare function collapseInitialLandscapePanels(rightbar: HTMLElement): () => void;
 //# sourceMappingURL=sidebar-panels.d.ts.map

@@ -129,6 +129,16 @@ test('gateway pairing page: DSH-styled shell with the proxied logo and the origi
   }
 })
 
+test('gateway pairing page: shows the settings hint once in each language', async () => {
+  for (const [lang, settings] of [['en', 'DSH Plugins page'], ['zh-CN', 'DSH「插件」页']]) {
+    const page = await request(SHARED_PORT, { path: '/', headers: { ...REMOTE_HEADERS, 'accept-language': lang } })
+    assert.strictEqual(page.status, 401)
+    const visibleHtml = page.body.split('<script>')[0]
+    assert.ok(visibleHtml.match(/<p class="sub">[^<]+<\/p>/)?.[0].includes(settings), lang)
+    assert.strictEqual(visibleHtml.split(settings).length - 1, 1, lang)
+  }
+})
+
 test('gateway logo proxy (T71-fix): response headers are whitelisted, 200 carries CSP + nosniff; POST 405, HEAD bodyless', async () => {
   sharedHandler = (_req, res) => {
     res.writeHead(200, { 'Content-Type': 'image/svg+xml', 'Set-Cookie': 'up=1', 'X-Up-Leak': 'yes', 'Cache-Control': 'no-store' })
