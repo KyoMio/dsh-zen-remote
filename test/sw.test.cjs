@@ -9,7 +9,7 @@
  * ALL JS/CSS (including the DSH client bundle and plugin client bundles)
  * stale-first, so a phone that had the PWA open across a deploy kept
  * showing yesterday's cached CSS under today's freshly network-fetched HTML.
- * v4 only cache-firsts the true static shell (manifest/icons/offline
+ * The worker only cache-firsts the true static shell (manifest/icons/offline
  * fallback) plus content-addressed URLs (Vite filename hash, DSH's
  * ?rev=<content hash> plugin batches); everything else stays network-first.
  */
@@ -21,6 +21,7 @@ const path = require('node:path')
 const vm = require('node:vm')
 
 const SW_SOURCE = fs.readFileSync(path.join(__dirname, '..', 'pwa', 'sw.js'), 'utf8')
+const OFFLINE_PAGE = fs.readFileSync(path.join(__dirname, '..', 'pwa', 'offline.html'), 'utf8')
 const ORIGIN = 'https://x.test'
 
 function loadSw(fetchImpl, opts) {
@@ -40,7 +41,9 @@ function loadSw(fetchImpl, opts) {
           if (o.putHangs) return new Promise(() => {})
           store.set(keyOf(reqOrKey), res)
         },
-        addAll: async (urls) => { for (const u of urls) store.set(u, { ok: true, seeded: true }) }
+        addAll: async (urls) => {
+          for (const u of urls) store.set(u, u === '/pwa/offline.html' ? new Response(OFFLINE_PAGE) : { ok: true })
+        }
       }
     },
     keys: async () => Array.from(cacheStores.keys())
@@ -57,6 +60,7 @@ function loadSw(fetchImpl, opts) {
   }
   const self = {
     location: { origin: ORIGIN },
+    skipWaiting() {},
     addEventListener: (type, fn) => { listeners[type] = fn }
   }
   const context = vm.createContext({ self, caches, fetch: fetchFn, URL, Set, Response, console })
@@ -265,21 +269,27 @@ test('sw: DSH bundle asset falls back to the cache only when the network is actu
   assert.strictEqual(networkCalls, 2, 'network was retried, not skipped')
 })
 
-test('sw: HTML navigation is network-first, falling back to the last successfully loaded page offline', async () => {
-  let networkCalls = 0
+test('sw: warm navigation serves the precached offline page and recovers at the same URL', async () => {
+  let online = true
   const sw = loadSw(async () => {
-    networkCalls++
-    if (networkCalls === 1) return { ok: true, marker: 'page-v1' }
-    throw new Error('offline')
+    if (!online) throw new Error('offline')
+    return new Response('<h1>Session page</h1>')
   })
-  const req = { method: 'GET', url: ORIGIN + '/', mode: 'navigate' }
+  let installed
+  sw.listeners.install({ waitUntil: (p) => { installed = p } })
+  await installed
+  const req = { method: 'GET', url: ORIGIN + '/sessions/one', mode: 'navigate' }
+  assert.strictEqual(await (await dispatchFetch(sw, req)).text(), '<h1>Session page</h1>')
+  assert.deepStrictEqual(sw.putCalls, [], 'live navigation HTML must not be cached')
 
-  const res1 = await dispatchFetch(sw, req)
-  assert.strictEqual(res1.marker, 'page-v1')
+  online = false
+  const offline = await (await dispatchFetch(sw, req)).text()
+  assert.strictEqual(offline, OFFLINE_PAGE)
+  assert.match(offline, /<h1>Offline<\/h1>/)
 
-  const res2 = await dispatchFetch(sw, req)
-  assert.strictEqual(res2.marker, 'page-v1', 'offline nav served the last-good page from cache')
-  assert.strictEqual(networkCalls, 2, 'still tried the network first on the second request')
+  online = true
+  assert.strictEqual(await (await dispatchFetch(sw, req)).text(), '<h1>Session page</h1>')
+  assert.ok(sw.fetchCalls.every((url) => url === req.url), 'fallback does not redirect the original route')
 })
 
 test('sw: HTML navigation falls back to the built-in offline hint when nothing is cached yet', async () => {
@@ -288,6 +298,7 @@ test('sw: HTML navigation falls back to the built-in offline hint when nothing i
 
   const res = await dispatchFetch(sw, req)
   const text = await res.text()
+  assert.match(text, /<h1>Offline<\/h1>/, 'built-in fallback renders an explicit offline heading')
   assert.match(text, /location\.reload/, 'built-in offline hint served, and it retries on its own')
 })
 
@@ -328,4 +339,3 @@ test('sw: push notification uses monochrome badge-96.png for badge and icon-192.
   assert.strictEqual(calls[0].options.icon, '/pwa/icons/icon-192.png')
   assert.strictEqual(calls[0].options.badge, '/pwa/icons/badge-96.png')
 })
-

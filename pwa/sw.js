@@ -16,8 +16,8 @@
  *    app.css/inject.js/touch-gestures.js, API calls, fonts, images) ->
  *    network-first, falling back to cache only when the network fetch
  *    actually fails (offline).
- *  - SPA navigations (HTML doc) -> network-first, falling back to the last
- *    successfully loaded page when offline.
+ *  - SPA navigations (HTML doc) -> network-first, falling back to a
+ *    dedicated offline page rather than booting DSH without its server.
  *
  * v2 treated ALL JS/CSS/fonts/images as cache-first-ish (stale-while-
  * revalidate: serve the cached copy immediately, refresh in the background).
@@ -34,8 +34,9 @@
  */
 'use strict'
 
-const SHELL_CACHE = 'dsh-mobile-pwa-shell-v4'
+const SHELL_CACHE = 'dsh-mobile-pwa-shell-v5'
 const RUNTIME_CACHE = 'dsh-mobile-pwa-runtime-v4'
+const OFFLINE_PATH = '/pwa/offline.html'
 
 const SHELL_PATHS = new Set([
   '/pwa/manifest.json',
@@ -43,7 +44,7 @@ const SHELL_PATHS = new Set([
   '/pwa/icons/icon-192.png',
   '/pwa/icons/icon-512.png',
   '/pwa/icons/icon-maskable-512.png',
-  '/pwa/offline.html'
+  OFFLINE_PATH
 ])
 
 // A Vite content hash in the filename (/assets/index-CN7NIWNw.js, hashed
@@ -107,13 +108,7 @@ const T = (String((typeof navigator !== 'undefined' && navigator.language) || ''
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(SHELL_CACHE).then((cache) => cache.addAll([
-      '/pwa/manifest.json',
-      '/pwa/icons/badge-96.png',
-      '/pwa/icons/icon-192.png',
-      '/pwa/icons/icon-512.png',
-      '/pwa/icons/icon-maskable-512.png'
-    ]))
+    caches.open(SHELL_CACHE).then((cache) => cache.addAll([...SHELL_PATHS]))
   )
   // Safe to activate immediately: this worker only decides how *future*
   // fetches are served (cache-first for the static shell and content-addressed
@@ -154,6 +149,13 @@ self.addEventListener('fetch', (event) => {
   // Same-origin only; we only manage the DSH origin behind the gateway.
   if (url.origin !== self.location.origin) return
 
+  // Navigations must always retry the network, even after showing the
+  // offline page. Its URL is otherwise a cache-first shell asset.
+  if (req.mode === 'navigate') {
+    event.respondWith(networkFirstNavigation(req))
+    return
+  }
+
   // 1. True static shell -> cache-first.
   if (req.method === 'GET' && SHELL_PATHS.has(url.pathname)) {
     event.respondWith(cacheFirst(req, SHELL_CACHE))
@@ -169,14 +171,7 @@ self.addEventListener('fetch', (event) => {
     return
   }
 
-  // 3. HTML navigations -> network-first with offline fallback to the last
-  //    successfully loaded page.
-  if (req.mode === 'navigate') {
-    event.respondWith(networkFirstNavigation(req))
-    return
-  }
-
-  // 4. Everything else same-origin GET -> network-first. Unhashed JS/CSS,
+  // 3. Everything else same-origin GET -> network-first. Unhashed JS/CSS,
   //    API calls, fonts and images can change on any deploy without their
   //    URL changing, so the server's current copy always wins; the cache
   //    only serves them when offline.
@@ -225,17 +220,14 @@ async function networkFirst(req, cacheName) {
 }
 
 async function networkFirstNavigation(req) {
-  const cache = await caches.open(SHELL_CACHE)
   try {
-    const res = await fetch(req)
-    if (res && res.ok) cache.put('/pwa/offline.html', res.clone())
-    return res
+    return await fetch(req)
   } catch (err) {
-    const cached = await cache.match('/pwa/offline.html')
+    const cached = await caches.open(SHELL_CACHE).then((cache) => cache.match(OFFLINE_PATH)).catch(() => undefined)
     if (cached) return cached
     // Last resort: offline fallback hint.
     return new Response(
-      '<!doctype html><meta charset="utf-8"><title>' + T.offlineTitle + '</title><style>body{font-family:system-ui;background:#0f1115;color:#e6e8ec;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}p{max-width:24em;text-align:center;line-height:1.7}</style><script>setInterval(()=>location.reload(),4000)</script><p>' + T.offlineBody + '</p>',
+      '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>' + T.offlineTitle + '</title><style>body{font-family:system-ui;background:#0f1115;color:#e6e8ec;display:grid;place-content:center;min-height:100vh;margin:0;padding:0 16px;text-align:center}p{max-width:24em;line-height:1.7}</style><script>setInterval(()=>location.reload(),4000)</script><h1>' + T.offlineTitle + '</h1><p>' + T.offlineBody + '</p>',
       { headers: { 'Content-Type': 'text/html; charset=utf-8' } }
     )
   }

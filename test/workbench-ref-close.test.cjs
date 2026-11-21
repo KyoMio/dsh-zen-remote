@@ -126,3 +126,51 @@ test('installWorkbenchRefClose: capture-phase tap on _explorerRef defers closeOp
   stop()
   assert.equal(state.listeners.length, 0)
 })
+
+test('landscape entry collapses each visible initial panel without swallowing deliberate tool opens', async (t) => {
+  const { collapseInitialLandscapePanels, OFFICIAL_PANEL, OFFICIAL_PANEL_OPEN, OFFICIAL_COLLAPSE } = await loadPanels()
+  const panels = []
+  const rightbar = { querySelectorAll: (selector) => selector === OFFICIAL_PANEL ? panels : [] }
+  let onMutation
+  const previous = Object.getOwnPropertyDescriptor(globalThis, 'MutationObserver')
+  Object.defineProperty(globalThis, 'MutationObserver', { configurable: true, value: class {
+    constructor(callback) { onMutation = callback }
+    observe() {}
+    disconnect() { onMutation = undefined }
+  } })
+  t.after(() => {
+    if (previous) Object.defineProperty(globalThis, 'MutationObserver', previous)
+    else delete globalThis.MutationObserver
+  })
+  const makePanel = ({ open, hidden = false }) => ({
+    open, hidden, clicks: 0,
+    closest(selector) { return selector === '[hidden]' && this.hidden ? this : null },
+    matches(selector) { return selector === OFFICIAL_PANEL_OPEN && this.open },
+    querySelector(selector) {
+      return selector === OFFICIAL_COLLAPSE && this.open ? { click: () => { this.clicks++; this.open = false } } : null
+    },
+  })
+  const original = makePanel({ open: true })
+  const inactive = makePanel({ open: true, hidden: true })
+  panels.push(original, inactive)
+  const stop = collapseInitialLandscapePanels(rightbar)
+  assert.equal(original.open, false)
+  assert.equal(inactive.open, true, 'do not change another session’s hidden panel')
+
+  original.open = true
+  onMutation()
+  assert.equal(original.clicks, 1, 'manual reopen stays open')
+
+  inactive.hidden = false
+  onMutation()
+  assert.equal(inactive.open, false, 'first viewing another session also leaves chat available')
+
+  const lateClosed = makePanel({ open: false })
+  panels.push(lateClosed)
+  onMutation()
+  lateClosed.open = true
+  onMutation()
+  assert.equal(lateClosed.clicks, 0, 'a panel that began closed stays manually openable')
+  stop()
+  assert.equal(onMutation, undefined)
+})

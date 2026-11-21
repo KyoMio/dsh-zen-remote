@@ -35,6 +35,7 @@ export const OFFICIAL_PANEL = '[data-sidebar-right-panel]'
 export const OFFICIAL_PANEL_OPEN = '[data-sidebar-right-panel][data-sidebar-right-open]'
 export const OFFICIAL_EXPAND = '[data-sidebar-right-expand]'
 export const OFFICIAL_COLLAPSE = '[data-sidebar-right-toggle]'
+export const LANDSCAPE_PHONE_QUERY = '(min-width: 768px) and (max-width: 1023px) and (max-height: 500px) and (orientation: landscape) and (pointer: coarse)'
 
 export const BETTER_ROOT = '[data-dsh-better-sidebar]'
 export const BETTER_TOGGLE = '[data-dsh-better-sidebar] button[class$="_toggleButton"]'
@@ -96,4 +97,28 @@ export function closeOpenSidebar(): boolean {
     return true
   }
   return false
+}
+
+/** Start with the chat on a short landscape screen; leave later tool opens alone. */
+export function collapseInitialLandscapePanels(rightbar: HTMLElement): () => void {
+  const visited = new WeakSet<HTMLElement>()
+  const sync = () => {
+    for (const panel of rightbar.querySelectorAll<HTMLElement>(OFFICIAL_PANEL)) {
+      if (visited.has(panel) || panel.closest('[hidden]')) continue
+      const open = panel.matches(OFFICIAL_PANEL_OPEN)
+      const collapse = open ? panel.querySelector<HTMLButtonElement>(OFFICIAL_COLLAPSE) : null
+      if (open && !collapse) continue
+      visited.add(panel)
+      collapse?.click()
+    }
+  }
+  const observer = new MutationObserver(sync)
+  observer.observe(rightbar, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ['hidden', 'data-sidebar-right-open'],
+  })
+  sync()
+  return () => observer.disconnect()
 }
