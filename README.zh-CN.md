@@ -77,6 +77,8 @@
 
 ## 1. 安装
 
+英文安装说明见 [Install](README.md#1-install)。
+
 ### 界面一键安装（推荐，桌面端 App 与 Web 端通用）
 
 打开 DSH 左侧**「插件」**页 → 点击**「添加插件」**→ 输入 `dsh-zen-remote` → 安装完成后点击**「立即启用」**，然后重启 DSH 桌面端 App（或 `dsh web`）。
