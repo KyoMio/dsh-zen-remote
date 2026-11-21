@@ -572,6 +572,32 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
     await closeServer(smtp.server);
   });
 
+  test('signup accepts the emailed otpCode and creates an authenticated session', async () => {
+    const email = 'console-signup@example.com';
+    const policy = await api(handle.base, 'GET', '/api/v1/auth/me');
+    assert.equal(policy.json.data.requireEmailVerification, true);
+    assert.equal(policy.json.data.smtpConfigured, true);
+    const sent = await api(handle.base, 'POST', '/api/v1/auth/send-otp', {
+      body: { email, purpose: 'signup', locale: 'zh' },
+    });
+    assert.equal(sent.status, 200);
+    const otpCode = otpFromMessage(smtp.state.messages.at(-1));
+    const wrong = await api(handle.base, 'POST', '/api/v1/auth/signup', {
+      body: { email, password: PASSWORD, otpCode: wrongCode(otpCode) },
+    });
+    assertEnvelopeError(wrong.json, 'OTP_INVALID');
+    const signup = await api(handle.base, 'POST', '/api/v1/auth/signup', {
+      body: { email, password: PASSWORD, otpCode },
+    });
+    assert.equal(signup.status, 200);
+    assert.ok(signup.json.data.user.emailVerifiedAt);
+    const me = await api(handle.base, 'GET', '/api/v1/auth/me', { cookie: sessionCookie(signup) });
+    assert.equal(me.json.data.authenticated, true);
+    assert.equal(me.json.data.user.email, email);
+    smtp.state.messages.length = 0;
+    otpSendRateLimiter.clear();
+  });
+
   test('缺码/非法格式 400；send-otp → 冷却 → 错 5 次锁定 → 重签注册成功 & /auth/me 带配额 → 已验证邮箱 409', async () => {
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: EMAIL, password: PASSWORD } })).status, 400);
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: EMAIL, password: PASSWORD, otpCode: '12ab56' } })).status, 400);

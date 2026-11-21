@@ -72,6 +72,8 @@ function readStoredLocale(): Locale {
 function authErrorToKey(err: unknown): LocaleKey {
   const code = err instanceof ConsoleApiError ? err.code : '';
   switch (code) {
+    case 'INVALID_REQUEST':
+      return 'error.invalidRequest';
     case 'INVALID_CREDENTIALS':
       return 'error.invalidCredentials';
     case 'ACCOUNT_DISABLED':
@@ -493,13 +495,14 @@ export function App() {
     async (
       purpose: 'signup' | 'reset_password',
       email: string,
+      isCurrent: () => boolean,
     ): Promise<{ sent: boolean; cooldownSec: number } | null> => {
       setAuthBusy(true);
       setAuthError(null);
       try {
         return await client.sendOtp({ email, purpose, locale });
       } catch (err) {
-        setAuthError(authErrorToKey(err));
+        if (isCurrent()) setAuthError(authErrorToKey(err));
         return null;
       } finally {
         setAuthBusy(false);
