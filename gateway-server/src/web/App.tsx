@@ -196,17 +196,19 @@ export function App() {
   }, []);
 
   const refreshNetworks = useCallback(async (): Promise<void> => {
+    const sequence = store.beginNetworkRefresh();
     try {
-      store.setNetworks(await client.listNetworks());
+      store.applyNetworkRefresh(sequence, await client.listNetworks());
     } catch {
       /* 列表拉取失败不打断视图；下一次动作或 SSE 会补 */
     }
   }, []);
 
   const refreshTopology = useCallback(async (networkId: string): Promise<void> => {
+    const sequence = store.beginTopologyRefresh(networkId);
     try {
       const snapshot = await client.fetchTopology(networkId);
-      if (snapshot !== null) store.applyTopologySnapshot(snapshot);
+      if (snapshot !== null) store.applyTopologyRefresh(sequence, snapshot);
     } catch {
       /* SSE 推送会补 */
     }
@@ -273,12 +275,8 @@ export function App() {
     } catch {
       /* 会话刷新失败不致命：下一次动作或轮询会补 */
     }
-    try {
-      store.setNetworks(await client.listNetworks());
-    } catch {
-      /* 列表刷新失败不致命 */
-    }
-  }, [refreshSession]);
+    await refreshNetworks();
+  }, [refreshSession, refreshNetworks]);
 
   /** 任一管理请求 401：会话已失效或权限被收回——立刻清空全部管理敏感切片
    * （零残留），再回 /auth/me 核对会话态（后端对失效会话返回匿名策略，

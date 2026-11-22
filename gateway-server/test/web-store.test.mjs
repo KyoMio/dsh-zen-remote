@@ -65,6 +65,61 @@ import {
 // ---------------------------------------------------------------- 夹具
 
 describe('console settings and device copy', () => {
+  test('only the latest-issued network refresh can replace the list', () => {
+    const store = new ConsoleStore();
+    const first = store.beginNetworkRefresh();
+    const second = store.beginNetworkRefresh();
+    store.applyNetworkRefresh(second, [makeNetworkView('home', 'B')]);
+    const current = store.getState();
+    store.applyNetworkRefresh(first, [makeNetworkView('home', 'A')]);
+    assert.equal(store.getState(), current);
+    const empty = store.beginNetworkRefresh();
+    store.applyNetworkRefresh(empty, []);
+    assert.deepEqual(store.getState().networks, []);
+  });
+
+  test('a failed latest refresh does not let an older response write the cache', () => {
+    const store = new ConsoleStore();
+    store.setNetworks([makeNetworkView('home', 'Cached')]);
+    const old = store.beginNetworkRefresh();
+    store.beginNetworkRefresh();
+    store.applyNetworkRefresh(old, [makeNetworkView('home', 'Stale')]);
+    assert.equal(store.getState().networks[0].name, 'Cached');
+  });
+
+  test('PATCH cache updates invalidate already-issued list and topology refreshes', () => {
+    const store = new ConsoleStore();
+    store.setNetworks([makeNetworkView('home', 'Old')]);
+    const list = store.beginNetworkRefresh();
+    const topology = store.beginTopologyRefresh('home');
+    store.updateNetwork(makeNetworkView('home', 'Confirmed'));
+    const current = store.getState();
+    store.applyNetworkRefresh(list, [makeNetworkView('home', 'Stale')]);
+    store.applyTopologyRefresh(topology, makeSnapshot('home'));
+    assert.equal(store.getState(), current);
+    const fresh = store.beginNetworkRefresh();
+    store.applyNetworkRefresh(fresh, [makeNetworkView('home', 'Confirmed')]);
+    assert.equal(store.getState().networks[0].name, 'Confirmed');
+  });
+
+  test('topology refresh ordering is independent per network and SSE invalidates old REST data', () => {
+    const store = new ConsoleStore();
+    const first = store.beginTopologyRefresh('home');
+    const work = store.beginTopologyRefresh('work');
+    const second = store.beginTopologyRefresh('home');
+    const latest = makeSnapshot('home', { network: { id: 'home', name: 'B', maxPeers: 12 } });
+    store.applyTopologyRefresh(second, latest);
+    store.applyTopologyRefresh(first, makeSnapshot('home'));
+    store.applyTopologyRefresh(work, makeSnapshot('work'));
+    assert.equal(store.getState().topology.home, latest);
+    assert.equal(store.getState().topology.work.network.id, 'work');
+    const pending = store.beginTopologyRefresh('home');
+    const pushed = makeSnapshot('home', { network: { id: 'home', name: 'Pushed', maxPeers: 16 } });
+    store.applyTopologySnapshot(pushed);
+    store.applyTopologyRefresh(pending, latest);
+    assert.equal(store.getState().topology.home, pushed);
+  });
+
   test('a confirmed PATCH replaces only its cached network without waiting for refresh', async () => {
     const original = makeNetworkView('home', 'Old');
     const other = makeNetworkView('work', 'Work');

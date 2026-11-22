@@ -745,6 +745,8 @@ export function deriveNetworkCounts(network: NetworkView, snapshot?: TopologySna
 export class ConsoleStore {
   private readonly listeners = new Set<() => void>();
   private state: ConsoleState = createInitialState();
+  private networkRefreshSequence = 0;
+  private readonly topologyRefreshSequences = new Map<string, number>();
 
   readonly getState = (): ConsoleState => this.state;
 
@@ -811,14 +813,34 @@ export class ConsoleStore {
   };
 
   readonly setNetworks = (networks: NetworkView[]): void => {
+    this.networkRefreshSequence += 1;
     this.setState(applyNetworks(this.state, networks));
   };
 
+  readonly beginNetworkRefresh = (): number => ++this.networkRefreshSequence;
+
+  readonly applyNetworkRefresh = (sequence: number, networks: NetworkView[]): void => {
+    if (sequence === this.networkRefreshSequence) this.setNetworks(networks);
+  };
+
   readonly updateNetwork = (network: NetworkView): void => {
+    this.networkRefreshSequence += 1;
+    this.beginTopologyRefresh(network.id);
     this.setState(applyNetwork(this.state, network));
   };
 
+  readonly beginTopologyRefresh = (networkId: string): number => {
+    const sequence = (this.topologyRefreshSequences.get(networkId) ?? 0) + 1;
+    this.topologyRefreshSequences.set(networkId, sequence);
+    return sequence;
+  };
+
+  readonly applyTopologyRefresh = (sequence: number, snapshot: TopologySnapshot): void => {
+    if (sequence === this.topologyRefreshSequences.get(snapshot.network.id)) this.applyTopologySnapshot(snapshot);
+  };
+
   readonly applyTopologySnapshot = (snapshot: TopologySnapshot): void => {
+    this.beginTopologyRefresh(snapshot.network.id);
     this.setState(applyTopologySnapshot(this.state, snapshot));
   };
 
