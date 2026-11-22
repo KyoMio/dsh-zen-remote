@@ -712,6 +712,13 @@ export function applyTopologySnapshot(state: ConsoleState, snapshot: TopologySna
   return { ...state, topology: { ...state.topology, [snapshot.network.id]: snapshot } };
 }
 
+export function topologyMembershipKey(snapshot: TopologySnapshot): string {
+  return JSON.stringify([
+    snapshot.members.map(({ nodeId, status }) => [nodeId, status]).sort(),
+    snapshot.pending.map(({ nodeId }) => nodeId).sort(),
+  ]);
+}
+
 /** 浅合并 ui 切片（组件改菜单开关、草稿等） */
 export function patchUiState(state: ConsoleState, patch: Partial<UiLocalState>): ConsoleState {
   return { ...state, ui: { ...state.ui, ...patch } };

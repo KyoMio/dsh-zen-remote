@@ -61,6 +61,7 @@ import {
   markAdminError,
   markAdminLoading,
   patchUiState,
+  topologyMembershipKey,
   removeNetwork,
   setLoggedOut,
 } from '../dist/web/store/console-store.js';
@@ -1783,6 +1784,17 @@ describe('GC-7b：quotaUsageLevel / isQuotaExceeded', () => {
     assert.equal(isQuotaExceeded(150, 100), true);
     assert.equal(isQuotaExceeded(150, null), false, '不限额永不超限');
     assert.equal(isQuotaExceeded(150, 0), false, '无效上限不算超限');
+  });
+});
+
+describe('topology membership refresh key', () => {
+  test('tracks admissions and pending transitions, not telemetry or ordering', () => {
+    const snapshot = { members: [{ nodeId: 'b', status: 'authorized', online: true }, { nodeId: 'a', status: 'paused' }], pending: [{ nodeId: 'c' }] };
+    const key = topologyMembershipKey(snapshot);
+    assert.equal(topologyMembershipKey({ ...snapshot, members: [...snapshot.members].reverse().map(m => ({ ...m, online: false, liveRelayKbps: 42 })) }), key);
+    assert.notEqual(topologyMembershipKey({ ...snapshot, members: [...snapshot.members, { nodeId: 'd', status: 'authorized' }] }), key);
+    assert.notEqual(topologyMembershipKey({ ...snapshot, members: snapshot.members.map(m => ({ ...m, status: 'authorized' })), pending: [] }), key);
+    assert.equal(topologyMembershipKey({ members: [], pending: [] }), '[[],[]]');
   });
 });
 

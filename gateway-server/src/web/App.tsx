@@ -27,7 +27,7 @@ import { TopBar } from './components/TopBar';
 import type { ViewKind } from './components/TopBar';
 import { LOCALE_STORAGE_KEY, resolveLocale, translate } from './i18n/locales';
 import type { Locale, LocaleKey, TranslateVars } from './i18n/locales';
-import { ConsoleApiError, ConsoleClient, ConsoleStore, ManagedRefreshCycle } from './store/console-store';
+import { ConsoleApiError, ConsoleClient, ConsoleStore, ManagedRefreshCycle, topologyMembershipKey } from './store/console-store';
 import type { AdminSliceKey, AdminSettingsData, AdminTlsView, MemberAction, SystemSettings, UiLocalState } from './store/console-store';
 
 const client = new ConsoleClient();
@@ -252,15 +252,28 @@ export function App() {
   useEffect(() => {
     if (!signedIn || selectedNetworkId === null) return;
     let cancelled = false;
+    let membershipKey: string | undefined;
+    let refreshTimer: ReturnType<typeof setTimeout> | undefined;
     void refreshTopology(selectedNetworkId);
     const unsubscribe = client.subscribeTopology(selectedNetworkId, (snapshot) => {
-      if (!cancelled) store.applyTopologySnapshot(snapshot);
+      if (cancelled) return;
+      store.applyTopologySnapshot(snapshot);
+      const nextKey = topologyMembershipKey(snapshot);
+      if (nextKey !== membershipKey) {
+        membershipKey = nextKey;
+        if (refreshTimer !== undefined) clearTimeout(refreshTimer);
+        refreshTimer = setTimeout(() => {
+          refreshTimer = undefined;
+          void refreshNetworks();
+        }, 250);
+      }
     });
     return () => {
       cancelled = true;
+      if (refreshTimer !== undefined) clearTimeout(refreshTimer);
       unsubscribe();
     };
-  }, [signedIn, selectedNetworkId, refreshTopology]);
+  }, [signedIn, selectedNetworkId, refreshTopology, refreshNetworks]);
 
   // ------------------------------------------------- 管理四切片（GC-10b 收口）
 
