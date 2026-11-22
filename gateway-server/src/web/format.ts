@@ -3,7 +3,44 @@
 // 浏览器半边经 tsconfig.web.json 类型检查——两边共享同一份实现。
 
 import type { Locale, TranslateFn } from './i18n/locales.js';
-import type { MemberStatus, TopologyLink, TopologyMemberRow, UserQuotaSummary } from './store/console-store.js';
+import type { MemberStatus, NetworkView, TopologyLink, TopologyMemberRow, UserQuotaSummary } from './store/console-store.js';
+
+export function missingPluginVersionLabel(member: { online?: boolean }, t: TranslateFn): string {
+  return t(member.online === true ? 'devices.pluginVersionUnknown'
+    : member.online === false ? 'devices.pluginVersionOffline' : 'devices.pluginVersionUnavailable');
+}
+
+export type NetworkSettingsValues = Pick<NetworkView, 'name' | 'maxPeers' | 'peerDirectMaxRttMs' | 'admissionMode'>;
+
+export interface NetworkSettingsDraft {
+  name: string;
+  maxPeers: string;
+  peerDirectMaxRttMs: string;
+  admissionMode: NetworkSettingsValues['admissionMode'];
+}
+
+export function buildNetworkSettingsPatch(baseline: NetworkSettingsValues, draft: NetworkSettingsDraft, peerCap: number): Partial<NetworkSettingsValues> | null {
+  const patch: Partial<NetworkSettingsValues> = {};
+  const name = draft.name.trim();
+  const peers = Number(draft.maxPeers);
+  const rtt = Number(draft.peerDirectMaxRttMs);
+  if (name !== baseline.name) patch.name = name;
+  if (peers !== baseline.maxPeers) patch.maxPeers = peers;
+  if (rtt !== baseline.peerDirectMaxRttMs || draft.peerDirectMaxRttMs.trim() === '') patch.peerDirectMaxRttMs = rtt;
+  if (draft.admissionMode !== baseline.admissionMode) patch.admissionMode = draft.admissionMode;
+  if (!validNetworkSettingsDraft(patch.name ?? baseline.name,
+    patch.maxPeers === undefined ? '2' : draft.maxPeers,
+    patch.peerDirectMaxRttMs === undefined ? '0' : draft.peerDirectMaxRttMs, peerCap)) return null;
+  return patch;
+}
+
+export function validNetworkSettingsDraft(name: string, peers: string, rtt: string, peerCap: number): boolean {
+  const count = Number(peers);
+  const latency = Number(rtt);
+  return name.trim().length >= 1 && name.trim().length <= 32
+    && Number.isInteger(count) && count >= 2 && count <= Math.min(64, peerCap)
+    && rtt.trim() !== '' && Number.isInteger(latency) && latency >= 0 && latency <= 10000;
+}
 
 /**
  * 实时中转速率：'0 KB/s'、'12 KB/s'、'1.5 MB/s'（任务单要求等宽大字展示）。
