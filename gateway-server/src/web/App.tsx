@@ -215,16 +215,16 @@ export function App() {
   // 启动：会话探测 → 已登录顺手拉网络列表
   useEffect(() => {
     let cancelled = false;
+    const sequence = store.beginSessionRefresh();
     void (async () => {
       try {
         const me = await client.fetchMe();
-        if (cancelled) return;
-        store.init(me);
+        if (cancelled || !store.applySessionRefresh(sequence, me)) return;
         if (me.authenticated) await refreshNetworks();
       } catch {
-        if (!cancelled) {
+        if (!cancelled && store.isSessionRefreshCurrent(sequence)) {
           setBootFailed(true);
-          store.init({ authenticated: false, allowSignup: false, maxNetworksPerUser: 3 });
+          store.applySessionRefresh(sequence, { authenticated: false, allowSignup: false, maxNetworksPerUser: 3 });
         }
       }
     })();
@@ -261,8 +261,9 @@ export function App() {
 
   /** 重新拉 /auth/me 落库：换绑邮箱成功后顶栏邮箱、配额摘要与弹窗即时刷新 */
   const refreshSession = useCallback(async (): Promise<void> => {
+    const sequence = store.beginSessionRefresh();
     const me = await client.fetchMe();
-    store.init(me);
+    store.applySessionRefresh(sequence, me);
   }, []);
 
   /** 管理变更后的联动刷新：/auth/me 落库（当前管理员配额与 publicPolicy）+
@@ -473,6 +474,7 @@ export function App() {
           await client.resetPassword({ email, otpCode: otpCode ?? '', newPassword: password });
           return true;
         }
+        store.invalidateSessionRefreshes();
         const result =
           mode === 'login' ? await client.login(email, password) : await client.signup(email, password, otpCode);
         // session + meta + quota + publicPolicy 一次落库（GC-7b 响应体同构）
@@ -512,6 +514,7 @@ export function App() {
   );
 
   const handleLogout = useCallback(async (): Promise<void> => {
+    store.invalidateSessionRefreshes();
     try {
       await client.logout();
     } catch {

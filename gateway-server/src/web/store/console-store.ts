@@ -740,6 +740,7 @@ export function deriveNetworkCounts(network: NetworkView, snapshot?: TopologySna
 export class ConsoleStore {
   private readonly listeners = new Set<() => void>();
   private state: ConsoleState = createInitialState();
+  private sessionRefreshSequence = 0;
 
   readonly getState = (): ConsoleState => this.state;
 
@@ -755,12 +756,27 @@ export class ConsoleStore {
     for (const listener of [...this.listeners]) listener();
   }
 
+  readonly beginSessionRefresh = (): number => ++this.sessionRefreshSequence;
+
+  readonly invalidateSessionRefreshes = (): void => {
+    this.sessionRefreshSequence += 1;
+  };
+
+  readonly isSessionRefreshCurrent = (sequence: number): boolean => sequence === this.sessionRefreshSequence;
+
+  readonly applySessionRefresh = (sequence: number, me: MeInput): boolean => {
+    if (!this.isSessionRefreshCurrent(sequence)) return false;
+    this.init(me);
+    return true;
+  };
+
   /**
    * 启动期 /auth/me（fetchMe）回来后的就绪动作：公开策略无论登录与否都写入；
    * 登录态写 session 与 quota，未登录顺手清全部业务与管理员数据。
    * 缺省字段按关闸兜底（启动降级路径 / 旧形状夹具）。
    */
   init(me: MeInput): void {
+    this.invalidateSessionRefreshes();
     // 入参容忍匿名分支缺省公开策略字段（启动降级路径）：关闸兜底 + 旧 meta 占位
     const allowSignup = me.allowSignup ?? false;
     const maxNetworksPerUser = me.maxNetworksPerUser ?? 3;
@@ -785,11 +801,13 @@ export class ConsoleStore {
   }
 
   readonly setSession = (user: PublicUser, meta: SessionMeta): void => {
+    this.invalidateSessionRefreshes();
     this.setState(applySession(this.state, user, meta));
   };
 
   /** 登录/注册响应体一次落库：session + meta + quota + publicPolicy（GC-7b） */
   readonly applySessionPayload = (payload: SessionPayload): void => {
+    this.invalidateSessionRefreshes();
     this.setState(applySessionPayload(this.state, payload));
   };
 
@@ -802,6 +820,7 @@ export class ConsoleStore {
   };
 
   readonly logout = (meta: SessionMeta): void => {
+    this.invalidateSessionRefreshes();
     this.setState(setLoggedOut(this.state, meta));
   };
 
