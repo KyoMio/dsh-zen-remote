@@ -1114,21 +1114,22 @@ export class PgStore implements GatewayStore {
   }
 
   async updateNetwork(id: string, patch: NetworkPatch): Promise<NetworkRecord | null> {
-    const existing = await this.getNetwork(id);
-    if (existing === null) return null;
-    const next = {
-      name: patch.name ?? existing.name,
-      admissionMode: patch.admissionMode ?? existing.admissionMode,
-      maxPeers: patch.maxPeers ?? existing.maxPeers,
-      peerDirectMaxRttMs: patch.peerDirectMaxRttMs ?? existing.peerDirectMaxRttMs,
-    };
-    await this.query('UPDATE networks SET name = $2, admission_mode = $3, max_peers = $4, peer_direct_max_rtt_ms = $5 WHERE id = $1', [
-      id,
-      next.name,
-      next.admissionMode,
-      next.maxPeers,
-      next.peerDirectMaxRttMs,
-    ]);
+    const assignments: string[] = [];
+    const values: unknown[] = [id];
+    for (const [column, value] of [
+      ['name', patch.name],
+      ['admission_mode', patch.admissionMode],
+      ['max_peers', patch.maxPeers],
+      ['peer_direct_max_rtt_ms', patch.peerDirectMaxRttMs],
+    ] as const) {
+      if (value !== undefined) {
+        values.push(value);
+        assignments.push(`${column} = $${values.length}`);
+      }
+    }
+    if (assignments.length > 0) {
+      await this.query(`UPDATE networks SET ${assignments.join(', ')} WHERE id = $1`, values);
+    }
     return this.getNetwork(id);
   }
 

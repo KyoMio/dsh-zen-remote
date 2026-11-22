@@ -328,6 +328,29 @@ function runTestChild(mode, schema, deadlineMs) {
     assert.ok(await store.getSessionUser(tenantTokenHash, Date.now()));
   });
 
+  test('interleaved network patches preserve independently edited fields', { timeout: 30_000 }, async (t) => {
+    const network = await store.createNetwork({ ownerId: adminId, name: 'Concurrent settings', admissionMode: 'manual', joinKeyEnc: enc('settings-key'), maxPeers: 8 });
+    t.after(() => store.deleteNetwork(network.id));
+    await withRootClient(databaseUrlFor(ownedSchema, 'zr_network_patch_test'), async client => {
+      let updates = 0;
+      let release;
+      const ready = new Promise(resolve => { release = resolve; });
+      t.after(() => release());
+      const concurrent = new PgStore(async (sql, params) => {
+        if (sql.startsWith('UPDATE networks SET')) {
+          if (++updates === 2) release();
+          await ready;
+        }
+        return client.query(sql, params);
+      });
+      await Promise.all([
+        concurrent.updateNetwork(network.id, { name: 'Renamed concurrently' }),
+        concurrent.updateNetwork(network.id, { peerDirectMaxRttMs: 500 }),
+      ]);
+      assert.deepEqual(await store.getNetwork(network.id), { ...network, name: 'Renamed concurrently', peerDirectMaxRttMs: 500 });
+    });
+  });
+
   test('顺序建网与成员持久化：key 模式入网 authorized → pause → paused', { timeout: 30_000 }, async () => {
     quotaNet = await store.createNetwork({
       ownerId: tenantId,

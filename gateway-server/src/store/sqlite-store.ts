@@ -996,18 +996,22 @@ export class SqliteStore implements GatewayStore {
   }
 
   async updateNetwork(id: string, patch: NetworkPatch): Promise<NetworkRecord | null> {
-    const existing = this.getNetworkRow(id);
-    if (existing === undefined) return null;
-    const current = mapNetworkRow(existing);
-    const next = {
-      name: patch.name ?? current.name,
-      admissionMode: patch.admissionMode ?? current.admissionMode,
-      maxPeers: patch.maxPeers ?? current.maxPeers,
-      peerDirectMaxRttMs: patch.peerDirectMaxRttMs ?? current.peerDirectMaxRttMs,
-    };
-    this.db
-      .prepare('UPDATE networks SET name = ?, admission_mode = ?, max_peers = ?, peer_direct_max_rtt_ms = ? WHERE id = ?')
-      .run(next.name, next.admissionMode, next.maxPeers, next.peerDirectMaxRttMs, id);
+    const assignments: string[] = [];
+    const values: Array<string | number> = [];
+    for (const [column, value] of [
+      ['name', patch.name],
+      ['admission_mode', patch.admissionMode],
+      ['max_peers', patch.maxPeers],
+      ['peer_direct_max_rtt_ms', patch.peerDirectMaxRttMs],
+    ] as const) {
+      if (value !== undefined) {
+        values.push(value);
+        assignments.push(`${column} = ?`);
+      }
+    }
+    if (assignments.length > 0) {
+      this.db.prepare(`UPDATE networks SET ${assignments.join(', ')} WHERE id = ?`).run(...values, id);
+    }
     const updated = this.getNetworkRow(id);
     return updated === undefined ? null : mapNetworkRow(updated);
   }
