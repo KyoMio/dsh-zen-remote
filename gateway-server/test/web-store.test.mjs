@@ -616,6 +616,137 @@ describe('console-store：SSE 快照合并只动 topology 切片', () => {
 });
 
 describe('ConsoleStore（可订阅包装）', () => {
+  const signedIn = { authenticated: true, user: TEST_USER, ...TEST_META };
+
+  test('logout discards late auth/me, network list and topology responses together', () => {
+    const store = new ConsoleStore();
+    store.init(signedIn);
+    const network = makeNetworkView('home', 'Home');
+    const snapshot = makeSnapshot('home');
+    store.setNetworks([network]);
+    store.applyTopologySnapshot(snapshot);
+    const session = store.beginSessionRefresh();
+    const list = store.beginNetworkRefresh();
+    const topology = store.beginTopologyRefresh('home');
+    store.logout(TEST_META);
+    const loggedOut = store.getState();
+    assert.equal(store.applySessionRefresh(session, signedIn), false);
+    store.applyNetworkRefresh(list, [network]);
+    store.applyTopologyRefresh(topology, snapshot);
+    assert.equal(store.getState(), loggedOut);
+    assert.equal(loggedOut.session, null);
+    assert.equal(loggedOut.quota, null);
+    assert.deepEqual(loggedOut.networks, []);
+    assert.deepEqual(loggedOut.topology, {});
+  });
+
+  test('session replacement invalidates session, network list and topology reads', () => {
+    const user = { ...TEST_USER, id: 'replacement', email: 'replacement@local' };
+    for (const replace of [
+      store => store.setSession(user, TEST_META),
+      store => store.applySessionPayload({ user, ...TEST_META }),
+      store => store.init({ ...signedIn, user }),
+    ]) {
+      const store = new ConsoleStore();
+      store.init(signedIn);
+      const session = store.beginSessionRefresh();
+      const list = store.beginNetworkRefresh();
+      const topology = store.beginTopologyRefresh('home');
+      replace(store);
+      const current = store.getState();
+      assert.equal(store.applySessionRefresh(session, signedIn), false);
+      store.applyNetworkRefresh(list, [makeNetworkView('home', 'Old account')]);
+      store.applyTopologyRefresh(topology, makeSnapshot('home'));
+      assert.equal(store.getState(), current);
+      assert.equal(current.session.user.id, user.id);
+      assert.deepEqual(current.networks, []);
+      assert.deepEqual(current.topology, {});
+    }
+  });
+
+  test('only the latest auth/me request can apply session, policy and quota', () => {
+    const store = new ConsoleStore();
+    const initial = store.beginSessionRefresh();
+    const newer = store.beginSessionRefresh();
+    const before = store.getState();
+    assert.equal(store.applySessionRefresh(initial, signedIn), false);
+    assert.equal(store.getState(), before);
+    const latest = { ...signedIn, user: { ...TEST_USER, email: 'updated@local' }, quota: makeQuota({ usedNetworks: 2 }), defaultMaxPeers: 16 };
+    assert.equal(store.applySessionRefresh(newer, latest), true);
+    const applied = store.getState();
+    assert.equal(applied.session.user.email, 'updated@local');
+    assert.equal(applied.quota.usedNetworks, 2);
+    assert.equal(applied.publicPolicy.defaultMaxPeers, 16);
+    assert.equal(store.applySessionRefresh(initial, { authenticated: false }), false);
+    assert.equal(store.getState(), applied);
+  });
+
+  test('logout discards late signed-in responses without emitting or restoring data', () => {
+    const store = new ConsoleStore();
+    store.init(signedIn);
+    store.setNetworks([makeNetworkView('home', 'Home')]);
+    const pending = store.beginSessionRefresh();
+    store.logout(TEST_META);
+    const loggedOut = store.getState();
+    let emissions = 0;
+    const unsubscribe = store.subscribe(() => { emissions++; });
+    assert.equal(store.applySessionRefresh(pending, signedIn), false);
+    unsubscribe();
+    assert.equal(store.getState(), loggedOut);
+    assert.equal(loggedOut.session, null);
+    assert.equal(loggedOut.quota, null);
+    assert.deepEqual(loggedOut.networks, []);
+    assert.equal(emissions, 0);
+    const next = store.beginSessionRefresh();
+    assert.equal(store.applySessionRefresh(next, { authenticated: false, allowSignup: true }), true);
+    assert.equal(store.getState().session, null);
+    assert.equal(store.getState().publicPolicy.allowSignup, true);
+  });
+
+  test('login and account replacement invalidate both signed-in and anonymous stale responses', () => {
+    const replacement = { ...TEST_USER, id: 'u-2', email: 'other@local' };
+    for (const replace of [
+      store => store.setSession(replacement, TEST_META),
+      store => store.applySessionPayload({ user: replacement, ...TEST_META }),
+      store => store.init({ ...signedIn, user: replacement }),
+    ]) {
+      for (const stale of [signedIn, { authenticated: false }]) {
+        const store = new ConsoleStore();
+        const pending = store.beginSessionRefresh();
+        replace(store);
+        const current = store.getState();
+        assert.equal(store.applySessionRefresh(pending, stale), false);
+        assert.equal(store.getState(), current);
+        assert.equal(current.session.user.id, replacement.id);
+      }
+    }
+  });
+
+  test('auth action start invalidates pending refreshes before the action completes', () => {
+    const store = new ConsoleStore();
+    store.init(signedIn);
+    const pending = store.beginSessionRefresh();
+    const before = store.getState();
+    store.invalidateSessionRefreshes();
+    assert.equal(store.isSessionRefreshCurrent(pending), false);
+    assert.equal(store.applySessionRefresh(pending, { authenticated: false }), false);
+    assert.equal(store.getState(), before);
+  });
+
+  test('a failed newer request does not permit an older response or boot fallback', () => {
+    const store = new ConsoleStore();
+    store.init(signedIn);
+    const initial = store.beginSessionRefresh();
+    const latest = store.beginSessionRefresh();
+    const before = store.getState();
+    assert.equal(store.isSessionRefreshCurrent(latest), true);
+    assert.equal(store.isSessionRefreshCurrent(initial), false);
+    assert.equal(store.applySessionRefresh(initial, { authenticated: false }), false);
+    assert.equal(store.getState(), before);
+    assert.equal(store.applySessionRefresh(latest, { authenticated: false }), true);
+    assert.equal(store.getState().session, null);
+  });
+
   test('init 按 /auth/me 结果就绪；每次变更只发一次通知', () => {
     const store = new ConsoleStore();
     assert.equal(store.getState().boot, 'loading');

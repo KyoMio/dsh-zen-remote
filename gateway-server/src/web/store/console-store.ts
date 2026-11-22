@@ -750,6 +750,7 @@ export function deriveNetworkCounts(network: NetworkView, snapshot?: TopologySna
 export class ConsoleStore {
   private readonly listeners = new Set<() => void>();
   private state: ConsoleState = createInitialState();
+  private sessionRefreshSequence = 0;
   private networkRefreshSequence = 0;
   private readonly topologyRefreshSequences = new Map<string, number>();
 
@@ -767,6 +768,20 @@ export class ConsoleStore {
     for (const listener of [...this.listeners]) listener();
   }
 
+  readonly beginSessionRefresh = (): number => ++this.sessionRefreshSequence;
+
+  readonly invalidateSessionRefreshes = (): void => {
+    this.sessionRefreshSequence += 1;
+  };
+
+  readonly isSessionRefreshCurrent = (sequence: number): boolean => sequence === this.sessionRefreshSequence;
+
+  readonly applySessionRefresh = (sequence: number, me: MeInput): boolean => {
+    if (!this.isSessionRefreshCurrent(sequence)) return false;
+    this.init(me);
+    return true;
+  };
+
   private invalidateNetworkRefreshes(): void {
     this.networkRefreshSequence += 1;
     for (const id of this.topologyRefreshSequences.keys()) this.beginTopologyRefresh(id);
@@ -778,6 +793,8 @@ export class ConsoleStore {
    * 缺省字段按关闸兜底（启动降级路径 / 旧形状夹具）。
    */
   init(me: MeInput): void {
+    this.invalidateSessionRefreshes();
+    if (!me.authenticated || this.state.session?.user.id !== me.user.id) this.invalidateNetworkRefreshes();
     // 入参容忍匿名分支缺省公开策略字段（启动降级路径）：关闸兜底 + 旧 meta 占位
     const allowSignup = me.allowSignup ?? false;
     const maxNetworksPerUser = me.maxNetworksPerUser ?? 3;
@@ -797,17 +814,20 @@ export class ConsoleStore {
         quota: me.quota ?? null,
       });
     } else {
-      this.invalidateNetworkRefreshes();
       this.setState({ ...setLoggedOut(this.state, meta), boot: 'ready', publicPolicy });
     }
   }
 
   readonly setSession = (user: PublicUser, meta: SessionMeta): void => {
+    this.invalidateSessionRefreshes();
+    this.invalidateNetworkRefreshes();
     this.setState(applySession(this.state, user, meta));
   };
 
   /** 登录/注册响应体一次落库：session + meta + quota + publicPolicy（GC-7b） */
   readonly applySessionPayload = (payload: SessionPayload): void => {
+    this.invalidateSessionRefreshes();
+    this.invalidateNetworkRefreshes();
     this.setState(applySessionPayload(this.state, payload));
   };
 
@@ -820,6 +840,7 @@ export class ConsoleStore {
   };
 
   readonly logout = (meta: SessionMeta): void => {
+    this.invalidateSessionRefreshes();
     this.invalidateNetworkRefreshes();
     this.setState(setLoggedOut(this.state, meta));
   };
