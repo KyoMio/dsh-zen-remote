@@ -184,7 +184,7 @@ zr-net://<主机>[:<端口>]/<网络ID>[?tls=0|1][#<入网口令>]
 
 - **修改密码**：保存后其他已登录设备全部自动退出，当前浏览器保持登录；
 
-New passwords for signup, reset, account change, and administrator assignment must be **10–128 characters**, must not be common, have fewer than four distinct characters, be entirely consecutive ascending/descending characters, or contain an email local part of at least four characters. Login and the bootstrap admin environment password remain unchanged. Signup code requests do not reveal registered addresses or send them mail. Without email verification, duplicate signup returns a generic error. All signup attempts are counted per direct peer address (`X-Forwarded-For` is not trusted), with a limit of 20 per 15 minutes in both email-verification modes. Behind a single reverse proxy, all visitors share this limit. Trusted-proxy configuration is a follow-up.
+- **密码与注册规则**：注册、找回密码、账号设置改密和管理员设置密码时，新密码须为 **10–128 个字符**，且不能是常见密码、不同字符少于 4 种、整串为升序或降序连续字符，也不能包含长度至少 4 位的邮箱用户名部分。登录和初始管理员环境变量密码不受影响。注册发码不会透露邮箱是否已注册，也不会向已注册邮箱发信；未开启邮箱验证时，重复注册只返回通用错误。所有注册请求按直连对端地址计数（不信任 `X-Forwarded-For`），无论是否开启邮箱验证，每 15 分钟限 20 次；部署在同一个反向代理后面时，所有访客共用这一额度。可信代理配置留作后续。
 - **更换邮箱**：网关未配置发信服务（SMTP）时，输入当前密码即可直接换绑；已配置发信服务后，需要输入发到新邮箱的 6 位验证码确认。
 
 ## 网关管理面板
