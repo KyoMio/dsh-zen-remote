@@ -5,6 +5,18 @@
 import type { Locale, TranslateFn } from './i18n/locales.js';
 import type { MemberStatus, TopologyLink, TopologyMemberRow, UserQuotaSummary } from './store/console-store.js';
 
+export function missingPluginVersionLabel(member: Pick<TopologyMemberRow, 'online'>, t: TranslateFn): string {
+  return t(member.online ? 'devices.pluginVersionUnknown' : 'devices.pluginVersionOffline');
+}
+
+export function validNetworkSettingsDraft(name: string, peers: string, rtt: string, peerCap: number): boolean {
+  const count = Number(peers);
+  const latency = Number(rtt);
+  return name.trim().length >= 1 && name.trim().length <= 32
+    && Number.isInteger(count) && count >= 2 && count <= Math.min(64, peerCap)
+    && rtt.trim() !== '' && Number.isInteger(latency) && latency >= 0 && latency <= 10000;
+}
+
 /**
  * 实时中转速率：'0 KB/s'、'12 KB/s'、'1.5 MB/s'（任务单要求等宽大字展示）。
  * 入参单位契约（PC-17）：KB/s = 1024 字节/秒——即拓扑 API 里 liveRelayKbps /

@@ -31,6 +31,8 @@ import {
   isQuotaExceeded,
   maskInviteUri,
   memberStatusView,
+  missingPluginVersionLabel,
+  validNetworkSettingsDraft,
   quotaUsageLevel,
   resolvePairLink,
   summarizeMemberConnections,
@@ -60,6 +62,33 @@ import {
 } from '../dist/web/store/console-store.js';
 
 // ---------------------------------------------------------------- 夹具
+
+describe('console settings and device copy', () => {
+  test('settings drafts validate all fields together, including quota and RTT boundaries', () => {
+    assert.equal(validNetworkSettingsDraft(' Home ', '8', '0', 8), true);
+    assert.equal(validNetworkSettingsDraft('Home', '6', '10000', 12), true);
+    for (const values of [
+      ['', '8', '300', 8], ['   ', '8', '300', 8], ['x'.repeat(33), '8', '300', 8],
+      ['Home', '', '300', 8], ['Home', '9', '300', 8], ['Home', '1', '300', 8],
+      ['Home', '2.5', '300', 8], ['Home', '65', '300', 100],
+      ['Home', '8', '', 8], ['Home', '8', '-1', 8], ['Home', '8', '10001', 8],
+      ['Home', '8', 'NaN', 8], ['Home', '8', '0.5', 8],
+    ]) assert.equal(validNetworkSettingsDraft(...values), false, JSON.stringify(values));
+  });
+
+  for (const locale of ['zh', 'en']) {
+    const t = (key, vars) => translate(locale, key, vars);
+    test(`${locale}: missing versions distinguish offline from online legacy clients`, () => {
+      assert.equal(missingPluginVersionLabel({ online: false }, t), t('devices.pluginVersionOffline'));
+      assert.equal(missingPluginVersionLabel({ online: true }, t), t('devices.pluginVersionUnknown'));
+      assert.notEqual(t('devices.pluginVersionOffline'), t('devices.pluginVersionUnknown'));
+    });
+    test(`${locale}: manual approval hint does not assume a desktop layout`, () => {
+      assert.doesNotMatch(t('network.inviteHintManual'), /右侧|右边|on the right/i);
+      assert.match(t('network.inviteHintManual'), /批准|approve/i);
+    });
+  }
+});
 
 function makeNetworkView(id, name, overrides = {}) {
   return {

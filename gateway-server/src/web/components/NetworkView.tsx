@@ -41,6 +41,7 @@ import {
   relativeTime,
   summarizeMemberConnections,
   summarizeNetworkPairs,
+  validNetworkSettingsDraft,
 } from '../format';
 import type { UsageLevel } from '../format';
 import { Modal } from './Modal';
@@ -146,6 +147,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
   const [name, setName] = useState(network.name);
   const [maxPeersDraft, setMaxPeersDraft] = useState(String(network.maxPeers));
   const [rttCapDraft, setRttCapDraft] = useState(String(network.peerDirectMaxRttMs));
+  const [admissionMode, setAdmissionMode] = useState(network.admissionMode);
   // 危险按钮的两击确认统一走 ui.confirmTarget：同一时刻只有一个处于确认态，
   // 且点弹窗外任何位置都会被 App 的 document 级监听取消
   const confirmingRotate = ui.confirmTarget === 'rotate-key';
@@ -158,38 +160,19 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
   const groupPeerCap = unlimitedPeers || quota === null ? 64 : quota.maxPeersPerNetwork;
   const grandfathered = quota !== null && !unlimitedPeers && network.maxPeers > groupPeerCap;
 
-  // 名称与上限：失焦或回车提交；非法值回滚显示服务端真值
-  const commitName = (): void => {
-    const trimmed = name.trim();
-    if (trimmed.length >= 1 && trimmed.length <= 32 && trimmed !== network.name) {
-      onPatch({ name: trimmed });
-    } else {
-      setName(network.name);
-    }
-  };
-  const commitMaxPeers = (): void => {
-    const value = Number(maxPeersDraft);
-    const withinGroupCap = value <= groupPeerCap;
-    const grandfatheredShrink = grandfathered && value <= network.maxPeers;
-    if (Number.isInteger(value) && value >= 2 && value <= 64 && value !== network.maxPeers && (withinGroupCap || grandfatheredShrink)) {
-      onPatch({ maxPeers: value });
-    } else {
-      setMaxPeersDraft(String(network.maxPeers));
-    }
-  };
-  // 直连 RTT 上限无组限额：仅做区间校验，非法值回滚服务端真值（与 maxPeers 同款提交时机）
-  const commitRttCap = (): void => {
-    const value = Number(rttCapDraft);
-    if (Number.isInteger(value) && value >= 0 && value <= 10000 && value !== network.peerDirectMaxRttMs) {
-      onPatch({ peerDirectMaxRttMs: value });
-    } else {
-      setRttCapDraft(String(network.peerDirectMaxRttMs));
-    }
-  };
-  const submitOnEnter = (event: { key: string; preventDefault: () => void }, commit: () => void): void => {
-    if (event.key !== 'Enter') return;
-    event.preventDefault();
-    commit();
+  const trimmedName = name.trim();
+  const maxPeers = Number(maxPeersDraft);
+  const rttCap = Number(rttCapDraft);
+  const valid = validNetworkSettingsDraft(name, maxPeersDraft, rttCapDraft, Math.max(groupPeerCap, network.maxPeers));
+  const save = (): void => {
+    if (!valid || busy) return;
+    const patch: NetworkPatchInput = {};
+    if (trimmedName !== network.name) patch.name = trimmedName;
+    if (maxPeers !== network.maxPeers) patch.maxPeers = maxPeers;
+    if (rttCap !== network.peerDirectMaxRttMs) patch.peerDirectMaxRttMs = rttCap;
+    if (admissionMode !== network.admissionMode) patch.admissionMode = admissionMode;
+    if (Object.keys(patch).length > 0) onPatch(patch);
+    onClose();
   };
 
   return (
@@ -206,8 +189,6 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
             maxLength={32}
             value={name}
             onChange={(e) => setName(e.target.value)}
-            onBlur={commitName}
-            onKeyDown={(e) => submitOnEnter(e, commitName)}
           />
         </div>
 
@@ -224,8 +205,6 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
             step={1}
             value={maxPeersDraft}
             onChange={(e) => setMaxPeersDraft(e.target.value)}
-            onBlur={commitMaxPeers}
-            onKeyDown={(e) => submitOnEnter(e, commitMaxPeers)}
           />
           {quota !== null && (
             <p className="field-hint">
@@ -250,8 +229,6 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
             step={1}
             value={rttCapDraft}
             onChange={(e) => setRttCapDraft(e.target.value)}
-            onBlur={commitRttCap}
-            onKeyDown={(e) => submitOnEnter(e, commitRttCap)}
           />
           <p className="field-hint">{t('network.directRttCapHint')}</p>
         </div>
@@ -268,10 +245,8 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
               <input
                 type="radio"
                 name="admission-mode"
-                checked={network.admissionMode === mode}
-                onChange={() => {
-                  if (network.admissionMode !== mode) onPatch({ admissionMode: mode });
-                }}
+                checked={admissionMode === mode}
+                onChange={() => setAdmissionMode(mode)}
               />
               <span>{label}</span>
             </label>
@@ -331,8 +306,8 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
           <button type="button" className="btn" onClick={onClose}>
             {t('common.cancel')}
           </button>
-          <button type="button" className="btn primary" onClick={onClose}>
-            {t('common.done')}
+          <button type="button" className="btn primary" disabled={busy || !valid} onClick={save}>
+            {t('common.save')}
           </button>
         </div>
       </div>
