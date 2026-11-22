@@ -655,10 +655,10 @@ export function App() {
     async (networkId: string, patch: NetworkPatchInput): Promise<boolean> => {
       setActionBusy(true);
       try {
-        await client.patchNetwork(networkId, patch);
-        await refreshTopology(networkId);
-        store.setNetworks(await client.listNetworks());
+        store.updateNetwork(await client.patchNetwork(networkId, patch));
         showToast('toast.saved');
+        void refreshTopology(networkId);
+        void refreshNetworks();
         return true;
       } catch (err) {
         showToast(authErrorToKey(err));
@@ -667,7 +667,7 @@ export function App() {
         setActionBusy(false);
       }
     },
-    [refreshTopology, showToast],
+    [refreshTopology, refreshNetworks, showToast],
   );
 
   const handleRotateInviteKey = useCallback(

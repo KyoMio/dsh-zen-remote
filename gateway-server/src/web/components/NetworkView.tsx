@@ -200,6 +200,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
             type="text"
             maxLength={32}
             value={name}
+            disabled={busy || saving}
             onChange={(e) => setName(e.target.value)}
           />
         </div>
@@ -216,6 +217,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
             max={Math.min(64, Math.max(groupPeerCap, network.maxPeers))}
             step={1}
             value={maxPeersDraft}
+            disabled={busy || saving}
             onChange={(e) => setMaxPeersDraft(e.target.value)}
           />
           {quota !== null && (
@@ -240,6 +242,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
             max={10000}
             step={1}
             value={rttCapDraft}
+            disabled={busy || saving}
             onChange={(e) => setRttCapDraft(e.target.value)}
           />
           <p className="field-hint">{t('network.directRttCapHint')}</p>
@@ -258,6 +261,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
                 type="radio"
                 name="admission-mode"
                 checked={admissionMode === mode}
+                disabled={busy || saving}
                 onChange={() => setAdmissionMode(mode)}
               />
               <span>{label}</span>

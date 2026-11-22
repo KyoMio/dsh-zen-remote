@@ -48,6 +48,7 @@ import {
   applyAdminGroups,
   applyAdminRuntime,
   applyNetworks,
+  applyNetwork,
   applyPublicPolicy,
   applyQuota,
   applySession,
@@ -64,6 +65,34 @@ import {
 // ---------------------------------------------------------------- 夹具
 
 describe('console settings and device copy', () => {
+  test('a confirmed PATCH replaces only its cached network without waiting for refresh', async () => {
+    const original = makeNetworkView('home', 'Old');
+    const other = makeNetworkView('work', 'Work');
+    const store = new ConsoleStore();
+    store.setNetworks([original, other]);
+    const state = store.getState();
+    const confirmed = { ...original, name: 'New', maxPeers: 12, peerDirectMaxRttMs: 500 };
+    const client = new ConsoleClient({ fetchImpl: async (_url, init) => {
+      if (init.method === 'PATCH') return { status: 200, json: async () => ({ ok: true, data: confirmed }) };
+      throw new Error('Refresh unavailable');
+    } });
+    store.updateNetwork(await client.patchNetwork('home', { name: 'New', maxPeers: 12, peerDirectMaxRttMs: 500 }));
+    await assert.rejects(client.listNetworks(), /Refresh unavailable/);
+    assert.deepEqual(store.getState().networks[0], confirmed);
+    assert.equal(store.getState().networks[1], other);
+    assert.equal(store.getState().ui, state.ui);
+    assert.equal(store.getState().topology, state.topology);
+    assert.equal(state.networks[0], original);
+    assert.equal(original.name, 'Old');
+  });
+
+  test('a confirmed update does not add missing or removed networks', () => {
+    const state = createInitialState();
+    assert.equal(applyNetwork(state, makeNetworkView('missing', 'New')), state);
+    const populated = applyNetworks(state, [makeNetworkView('home', 'Home')]);
+    assert.equal(applyNetwork(populated, makeNetworkView('missing', 'New')), populated);
+  });
+
   test('settings drafts validate all fields together, including quota and RTT boundaries', () => {
     assert.equal(validNetworkSettingsDraft(' Home ', '8', '0', 8), true);
     assert.equal(validNetworkSettingsDraft('Home', '6', '10000', 12), true);

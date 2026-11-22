@@ -690,6 +690,11 @@ export function applyNetworks(state: ConsoleState, networks: NetworkView[]): Con
   return { ...state, networks };
 }
 
+export function applyNetwork(state: ConsoleState, network: NetworkView): ConsoleState {
+  if (!state.networks.some((entry) => entry.id === network.id)) return state;
+  return { ...state, networks: state.networks.map((entry) => entry.id === network.id ? network : entry) };
+}
+
 /**
  * SSE 快照合并（含首载 REST 快照）：只替换 topology[snapshot.network.id]。
  * 其余切片引用原样保留——这是「实时推送不冲掉交互状态」的实现根基。
@@ -807,6 +812,10 @@ export class ConsoleStore {
 
   readonly setNetworks = (networks: NetworkView[]): void => {
     this.setState(applyNetworks(this.state, networks));
+  };
+
+  readonly updateNetwork = (network: NetworkView): void => {
+    this.setState(applyNetwork(this.state, network));
   };
 
   readonly applyTopologySnapshot = (snapshot: TopologySnapshot): void => {
