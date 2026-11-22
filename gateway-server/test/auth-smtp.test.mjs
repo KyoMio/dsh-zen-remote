@@ -30,6 +30,7 @@ import {
   TENANT_HASH,
   getTestTlsPair,
   seedSession,
+  waitFor,
 } from './helpers/fixtures.mjs';
 
 const HOST = '127.0.0.1';
@@ -631,6 +632,7 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
       body: { email, purpose: 'signup', locale: 'zh' },
     });
     assert.equal(sent.status, 200);
+    await waitFor(() => smtp.state.messages.length > 0);
     const otpCode = otpFromMessage(smtp.state.messages.at(-1));
     const wrong = await api(handle.base, 'POST', '/api/v1/auth/signup', {
       body: { email, password: PASSWORD, otpCode: wrongCode(otpCode) },
@@ -654,6 +656,7 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
 
     const sendRes = await api(handle.base, 'POST', '/api/v1/auth/send-otp', { body: { email: EMAIL, purpose: 'signup' } });
     assert.equal(sendRes.status, 200);
+    await waitFor(() => smtp.state.messages.length > 0);
     assert.equal(smtp.state.messages.length, 1);
     assert.equal(smtp.state.messages[0].to, `RCPT TO:<${EMAIL}>`);
 
@@ -695,6 +698,68 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
     const retry = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: EMAIL, password: PASSWORD, otpCode: '123456' } });
     assertEnvelopeError(retry.json, 'OTP_INVALID');
   });
+});
+
+test('signup existing and unused emails share resend cooldown, wrong-code lockout and expiry', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  otpSendRateLimiter.clear();
+  const smtp = createMockSmtp();
+  const port = await listen(smtp.server);
+  t.after(() => closeServer(smtp.server));
+  const handle = await startServer({ seed: seedSettings({ allowSignup: true, requireEmailVerification: true,
+    smtpConfigEnc: encodeSmtpConfig({ host: HOST, port, security: 'none', username: 'mailer@gateway.local', password: 'smtp-test-pass', fromAddress: 'gateway@example.com' }, MASTER_KEY) }) });
+  t.after(() => stopServer(handle));
+  t.after(() => otpSendRateLimiter.clear());
+  const registered = 'registered-parity@example.com';
+  const unused = 'unused-parity@example.com';
+  await handle.store.createUser({ email: registered, passwordHash: TENANT_HASH, role: 'user' });
+  const issue = t.mock.method(handle.store, 'issueEmailOtp');
+  const send = email => api(handle.base, 'POST', '/api/v1/auth/send-otp', { body: { email, purpose: 'signup' } });
+  const verify = (email, otpCode) => api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email, password: 'Copper!River-742', otpCode } });
+  const same = (a, b) => { assert.equal(a.status, b.status); assert.deepEqual(a.json, b.json); };
+  same(await verify(registered, '000000'), await verify(unused, '000000'));
+  same(await send(registered), await send(unused));
+  await waitFor(() => smtp.state.messages.length === 1);
+  assert.equal(issue.mock.callCount(), 1);
+  const wrong = wrongCode(otpFromMessage(smtp.state.messages[0]));
+  same(await send(registered), await send(unused));
+  for (let attempt = 1; attempt <= OTP_MAX_ATTEMPTS + 1; attempt++) {
+    const a = await verify(registered, wrong);
+    same(a, await verify(unused, wrong));
+    assertEnvelopeError(a.json, attempt >= OTP_MAX_ATTEMPTS ? 'OTP_LOCKED' : 'OTP_INVALID');
+  }
+  t.mock.timers.tick(OTP_COOLDOWN_MS);
+  same(await send(registered), await send(unused));
+  await waitFor(() => smtp.state.messages.length === 2);
+  const wrongAgain = wrongCode(otpFromMessage(smtp.state.messages[1]));
+  same(await verify(registered, wrongAgain), await verify(unused, wrongAgain));
+  t.mock.timers.tick(OTP_TTL_MS);
+  same(await verify(registered, wrongAgain), await verify(unused, wrongAgain));
+});
+
+test('signup delivery failure is logged but returns normal success and cooldown', async (t) => {
+  otpSendRateLimiter.clear();
+  const smtp = createMockSmtp();
+  const port = await listen(smtp.server);
+  t.after(() => closeServer(smtp.server));
+  const handle = await startServer({ seed: seedSettings({ allowSignup: true, requireEmailVerification: true,
+    smtpConfigEnc: encodeSmtpConfig({ host: HOST, port, security: 'none', username: 'invalid', password: 'invalid', fromAddress: 'gateway@example.com' }, MASTER_KEY) }) });
+  t.after(() => stopServer(handle));
+  t.after(() => otpSendRateLimiter.clear());
+  const log = t.mock.method(console, 'error', () => {});
+  await handle.store.createUser({ email: 'registered-failure@example.com', passwordHash: TENANT_HASH, role: 'user' });
+  const send = email => api(handle.base, 'POST', '/api/v1/auth/send-otp', { body: { email, purpose: 'signup' } });
+  const existing = await send('registered-failure@example.com');
+  const unused = await send('unused-failure@example.com');
+  assert.equal(unused.status, 200);
+  assert.deepEqual(unused.json, existing.json);
+  await waitFor(() => log.mock.callCount() === 1);
+  assert.deepEqual(log.mock.calls[0].arguments, ['Signup verification email delivery failed']);
+  const a = await send('registered-failure@example.com');
+  const b = await send('unused-failure@example.com');
+  assert.equal(a.status, 429);
+  assert.deepEqual(a.json, b.json);
+  await smtp.waitIdle();
 });
 
 describe('忘记密码重置、IP 限流、已登录改密与两步换绑邮箱（假 SMTP）', () => {

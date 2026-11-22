@@ -559,6 +559,34 @@ export const OTP_IP_WINDOW_MS = 15 * 60_000;
 /** 同 IP 窗内最多发码次数（send-otp 与换绑邮箱申请共用一个计数器） */
 export const OTP_IP_MAX_REQUESTS = 20;
 
+const signupDecoys = new WeakMap<GatewayStore, Map<string, { expiresAt: number; cooldownUntil: number; attempts: number }>>();
+
+function signupDecoyRows(store: GatewayStore): Map<string, { expiresAt: number; cooldownUntil: number; attempts: number }> {
+  let rows = signupDecoys.get(store);
+  if (rows === undefined) {
+    rows = new Map();
+    signupDecoys.set(store, rows);
+  }
+  for (const [email, row] of rows) if (row.expiresAt <= Date.now()) rows.delete(email);
+  return rows;
+}
+
+function issueSignupDecoy(store: GatewayStore, email: string): void {
+  const rows = signupDecoyRows(store);
+  const now = Date.now();
+  if ((rows.get(email)?.cooldownUntil ?? 0) > now) throw new StoreError('otp-cooldown', 'verification code was issued recently');
+  rows.set(email, { expiresAt: now + OTP_TTL_MS, cooldownUntil: now + OTP_COOLDOWN_MS, attempts: 0 });
+}
+
+function verifySignupDecoy(store: GatewayStore, email: string): never {
+  const row = signupDecoyRows(store).get(email);
+  if (row !== undefined) {
+    row.attempts += 1;
+    if (row.attempts >= OTP_MAX_ATTEMPTS) throw new StoreError('otp-locked', 'verification code is locked');
+  }
+  throw new StoreError('otp-invalid', 'verification code is invalid or expired');
+}
+
 /** 验证码只在 HMAC 里参与比对：masterKey 混入密钥位，库里泄露 code_hash 推不出明文码 */
 export function hashOtpCode(masterKey: Buffer, purpose: EmailOtpPurpose, email: string, code: string): string {
   return createHmac('sha256', masterKey).update(`${purpose}:${email.trim().toLowerCase()}:${code}`).digest('hex');
@@ -633,10 +661,7 @@ export const LOGIN_ACCOUNT_MAX_ATTEMPTS = 10;
 export const loginIpRateLimiter = new SlidingWindowRateLimiter(LOGIN_RATE_WINDOW_MS, LOGIN_IP_MAX_ATTEMPTS);
 export const loginAccountRateLimiter = new SlidingWindowRateLimiter(LOGIN_RATE_WINDOW_MS, LOGIN_ACCOUNT_MAX_ATTEMPTS);
 
-/**
- * 签发验证码并发信。发信失败（含配置非法）统一抛 502 SMTP_SEND_FAILED，SmtpClientError
- * 的消息细节（更不可能含 SMTP 密码）一律不透传给客户端。smtp 必须已过 isSmtpConfigured。
- */
+/** Signup delivery is detached; other purposes report sanitized SMTP failures. */
 export async function issueAndSendOtp(
   ctx: RouteContext,
   env: AuthEnvironment,
@@ -660,10 +685,15 @@ export async function issueAndSendOtp(
     ttlMinutes: OTP_TTL_MS / 60_000,
     publicUrl: env.ext.publicUrl ?? ctx.config.publicUrl,
   });
-  try {
-    await sendMail(smtp, { to: email, subject: rendered.subject, text: rendered.text });
-  } catch {
-    throw new ApiError(502, 'SMTP_SEND_FAILED', 'failed to send the verification email');
+  const delivery = sendMail(smtp, { to: email, subject: rendered.subject, text: rendered.text });
+  if (purpose === 'signup') {
+    void delivery.catch(() => console.error('Signup verification email delivery failed'));
+  } else {
+    try {
+      await delivery;
+    } catch {
+      throw new ApiError(502, 'SMTP_SEND_FAILED', 'failed to send the verification email');
+    }
   }
 }
 
@@ -868,12 +898,17 @@ async function handleSignup(ctx: RouteContext): Promise<void> {
   let emailVerifiedAt: string | null = null;
   if (env.ext.requireEmailVerification) {
     const code = readOtpCode(body);
-    await ctx.store.verifyAndConsumeEmailOtp({
-      email,
-      purpose: 'signup',
-      codeHash: hashOtpCode(ctx.masterKey, 'signup', email, code),
-      maxAttempts: OTP_MAX_ATTEMPTS,
-    });
+    try {
+      if (await ctx.store.findUserByEmail(email) !== null) verifySignupDecoy(ctx.store, email);
+      await ctx.store.verifyAndConsumeEmailOtp({
+        email,
+        purpose: 'signup',
+        codeHash: hashOtpCode(ctx.masterKey, 'signup', email, code),
+        maxAttempts: OTP_MAX_ATTEMPTS,
+      });
+    } finally {
+      await equalizeAuthTiming();
+    }
     emailVerifiedAt = new Date().toISOString();
   }
   let user: UserRecord;
@@ -948,12 +983,15 @@ async function handleSendOtp(ctx: RouteContext): Promise<void> {
     if (!env.ext.allowSignup) {
       throw new ApiError(403, 'SIGNUP_DISABLED', 'signup is disabled on this gateway');
     }
-    const existing = await ctx.store.findUserByEmail(email);
-    if (existing !== null) {
+    try {
+      const existing = await ctx.store.findUserByEmail(email);
+      if (existing !== null) issueSignupDecoy(ctx.store, email);
+      else await issueAndSendOtp(ctx, env, env.smtp, email, purpose, locale);
+    } finally {
       await equalizeAuthTiming();
-      sendOk(ctx.res, { sent: true, cooldownSec: OTP_COOLDOWN_MS / 1000 });
-      return;
     }
+    sendOk(ctx.res, { sent: true, cooldownSec: OTP_COOLDOWN_MS / 1000 });
+    return;
   } else {
     const existing = await ctx.store.findUserByEmail(email);
     if (existing === null || !existing.active) {
