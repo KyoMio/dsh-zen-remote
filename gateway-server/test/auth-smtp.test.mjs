@@ -1,11 +1,17 @@
 // GC-4 + GC-5 consolidated SMTP client + email OTP + self-service account REST tests.
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import tls from 'node:tls';
 
 import { createGatewayApiServer } from '../dist/server.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
+import { PgStore } from '../dist/store/pg-store.js';
 import { deriveMasterKeyFromSecret, hashPassword } from '../dist/master-key.js';
 import {
   OTP_COOLDOWN_MS,
@@ -564,6 +570,20 @@ test('verified signup maps a duplicate-email race to OTP_INVALID', async (t) => 
   assertEnvelopeError(result.json, 'OTP_INVALID');
 });
 
+test('a registered email with a known outstanding OTP still cannot sign up', async (t) => {
+  const handle = await startServer({ seed: { allowSignup: true, requireEmailVerification: true } });
+  t.after(() => stopServer(handle));
+  const email = 'registered-otp@example.com';
+  const code = '123456';
+  await handle.store.issueEmailOtp({ email, purpose: 'signup', codeHash: hashOtpCode(MASTER_KEY, 'signup', email, code), ttlMs: OTP_TTL_MS, cooldownMs: OTP_COOLDOWN_MS });
+  const user = await handle.store.createUser({ email, passwordHash: TENANT_HASH, role: 'user' });
+  const response = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email, password: 'Copper!River-742', otpCode: code } });
+  assert.equal(response.status, 400);
+  assertEnvelopeError(response.json, 'OTP_INVALID');
+  assert.deepEqual(response.setCookies, []);
+  assert.equal((await handle.store.findUserByEmail(email)).id, user.id);
+});
+
 describe('SMTP 未配置（独立实例）', () => {
   let handle;
   let adminCookie;
@@ -724,16 +744,58 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
   });
 });
 
-test('signup existing and unused emails share resend cooldown, wrong-code lockout and expiry', async (t) => {
+for (const backend of ['SQLite', 'PostgreSQL']) {
+test(`${backend}: signup cooldown, wrong-code lockout and expiry stay identical after restarts`, {
+  skip: backend === 'PostgreSQL' && !process.env.ZR_TEST_PG_URL && !process.env.ZR_TEST_PG_URL_FILE,
+}, async (t) => {
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   otpSendRateLimiter.clear();
   const smtp = createMockSmtp();
   const port = await listen(smtp.server);
   t.after(() => closeServer(smtp.server));
-  const handle = await startServer({ seed: seedSettings({ allowSignup: true, requireEmailVerification: true,
-    smtpConfigEnc: encodeSmtpConfig({ host: HOST, port, security: 'none', username: 'mailer@gateway.local', password: 'smtp-test-pass', fromAddress: 'gateway@example.com' }, MASTER_KEY) }) });
-  t.after(() => stopServer(handle));
-  t.after(() => otpSendRateLimiter.clear());
+  const seed = seedSettings({ allowSignup: true, requireEmailVerification: true,
+    smtpConfigEnc: encodeSmtpConfig({ host: HOST, port, security: 'none', username: 'mailer@gateway.local', password: 'smtp-test-pass', fromAddress: 'gateway@example.com' }, MASTER_KEY) });
+  let openStore;
+  let root;
+  let schema;
+  let directory;
+  let handle;
+  t.after(async () => {
+    try {
+      if (handle) await stopServer(handle);
+    } finally {
+      try {
+        if (schema) await root.query(`DROP SCHEMA "${schema}" CASCADE`);
+      } finally {
+        if (root) await root.end();
+        if (directory) await rm(directory, { recursive: true, force: true });
+        otpSendRateLimiter.clear();
+        signupRateLimiter.clear();
+      }
+    }
+  });
+  if (backend === 'SQLite') {
+    directory = await mkdtemp(path.join(os.tmpdir(), 'zr-signup-restart-'));
+    openStore = () => new SqliteStore({ path: path.join(directory, 'gateway.sqlite'), seed });
+  } else {
+    const databaseUrl = process.env.ZR_TEST_PG_URL?.trim() || readFileSync(process.env.ZR_TEST_PG_URL_FILE, 'utf8').trim();
+    const { default: pg } = await import('pg');
+    root = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5000, query_timeout: 5000 });
+    await root.connect();
+    const name = `zr_signup_test_${randomBytes(12).toString('hex')}`;
+    await root.query(`CREATE SCHEMA "${name}"`);
+    schema = name;
+    const url = new URL(databaseUrl);
+    url.searchParams.set('options', `-c search_path=${schema} -c statement_timeout=5000`);
+    openStore = () => PgStore.connect(url.toString(), seed);
+  }
+  const restart = async () => {
+    if (handle) await stopServer(handle);
+    handle = undefined;
+    handle = await startServer({ store: await openStore() });
+    otpSendRateLimiter.clear();
+  };
+  await restart();
   const registered = 'registered-parity@example.com';
   const unused = 'unused-parity@example.com';
   await handle.store.createUser({ email: registered, passwordHash: TENANT_HASH, role: 'user' });
@@ -744,10 +806,15 @@ test('signup existing and unused emails share resend cooldown, wrong-code lockou
   same(await verify(registered, '000000'), await verify(unused, '000000'));
   same(await send(registered), await send(unused));
   await waitFor(() => smtp.state.messages.length === 1);
-  assert.equal(issue.mock.callCount(), 1);
+  assert.equal(issue.mock.callCount(), 2);
   const wrong = wrongCode(otpFromMessage(smtp.state.messages[0]));
-  same(await send(registered), await send(unused));
+  await restart();
+  const cooldown = await send(registered);
+  same(cooldown, await send(unused));
+  assert.equal(cooldown.status, 429);
+  assertEnvelopeError(cooldown.json, 'OTP_COOLDOWN');
   for (let attempt = 1; attempt <= OTP_MAX_ATTEMPTS + 1; attempt++) {
+    if (attempt === OTP_MAX_ATTEMPTS || attempt === OTP_MAX_ATTEMPTS + 1) await restart();
     const a = await verify(registered, wrong);
     same(a, await verify(unused, wrong));
     assertEnvelopeError(a.json, attempt >= OTP_MAX_ATTEMPTS ? 'OTP_LOCKED' : 'OTP_INVALID');
@@ -758,8 +825,15 @@ test('signup existing and unused emails share resend cooldown, wrong-code lockou
   const wrongAgain = wrongCode(otpFromMessage(smtp.state.messages[1]));
   same(await verify(registered, wrongAgain), await verify(unused, wrongAgain));
   t.mock.timers.tick(OTP_TTL_MS);
-  same(await verify(registered, wrongAgain), await verify(unused, wrongAgain));
+  await restart();
+  const expired = await verify(registered, wrongAgain);
+  same(expired, await verify(unused, wrongAgain));
+  assertEnvelopeError(expired.json, 'OTP_INVALID');
+  assert.equal(smtp.state.messages.length, 2);
+  assert.notEqual(await handle.store.findUserByEmail(registered), null);
+  assert.equal(await handle.store.findUserByEmail(unused), null);
 });
+}
 
 test('signup delivery failure is logged but returns normal success and cooldown', async (t) => {
   otpSendRateLimiter.clear();
