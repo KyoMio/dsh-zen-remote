@@ -115,6 +115,7 @@ export function PasswordField(props: {
           type={visible ? 'text' : 'password'}
           required={props.required}
           minLength={props.minLength}
+          maxLength={hasMinHint ? 128 : undefined}
           autoComplete={props.autoComplete}
           aria-invalid={tooShort || undefined}
           aria-describedby={describedBy}
@@ -273,7 +274,7 @@ export function LoginView(props: LoginViewProps) {
     event.preventDefault();
     if (busy) return;
     const password = mode === 'forgot' ? newPassword : ui.loginPassword;
-    if (mode !== 'login' && (password.length < 10 || password.length > 128)) return;
+    if (mode !== 'login' && password.length < 10) return;
     const ok = await onSubmit(mode, email, mode === 'forgot' ? newPassword : ui.loginPassword, needsOtp ? otpCode : undefined);
     if (ok && mode === 'forgot') {
       // 重置成功：清草稿回登录页，并给一句明确的下一步提示
