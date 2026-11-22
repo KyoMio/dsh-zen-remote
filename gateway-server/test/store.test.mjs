@@ -408,19 +408,25 @@ describe('SqliteStore', () => {
   });
 
   test('network patches write only supplied columns, including zero RTT', async (t) => {
-    const raw = new DatabaseSync(dbPath);
-    const columns = ['name', 'admission_mode', 'max_peers', 'peer_direct_max_rtt_ms'];
-    t.after(() => {
-      for (const column of columns) raw.exec(`DROP TRIGGER IF EXISTS patch_${column}`);
-      raw.exec('DROP TABLE IF EXISTS network_patch_columns');
-      raw.close();
+    const dir = tmpDir('network-patch');
+    let store;
+    let raw;
+    t.after(async () => {
+      raw?.close();
+      await store?.close();
+      fs.rmSync(dir, { recursive: true, force: true });
     });
+    const dbPath = path.join(dir, 'gateway.db');
+    store = new SqliteStore({ path: dbPath });
+    const owner = await store.createUser({ email: 'patch-owner@local', passwordHash: await hashPassword('patch-test-password'), role: 'admin' });
+    const net = await store.createNetwork({ ownerId: owner.id, name: 'Patch test', admissionMode: 'manual', joinKeyEnc: 'encrypted-key', maxPeers: 8 });
+    raw = new DatabaseSync(dbPath);
+    const columns = ['name', 'admission_mode', 'max_peers', 'peer_direct_max_rtt_ms'];
     raw.exec('CREATE TABLE network_patch_columns (name TEXT)');
     for (const column of columns) {
       raw.exec(`CREATE TRIGGER patch_${column} AFTER UPDATE OF ${column} ON networks
         BEGIN INSERT INTO network_patch_columns VALUES ('${column}'); END`);
     }
-    const net = (await store.listNetworksByOwner(adminId))[0];
     let expected = await store.getNetwork(net.id);
     for (const [patch, written] of [
       [{ name: "Admin's renamed network" }, ['name']],
