@@ -137,8 +137,9 @@ async function login(base, email, password) {
 
 /** 经 store 直造成员（模拟 PG-5 入网协议落库后的状态），REST 层在其上做状态操作 */
 async function seedMember(store, netId, nodeId, state) {
-  const attempt = (publicKeyHex, matched) =>
+  const attempt = async (publicKeyHex, matched) =>
     store.upsertMemberJoinAttempt({
+      verifiedJoinKeyEnc: (await store.getNetwork(netId)).joinKeyEnc,
       networkId: netId,
       nodeId,
       name: `node-${nodeId}`,
@@ -164,6 +165,35 @@ async function seedMember(store, netId, nodeId, state) {
 }
 
 // ---------------------------------------------------------------- 主服务器：会话 / 注册 / 同源 / 隔离 / CRUD / 成员 / 管理员
+
+test('network invite options validate bounds and rotation resets usage and expiry', async (t) => {
+  const handle = await startServer();
+  t.after(() => stopServer(handle));
+  const { cookie } = await seedSession(handle.store, { email: ADMIN_EMAIL, role: 'admin', passwordHash: ADMIN_HASH });
+  for (const options of [{ inviteTtlHours: 0 }, { inviteTtlHours: 721 }, { inviteTtlHours: 1.5 }, { inviteTtlHours: null }, { inviteMaxUses: 0 }, { inviteMaxUses: 1001 }, { inviteMaxUses: '10' }]) {
+    const bad = await api(handle.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'Invalid', ...options } });
+    assert.equal(bad.status, 400);
+    assertEnvelopeError(bad.json, 'INVALID_REQUEST');
+  }
+  const created = await api(handle.base, 'POST', '/api/v1/networks', { cookie, body: { name: 'Invites', admissionMode: 'key', inviteTtlHours: 1, inviteMaxUses: 1 } });
+  assert.equal(created.status, 200);
+  const network = created.json.data;
+  assert.equal(network.inviteMaxUses, 1);
+  await handle.store.upsertMemberJoinAttempt({ networkId: network.id, nodeId: 'aaaaaaaa', publicKeyHex: 'public-a', joinKeyMatched: true, verifiedJoinKeyEnc: (await handle.store.getNetwork(network.id)).joinKeyEnc });
+  const exhausted = await api(handle.base, 'GET', '/api/v1/networks', { cookie });
+  const exhaustedNetwork = exhausted.json.data.find((item) => item.id === network.id);
+  assert.equal(exhaustedNetwork.inviteExpired, true);
+  assert.equal(exhaustedNetwork.inviteUses, 1);
+  const badRotate = await api(handle.base, 'POST', `/api/v1/networks/${network.id}/rotate-key`, { cookie, body: { inviteMaxUses: 0 } });
+  assert.equal(badRotate.status, 400);
+  const rotated = await api(handle.base, 'POST', `/api/v1/networks/${network.id}/rotate-key`, { cookie, body: { inviteTtlHours: 720, inviteMaxUses: 1000 } });
+  assert.equal(rotated.status, 200);
+  assert.equal(rotated.json.data.inviteUses, 0);
+  assert.equal(rotated.json.data.inviteMaxUses, 1000);
+  assert.equal(rotated.json.data.inviteExpired, false);
+  assert.notEqual(rotated.json.data.joinKey, network.joinKey);
+  assert.ok(Date.parse(rotated.json.data.inviteExpiresAt) > Date.now() + 719 * 3600_000);
+});
 
 describe('REST API /api/v1（主服务器）', () => {
   let handle;
@@ -320,7 +350,7 @@ describe('REST API /api/v1（主服务器）', () => {
   describe('signup 与 allowSignup 开关联动', () => {
     test('allowSignup=false → 403 SIGNUP_DISABLED', async () => {
       const res = await api(handle.base, 'POST', '/api/v1/auth/signup', {
-        body: { email: 'newbie@local', password: 'newbie-pass-123' },
+        body: { email: 'newbie@local', password: 'Copper!River-742' },
       });
       assert.equal(res.status, 403);
       assertEnvelopeError(res.json, 'SIGNUP_DISABLED');
@@ -337,7 +367,7 @@ describe('REST API /api/v1（主服务器）', () => {
 
     test('allowSignup=true → 注册成功且自动登录（role 固定 user、active）', async () => {
       const res = await api(handle.base, 'POST', '/api/v1/auth/signup', {
-        body: { email: 'newbie@local', password: 'newbie-pass-123' },
+        body: { email: 'newbie@local', password: 'Copper!River-742' },
       });
       assert.equal(res.status, 200);
       assert.equal(res.json.ok, true);
@@ -350,12 +380,12 @@ describe('REST API /api/v1（主服务器）', () => {
       assert.equal(stored.active, true);
     });
 
-    test('重复邮箱注册 → 409 EMAIL_TAKEN', async () => {
+    test('duplicate signup returns a generic failure', async () => {
       const res = await api(handle.base, 'POST', '/api/v1/auth/signup', {
         body: { email: 'newbie@local', password: 'another-pass-123' },
       });
-      assert.equal(res.status, 409);
-      assertEnvelopeError(res.json, 'EMAIL_TAKEN');
+      assert.equal(res.status, 400);
+      assertEnvelopeError(res.json, 'SIGNUP_FAILED');
     });
 
     test('注册参数校验：密码太短 / 邮箱缺 @ → 400', async () => {
@@ -363,7 +393,7 @@ describe('REST API /api/v1（主服务器）', () => {
         body: { email: 'x@local', password: 'short' },
       });
       assert.equal(short.status, 400);
-      assertEnvelopeError(short.json, 'INVALID_REQUEST');
+      assertEnvelopeError(short.json, 'WEAK_PASSWORD');
       const badEmail = await api(handle.base, 'POST', '/api/v1/auth/signup', {
         body: { email: 'not-an-email', password: 'long-enough-pass' },
       });
@@ -452,6 +482,10 @@ describe('REST API /api/v1（主服务器）', () => {
       assert.equal(data.admissionMode, 'both'); // 缺省 both
       assert.equal(data.maxPeers, 4); // 缺省 defaultMaxPeers
       assert.match(data.joinKey, /^[0-9a-f]{64}$/); // 高熵 joinKey
+      assert.equal(data.inviteMaxUses, 10);
+      assert.equal(data.inviteUses, 0);
+      assert.equal(data.inviteExpired, false);
+      assert.ok(Date.parse(data.inviteExpiresAt) > Date.now() + 167 * 3600_000);
       const host = new URL(handle.base).host;
       assert.equal(data.joinUri, `zr-net://${host}/${data.id}#${data.joinKey}`);
       assert.equal(data.gatewayUrl, `http://${host}`);
@@ -1099,6 +1133,7 @@ describe('publicUrl 主机与运行时统计注入（独立实例）', () => {
     const staleSig = signLeave(staleTs);
 
     await handle.store.upsertMemberJoinAttempt({
+      verifiedJoinKeyEnc: (await handle.store.getNetwork(netId)).joinKeyEnc,
       networkId: netId,
       nodeId: node1,
       name: 'leave-dev',
@@ -1997,7 +2032,7 @@ describe('GC-6a 用户管理 /admin/users CRUD 与密码重置', () => {
       body: { email: 'short@local', password: 'short' },
     });
     assert.equal(shortPass.status, 400);
-    assertEnvelopeError(shortPass.json, 'INVALID_REQUEST');
+    assertEnvelopeError(shortPass.json, 'WEAK_PASSWORD');
   });
 
   test('PATCH 部分更新：空体 400、未知用户 404、非法到期时间 400、groupId null 复位默认组', async () => {
@@ -2058,7 +2093,7 @@ describe('GC-6a 用户管理 /admin/users CRUD 与密码重置', () => {
     // POST 新用户 groupId: null → 新默认组
     const created = await api(handle.base, 'POST', '/api/v1/admin/users', {
       cookie: adminCookie,
-      body: { email: 'nulldef@local', password: 'nulldef-pass-1', groupId: null },
+      body: { email: 'nulldef@local', password: 'Copper!River-742', groupId: null },
     });
     assert.equal(created.status, 200);
     assert.equal(created.json.data.groupId, newDefId);
@@ -2126,7 +2161,7 @@ describe('GC-6a 用户管理 /admin/users CRUD 与密码重置', () => {
       body: { newPassword: 'short' },
     });
     assert.equal(tooShort.status, 400);
-    assertEnvelopeError(tooShort.json, 'INVALID_REQUEST');
+    assertEnvelopeError(tooShort.json, 'WEAK_PASSWORD');
 
     const unknown = await api(handle.base, 'POST', '/api/v1/admin/users/ffffffffffffffff/reset-password', {
       cookie: adminCookie,
@@ -3010,4 +3045,3 @@ describe('T5 /api/v1/admin/update* 与 /admin/runtime update 摘要', () => {
     }
   });
 });
-

@@ -121,6 +121,19 @@ export function quotaUsageLevel(used: number, limit: number | null): UsageLevel 
   return 'ok';
 }
 
+export function inviteExpiryDelay(iso: string | null, now = Date.now()): number {
+  const expiresAt = iso === null ? NaN : Date.parse(iso);
+  return Number.isFinite(expiresAt) ? Math.min(2_147_483_647, Math.max(0, expiresAt - now)) : 0;
+}
+
+export function formatInviteExpiry(iso: string | null, locale: Locale): string {
+  if (iso === null || !Number.isFinite(Date.parse(iso))) return '—';
+  const date = new Date(iso);
+  return locale === 'zh'
+    ? date.toLocaleString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
+    : date.toLocaleString('en-US');
+}
+
 /**
  * 用户组到期时间 → 展示串（日期取 ISO 的 UTC 年月日，与管理端录入口径一致）：
  * null → 「长期有效 / No expiry」；无法解析 → '—'；已到 nowMs（含当天起算时刻

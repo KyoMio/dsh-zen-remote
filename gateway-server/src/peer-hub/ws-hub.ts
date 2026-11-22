@@ -914,11 +914,16 @@ export class PeerWsHub {
         name,
         publicKeyHex,
         joinKeyMatched,
+        verifiedJoinKeyEnc: joinKeyMatched ? network.joinKeyEnc : undefined,
         isReconnect,
         maxPeersCap,
       });
     } catch (error) {
       const code = (error as { code?: string }).code;
+      if (code === 'invite-expired') {
+        deny(ws, 'invite link expired or exhausted');
+        return null;
+      }
       if (code === 'member-removed') {
         deny(ws, 'removed from network');
         return null;

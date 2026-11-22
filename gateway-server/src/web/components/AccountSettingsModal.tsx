@@ -55,6 +55,8 @@ function accountErrorToKey(err: unknown): LocaleKey {
       return 'error.currentPasswordWrong';
     case 'EMAIL_TAKEN':
       return 'error.emailTaken';
+    case 'WEAK_PASSWORD':
+      return 'error.weakPassword';
     case 'RATE_LIMITED':
       return 'error.rateLimited';
     case 'OTP_COOLDOWN':
@@ -218,7 +220,7 @@ function ChangePasswordSection(props: {
         label={t('auth.newPassword')}
         value={next}
         required
-        minLength={8}
+        minLength={10}
         autoComplete="new-password"
         onChange={(v) => {
           setNext(v);
@@ -233,7 +235,7 @@ function ChangePasswordSection(props: {
             {t('toast.saved')}
           </p>
         )}
-        <button type="submit" className="btn primary" disabled={busy || current.length === 0 || next.length < 8}>
+        <button type="submit" className="btn primary" disabled={busy || current.length === 0 || next.length < 10}>
           {t('common.save')}
         </button>
       </div>

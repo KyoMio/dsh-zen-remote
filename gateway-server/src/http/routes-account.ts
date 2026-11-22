@@ -21,6 +21,7 @@ import {
 import type { RouteContext, RouteDef } from './auth.js';
 import { hashPassword, verifyPassword } from '../master-key.js';
 import type { MailLocale } from '../mail/templates.js';
+import { checkPassword, PASSWORD_POLICY_MESSAGE } from './password-policy.js';
 
 function readString(body: Record<string, unknown>, key: string): string {
   const value = body[key];
@@ -49,8 +50,11 @@ async function handleChangePassword(ctx: RouteContext): Promise<void> {
   const body = await readJsonObjectBody(ctx.req);
   const currentPassword = readString(body, 'currentPassword');
   const newPassword = readString(body, 'newPassword');
-  if (currentPassword.length === 0 || newPassword.length < 8 || newPassword.length > 128) {
-    throw new ApiError(400, 'INVALID_REQUEST', 'currentPassword and newPassword (8..128 characters) are required');
+  if (currentPassword.length === 0) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'currentPassword is required');
+  }
+  if (!checkPassword(newPassword, user.email)) {
+    throw new ApiError(400, 'WEAK_PASSWORD', PASSWORD_POLICY_MESSAGE);
   }
   if (!(await verifyPassword(currentPassword, user.passwordHash))) {
     throw new ApiError(401, 'INVALID_CREDENTIALS', 'current password is incorrect');

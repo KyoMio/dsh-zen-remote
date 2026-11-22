@@ -103,6 +103,8 @@ export function adminErrorToKey(err: unknown): LocaleKey {
       return 'error.duplicateGroupCode';
     case 'EMAIL_TAKEN':
       return 'error.emailTaken';
+    case 'WEAK_PASSWORD':
+      return 'error.weakPassword';
     case 'PEER_LIMIT_EXCEEDED_BY_GROUP':
       return 'error.peerLimitByGroup';
     case 'INVALID_API_KEY':

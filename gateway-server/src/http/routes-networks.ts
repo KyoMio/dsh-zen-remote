@@ -36,6 +36,16 @@ function generateJoinKey(): string {
   return randomBytes(32).toString('hex');
 }
 
+function readInviteOptions(body: Record<string, unknown>): { inviteTtlHours: number; inviteMaxUses: number } {
+  const inviteTtlHours = body['inviteTtlHours'] === undefined ? 168 : body['inviteTtlHours'];
+  const inviteMaxUses = body['inviteMaxUses'] === undefined ? 10 : body['inviteMaxUses'];
+  if (!Number.isInteger(inviteTtlHours) || typeof inviteTtlHours !== 'number' || inviteTtlHours < 1 || inviteTtlHours > 720 ||
+      !Number.isInteger(inviteMaxUses) || typeof inviteMaxUses !== 'number' || inviteMaxUses < 1 || inviteMaxUses > 1000) {
+    throw new ApiError(400, 'INVALID_REQUEST', 'inviteTtlHours must be 1..720 and inviteMaxUses must be 1..1000 integers');
+  }
+  return { inviteTtlHours, inviteMaxUses };
+}
+
 function isLoopbackOrPrivateHostname(hostname: string): boolean {
   const h = hostname.startsWith('[') && hostname.endsWith(']') ? hostname.slice(1, -1).toLowerCase() : hostname.toLowerCase();
   if (h === 'localhost' || h === '::1') return true;
@@ -169,6 +179,10 @@ async function networkView(ctx: RouteContext, network: NetworkRecord): Promise<R
     peerDirectMaxRttMs: network.peerDirectMaxRttMs,
     createdAt: network.createdAt,
     joinKey,
+    inviteExpiresAt: network.joinKeyExpiresAt,
+    inviteMaxUses: network.joinKeyMaxUses,
+    inviteUses: network.joinKeyUses,
+    inviteExpired: Date.now() >= Date.parse(network.joinKeyExpiresAt) || network.joinKeyUses >= network.joinKeyMaxUses,
     joinUri: `${endpoint.scheme}://${endpoint.authority}/${network.id}${endpoint.query}${uriSuffix}`,
     gatewayUrl: endpoint.gatewayUrl,
     onlineDevices: ctx.runtime.getOnlineCountByNetwork(network.id),
@@ -232,6 +246,7 @@ async function handleCreateNetwork(ctx: RouteContext): Promise<void> {
     name,
     admissionMode,
     joinKeyEnc: encryptSecret(joinKey, ctx.masterKey),
+    ...readInviteOptions(body),
     maxPeers,
   });
   sendOk(ctx.res, await networkView(ctx, network));
@@ -293,7 +308,8 @@ async function handleRotateKey(ctx: RouteContext, params: Record<string, string>
   const networkId = params['id'] ?? '';
   await loadOwnedNetwork(ctx, user.id, networkId);
   const joinKey = generateJoinKey();
-  await ctx.store.rotateNetworkJoinKey(networkId, encryptSecret(joinKey, ctx.masterKey));
+  const options = readInviteOptions(await readJsonObjectBody(ctx.req));
+  await ctx.store.rotateNetworkJoinKey(networkId, encryptSecret(joinKey, ctx.masterKey), options);
   const updated = await ctx.store.getNetwork(networkId);
   if (updated === null) {
     throw new ApiError(404, 'NOT_FOUND', 'network not found');

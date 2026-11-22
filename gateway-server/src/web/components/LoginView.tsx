@@ -115,6 +115,7 @@ export function PasswordField(props: {
           type={visible ? 'text' : 'password'}
           required={props.required}
           minLength={props.minLength}
+          maxLength={hasMinHint ? 128 : undefined}
           autoComplete={props.autoComplete}
           aria-invalid={tooShort || undefined}
           aria-describedby={describedBy}
@@ -272,6 +273,8 @@ export function LoginView(props: LoginViewProps) {
   const handleSubmit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     if (busy) return;
+    const password = mode === 'forgot' ? newPassword : ui.loginPassword;
+    if (mode !== 'login' && password.length < 10) return;
     const ok = await onSubmit(mode, email, mode === 'forgot' ? newPassword : ui.loginPassword, needsOtp ? otpCode : undefined);
     if (ok && mode === 'forgot') {
       // 重置成功：清草稿回登录页，并给一句明确的下一步提示
@@ -382,7 +385,7 @@ export function LoginView(props: LoginViewProps) {
               label={t('auth.newPassword')}
               value={newPassword}
               required
-              minLength={8}
+              minLength={10}
               autoComplete="new-password"
               onChange={setNewPassword}
               t={t}
@@ -473,7 +476,7 @@ export function LoginView(props: LoginViewProps) {
                 label={t('auth.password')}
                 value={ui.loginPassword}
                 required
-                minLength={8}
+                minLength={10}
                 autoComplete="new-password"
                 onChange={(v) => onUi({ loginPassword: v })}
                 t={t}

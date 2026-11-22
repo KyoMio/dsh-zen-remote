@@ -41,6 +41,67 @@ function rejectsCode(promise, code) {
 
 // ---------------------------------------------------------------- config
 
+test('invites enforce atomic caps, expiry, reconnects, pending admission and rotation', async (t) => {
+  const now = Date.now();
+  t.mock.timers.enable({ apis: ['Date'], now });
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  const owner = await store.createUser({ email: 'owner@example.com', role: 'admin', passwordHash: TENANT_HASH });
+  const network = await store.createNetwork({ ownerId: owner.id, name: 'Invites', admissionMode: 'key', joinKeyEnc: 'encrypted', maxPeers: 64, inviteTtlHours: 1, inviteMaxUses: 2 });
+  const join = async (nodeId, extra = {}) => store.upsertMemberJoinAttempt({ networkId: network.id, nodeId, publicKeyHex: `public-${nodeId}`, joinKeyMatched: true, verifiedJoinKeyEnc: (await store.getNetwork(network.id)).joinKeyEnc, ...extra });
+  assert.equal(await join('bad', { joinKeyMatched: false }), null);
+  const results = await Promise.allSettled(Array.from({ length: 8 }, (_, i) => join(`node-${i}`)));
+  assert.equal(results.filter((r) => r.status === 'fulfilled').length, 2);
+  for (const r of results.filter((r) => r.status === 'rejected')) assert.equal(r.reason.code, 'invite-expired');
+  assert.equal((await store.getNetwork(network.id)).joinKeyUses, 2);
+  t.mock.timers.tick(3600_000);
+  await rejectsCode(join('expired'), 'invite-expired');
+  assert.equal((await join('node-0', { isReconnect: true })).status, 'authorized');
+  assert.equal((await join('node-0', { isReconnect: true, joinKeyMatched: false })).status, 'authorized');
+  assert.equal((await store.getNetwork(network.id)).joinKeyUses, 2);
+  await store.updateNetwork(network.id, { admissionMode: 'both' });
+  assert.equal((await join('pending')).status, 'pending');
+  await store.transitionMemberStatus(network.id, 'pending', 'approve');
+  assert.equal((await store.getNetwork(network.id)).joinKeyUses, 2);
+  await store.rotateNetworkJoinKey(network.id, 'new-encrypted', { inviteTtlHours: 2, inviteMaxUses: 1 });
+  const rotated = await store.getNetwork(network.id);
+  assert.equal(rotated.joinKeyUses, 0);
+  assert.equal(rotated.joinKeyMaxUses, 1);
+  assert.equal(rotated.joinKeyExpiresAt, new Date(now + 3 * 3600_000).toISOString());
+  assert.equal((await join('upgrade', { joinKeyMatched: false })).status, 'pending');
+  assert.equal((await join('upgrade')).status, 'authorized');
+  assert.equal((await store.getNetwork(network.id)).joinKeyUses, 1);
+  await store.rotateNetworkJoinKey(network.id, 'default-encrypted');
+  const defaults = await store.getNetwork(network.id);
+  assert.equal(defaults.joinKeyUses, 0);
+  assert.equal(defaults.joinKeyMaxUses, 10);
+  assert.equal(defaults.joinKeyExpiresAt, new Date(now + 169 * 3600_000).toISOString());
+  t.mock.timers.tick(168 * 3600_000);
+  await store.updateNetwork(network.id, { admissionMode: 'key' });
+  await rejectsCode(join('time-expired'), 'invite-expired');
+});
+
+test('rotating an invite invalidates an already verified admission without consuming the new quota', async (t) => {
+  const store = new SqliteStore();
+  t.after(() => store.close());
+  const owner = await store.createUser({ email: 'rotate-race@example.com', role: 'admin', passwordHash: TENANT_HASH });
+  const network = await store.createNetwork({ ownerId: owner.id, name: 'Rotation race', admissionMode: 'key', joinKeyEnc: 'old-invite', maxPeers: 8 });
+  const verifiedAttempt = { networkId: network.id, nodeId: '1234abcd', publicKeyHex: 'ab'.repeat(32), joinKeyMatched: true, verifiedJoinKeyEnc: network.joinKeyEnc };
+  await store.rotateNetworkJoinKey(network.id, 'new-invite', { inviteMaxUses: 1 });
+  assert.equal(await store.upsertMemberJoinAttempt(verifiedAttempt), null);
+  assert.deepEqual(await store.listMembers(network.id), []);
+  assert.equal((await store.getNetwork(network.id)).joinKeyUses, 0);
+  assert.equal(await store.upsertMemberJoinAttempt({ ...verifiedAttempt, verifiedJoinKeyEnc: undefined }), null);
+  await store.updateNetwork(network.id, { admissionMode: 'both' });
+  assert.equal((await store.upsertMemberJoinAttempt(verifiedAttempt)).status, 'pending');
+  assert.equal((await store.upsertMemberJoinAttempt(verifiedAttempt)).status, 'pending');
+  assert.equal((await store.getNetwork(network.id)).joinKeyUses, 0);
+  assert.equal((await store.upsertMemberJoinAttempt({ ...verifiedAttempt, verifiedJoinKeyEnc: 'new-invite' })).status, 'authorized');
+  assert.equal((await store.getNetwork(network.id)).joinKeyUses, 1);
+  assert.equal((await store.upsertMemberJoinAttempt({ ...verifiedAttempt, isReconnect: true })).status, 'authorized');
+  assert.equal((await store.getNetwork(network.id)).joinKeyUses, 1);
+});
+
 describe('resolveGatewayConfig', () => {
   test('默认值', () => {
     const cfg = resolveGatewayConfig({});
@@ -457,6 +518,7 @@ describe('SqliteStore', () => {
   // 在指定网络上按 admissionMode 造一个入网尝试
   async function join(net, nodeId, { matched = true, pub, name } = {}) {
     return store.upsertMemberJoinAttempt({
+      verifiedJoinKeyEnc: net.joinKeyEnc,
       networkId: net.id,
       nodeId,
       name: name ?? `node-${nodeId}`,
@@ -926,7 +988,9 @@ describe('SqliteStore GC-2 扩展', () => {
     }
   });
 
-  test('旧库迁移：networks 缺 peer_direct_max_rtt_ms 列时打开后补齐，旧行回落默认 300', async () => {
+  test('legacy networks receive RTT defaults and a seven-day invite grace period', async (t) => {
+    const now = Date.now();
+    t.mock.timers.enable({ apis: ['Date'], now });
     const dir = tmpDir('net-rtt-migrate');
     const dbPath = path.join(dir, 'legacy.db');
     // 旧版形：networks 没有 peer_direct_max_rtt_ms（其余列照 T3 之前形）
@@ -954,6 +1018,9 @@ describe('SqliteStore GC-2 扩展', () => {
       assert.ok(net !== null);
       assert.equal(net.maxPeers, 8);
       assert.equal(net.peerDirectMaxRttMs, 300, '旧行由列默认值回落 300ms');
+      assert.equal(net.joinKeyExpiresAt, new Date(now + 7 * 86400_000).toISOString());
+      assert.equal(net.joinKeyMaxUses, 10);
+      assert.equal(net.joinKeyUses, 0);
       const raw = new DatabaseSync(dbPath);
       try {
         const cols = raw.prepare('PRAGMA table_info(networks)').all().map((c) => c.name);
@@ -1295,6 +1362,7 @@ describe('SqliteStore GC-2 扩展', () => {
       const net = await store.createNetwork({ ownerId: admin.id, name: 'cap-net', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 4 });
       const attempt = (nodeId, matched, cap) =>
         store.upsertMemberJoinAttempt({
+          verifiedJoinKeyEnc: net.joinKeyEnc,
           networkId: net.id,
           nodeId,
           name: `node-${nodeId}`,
@@ -1418,8 +1486,8 @@ describe('SqliteStore GC-2 扩展', () => {
       const admin = await store.findUserByEmail('a@local');
       const n1 = await store.createNetwork({ ownerId: admin.id, name: 'n1', admissionMode: 'key', joinKeyEnc: 'e', maxPeers: 4 });
       const n2 = await store.createNetwork({ ownerId: admin.id, name: 'n2', admissionMode: 'key', joinKeyEnc: 'e', maxPeers: 4 });
-      await store.upsertMemberJoinAttempt({ networkId: n1.id, nodeId: 'aa11aaaa', publicKeyHex: 'aa11aaaapub', joinKeyMatched: true });
-      await store.upsertMemberJoinAttempt({ networkId: n2.id, nodeId: 'bb22bbbb', publicKeyHex: 'bb22bbbbpub', joinKeyMatched: true });
+      await store.upsertMemberJoinAttempt({ networkId: n1.id, nodeId: 'aa11aaaa', publicKeyHex: 'aa11aaaapub', joinKeyMatched: true, verifiedJoinKeyEnc: n1.joinKeyEnc });
+      await store.upsertMemberJoinAttempt({ networkId: n2.id, nodeId: 'bb22bbbb', publicKeyHex: 'bb22bbbbpub', joinKeyMatched: true, verifiedJoinKeyEnc: n2.joinKeyEnc });
 
       // 跨月批次：10 月两网络聚合 250、11 月 200
       await store.flushMemberTelemetry([
@@ -1616,6 +1684,7 @@ describe('PAS-1a：decideJoinAttempt 重连防复活、manual 强审批与 verif
 
       // 首次入网成功，随后切换到 manual 并再次显式入网 → 回退 pending 且刷新 createdAt
       const joined = await s.upsertMemberJoinAttempt({
+        verifiedJoinKeyEnc: net.joinKeyEnc,
         networkId: net.id,
         nodeId: '12345678',
         name: 'node-a',

@@ -351,6 +351,65 @@ function runTestChild(mode, schema, deadlineMs) {
     });
   });
 
+  test('legacy networks receive seven-day invite migration grace without resetting on reopen', async (t) => {
+    const schema = await createOwnedSchema(rawUrl);
+    t.after(() => dropOwnedSchema(rawUrl, schema));
+    const url = databaseUrlFor(schema, 'zr_invite_migration');
+    let legacy = await PgStore.connect(url);
+    t.after(() => legacy.close());
+    const owner = await legacy.createUser({ email: 'legacy@local', passwordHash: 'unused', role: 'admin' });
+    const network = await legacy.createNetwork({ ownerId: owner.id, name: 'Legacy invite', admissionMode: 'key', joinKeyEnc: enc('legacy-key'), maxPeers: 8 });
+    await legacy.close();
+    await withRootClient(url, c => c.query('ALTER TABLE networks DROP COLUMN join_key_expires_at, DROP COLUMN join_key_max_uses, DROP COLUMN join_key_uses'));
+    const beforeMigration = Date.now();
+    legacy = await PgStore.connect(url);
+    const migrated = await legacy.getNetwork(network.id);
+    const grace = Date.parse(migrated.joinKeyExpiresAt);
+    assert.ok(grace >= beforeMigration + 7 * 86_400_000);
+    assert.ok(grace <= Date.now() + 7 * 86_400_000);
+    assert.equal(migrated.joinKeyMaxUses, 10);
+    assert.equal(migrated.joinKeyUses, 0);
+    await legacy.initSchema();
+    assert.deepEqual(await legacy.getNetwork(network.id), migrated);
+  });
+
+  test('invite rotation rejects previously verified joins without consuming the new quota', async (t) => {
+    const network = await store.createNetwork({ ownerId: adminId, name: 'Rotation race', admissionMode: 'key', joinKeyEnc: enc('old-invite'), maxPeers: 8 });
+    t.after(() => store.deleteNetwork(network.id));
+    const verifiedAttempt = { networkId: network.id, nodeId: '1234abcd', publicKeyHex: 'ab'.repeat(32), joinKeyMatched: true, verifiedJoinKeyEnc: network.joinKeyEnc };
+    const currentKeyEnc = enc('new-invite');
+    await store.rotateNetworkJoinKey(network.id, currentKeyEnc, { inviteMaxUses: 1 });
+    assert.equal(await store.upsertMemberJoinAttempt(verifiedAttempt), null);
+    assert.deepEqual(await store.listMembers(network.id), []);
+    assert.equal((await store.getNetwork(network.id)).joinKeyUses, 0);
+    assert.equal(await store.upsertMemberJoinAttempt({ ...verifiedAttempt, verifiedJoinKeyEnc: undefined }), null);
+    await store.updateNetwork(network.id, { admissionMode: 'both' });
+    assert.equal((await store.upsertMemberJoinAttempt(verifiedAttempt)).status, 'pending');
+    assert.equal((await store.upsertMemberJoinAttempt(verifiedAttempt)).status, 'pending');
+    assert.equal((await store.getNetwork(network.id)).joinKeyUses, 0);
+    assert.equal((await store.upsertMemberJoinAttempt({ ...verifiedAttempt, verifiedJoinKeyEnc: currentKeyEnc })).status, 'authorized');
+    assert.equal((await store.getNetwork(network.id)).joinKeyUses, 1);
+    assert.equal((await store.upsertMemberJoinAttempt({ ...verifiedAttempt, isReconnect: true })).status, 'authorized');
+    assert.equal((await store.getNetwork(network.id)).joinKeyUses, 1);
+  });
+
+  test('concurrent invite admissions cannot exceed the usage cap', async (t) => {
+    const network = await store.createNetwork({ ownerId: adminId, name: 'Bounded invites', admissionMode: 'key', joinKeyEnc: enc('invite-key'), maxPeers: 64, inviteTtlHours: 1, inviteMaxUses: 2 });
+    t.after(() => store.deleteNetwork(network.id));
+    const join = async (i, extra = {}) => store.upsertMemberJoinAttempt({ networkId: network.id, nodeId: String(i).padStart(8, '0'), publicKeyHex: `public-${i}`, joinKeyMatched: true, verifiedJoinKeyEnc: (await store.getNetwork(network.id)).joinKeyEnc, ...extra });
+    const results = await Promise.allSettled(Array.from({ length: 8 }, (_, i) => join(i)));
+    assert.equal(results.filter((r) => r.status === 'fulfilled').length, 2);
+    for (const r of results.filter((r) => r.status === 'rejected')) assert.equal(r.reason.code, 'invite-expired');
+    assert.equal((await store.getNetwork(network.id)).joinKeyUses, 2);
+    const admitted = results.findIndex((r) => r.status === 'fulfilled');
+    assert.equal((await join(admitted, { isReconnect: true })).status, 'authorized');
+    await store.rotateNetworkJoinKey(network.id, enc('rotated-key'));
+    const rotated = await store.getNetwork(network.id);
+    assert.equal(rotated.joinKeyUses, 0);
+    assert.equal(rotated.joinKeyMaxUses, 10);
+    assert.equal((await join(9)).status, 'authorized');
+  });
+
   test('顺序建网与成员持久化：key 模式入网 authorized → pause → paused', { timeout: 30_000 }, async () => {
     quotaNet = await store.createNetwork({
       ownerId: tenantId,
@@ -363,6 +422,7 @@ function runTestChild(mode, schema, deadlineMs) {
 
     const joined = await store.upsertMemberJoinAttempt({
       networkId: quotaNet.id,
+      verifiedJoinKeyEnc: quotaNet.joinKeyEnc,
       nodeId: pausedNodeId,
       publicKeyHex: 'a1'.repeat(32), // 合同形状：64 位 hex 公钥
       joinKeyMatched: true,
@@ -828,6 +888,7 @@ function runTestChild(mode, schema, deadlineMs) {
 
   async function join10(net, nodeId, { matched = true, pub } = {}) {
     return store.upsertMemberJoinAttempt({
+      verifiedJoinKeyEnc: net.joinKeyEnc,
       networkId: net.id,
       nodeId,
       name: `node-${nodeId}`,
@@ -1027,6 +1088,7 @@ function runTestChild(mode, schema, deadlineMs) {
     });
     for (const nodeId of ['51aaaaaa', '52aaaaaa']) {
       const joined = await store.upsertMemberJoinAttempt({
+        verifiedJoinKeyEnc: net.joinKeyEnc,
         networkId: net.id,
         nodeId,
         name: `node-${nodeId}`,

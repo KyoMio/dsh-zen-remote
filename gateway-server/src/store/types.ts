@@ -407,6 +407,9 @@ export interface NetworkRecord {
   admissionMode: AdmissionMode;
   /** AES-256-GCM 密文（master-key.encryptSecret），库里永不存明文口令 */
   joinKeyEnc: string;
+  joinKeyExpiresAt: string;
+  joinKeyMaxUses: number;
+  joinKeyUses: number;
   maxPeers: number;
   /** 节点端直连 RTT 上限（ms）：超此值的 direct 路径按不可信处理；0 = 不设上限 */
   peerDirectMaxRttMs: number;
@@ -458,6 +461,7 @@ export interface JoinAttemptInput {
   publicKeyHex: string;
   /** 挑战验签通过后，调用方比对 join key 的结果（HTTP 层职责，store 不碰明文口令） */
   joinKeyMatched: boolean;
+  verifiedJoinKeyEnc?: string;
   /**
    * 节点端声明为已入网后的自动重连（`reconnect: true`）。当成员行缺失或为
    * `revoked` 时由 store 返回 `'removed'` / 抛 `'member-removed'`，阻断离线
@@ -485,6 +489,7 @@ export interface TelemetryUpdate {
 
 /** StoreError：业务性拒绝统一抛此错误，调用方按 code 分支（HTTP 层映射状态码） */
 export type StoreErrorCode =
+  | 'invite-expired'
   | 'duplicate-email'
   | 'quota-exceeded'
   | 'limit-reached'
@@ -655,6 +660,8 @@ export interface CreateNetworkInput {
   admissionMode: AdmissionMode;
   joinKeyEnc: string;
   maxPeers: number;
+  inviteTtlHours?: number;
+  inviteMaxUses?: number;
 }
 
 /** 节点端按网关地址发现网络时的最小公开摘要（不含 joinKeyEnc、不含 ownerId） */
@@ -752,7 +759,7 @@ export interface GatewayStore {
   listPublicNetworks(): Promise<PublicNetworkSummary[]>;
   getNetwork(id: string): Promise<NetworkRecord | null>;
   updateNetwork(id: string, patch: NetworkPatch): Promise<NetworkRecord | null>;
-  rotateNetworkJoinKey(id: string, newJoinKeyEnc: string): Promise<void>;
+  rotateNetworkJoinKey(id: string, newJoinKeyEnc: string, options?: { inviteTtlHours?: number; inviteMaxUses?: number }): Promise<void>;
   /** 级联删除 network_members */
   deleteNetwork(id: string): Promise<void>;
 

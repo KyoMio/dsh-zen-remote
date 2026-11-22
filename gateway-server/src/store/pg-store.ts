@@ -95,6 +95,10 @@ const PG_SCHEMA_STATEMENTS: ReadonlyArray<string> = [
   'CREATE INDEX IF NOT EXISTS idx_networks_owner_id ON networks(owner_id)',
   // 旧库平滑迁移：与下方 users 三条同款 ADD COLUMN IF NOT EXISTS（peer-network-switch T3）
   `ALTER TABLE networks ADD COLUMN IF NOT EXISTS peer_direct_max_rtt_ms INTEGER NOT NULL DEFAULT ${PEER_DIRECT_MAX_RTT_MS_DEFAULT}`,
+  'ALTER TABLE networks ADD COLUMN IF NOT EXISTS join_key_expires_at TIMESTAMPTZ',
+  "UPDATE networks SET join_key_expires_at = CURRENT_TIMESTAMP + INTERVAL '7 days' WHERE join_key_expires_at IS NULL",
+  'ALTER TABLE networks ADD COLUMN IF NOT EXISTS join_key_max_uses INTEGER NOT NULL DEFAULT 10',
+  'ALTER TABLE networks ADD COLUMN IF NOT EXISTS join_key_uses INTEGER NOT NULL DEFAULT 0',
   `CREATE TABLE IF NOT EXISTS network_members (
     network_id TEXT NOT NULL REFERENCES networks(id) ON DELETE CASCADE,
     node_id TEXT NOT NULL,
@@ -240,6 +244,9 @@ function mapNetworkRow(row: Row): NetworkRecord {
     name: str(row.name),
     admissionMode: str(row.admission_mode) as AdmissionMode,
     joinKeyEnc: str(row.join_key_enc),
+    joinKeyExpiresAt: toIso(row.join_key_expires_at),
+    joinKeyMaxUses: toNum(row.join_key_max_uses),
+    joinKeyUses: toNum(row.join_key_uses),
     maxPeers: toNum(row.max_peers),
     peerDirectMaxRttMs: row.peer_direct_max_rtt_ms === null || row.peer_direct_max_rtt_ms === undefined
       ? PEER_DIRECT_MAX_RTT_MS_DEFAULT
@@ -1084,8 +1091,8 @@ export class PgStore implements GatewayStore {
       }
       const id = randomBytes(8).toString('hex');
       const inserted = await tx(
-        'INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, peer_direct_max_rtt_ms, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *',
-        [id, input.ownerId, input.name, input.admissionMode, input.joinKeyEnc, input.maxPeers, PEER_DIRECT_MAX_RTT_MS_DEFAULT, new Date()],
+        'INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, peer_direct_max_rtt_ms, created_at, join_key_expires_at, join_key_max_uses) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *',
+        [id, input.ownerId, input.name, input.admissionMode, input.joinKeyEnc, input.maxPeers, PEER_DIRECT_MAX_RTT_MS_DEFAULT, new Date(), new Date(Date.now() + (input.inviteTtlHours ?? 168) * 3600_000), input.inviteMaxUses ?? 10],
       );
       return mapNetworkRow(inserted.rows[0] as Row);
     });
@@ -1133,8 +1140,8 @@ export class PgStore implements GatewayStore {
     return this.getNetwork(id);
   }
 
-  async rotateNetworkJoinKey(id: string, newJoinKeyEnc: string): Promise<void> {
-    await this.query('UPDATE networks SET join_key_enc = $2 WHERE id = $1', [id, newJoinKeyEnc]);
+  async rotateNetworkJoinKey(id: string, newJoinKeyEnc: string, options: { inviteTtlHours?: number; inviteMaxUses?: number } = {}): Promise<void> {
+    await this.query('UPDATE networks SET join_key_enc = $2, join_key_expires_at = $3, join_key_max_uses = $4, join_key_uses = 0 WHERE id = $1', [id, newJoinKeyEnc, new Date(Date.now() + (options.inviteTtlHours ?? 168) * 3600_000), options.inviteMaxUses ?? 10]);
   }
 
   async deleteNetwork(id: string): Promise<void> {
@@ -1147,7 +1154,7 @@ export class PgStore implements GatewayStore {
   async upsertMemberJoinAttempt(input: JoinAttemptInput): Promise<MemberRecord | null> {
     return this.inTransaction(async (tx) => {
       // 锁网络行：同网络的入网判定串行化，容量计数不会被并发入网穿透
-      const network = await tx('SELECT id, admission_mode, max_peers FROM networks WHERE id = $1 FOR UPDATE', [input.networkId]);
+      const network = await tx('SELECT * FROM networks WHERE id = $1 FOR UPDATE', [input.networkId]);
       if (network.rows.length === 0) {
         throw new StoreError('network-not-found', `network ${input.networkId} does not exist`);
       }
@@ -1180,12 +1187,14 @@ export class PgStore implements GatewayStore {
       const effectiveMax = input.maxPeersCap !== undefined
         ? Math.min(toNum(networkRow.max_peers), input.maxPeersCap)
         : toNum(networkRow.max_peers);
+      const inviteUsable = Date.now() < Date.parse(toIso(networkRow.join_key_expires_at)) && toNum(networkRow.join_key_uses) < toNum(networkRow.join_key_max_uses);
+      const inviteMatched = input.joinKeyMatched && input.verifiedJoinKeyEnc === str(networkRow.join_key_enc);
       const decision = decideJoinAttempt({
         admissionMode: str(networkRow.admission_mode) as AdmissionMode,
         maxPeers: effectiveMax,
         existing: decisionExisting,
         incomingPublicKeyHex: input.publicKeyHex,
-        joinKeyMatched: input.joinKeyMatched,
+        joinKeyMatched: inviteMatched && inviteUsable,
         capacityUsed,
         isReconnect: input.isReconnect,
       });
@@ -1193,12 +1202,18 @@ export class PgStore implements GatewayStore {
       if (decision === 'removed') {
         throw new StoreError('member-removed', `member ${input.nodeId} was removed from network ${input.networkId}`);
       }
-      if (decision === 'reject') return null;
+      if (decision === 'reject') {
+        if (inviteMatched && !inviteUsable) throw new StoreError('invite-expired', 'invite link expired or exhausted');
+        return null;
+      }
       if (decision === 'limit-reached') {
         // F3：口令匹配但席位满，明确抛错，让上层能把「网络已满」与「口令错误」区分开
         throw new StoreError('limit-reached', `network ${input.networkId} is at max peers (${effectiveMax})`);
       }
       if (decision === 'keep' && existingRow !== null) return mapMemberRow(existingRow);
+      if (decision === 'authorize') {
+        await tx('UPDATE networks SET join_key_uses = join_key_uses + 1 WHERE id = $1', [input.networkId]);
+      }
       if (decision === 'mismatch' && existingRow !== null) {
         const updated = await tx(
           'UPDATE network_members SET status = $3, candidate_public_key_hex = $4 WHERE network_id = $1 AND node_id = $2 RETURNING *',

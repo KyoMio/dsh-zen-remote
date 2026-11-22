@@ -6,6 +6,7 @@
 // settings（GC-6b 起切到扩展设置视图）：HTTP 层给出脱敏视图（含 smtp 已配置态与
 // adminApiKey 前缀），底层 store 仍保持基础 4 键 SystemSettings 契约与钩子签名不变。
 import { randomBytes } from 'node:crypto';
+import { checkPassword, PASSWORD_POLICY_MESSAGE } from './password-policy.js';
 
 import { sendMail, SmtpClientError } from '../mail/smtp-client.js';
 import type { SmtpSecurityMode } from '../mail/smtp-client.js';
@@ -784,16 +785,17 @@ async function resolveTargetGroupId(ctx: RouteContext, body: Record<string, unkn
   return undefined;
 }
 
-/** 密码公共形态：显式给（8..128）或自动生成 16 位；返回 [实际密码, 生成的密码] */
-function resolvePassword(body: Record<string, unknown>, key: string): [string, string | undefined] {
+/** Return the supplied policy-compliant password or a generated 16-character password. */
+function resolvePassword(body: Record<string, unknown>, key: string, email?: string): [string, string | undefined] {
   const raw = body[key];
   if (typeof raw === 'string' && raw.length > 0) {
-    if (raw.length < 8 || raw.length > 128) {
-      throw new ApiError(400, 'INVALID_REQUEST', `${key} must be 8..128 characters`);
+    if (!checkPassword(raw, email)) {
+      throw new ApiError(400, 'WEAK_PASSWORD', PASSWORD_POLICY_MESSAGE);
     }
     return [raw, undefined];
   }
-  const generated = generatePassword(16);
+  let generated: string;
+  do { generated = generatePassword(16); } while (!checkPassword(generated, email));
   return [generated, generated];
 }
 
@@ -804,7 +806,7 @@ async function handleCreateUser(ctx: RouteContext): Promise<void> {
   if (!isValidEmail(email)) {
     throw new ApiError(400, 'INVALID_REQUEST', 'a valid email is required');
   }
-  const [password, generatedPassword] = resolvePassword(body, 'password');
+  const [password, generatedPassword] = resolvePassword(body, 'password', email);
   let role: UserRole = 'user';
   if (body['role'] !== undefined) {
     if (body['role'] !== 'admin' && body['role'] !== 'user') {
@@ -904,7 +906,9 @@ async function handleResetUserPassword(ctx: RouteContext, params: Record<string,
   await requireAdmin(ctx);
   const targetId = params['id'] ?? '';
   const body = await readJsonObjectBody(ctx.req);
-  const [password, generatedPassword] = resolvePassword(body, 'newPassword');
+  const target = await ctx.store.findUserById(targetId);
+  if (target === null) throw new ApiError(404, 'NOT_FOUND', 'user not found');
+  const [password, generatedPassword] = resolvePassword(body, 'newPassword', target.email);
   // keepTokenHash 缺省 → 该用户全部历史会话立即吊销；用户不存在 → 404 NOT_FOUND
   await ctx.store.updateUserPassword(targetId, await hashPassword(password));
   if (generatedPassword !== undefined) {

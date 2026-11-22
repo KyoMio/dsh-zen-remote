@@ -1,11 +1,17 @@
 // GC-4 + GC-5 consolidated SMTP client + email OTP + self-service account REST tests.
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
 import net from 'node:net';
+import os from 'node:os';
+import path from 'node:path';
 import tls from 'node:tls';
 
 import { createGatewayApiServer } from '../dist/server.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
+import { PgStore } from '../dist/store/pg-store.js';
 import { deriveMasterKeyFromSecret, hashPassword } from '../dist/master-key.js';
 import {
   OTP_COOLDOWN_MS,
@@ -17,7 +23,10 @@ import {
   loginAccountRateLimiter,
   loginIpRateLimiter,
   otpSendRateLimiter,
+  signupRateLimiter,
 } from '../dist/http/auth.js';
+import { checkPassword } from '../dist/http/password-policy.js';
+import { StoreError } from '../dist/store/types.js';
 import { sendMail, SmtpClientError } from '../dist/mail/smtp-client.js';
 import { renderOtpEmail, renderSmtpTestEmail } from '../dist/mail/templates.js';
 import {
@@ -27,6 +36,7 @@ import {
   TENANT_HASH,
   getTestTlsPair,
   seedSession,
+  waitFor,
 } from './helpers/fixtures.mjs';
 
 const HOST = '127.0.0.1';
@@ -219,6 +229,7 @@ function seedSettings(overrides = {}) {
 }
 
 async function startServer(opts = {}) {
+  signupRateLimiter.clear();
   const store = opts.store ?? new SqliteStore({ seed: seedSettings(opts.seed) });
   const server = createGatewayApiServer({ store, masterKey: MASTER_KEY, publicUrl: opts.publicUrl });
   await new Promise((resolve, reject) => {
@@ -489,6 +500,90 @@ describe('header injection、本地校验与超时清理', () => {
 
 // ---------------------------------------------------------------- OTP & account REST (GC-5)
 
+test('password policy covers weak patterns, email names, boundaries and strong passwords', () => {
+  for (const password of ['', 'aaaaaaaaaa', 'ababababab', 'password123', 'PASSWORD123', 'qwertyuiop', '1234567890', 'iloveyou12', 'abcdefghij', '0987654321', 'Ab3!xy789', 'prefixALICE!42', 'x'.repeat(129)]) {
+    assert.equal(checkPassword(password, 'alice@example.com'), false, password);
+  }
+  assert.equal(checkPassword('Copper!River-742', 'alice@example.com'), true);
+  assert.equal(checkPassword('aB3!xy7890'), true);
+  assert.equal(checkPassword('Copper!River-742'.padEnd(128, 'z')), true);
+  assert.equal(checkPassword('cat-Copper!742', 'cat@example.com'), true);
+});
+
+test('signup without verification hides duplicates, validates passwords and limits client IP attempts', async (t) => {
+  const handle = await startServer({ seed: { allowSignup: true } });
+  signupRateLimiter.clear();
+  t.after(async () => { signupRateLimiter.clear(); await stopServer(handle); });
+  for (const password of ['aaaaaaaaaa', 'password123', 'abcdefghij', 'Ab3!xy789', 'Alice!River742']) {
+    const res = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: 'alice@example.com', password } });
+    assert.equal(res.status, 400);
+    assertEnvelopeError(res.json, 'WEAK_PASSWORD');
+  }
+  signupRateLimiter.clear();
+  const body = { email: 'alice@example.com', password: 'Copper!River-742' };
+  assert.equal((await api(handle.base, 'POST', '/api/v1/auth/signup', { body })).status, 200);
+  const duplicate = await api(handle.base, 'POST', '/api/v1/auth/signup', { body });
+  assert.equal(duplicate.status, 400);
+  assertEnvelopeError(duplicate.json, 'SIGNUP_FAILED');
+  signupRateLimiter.clear();
+  for (let i = 0; i < OTP_IP_MAX_REQUESTS; i++) {
+    const invalid = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: 'invalid', password: '' } });
+    assert.equal(invalid.status, 400);
+  }
+  const limited = await api(handle.base, 'POST', '/api/v1/auth/signup', { body });
+  assert.equal(limited.status, 429);
+  assertEnvelopeError(limited.json, 'RATE_LIMITED');
+});
+
+test('signup with verification limits client IP attempts before OTP verification', async (t) => {
+  const handle = await startServer({ seed: { allowSignup: true, requireEmailVerification: true } });
+  t.after(async () => { signupRateLimiter.clear(); await stopServer(handle); });
+  const verify = t.mock.method(handle.store, 'verifyAndConsumeEmailOtp');
+  for (let i = 0; i < OTP_IP_MAX_REQUESTS; i++) {
+    const response = await api(handle.base, 'POST', '/api/v1/auth/signup', {
+      body: { email: `attempt-${i}@example.com`, password: 'Copper!River-742', otpCode: '123456' },
+    });
+    assert.equal(response.status, 400);
+    assertEnvelopeError(response.json, 'OTP_INVALID');
+  }
+  assert.equal(verify.mock.callCount(), OTP_IP_MAX_REQUESTS);
+  for (const body of [
+    { email: 'another@example.com', password: 'Copper!River-742', otpCode: '123456' },
+    {},
+  ]) {
+    const response = await api(handle.base, 'POST', '/api/v1/auth/signup', { body });
+    assert.equal(response.status, 429);
+    assertEnvelopeError(response.json, 'RATE_LIMITED');
+  }
+  assert.equal(verify.mock.callCount(), OTP_IP_MAX_REQUESTS);
+});
+
+test('verified signup maps a duplicate-email race to OTP_INVALID', async (t) => {
+  const handle = await startServer({ seed: { allowSignup: true, requireEmailVerification: true } });
+  t.after(() => stopServer(handle));
+  const email = 'alice@example.com';
+  const code = '123456';
+  await handle.store.issueEmailOtp({ email, purpose: 'signup', codeHash: hashOtpCode(MASTER_KEY, 'signup', email, code), ttlMs: OTP_TTL_MS, cooldownMs: OTP_COOLDOWN_MS });
+  t.mock.method(handle.store, 'createUser', async () => { throw new StoreError('duplicate-email'); });
+  const result = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email, password: 'Copper!River-742', otpCode: code } });
+  assert.equal(result.status, 400);
+  assertEnvelopeError(result.json, 'OTP_INVALID');
+});
+
+test('a registered email with a known outstanding OTP still cannot sign up', async (t) => {
+  const handle = await startServer({ seed: { allowSignup: true, requireEmailVerification: true } });
+  t.after(() => stopServer(handle));
+  const email = 'registered-otp@example.com';
+  const code = '123456';
+  await handle.store.issueEmailOtp({ email, purpose: 'signup', codeHash: hashOtpCode(MASTER_KEY, 'signup', email, code), ttlMs: OTP_TTL_MS, cooldownMs: OTP_COOLDOWN_MS });
+  const user = await handle.store.createUser({ email, passwordHash: TENANT_HASH, role: 'user' });
+  const response = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email, password: 'Copper!River-742', otpCode: code } });
+  assert.equal(response.status, 400);
+  assertEnvelopeError(response.json, 'OTP_INVALID');
+  assert.deepEqual(response.setCookies, []);
+  assert.equal((await handle.store.findUserByEmail(email)).id, user.id);
+});
+
 describe('SMTP 未配置（独立实例）', () => {
   let handle;
   let adminCookie;
@@ -550,7 +645,7 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
   let smtp;
   let smtpPort;
   const EMAIL = 'alice@example.com';
-  const PASSWORD = 'alice-pass-1234';
+  const PASSWORD = 'Copper!River-742';
 
   before(async () => {
     smtp = createMockSmtp();
@@ -581,6 +676,7 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
       body: { email, purpose: 'signup', locale: 'zh' },
     });
     assert.equal(sent.status, 200);
+    await waitFor(() => smtp.state.messages.length > 0);
     const otpCode = otpFromMessage(smtp.state.messages.at(-1));
     const wrong = await api(handle.base, 'POST', '/api/v1/auth/signup', {
       body: { email, password: PASSWORD, otpCode: wrongCode(otpCode) },
@@ -598,12 +694,13 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
     otpSendRateLimiter.clear();
   });
 
-  test('缺码/非法格式 400；send-otp → 冷却 → 错 5 次锁定 → 重签注册成功 & /auth/me 带配额 → 已验证邮箱 409', async () => {
+  test('signup OTP validation, cooldown, locking and anti-enumeration for registered emails', async () => {
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: EMAIL, password: PASSWORD } })).status, 400);
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: EMAIL, password: PASSWORD, otpCode: '12ab56' } })).status, 400);
 
     const sendRes = await api(handle.base, 'POST', '/api/v1/auth/send-otp', { body: { email: EMAIL, purpose: 'signup' } });
     assert.equal(sendRes.status, 200);
+    await waitFor(() => smtp.state.messages.length > 0);
     assert.equal(smtp.state.messages.length, 1);
     assert.equal(smtp.state.messages[0].to, `RCPT TO:<${EMAIL}>`);
 
@@ -637,10 +734,130 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
     assert.equal(me.json.data.quota.maxNetworks, 2);
 
     otpSendRateLimiter.clear();
+    const mailCount = smtp.state.messages.length;
     const taken = await api(handle.base, 'POST', '/api/v1/auth/send-otp', { body: { email: EMAIL, purpose: 'signup' } });
-    assert.equal(taken.status, 409);
-    assertEnvelopeError(taken.json, 'EMAIL_TAKEN');
+    assert.equal(taken.status, 200);
+    assert.deepEqual(taken.json.data, { sent: true, cooldownSec: OTP_COOLDOWN_MS / 1000 });
+    assert.equal(smtp.state.messages.length, mailCount);
+    const retry = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: EMAIL, password: PASSWORD, otpCode: '123456' } });
+    assertEnvelopeError(retry.json, 'OTP_INVALID');
   });
+});
+
+for (const backend of ['SQLite', 'PostgreSQL']) {
+test(`${backend}: signup cooldown, wrong-code lockout and expiry stay identical after restarts`, {
+  skip: backend === 'PostgreSQL' && !process.env.ZR_TEST_PG_URL && !process.env.ZR_TEST_PG_URL_FILE,
+}, async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  otpSendRateLimiter.clear();
+  const smtp = createMockSmtp();
+  const port = await listen(smtp.server);
+  t.after(() => closeServer(smtp.server));
+  const seed = seedSettings({ allowSignup: true, requireEmailVerification: true,
+    smtpConfigEnc: encodeSmtpConfig({ host: HOST, port, security: 'none', username: 'mailer@gateway.local', password: 'smtp-test-pass', fromAddress: 'gateway@example.com' }, MASTER_KEY) });
+  let openStore;
+  let root;
+  let schema;
+  let directory;
+  let handle;
+  t.after(async () => {
+    try {
+      if (handle) await stopServer(handle);
+    } finally {
+      try {
+        if (schema) await root.query(`DROP SCHEMA "${schema}" CASCADE`);
+      } finally {
+        if (root) await root.end();
+        if (directory) await rm(directory, { recursive: true, force: true });
+        otpSendRateLimiter.clear();
+        signupRateLimiter.clear();
+      }
+    }
+  });
+  if (backend === 'SQLite') {
+    directory = await mkdtemp(path.join(os.tmpdir(), 'zr-signup-restart-'));
+    openStore = () => new SqliteStore({ path: path.join(directory, 'gateway.sqlite'), seed });
+  } else {
+    const databaseUrl = process.env.ZR_TEST_PG_URL?.trim() || readFileSync(process.env.ZR_TEST_PG_URL_FILE, 'utf8').trim();
+    const { default: pg } = await import('pg');
+    root = new pg.Client({ connectionString: databaseUrl, connectionTimeoutMillis: 5000, query_timeout: 5000 });
+    await root.connect();
+    const name = `zr_signup_test_${randomBytes(12).toString('hex')}`;
+    await root.query(`CREATE SCHEMA "${name}"`);
+    schema = name;
+    const url = new URL(databaseUrl);
+    url.searchParams.set('options', `-c search_path=${schema} -c statement_timeout=5000`);
+    openStore = () => PgStore.connect(url.toString(), seed);
+  }
+  const restart = async () => {
+    if (handle) await stopServer(handle);
+    handle = undefined;
+    handle = await startServer({ store: await openStore() });
+    otpSendRateLimiter.clear();
+  };
+  await restart();
+  const registered = 'registered-parity@example.com';
+  const unused = 'unused-parity@example.com';
+  await handle.store.createUser({ email: registered, passwordHash: TENANT_HASH, role: 'user' });
+  const issue = t.mock.method(handle.store, 'issueEmailOtp');
+  const send = email => api(handle.base, 'POST', '/api/v1/auth/send-otp', { body: { email, purpose: 'signup' } });
+  const verify = (email, otpCode) => api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email, password: 'Copper!River-742', otpCode } });
+  const same = (a, b) => { assert.equal(a.status, b.status); assert.deepEqual(a.json, b.json); };
+  same(await verify(registered, '000000'), await verify(unused, '000000'));
+  same(await send(registered), await send(unused));
+  await waitFor(() => smtp.state.messages.length === 1);
+  assert.equal(issue.mock.callCount(), 2);
+  const wrong = wrongCode(otpFromMessage(smtp.state.messages[0]));
+  await restart();
+  const cooldown = await send(registered);
+  same(cooldown, await send(unused));
+  assert.equal(cooldown.status, 429);
+  assertEnvelopeError(cooldown.json, 'OTP_COOLDOWN');
+  for (let attempt = 1; attempt <= OTP_MAX_ATTEMPTS + 1; attempt++) {
+    if (attempt === OTP_MAX_ATTEMPTS || attempt === OTP_MAX_ATTEMPTS + 1) await restart();
+    const a = await verify(registered, wrong);
+    same(a, await verify(unused, wrong));
+    assertEnvelopeError(a.json, attempt >= OTP_MAX_ATTEMPTS ? 'OTP_LOCKED' : 'OTP_INVALID');
+  }
+  t.mock.timers.tick(OTP_COOLDOWN_MS);
+  same(await send(registered), await send(unused));
+  await waitFor(() => smtp.state.messages.length === 2);
+  const wrongAgain = wrongCode(otpFromMessage(smtp.state.messages[1]));
+  same(await verify(registered, wrongAgain), await verify(unused, wrongAgain));
+  t.mock.timers.tick(OTP_TTL_MS);
+  await restart();
+  const expired = await verify(registered, wrongAgain);
+  same(expired, await verify(unused, wrongAgain));
+  assertEnvelopeError(expired.json, 'OTP_INVALID');
+  assert.equal(smtp.state.messages.length, 2);
+  assert.notEqual(await handle.store.findUserByEmail(registered), null);
+  assert.equal(await handle.store.findUserByEmail(unused), null);
+});
+}
+
+test('signup delivery failure is logged but returns normal success and cooldown', async (t) => {
+  otpSendRateLimiter.clear();
+  const smtp = createMockSmtp();
+  const port = await listen(smtp.server);
+  t.after(() => closeServer(smtp.server));
+  const handle = await startServer({ seed: seedSettings({ allowSignup: true, requireEmailVerification: true,
+    smtpConfigEnc: encodeSmtpConfig({ host: HOST, port, security: 'none', username: 'invalid', password: 'invalid', fromAddress: 'gateway@example.com' }, MASTER_KEY) }) });
+  t.after(() => stopServer(handle));
+  t.after(() => otpSendRateLimiter.clear());
+  const log = t.mock.method(console, 'error', () => {});
+  await handle.store.createUser({ email: 'registered-failure@example.com', passwordHash: TENANT_HASH, role: 'user' });
+  const send = email => api(handle.base, 'POST', '/api/v1/auth/send-otp', { body: { email, purpose: 'signup' } });
+  const existing = await send('registered-failure@example.com');
+  const unused = await send('unused-failure@example.com');
+  assert.equal(unused.status, 200);
+  assert.deepEqual(unused.json, existing.json);
+  await waitFor(() => log.mock.callCount() === 1);
+  assert.deepEqual(log.mock.calls[0].arguments, ['Signup verification email delivery failed']);
+  const a = await send('registered-failure@example.com');
+  const b = await send('unused-failure@example.com');
+  assert.equal(a.status, 429);
+  assert.deepEqual(a.json, b.json);
+  await smtp.waitIdle();
 });
 
 describe('忘记密码重置、IP 限流、已登录改密与两步换绑邮箱（假 SMTP）', () => {
@@ -678,6 +895,11 @@ describe('忘记密码重置、IP 限流、已登录改密与两步换绑邮箱�
     const real = otpFromMessage(smtp.state.messages[0]);
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/reset-password', { body: { email: TENANT_EMAIL, otpCode: 'abc123', newPassword: NEW_PASS } })).status, 400);
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/reset-password', { body: { email: TENANT_EMAIL, otpCode: real, newPassword: 'short' } })).status, 400);
+    for (const newPassword of ['aaaaaaaaaa', 'password123', 'abcdefghij', 'Ab3!xy789', 'Tenant!River742']) {
+      const weak = await api(handle.base, 'POST', '/api/v1/auth/reset-password', { body: { email: TENANT_EMAIL, otpCode: real, newPassword } });
+      assert.equal(weak.status, 400);
+      assertEnvelopeError(weak.json, 'WEAK_PASSWORD');
+    }
 
     const tenantUser = await handle.store.findUserByEmail(TENANT_EMAIL);
     const cookieA = `zr_gw_session=${(await handle.store.createSession(tenantUser.id, 86_400_000)).token}`;
@@ -689,6 +911,11 @@ describe('忘记密码重置、IP 限流、已登录改密与两步换绑邮箱�
     }
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/login', { body: { email: TENANT_EMAIL, password: TENANT_PASS } })).status, 401);
     const cookieNew = await login(handle.base, TENANT_EMAIL, NEW_PASS);
+    for (const newPassword of ['aaaaaaaaaa', 'password123', 'abcdefghij', 'Ab3!xy789', 'Tenant!River742']) {
+      const weak = await api(handle.base, 'PATCH', '/api/v1/auth/account/password', { cookie: cookieNew, body: { currentPassword: NEW_PASS, newPassword } });
+      assert.equal(weak.status, 400);
+      assertEnvelopeError(weak.json, 'WEAK_PASSWORD');
+    }
 
     // Self-service password change preserves current session, revokes others.
     const cookieOther = `zr_gw_session=${(await handle.store.createSession(tenantUser.id, 86_400_000)).token}`;

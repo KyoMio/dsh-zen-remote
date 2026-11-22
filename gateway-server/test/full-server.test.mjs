@@ -992,6 +992,7 @@ describe('PC-19 第二片：停止接收后补末批与有界退出', () => {
         maxPeers: 8,
       });
       await gw.store.upsertMemberJoinAttempt({
+        verifiedJoinKeyEnc: net.joinKeyEnc,
         networkId: net.id,
         nodeId: 'cc19cccc',
         publicKeyHex: 'cc'.repeat(32),

@@ -55,6 +55,10 @@ export interface NetworkView {
   createdAt: string;
   joinKey: string;
   joinUri: string;
+  inviteExpiresAt: string;
+  inviteMaxUses: number;
+  inviteUses: number;
+  inviteExpired: boolean;
   gatewayUrl: string;
   onlineDevices: number;
   totalDevices: number;
@@ -708,6 +712,13 @@ export function applyTopologySnapshot(state: ConsoleState, snapshot: TopologySna
   return { ...state, topology: { ...state.topology, [snapshot.network.id]: snapshot } };
 }
 
+export function topologyMembershipKey(snapshot: TopologySnapshot): string {
+  return JSON.stringify([
+    snapshot.members.map(({ nodeId, status }) => [nodeId, status]).sort(),
+    snapshot.pending.map(({ nodeId }) => nodeId).sort(),
+  ]);
+}
+
 /** 浅合并 ui 切片（组件改菜单开关、草稿等） */
 export function patchUiState(state: ConsoleState, patch: Partial<UiLocalState>): ConsoleState {
   return { ...state, ui: { ...state.ui, ...patch } };
@@ -1169,7 +1180,7 @@ export class ConsoleClient {
 
   /**
    * 发送邮箱验证码（注册 / 找回密码）。找回密码防枚举：邮箱不存在也返回成功。
-   * 错误码：429 OTP_COOLDOWN / RATE_LIMITED、403 SIGNUP_DISABLED、409 EMAIL_TAKEN、
+   * Errors: 429 OTP_COOLDOWN / RATE_LIMITED, 403 SIGNUP_DISABLED,
    * 503 SMTP_NOT_CONFIGURED。
    */
   async sendOtp(input: { email: string; purpose: 'signup' | 'reset_password'; locale?: Locale }): Promise<{ sent: boolean; cooldownSec: number }> {
