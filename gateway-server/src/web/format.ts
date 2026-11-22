@@ -121,6 +121,11 @@ export function quotaUsageLevel(used: number, limit: number | null): UsageLevel 
   return 'ok';
 }
 
+export function inviteExpiryDelay(iso: string | null, now = Date.now()): number {
+  const expiresAt = iso === null ? NaN : Date.parse(iso);
+  return Number.isFinite(expiresAt) ? Math.min(2_147_483_647, Math.max(0, expiresAt - now)) : 0;
+}
+
 export function formatInviteExpiry(iso: string | null, locale: Locale): string {
   if (iso === null || !Number.isFinite(Date.parse(iso))) return '—';
   const date = new Date(iso);

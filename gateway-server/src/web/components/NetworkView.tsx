@@ -34,6 +34,7 @@ import {
   formatInviteExpiry,
   formatRate,
   highestPluginVersion,
+  inviteExpiryDelay,
   isMemberPluginOutdated,
   isQuotaExceeded,
   maskInviteUri,
@@ -505,7 +506,22 @@ export function NetworkView(props: NetworkViewProps) {
   // 未传时回落本机读取——沿用 Modal.resolveCloseLabel 的同一 resolveLocale 先例
   const effectiveLocale = locale ?? readUiLocale();
   const [detailNodeId, setDetailNodeId] = useState<string | null>(null);
+  const [inviteNow, setInviteNow] = useState(Date.now);
   const partsAnchorRef = useRef<HTMLDivElement | null>(null);
+  const inviteExpired = network.inviteExpired || inviteExpiryDelay(network.inviteExpiresAt, inviteNow) === 0;
+  const canCopyInvite = (): boolean => !network.inviteExpired && inviteExpiryDelay(network.inviteExpiresAt) > 0;
+
+  useEffect(() => {
+    let timer: number | undefined;
+    const update = (): void => {
+      const now = Date.now();
+      setInviteNow(now);
+      const delay = inviteExpiryDelay(network.inviteExpiresAt, now);
+      if (delay > 0) timer = window.setTimeout(update, delay);
+    };
+    update();
+    return () => window.clearTimeout(timer);
+  }, [network.id, network.inviteExpiresAt]);
 
   // 切换网络即退出详情并收起分项浮层：详情和链接都属于具体网络
   useEffect(() => {
@@ -620,7 +636,7 @@ export function NetworkView(props: NetworkViewProps) {
             {t('network.inviteExpiry', { time: formatInviteExpiry(network.inviteExpiresAt, effectiveLocale) })}
             {' · '}{t('network.inviteUses', { used: network.inviteUses, max: network.inviteMaxUses })}
           </p>
-          {network.inviteExpired && (
+          {inviteExpired && (
             <p className="danger-hint">
               {t('network.inviteExpired')}{' '}
               <button type="button" className="btn" disabled={busy} onClick={() => onUi({ dialog: 'network-settings', confirmTarget: 'rotate-key' })}>
@@ -630,7 +646,7 @@ export function NetworkView(props: NetworkViewProps) {
           )}
           <div className="invite-box">
             <code className="invite-key mono">{maskInviteUri(network.joinUri)}</code>
-            <button type="button" className="btn primary" onClick={onCopyInvite}>
+            <button type="button" className="btn primary" disabled={inviteExpired} onClick={() => { if (canCopyInvite()) onCopyInvite(); }}>
               {t('common.copy')}
             </button>
           </div>
@@ -676,7 +692,8 @@ export function NetworkView(props: NetworkViewProps) {
                     <button
                       type="button"
                       className="btn ghost"
-                      onClick={() => onCopyField?.(network.joinKey, 'toast.joinPassphraseCopied')}
+                      disabled={inviteExpired}
+                      onClick={() => { if (canCopyInvite()) onCopyField?.(network.joinKey, 'toast.joinPassphraseCopied'); }}
                     >
                       {t('common.copy')}
                     </button>
@@ -697,7 +714,8 @@ export function NetworkView(props: NetworkViewProps) {
                 <button
                   type="button"
                   className="btn ghost"
-                  onClick={() => onCopyField?.(headlessCommand, 'toast.headlessCommandCopied')}
+                  disabled={inviteExpired}
+                  onClick={() => { if (canCopyInvite()) onCopyField?.(headlessCommand, 'toast.headlessCommandCopied'); }}
                 >
                   {t('common.copy')}
                 </button>

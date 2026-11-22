@@ -29,6 +29,7 @@ import {
   formatQuotaExpiry,
   formatRate,
   highestPluginVersion,
+  inviteExpiryDelay,
   isMemberPluginOutdated,
   isQuotaExceeded,
   maskInviteUri,
@@ -1799,6 +1800,21 @@ describe('topology membership refresh key', () => {
 });
 
 describe('invite expiry localization', () => {
+  test('schedules expiry at the boundary and clamps long timer delays', () => {
+    const now = Date.parse('2026-01-01T00:00:00.000Z');
+    const expiry = new Date(now + 1000).toISOString();
+    assert.equal(inviteExpiryDelay(expiry, now), 1000);
+    assert.equal(inviteExpiryDelay(expiry, now + 999), 1);
+    assert.equal(inviteExpiryDelay(expiry, now + 1000), 0);
+    assert.equal(inviteExpiryDelay(expiry, now + 2000), 0);
+    const longExpiry = new Date(now + 30 * 24 * 60 * 60 * 1000).toISOString();
+    assert.equal(inviteExpiryDelay(longExpiry, now), 2_147_483_647);
+    assert.equal(inviteExpiryDelay(longExpiry, now + 2_147_483_647), 444_516_353);
+    assert.equal(inviteExpiryDelay(null, now), 0);
+    assert.equal(inviteExpiryDelay('', now), 0);
+    assert.equal(inviteExpiryDelay('invalid', now), 0);
+  });
+
   test('uses the active UI locale and handles missing or invalid dates', () => {
     const date = new Date(2026, 10, 29, 6, 0, 58);
     assert.equal(formatInviteExpiry(date.toISOString(), 'zh'), '2026/11/29 06:00');
