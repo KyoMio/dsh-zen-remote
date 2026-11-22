@@ -285,7 +285,7 @@ function CreateUserModal(props: {
               id="admin-user-password"
               label={t('admin.initialPassword')}
               value={password}
-              minLength={8}
+              minLength={10}
               autoComplete="new-password"
               onChange={setPassword}
               t={t}
@@ -348,7 +348,7 @@ function CreateUserModal(props: {
             <button
               type="submit"
               className="btn primary"
-              disabled={busy || (!randomPassword && password.length > 0 && password.length < 8)}
+              disabled={busy || (!randomPassword && password.length > 0 && password.length < 10)}
             >
               {t('common.create')}
             </button>

@@ -24,6 +24,7 @@ import {
   effectiveNetworkMaxPeers,
   filterJoinedMembers,
   formatBytesQuota,
+  formatInviteExpiry,
   formatLatencyRange,
   formatQuotaExpiry,
   formatRate,
@@ -1785,6 +1786,17 @@ describe('GC-7b：quotaUsageLevel / isQuotaExceeded', () => {
   });
 });
 
+describe('invite expiry localization', () => {
+  test('uses the active UI locale and handles missing or invalid dates', () => {
+    const date = new Date(2026, 10, 29, 6, 0, 58);
+    assert.equal(formatInviteExpiry(date.toISOString(), 'zh'), '2026/11/29 06:00');
+    assert.equal(formatInviteExpiry(date.toISOString(), 'en'), date.toLocaleString('en-US'));
+    assert.equal(formatInviteExpiry(null, 'zh'), '—');
+    assert.equal(formatInviteExpiry('', 'en'), '—');
+    assert.equal(formatInviteExpiry('invalid', 'zh'), '—');
+  });
+});
+
 describe('GC-7b：formatQuotaExpiry 配额到期展示', () => {
   const future = '2026-06-01T00:00:00.000Z';
   const before = Date.parse('2026-01-15T00:00:00.000Z');
@@ -1859,8 +1871,12 @@ describe('GC-7b：GC-5/GC-6 管理文案插值', () => {
     assert.equal(translate('zh', 'admin.smtpTestFailed', { message: '超时' }), '发送失败：超时');
     assert.equal(translate('zh', 'common.usedOfLimit', { used: 2, limit: 3 }), '已用 2 / 3');
     assert.equal(translate('en', 'common.usedOfLimit', { used: 2, limit: 3 }), 'Used 2 / 3');
-    assert.equal(translate('zh', 'auth.passwordMinHint', { min: 8 }), '至少 8 位字符');
-    assert.equal(translate('en', 'auth.passwordMinHint', { min: 8 }), 'At least 8 characters');
+    assert.equal(translate('zh', 'auth.passwordMinHint', { min: 10 }), '至少 10 位，避免常见、重复或连续字符及邮箱用户名');
+    assert.equal(translate('en', 'auth.passwordMinHint', { min: 10 }), 'At least 10 characters; avoid common, repetitive or consecutive passwords and your email name');
+    assert.ok(translate('en', 'error.signupFailed').includes('Could not create account'));
+    assert.ok(translate('en', 'error.weakPassword').includes('10 characters'));
+    assert.equal(translate('en', 'network.inviteUses', { used: 2, max: 10 }), 'Used 2 / 10');
+    assert.equal(translate('en', 'network.inviteExpired'), 'Expired or used up — regenerate');
     assert.equal(translate('zh', 'admin.kpiAccountsSub', { users: 3, groups: 2 }), '3 位用户 · 2 个用户组');
     assert.equal(translate('en', 'admin.kpiAccountsSub', { users: 3, groups: 2 }), '3 users · 2 groups');
     assert.equal(LOCALES.zh['network.admissionBoth'], '有邀请链接就自动加入，否则需要手动批准');

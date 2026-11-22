@@ -162,6 +162,8 @@ node --experimental-sqlite dist/main.js
 
 ## 邀请链接格式（`zr-net://`）
 
+Invite keys expire after **7 days** and authorize at most **10 devices** by default. Creation and rotation accept `inviteTtlHours` (integer `1–720`, default `168`) and `inviteMaxUses` (integer `1–1000`, default `10`). The console shows expiry and usage and can regenerate the link. Existing members can still reconnect; manual approvals do not consume uses. Existing links receive a seven-day migration grace period.
+
 控制台为每个网络生成的邀请链接统一只有 `zr-net://` 一种格式：
 
 ```
@@ -181,6 +183,8 @@ zr-net://<主机>[:<端口>]/<网络ID>[?tls=0|1][#<入网口令>]
 登录后，右上角头像菜单里的「**账号设置…**」可以：
 
 - **修改密码**：保存后其他已登录设备全部自动退出，当前浏览器保持登录；
+
+New passwords for signup, reset, account change, and administrator assignment must be **10–128 characters**, must not be common, have fewer than four distinct characters, be entirely consecutive ascending/descending characters, or contain an email local part of at least four characters. Login and the bootstrap admin environment password remain unchanged. Signup code requests do not reveal registered addresses or send them mail. Without email verification, duplicate signup returns a generic error; signup attempts are limited to 20 per client IP per 15 minutes.
 - **更换邮箱**：网关未配置发信服务（SMTP）时，输入当前密码即可直接换绑；已配置发信服务后，需要输入发到新邮箱的 6 位验证码确认。
 
 ## 网关管理面板

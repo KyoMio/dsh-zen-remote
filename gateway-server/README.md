@@ -163,6 +163,8 @@ zr-net://<host>[:<port>]/<networkId>[?tls=0|1][#<joinKey>]
 ```
 
 - `<networkId>` is always 16 lowercase hex characters. Copying the full link includes `#<joinKey>`, while manual-approval networks also work without the `#<joinKey>` fragment.
+
+Invite keys expire after **7 days** and authorize at most **10 devices** by default. Creation and key rotation accept `inviteTtlHours` (integer `1–720`, default `168`) and `inviteMaxUses` (integer `1–1000`, default `10`). The console shows expiry and usage and can regenerate the link, resetting its usage. Existing members can reconnect after expiry or exhaustion; manual approvals do not consume uses. Existing links receive a seven-day grace period when upgrading.
 - **Omitting the port defaults to `19393`**. When behind standard ports (`https://` `443` or `http://` `80`), generated links explicitly include `:443` or `:80`.
 - `?tls=0|1` appears whenever transport differs from default host inference: loopback, RFC 1918 private IPv4 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), link-local, IPv6 ULA, CGNAT/Tailscale (`100.64.0.0/10`), and `.local` / `.lan` default to cleartext (`?tls=1` if fronted by TLS); public hosts/domains default to TLS (`?tls=0` for cleartext public IP).
 - Peers still accept legacy `zr-net+insecure://` and `zr-nets://` links on input, while all generated links use `zr-net://`.
@@ -173,6 +175,8 @@ zr-net://<host>[:<port>]/<networkId>[?tls=0|1][#<joinKey>]
 A default admin account (`admin@local` or `ZR_GATEWAY_ADMIN_USER`) is created automatically on first empty boot. Use **Account Settings…** in the top-right user menu to:
 
 - **Change password**: immediately revokes all other active sessions for your account while keeping your current browser signed in.
+
+New passwords (signup, reset, account change, and administrator-assigned passwords) must be **10–128 characters**, must not be common passwords, use fewer than four distinct characters, be entirely consecutive ascending/descending characters, or contain the email local part when it is at least four characters long. Existing passwords still work for login, and the bootstrap admin environment password is not subject to this policy. Signup code requests return the same success for registered and unregistered addresses without sending mail to registered addresses. With verification disabled, failed duplicate signups return a generic error and signup attempts are limited to 20 per client IP per 15 minutes.
 - **Change email**: changes directly with your current password when SMTP is unconfigured, or via a 6-digit verification code sent to the new address once SMTP is configured.
 
 ## Web Admin Console

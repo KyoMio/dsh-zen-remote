@@ -705,6 +705,32 @@ describe('PeerRateLimiter（令牌桶 + 滑窗）', () => {
 });
 
 describe('挑战应答入网与口令自动放行', () => {
+  test('expired invite proofs are denied distinctly while existing members reconnect', async (t) => {
+    const gw = await startGateway({ now: () => Date.now() });
+    t.after(() => gw.close());
+    const net = await createNetwork(gw, { mode: 'key' });
+    const member = identity();
+    const first = await wsOpen(gw.base);
+    t.after(() => first.terminate());
+    await authNode(first, member, { networkId: net.id, joinKey: net.joinKey });
+    assert.equal((await wsJson(first)).status, 'authorized');
+    first.close();
+    await wsClosed(first);
+    const now = Date.now();
+    t.mock.timers.enable({ apis: ['Date'], now });
+    t.mock.timers.tick(7 * 86400_000);
+    const rejected = await wsOpen(gw.base);
+    t.after(() => rejected.terminate());
+    await authNode(rejected, identity(), { networkId: net.id, joinKey: net.joinKey });
+    const denial = await wsJson(rejected);
+    assert.equal(denial.type, 'denied');
+    assert.equal(denial.reason, 'invite link expired or exhausted');
+    const reconnected = await wsOpen(gw.base);
+    t.after(() => reconnected.terminate());
+    await authNode(reconnected, member, { networkId: net.id, joinKey: net.joinKey, reconnect: true });
+    assert.equal((await wsJson(reconnected)).status, 'authorized');
+    assert.equal((await gw.store.getNetwork(net.id)).joinKeyUses, 1);
+  });
   test('key 模式：口令证明正确即 welcome authorized，后加入者触发 peer-joined 与双向 punch-coordinate', async () => {
     const gw = await startGateway();
     try {
@@ -3731,7 +3757,8 @@ describe('T2 /peer/v1/ws 双向版本握手与拓扑 pluginVersion', () => {
       await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey, name: 'legacy-a' });
       const welcomeA = await wsJson(wsA);
       assert.equal(welcomeA.status, 'authorized');
-      assert.equal(welcomeA.gatewayVersion, '0.2.0', 'gatewayVersion must come dynamically from gateway-server/package.json');
+      const { version } = JSON.parse((await import('node:fs')).readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+      assert.equal(welcomeA.gatewayVersion, version, 'gatewayVersion must come dynamically from gateway-server/package.json');
       assert.equal(welcomeA.wireCompatLevel, 1);
       assert.equal(welcomeA.recommendedPluginVersion, null);
 
@@ -3747,7 +3774,7 @@ describe('T2 /peer/v1/ws 双向版本握手与拓扑 pluginVersion', () => {
       });
       const welcomeB = await wsJson(wsB);
       assert.equal(welcomeB.status, 'authorized');
-      assert.equal(welcomeB.gatewayVersion, '0.2.0');
+      assert.equal(welcomeB.gatewayVersion, version);
       assert.equal(welcomeB.recommendedPluginVersion, '2.6.0');
       assert.equal(welcomeB.peers.length, 1);
       assert.equal(welcomeB.peers[0].pluginVersion, null);

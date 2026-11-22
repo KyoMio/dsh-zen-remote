@@ -14,6 +14,7 @@
 import { createHash, createHmac, randomBytes, randomInt } from 'node:crypto';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { TLSSocket } from 'node:tls';
+import { checkPassword, PASSWORD_POLICY_MESSAGE } from './password-policy.js';
 
 import { decryptSecret, encryptSecret, hashPassword, verifyPassword } from '../master-key.js';
 import { sendMail } from '../mail/smtp-client.js';
@@ -622,6 +623,7 @@ export class SlidingWindowRateLimiter {
 
 /** send-otp 与换绑邮箱申请共用的发码限流器（同一进程一个网关，进程级单例） */
 export const otpSendRateLimiter = new SlidingWindowRateLimiter(OTP_IP_WINDOW_MS, OTP_IP_MAX_REQUESTS);
+export const signupRateLimiter = new SlidingWindowRateLimiter(OTP_IP_WINDOW_MS, OTP_IP_MAX_REQUESTS);
 
 export const LOGIN_RATE_WINDOW_MS = 15 * 60_000;
 export const LOGIN_IP_MAX_ATTEMPTS = 20;
@@ -847,6 +849,9 @@ async function handleLogin(ctx: RouteContext): Promise<void> {
 
 async function handleSignup(ctx: RouteContext): Promise<void> {
   const env = await loadAuthEnvironment(ctx);
+  if (!env.ext.requireEmailVerification && !signupRateLimiter.tryConsume(requestClientIp(ctx.req))) {
+    throw new ApiError(429, 'RATE_LIMITED', 'too many signup attempts, try again later');
+  }
   if (!env.ext.allowSignup) {
     throw new ApiError(403, 'SIGNUP_DISABLED', 'signup is disabled on this gateway');
   }
@@ -856,8 +861,8 @@ async function handleSignup(ctx: RouteContext): Promise<void> {
   if (!isValidEmail(email)) {
     throw new ApiError(400, 'INVALID_REQUEST', 'a valid email is required');
   }
-  if (password.length < 8 || password.length > 128) {
-    throw new ApiError(400, 'INVALID_REQUEST', 'password must be 8..128 characters');
+  if (!checkPassword(password, email)) {
+    throw new ApiError(400, 'WEAK_PASSWORD', PASSWORD_POLICY_MESSAGE);
   }
   // 邮箱验证开启时先核销 signup 验证码（错码不建用户），成功即视为已验证
   let emailVerifiedAt: string | null = null;
@@ -871,12 +876,23 @@ async function handleSignup(ctx: RouteContext): Promise<void> {
     });
     emailVerifiedAt = new Date().toISOString();
   }
-  const user = await ctx.store.createUser({
-    email,
-    passwordHash: await hashPassword(password),
-    role: 'user',
-    emailVerifiedAt,
-  });
+  let user: UserRecord;
+  const passwordHash = await hashPassword(password);
+  try {
+    user = await ctx.store.createUser({
+      email,
+      passwordHash,
+      role: 'user',
+      emailVerifiedAt,
+    });
+  } catch (error) {
+    if (error instanceof StoreError && error.code === 'duplicate-email') {
+      throw env.ext.requireEmailVerification
+        ? new ApiError(400, 'OTP_INVALID', 'verification code is invalid or expired')
+        : new ApiError(400, 'SIGNUP_FAILED', 'could not create account with these details');
+    }
+    throw error;
+  }
   // 自动登录
   const session = await ctx.store.createSession(user.id, env.sessionTtlMs);
   ctx.res.setHeader('set-cookie', issueSessionCookie(ctx.req, session.token));
@@ -934,7 +950,9 @@ async function handleSendOtp(ctx: RouteContext): Promise<void> {
     }
     const existing = await ctx.store.findUserByEmail(email);
     if (existing !== null) {
-      throw new ApiError(409, 'EMAIL_TAKEN', 'email already registered');
+      await equalizeAuthTiming();
+      sendOk(ctx.res, { sent: true, cooldownSec: OTP_COOLDOWN_MS / 1000 });
+      return;
     }
   } else {
     const existing = await ctx.store.findUserByEmail(email);
@@ -962,8 +980,8 @@ async function handleResetPassword(ctx: RouteContext): Promise<void> {
     throw new ApiError(400, 'INVALID_REQUEST', 'a valid email is required');
   }
   const code = readOtpCode(body);
-  if (newPassword.length < 8 || newPassword.length > 128) {
-    throw new ApiError(400, 'INVALID_REQUEST', 'password must be 8..128 characters');
+  if (!checkPassword(newPassword, email)) {
+    throw new ApiError(400, 'WEAK_PASSWORD', PASSWORD_POLICY_MESSAGE);
   }
   await ctx.store.verifyAndConsumeEmailOtp({
     email,

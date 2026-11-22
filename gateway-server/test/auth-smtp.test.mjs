@@ -17,7 +17,10 @@ import {
   loginAccountRateLimiter,
   loginIpRateLimiter,
   otpSendRateLimiter,
+  signupRateLimiter,
 } from '../dist/http/auth.js';
+import { checkPassword } from '../dist/http/password-policy.js';
+import { StoreError } from '../dist/store/types.js';
 import { sendMail, SmtpClientError } from '../dist/mail/smtp-client.js';
 import { renderOtpEmail, renderSmtpTestEmail } from '../dist/mail/templates.js';
 import {
@@ -489,6 +492,53 @@ describe('header injection、本地校验与超时清理', () => {
 
 // ---------------------------------------------------------------- OTP & account REST (GC-5)
 
+test('password policy covers weak patterns, email names, boundaries and strong passwords', () => {
+  for (const password of ['', 'aaaaaaaaaa', 'ababababab', 'password123', 'PASSWORD123', 'qwertyuiop', '1234567890', 'iloveyou12', 'abcdefghij', '0987654321', 'Ab3!xy789', 'prefixALICE!42', 'x'.repeat(129)]) {
+    assert.equal(checkPassword(password, 'alice@example.com'), false, password);
+  }
+  assert.equal(checkPassword('Copper!River-742', 'alice@example.com'), true);
+  assert.equal(checkPassword('aB3!xy7890'), true);
+  assert.equal(checkPassword('Copper!River-742'.padEnd(128, 'z')), true);
+  assert.equal(checkPassword('cat-Copper!742', 'cat@example.com'), true);
+});
+
+test('signup without verification hides duplicates, validates passwords and limits client IP attempts', async (t) => {
+  const handle = await startServer({ seed: { allowSignup: true } });
+  signupRateLimiter.clear();
+  t.after(async () => { signupRateLimiter.clear(); await stopServer(handle); });
+  for (const password of ['aaaaaaaaaa', 'password123', 'abcdefghij', 'Ab3!xy789', 'Alice!River742']) {
+    const res = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: 'alice@example.com', password } });
+    assert.equal(res.status, 400);
+    assertEnvelopeError(res.json, 'WEAK_PASSWORD');
+  }
+  signupRateLimiter.clear();
+  const body = { email: 'alice@example.com', password: 'Copper!River-742' };
+  assert.equal((await api(handle.base, 'POST', '/api/v1/auth/signup', { body })).status, 200);
+  const duplicate = await api(handle.base, 'POST', '/api/v1/auth/signup', { body });
+  assert.equal(duplicate.status, 400);
+  assertEnvelopeError(duplicate.json, 'SIGNUP_FAILED');
+  signupRateLimiter.clear();
+  for (let i = 0; i < OTP_IP_MAX_REQUESTS; i++) {
+    const invalid = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: 'invalid', password: '' } });
+    assert.equal(invalid.status, 400);
+  }
+  const limited = await api(handle.base, 'POST', '/api/v1/auth/signup', { body });
+  assert.equal(limited.status, 429);
+  assertEnvelopeError(limited.json, 'RATE_LIMITED');
+});
+
+test('verified signup maps a duplicate-email race to OTP_INVALID', async (t) => {
+  const handle = await startServer({ seed: { allowSignup: true, requireEmailVerification: true } });
+  t.after(() => stopServer(handle));
+  const email = 'alice@example.com';
+  const code = '123456';
+  await handle.store.issueEmailOtp({ email, purpose: 'signup', codeHash: hashOtpCode(MASTER_KEY, 'signup', email, code), ttlMs: OTP_TTL_MS, cooldownMs: OTP_COOLDOWN_MS });
+  t.mock.method(handle.store, 'createUser', async () => { throw new StoreError('duplicate-email'); });
+  const result = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email, password: 'Copper!River-742', otpCode: code } });
+  assert.equal(result.status, 400);
+  assertEnvelopeError(result.json, 'OTP_INVALID');
+});
+
 describe('SMTP 未配置（独立实例）', () => {
   let handle;
   let adminCookie;
@@ -550,7 +600,7 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
   let smtp;
   let smtpPort;
   const EMAIL = 'alice@example.com';
-  const PASSWORD = 'alice-pass-1234';
+  const PASSWORD = 'Copper!River-742';
 
   before(async () => {
     smtp = createMockSmtp();
@@ -598,7 +648,7 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
     otpSendRateLimiter.clear();
   });
 
-  test('缺码/非法格式 400；send-otp → 冷却 → 错 5 次锁定 → 重签注册成功 & /auth/me 带配额 → 已验证邮箱 409', async () => {
+  test('signup OTP validation, cooldown, locking and anti-enumeration for registered emails', async () => {
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: EMAIL, password: PASSWORD } })).status, 400);
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: EMAIL, password: PASSWORD, otpCode: '12ab56' } })).status, 400);
 
@@ -637,9 +687,13 @@ describe('注册邮箱验证全链路（独立实例 + 假 SMTP）', () => {
     assert.equal(me.json.data.quota.maxNetworks, 2);
 
     otpSendRateLimiter.clear();
+    const mailCount = smtp.state.messages.length;
     const taken = await api(handle.base, 'POST', '/api/v1/auth/send-otp', { body: { email: EMAIL, purpose: 'signup' } });
-    assert.equal(taken.status, 409);
-    assertEnvelopeError(taken.json, 'EMAIL_TAKEN');
+    assert.equal(taken.status, 200);
+    assert.deepEqual(taken.json.data, { sent: true, cooldownSec: OTP_COOLDOWN_MS / 1000 });
+    assert.equal(smtp.state.messages.length, mailCount);
+    const retry = await api(handle.base, 'POST', '/api/v1/auth/signup', { body: { email: EMAIL, password: PASSWORD, otpCode: '123456' } });
+    assertEnvelopeError(retry.json, 'OTP_INVALID');
   });
 });
 
@@ -678,6 +732,11 @@ describe('忘记密码重置、IP 限流、已登录改密与两步换绑邮箱�
     const real = otpFromMessage(smtp.state.messages[0]);
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/reset-password', { body: { email: TENANT_EMAIL, otpCode: 'abc123', newPassword: NEW_PASS } })).status, 400);
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/reset-password', { body: { email: TENANT_EMAIL, otpCode: real, newPassword: 'short' } })).status, 400);
+    for (const newPassword of ['aaaaaaaaaa', 'password123', 'abcdefghij', 'Ab3!xy789', 'Tenant!River742']) {
+      const weak = await api(handle.base, 'POST', '/api/v1/auth/reset-password', { body: { email: TENANT_EMAIL, otpCode: real, newPassword } });
+      assert.equal(weak.status, 400);
+      assertEnvelopeError(weak.json, 'WEAK_PASSWORD');
+    }
 
     const tenantUser = await handle.store.findUserByEmail(TENANT_EMAIL);
     const cookieA = `zr_gw_session=${(await handle.store.createSession(tenantUser.id, 86_400_000)).token}`;
@@ -689,6 +748,11 @@ describe('忘记密码重置、IP 限流、已登录改密与两步换绑邮箱�
     }
     assert.equal((await api(handle.base, 'POST', '/api/v1/auth/login', { body: { email: TENANT_EMAIL, password: TENANT_PASS } })).status, 401);
     const cookieNew = await login(handle.base, TENANT_EMAIL, NEW_PASS);
+    for (const newPassword of ['aaaaaaaaaa', 'password123', 'abcdefghij', 'Ab3!xy789', 'Tenant!River742']) {
+      const weak = await api(handle.base, 'PATCH', '/api/v1/auth/account/password', { cookie: cookieNew, body: { currentPassword: NEW_PASS, newPassword } });
+      assert.equal(weak.status, 400);
+      assertEnvelopeError(weak.json, 'WEAK_PASSWORD');
+    }
 
     // Self-service password change preserves current session, revokes others.
     const cookieOther = `zr_gw_session=${(await handle.store.createSession(tenantUser.id, 86_400_000)).token}`;

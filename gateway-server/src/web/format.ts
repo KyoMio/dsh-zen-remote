@@ -121,6 +121,14 @@ export function quotaUsageLevel(used: number, limit: number | null): UsageLevel 
   return 'ok';
 }
 
+export function formatInviteExpiry(iso: string | null, locale: Locale): string {
+  if (iso === null || !Number.isFinite(Date.parse(iso))) return '—';
+  const date = new Date(iso);
+  return locale === 'zh'
+    ? date.toLocaleString('zh-CN', { year: 'numeric', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })
+    : date.toLocaleString('en-US');
+}
+
 /**
  * 用户组到期时间 → 展示串（日期取 ISO 的 UTC 年月日，与管理端录入口径一致）：
  * null → 「长期有效 / No expiry」；无法解析 → '—'；已到 nowMs（含当天起算时刻

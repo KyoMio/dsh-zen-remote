@@ -80,8 +80,10 @@ function authErrorToKey(err: unknown): LocaleKey {
       return 'error.accountDisabled';
     case 'SIGNUP_DISABLED':
       return 'error.signupDisabled';
-    case 'EMAIL_TAKEN':
-      return 'error.emailTaken';
+    case 'SIGNUP_FAILED':
+      return 'error.signupFailed';
+    case 'WEAK_PASSWORD':
+      return 'error.weakPassword';
     // OTP 三态与限流（GC-2/GC-5）
     case 'OTP_COOLDOWN':
       return 'error.otpCooldown';

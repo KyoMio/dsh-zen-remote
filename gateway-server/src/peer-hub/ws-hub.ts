@@ -919,6 +919,10 @@ export class PeerWsHub {
       });
     } catch (error) {
       const code = (error as { code?: string }).code;
+      if (code === 'invite-expired') {
+        deny(ws, 'invite link expired or exhausted');
+        return null;
+      }
       if (code === 'member-removed') {
         deny(ws, 'removed from network');
         return null;

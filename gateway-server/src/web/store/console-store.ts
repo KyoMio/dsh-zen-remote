@@ -55,6 +55,10 @@ export interface NetworkView {
   createdAt: string;
   joinKey: string;
   joinUri: string;
+  inviteExpiresAt: string;
+  inviteMaxUses: number;
+  inviteUses: number;
+  inviteExpired: boolean;
   gatewayUrl: string;
   onlineDevices: number;
   totalDevices: number;
@@ -1148,7 +1152,7 @@ export class ConsoleClient {
 
   /**
    * 发送邮箱验证码（注册 / 找回密码）。找回密码防枚举：邮箱不存在也返回成功。
-   * 错误码：429 OTP_COOLDOWN / RATE_LIMITED、403 SIGNUP_DISABLED、409 EMAIL_TAKEN、
+   * Errors: 429 OTP_COOLDOWN / RATE_LIMITED, 403 SIGNUP_DISABLED,
    * 503 SMTP_NOT_CONFIGURED。
    */
   async sendOtp(input: { email: string; purpose: 'signup' | 'reset_password'; locale?: Locale }): Promise<{ sent: boolean; cooldownSec: number }> {

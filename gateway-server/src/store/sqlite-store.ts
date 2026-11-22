@@ -220,6 +220,9 @@ function mapNetworkRow(row: Row): NetworkRecord {
     name: str(row.name),
     admissionMode: str(row.admission_mode) as AdmissionMode,
     joinKeyEnc: str(row.join_key_enc),
+    joinKeyExpiresAt: str(row.join_key_expires_at),
+    joinKeyMaxUses: toNum(row.join_key_max_uses),
+    joinKeyUses: toNum(row.join_key_uses),
     maxPeers: toNum(row.max_peers),
     peerDirectMaxRttMs: row.peer_direct_max_rtt_ms === null || row.peer_direct_max_rtt_ms === undefined
       ? PEER_DIRECT_MAX_RTT_MS_DEFAULT
@@ -285,6 +288,14 @@ export class SqliteStore implements GatewayStore {
   private migrateNetworkColumns(): void {
     const columns = this.db.prepare('PRAGMA table_info(networks)').all() as Array<Row>;
     const present = new Set(columns.map((column) => str(column.name)));
+    this.tx(() => {
+      if (!present.has('join_key_expires_at')) {
+        this.db.exec('ALTER TABLE networks ADD COLUMN join_key_expires_at TEXT');
+        this.db.prepare('UPDATE networks SET join_key_expires_at = ?').run(new Date(Date.now() + 168 * 3600_000).toISOString());
+      }
+      if (!present.has('join_key_max_uses')) this.db.exec('ALTER TABLE networks ADD COLUMN join_key_max_uses INTEGER NOT NULL DEFAULT 10');
+      if (!present.has('join_key_uses')) this.db.exec('ALTER TABLE networks ADD COLUMN join_key_uses INTEGER NOT NULL DEFAULT 0');
+    });
     if (!present.has('peer_direct_max_rtt_ms')) {
       this.db.exec(
         `ALTER TABLE networks ADD COLUMN peer_direct_max_rtt_ms INTEGER NOT NULL DEFAULT ${PEER_DIRECT_MAX_RTT_MS_DEFAULT} CHECK (peer_direct_max_rtt_ms BETWEEN 0 AND 10000)`,
@@ -961,9 +972,9 @@ export class SqliteStore implements GatewayStore {
       }
       this.db
         .prepare(
-          'INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, peer_direct_max_rtt_ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, peer_direct_max_rtt_ms, created_at, join_key_expires_at, join_key_max_uses) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         )
-        .run(id, input.ownerId, input.name, input.admissionMode, input.joinKeyEnc, input.maxPeers, PEER_DIRECT_MAX_RTT_MS_DEFAULT, nowIso());
+        .run(id, input.ownerId, input.name, input.admissionMode, input.joinKeyEnc, input.maxPeers, PEER_DIRECT_MAX_RTT_MS_DEFAULT, nowIso(), new Date(now + (input.inviteTtlHours ?? 168) * 3600_000).toISOString(), input.inviteMaxUses ?? 10);
     });
     const row = this.getNetworkRow(id);
     if (row === undefined) throw new StoreError('network-not-found', 'created network disappeared');
@@ -1016,8 +1027,9 @@ export class SqliteStore implements GatewayStore {
     return updated === undefined ? null : mapNetworkRow(updated);
   }
 
-  async rotateNetworkJoinKey(id: string, newJoinKeyEnc: string): Promise<void> {
-    this.db.prepare('UPDATE networks SET join_key_enc = ? WHERE id = ?').run(newJoinKeyEnc, id);
+  async rotateNetworkJoinKey(id: string, newJoinKeyEnc: string, options: { inviteTtlHours?: number; inviteMaxUses?: number } = {}): Promise<void> {
+    this.db.prepare('UPDATE networks SET join_key_enc = ?, join_key_expires_at = ?, join_key_max_uses = ?, join_key_uses = 0 WHERE id = ?')
+      .run(newJoinKeyEnc, new Date(Date.now() + (options.inviteTtlHours ?? 168) * 3600_000).toISOString(), options.inviteMaxUses ?? 10, id);
   }
 
   async deleteNetwork(id: string): Promise<void> {
@@ -1030,7 +1042,7 @@ export class SqliteStore implements GatewayStore {
   async upsertMemberJoinAttempt(input: JoinAttemptInput): Promise<MemberRecord | null> {
     return this.tx(() => {
       const network = this.db
-        .prepare('SELECT admission_mode, max_peers FROM networks WHERE id = ?')
+        .prepare('SELECT * FROM networks WHERE id = ?')
         .get(input.networkId) as Row | undefined;
       if (network === undefined) {
         throw new StoreError('network-not-found', `network ${input.networkId} does not exist`);
@@ -1059,12 +1071,13 @@ export class SqliteStore implements GatewayStore {
       const effectiveMax = input.maxPeersCap !== undefined
         ? Math.min(toNum(network.max_peers), input.maxPeersCap)
         : toNum(network.max_peers);
+      const inviteUsable = Date.now() < Date.parse(str(network.join_key_expires_at)) && toNum(network.join_key_uses) < toNum(network.join_key_max_uses);
       const decision = decideJoinAttempt({
         admissionMode: str(network.admission_mode) as AdmissionMode,
         maxPeers: effectiveMax,
         existing: decisionExisting,
         incomingPublicKeyHex: input.publicKeyHex,
-        joinKeyMatched: input.joinKeyMatched,
+        joinKeyMatched: input.joinKeyMatched && inviteUsable,
         capacityUsed,
         isReconnect: input.isReconnect,
       });
@@ -1072,11 +1085,17 @@ export class SqliteStore implements GatewayStore {
       if (decision === 'removed') {
         throw new StoreError('member-removed', `member ${input.nodeId} was removed from network ${input.networkId}`);
       }
-      if (decision === 'reject') return null;
+      if (decision === 'reject') {
+        if (input.joinKeyMatched && !inviteUsable) throw new StoreError('invite-expired', 'invite link expired or exhausted');
+        return null;
+      }
       if (decision === 'limit-reached') {
         throw new StoreError('limit-reached', `network ${input.networkId} is at max peers (${effectiveMax})`);
       }
       if (decision === 'keep' && existing !== undefined) return mapMemberRow(existing);
+      if (decision === 'authorize') {
+        this.db.prepare('UPDATE networks SET join_key_uses = join_key_uses + 1 WHERE id = ?').run(input.networkId);
+      }
       if (decision === 'mismatch' && existing !== undefined) {
         this.db
           .prepare('UPDATE network_members SET status = ?, candidate_public_key_hex = ? WHERE network_id = ? AND node_id = ?')

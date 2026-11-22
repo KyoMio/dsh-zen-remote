@@ -31,6 +31,7 @@ import {
   effectiveNetworkMaxPeers,
   filterJoinedMembers,
   formatBytesQuota,
+  formatInviteExpiry,
   formatRate,
   highestPluginVersion,
   isMemberPluginOutdated,
@@ -615,6 +616,18 @@ export function NetworkView(props: NetworkViewProps) {
             </p>
           )}
           <span className="field-label">{t('network.inviteLink')}</span>
+          <p className="invite-hint">
+            {t('network.inviteExpiry', { time: formatInviteExpiry(network.inviteExpiresAt, effectiveLocale) })}
+            {' · '}{t('network.inviteUses', { used: network.inviteUses, max: network.inviteMaxUses })}
+          </p>
+          {network.inviteExpired && (
+            <p className="danger-hint">
+              {t('network.inviteExpired')}{' '}
+              <button type="button" className="btn" disabled={busy} onClick={() => onUi({ dialog: 'network-settings', confirmTarget: 'rotate-key' })}>
+                {t('network.rotateInviteLink')}
+              </button>
+            </p>
+          )}
           <div className="invite-box">
             <code className="invite-key mono">{maskInviteUri(network.joinUri)}</code>
             <button type="button" className="btn primary" onClick={onCopyInvite}>
