@@ -19,6 +19,7 @@ import {
 } from '../dist/master-key.js';
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
+import { PgStore } from '../dist/store/pg-store.js';
 import { decideJoinAttempt, StoreError } from '../dist/store/types.js';
 import { gatewayLeaveMessage, verifyGatewayLeaveSignature } from '../dist/peer-hub/peer-crypto.js';
 import { TENANT_HASH } from './helpers/fixtures.mjs';
@@ -210,6 +211,64 @@ describe('master-key', () => {
   });
 });
 
+describe('PgStore network partial patches', () => {
+  function fixture(t, beforeQuery = async () => {}) {
+    const db = new DatabaseSync(':memory:');
+    t.after(() => db.close());
+    db.exec(`CREATE TABLE networks (
+      id TEXT PRIMARY KEY, owner_id TEXT, name TEXT NOT NULL, admission_mode TEXT NOT NULL,
+      join_key_enc TEXT, max_peers INTEGER NOT NULL, peer_direct_max_rtt_ms INTEGER NOT NULL, created_at TEXT
+    )`);
+    db.prepare('INSERT INTO networks VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run('network', 'owner', 'Home', 'manual', 'encrypted-key', 8, 300, '2026-01-01T00:00:00.000Z');
+    const store = new PgStore(async (sql, params = []) => {
+      await beforeQuery(sql);
+      const values = [];
+      const sqliteSql = sql.replace(/\$(\d+)/g, (_, index) => {
+        values.push(params[Number(index) - 1]);
+        return '?';
+      });
+      return { rows: db.prepare(sqliteSql).all(...values) };
+    });
+    return store;
+  }
+
+  test('interleaved patches from the same baseline preserve both fields', { timeout: 5000 }, async (t) => {
+    let updates = 0;
+    let release;
+    const ready = new Promise(resolve => { release = resolve; });
+    t.after(() => release());
+    const store = fixture(t, async sql => {
+      if (sql.startsWith('UPDATE networks SET')) {
+        if (++updates === 2) release();
+        await ready;
+      }
+    });
+    const baseline = await store.getNetwork('network');
+    const renamed = { name: `${baseline.name}'s new name` };
+    const latency = { peerDirectMaxRttMs: baseline.peerDirectMaxRttMs + 200 };
+    await Promise.all([store.updateNetwork(baseline.id, renamed), store.updateNetwork(baseline.id, latency)]);
+    assert.deepEqual(await store.getNetwork(baseline.id), { ...baseline, ...renamed, ...latency });
+  });
+
+  test('partial, empty and missing-row updates retain returned record semantics', async (t) => {
+    const store = fixture(t);
+    let expected = await store.getNetwork('network');
+    for (const patch of [{ name: "Home's network" }, { admissionMode: 'both' }, { maxPeers: 12 }, { peerDirectMaxRttMs: 0 }, {}, { name: undefined }]) {
+      expected = { ...expected, ...Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)) };
+      assert.deepEqual(await store.updateNetwork('network', patch), expected);
+    }
+    assert.equal(await store.updateNetwork('missing', {}), null);
+    assert.equal(await store.updateNetwork('missing', { name: 'Absent' }), null);
+  });
+
+  test('database write failures propagate', async () => {
+    const failure = new Error('Write unavailable');
+    const store = new PgStore(async () => { throw failure; });
+    await assert.rejects(store.updateNetwork('network', { name: 'Renamed' }), error => error === failure);
+  });
+});
+
 // ---------------------------------------------------------------- SqliteStore
 
 describe('SqliteStore', () => {
@@ -346,6 +405,41 @@ describe('SqliteStore', () => {
     assert.equal(updated.joinKeyEnc, net.joinKeyEnc);
     assert.equal(await store.getNetwork('does-not-exist-0000'), null);
     assert.equal(await store.updateNetwork('does-not-exist-0000', { name: 'x' }), null);
+  });
+
+  test('network patches write only supplied columns, including zero RTT', async (t) => {
+    const dir = tmpDir('network-patch');
+    let store;
+    let raw;
+    t.after(async () => {
+      raw?.close();
+      await store?.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+    const dbPath = path.join(dir, 'gateway.db');
+    store = new SqliteStore({ path: dbPath });
+    const owner = await store.createUser({ email: 'patch-owner@local', passwordHash: await hashPassword('patch-test-password'), role: 'admin' });
+    const net = await store.createNetwork({ ownerId: owner.id, name: 'Patch test', admissionMode: 'manual', joinKeyEnc: 'encrypted-key', maxPeers: 8 });
+    raw = new DatabaseSync(dbPath);
+    const columns = ['name', 'admission_mode', 'max_peers', 'peer_direct_max_rtt_ms'];
+    raw.exec('CREATE TABLE network_patch_columns (name TEXT)');
+    for (const column of columns) {
+      raw.exec(`CREATE TRIGGER patch_${column} AFTER UPDATE OF ${column} ON networks
+        BEGIN INSERT INTO network_patch_columns VALUES ('${column}'); END`);
+    }
+    let expected = await store.getNetwork(net.id);
+    for (const [patch, written] of [
+      [{ name: "Admin's renamed network" }, ['name']],
+      [{ peerDirectMaxRttMs: 0 }, ['peer_direct_max_rtt_ms']],
+      [{ admissionMode: 'both', maxPeers: 12 }, ['admission_mode', 'max_peers']],
+      [{}, []], [{ name: undefined }, []],
+    ]) {
+      expected = { ...expected, ...Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)) };
+      assert.deepEqual(await store.updateNetwork(net.id, patch), expected);
+      assert.deepEqual(raw.prepare('SELECT name FROM network_patch_columns ORDER BY name').all().map(row => row.name), written);
+      raw.exec('DELETE FROM network_patch_columns');
+    }
+    assert.equal(await store.updateNetwork('missing', {}), null);
   });
 
   test('rotateNetworkJoinKey：换密文、可解出新口令', async () => {
