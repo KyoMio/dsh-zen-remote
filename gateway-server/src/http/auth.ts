@@ -879,7 +879,7 @@ async function handleLogin(ctx: RouteContext): Promise<void> {
 
 async function handleSignup(ctx: RouteContext): Promise<void> {
   const env = await loadAuthEnvironment(ctx);
-  if (!env.ext.requireEmailVerification && !signupRateLimiter.tryConsume(requestClientIp(ctx.req))) {
+  if (!signupRateLimiter.tryConsume(requestClientIp(ctx.req))) {
     throw new ApiError(429, 'RATE_LIMITED', 'too many signup attempts, try again later');
   }
   if (!env.ext.allowSignup) {

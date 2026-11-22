@@ -223,6 +223,7 @@ function seedSettings(overrides = {}) {
 }
 
 async function startServer(opts = {}) {
+  signupRateLimiter.clear();
   const store = opts.store ?? new SqliteStore({ seed: seedSettings(opts.seed) });
   const server = createGatewayApiServer({ store, masterKey: MASTER_KEY, publicUrl: opts.publicUrl });
   await new Promise((resolve, reject) => {
@@ -526,6 +527,29 @@ test('signup without verification hides duplicates, validates passwords and limi
   const limited = await api(handle.base, 'POST', '/api/v1/auth/signup', { body });
   assert.equal(limited.status, 429);
   assertEnvelopeError(limited.json, 'RATE_LIMITED');
+});
+
+test('signup with verification limits client IP attempts before OTP verification', async (t) => {
+  const handle = await startServer({ seed: { allowSignup: true, requireEmailVerification: true } });
+  t.after(async () => { signupRateLimiter.clear(); await stopServer(handle); });
+  const verify = t.mock.method(handle.store, 'verifyAndConsumeEmailOtp');
+  for (let i = 0; i < OTP_IP_MAX_REQUESTS; i++) {
+    const response = await api(handle.base, 'POST', '/api/v1/auth/signup', {
+      body: { email: `attempt-${i}@example.com`, password: 'Copper!River-742', otpCode: '123456' },
+    });
+    assert.equal(response.status, 400);
+    assertEnvelopeError(response.json, 'OTP_INVALID');
+  }
+  assert.equal(verify.mock.callCount(), OTP_IP_MAX_REQUESTS);
+  for (const body of [
+    { email: 'another@example.com', password: 'Copper!River-742', otpCode: '123456' },
+    {},
+  ]) {
+    const response = await api(handle.base, 'POST', '/api/v1/auth/signup', { body });
+    assert.equal(response.status, 429);
+    assertEnvelopeError(response.json, 'RATE_LIMITED');
+  }
+  assert.equal(verify.mock.callCount(), OTP_IP_MAX_REQUESTS);
 });
 
 test('verified signup maps a duplicate-email race to OTP_INVALID', async (t) => {
