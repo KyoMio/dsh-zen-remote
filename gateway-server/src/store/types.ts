@@ -461,6 +461,7 @@ export interface JoinAttemptInput {
   publicKeyHex: string;
   /** 挑战验签通过后，调用方比对 join key 的结果（HTTP 层职责，store 不碰明文口令） */
   joinKeyMatched: boolean;
+  verifiedJoinKeyEnc?: string;
   /**
    * 节点端声明为已入网后的自动重连（`reconnect: true`）。当成员行缺失或为
    * `revoked` 时由 store 返回 `'removed'` / 抛 `'member-removed'`，阻断离线

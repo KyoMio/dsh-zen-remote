@@ -137,8 +137,9 @@ async function login(base, email, password) {
 
 /** 经 store 直造成员（模拟 PG-5 入网协议落库后的状态），REST 层在其上做状态操作 */
 async function seedMember(store, netId, nodeId, state) {
-  const attempt = (publicKeyHex, matched) =>
+  const attempt = async (publicKeyHex, matched) =>
     store.upsertMemberJoinAttempt({
+      verifiedJoinKeyEnc: (await store.getNetwork(netId)).joinKeyEnc,
       networkId: netId,
       nodeId,
       name: `node-${nodeId}`,
@@ -178,7 +179,7 @@ test('network invite options validate bounds and rotation resets usage and expir
   assert.equal(created.status, 200);
   const network = created.json.data;
   assert.equal(network.inviteMaxUses, 1);
-  await handle.store.upsertMemberJoinAttempt({ networkId: network.id, nodeId: 'aaaaaaaa', publicKeyHex: 'public-a', joinKeyMatched: true });
+  await handle.store.upsertMemberJoinAttempt({ networkId: network.id, nodeId: 'aaaaaaaa', publicKeyHex: 'public-a', joinKeyMatched: true, verifiedJoinKeyEnc: (await handle.store.getNetwork(network.id)).joinKeyEnc });
   const exhausted = await api(handle.base, 'GET', '/api/v1/networks', { cookie });
   const exhaustedNetwork = exhausted.json.data.find((item) => item.id === network.id);
   assert.equal(exhaustedNetwork.inviteExpired, true);
@@ -1132,6 +1133,7 @@ describe('publicUrl 主机与运行时统计注入（独立实例）', () => {
     const staleSig = signLeave(staleTs);
 
     await handle.store.upsertMemberJoinAttempt({
+      verifiedJoinKeyEnc: (await handle.store.getNetwork(netId)).joinKeyEnc,
       networkId: netId,
       nodeId: node1,
       name: 'leave-dev',

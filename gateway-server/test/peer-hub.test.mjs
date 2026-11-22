@@ -1015,6 +1015,7 @@ describe('mismatch 与 repin 恢复', () => {
       const b = identity();
       const impostor = identity(); // 「碰撞漏网」形态：库里 (net, b.nodeId) 行挂着别人的公钥
       await gw.store.upsertMemberJoinAttempt({
+        verifiedJoinKeyEnc: (await gw.store.getNetwork(net.id)).joinKeyEnc,
         networkId: net.id,
         nodeId: b.nodeId,
         name: 'bravo',
@@ -1631,6 +1632,7 @@ describe('PC-19 第一片：遥测成功后确认、串行 flush 与失败保留
     });
     for (const nodeId of ['aa19aaaa', 'bb19bbbb']) {
       const member = await store.upsertMemberJoinAttempt({
+        verifiedJoinKeyEnc: net.joinKeyEnc,
         networkId: net.id,
         nodeId,
         publicKeyHex: nodeId.slice(0, 2).repeat(32),
@@ -3561,6 +3563,7 @@ describe('T7：gateway-security-hardening（口令前置拦截与挂起连接隔
 
         // 库里已存在授权成员（使用 attacker.nodeId 模拟 32-bit nodeId 碰撞目标，但公钥为 victim）
         await gw.store.upsertMemberJoinAttempt({
+          verifiedJoinKeyEnc: (await gw.store.getNetwork(net.id)).joinKeyEnc,
           networkId: net.id,
           nodeId: attacker.nodeId,
           name: 'victim-online',

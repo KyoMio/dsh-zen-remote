@@ -373,10 +373,30 @@ function runTestChild(mode, schema, deadlineMs) {
     assert.deepEqual(await legacy.getNetwork(network.id), migrated);
   });
 
+  test('invite rotation rejects previously verified joins without consuming the new quota', async (t) => {
+    const network = await store.createNetwork({ ownerId: adminId, name: 'Rotation race', admissionMode: 'key', joinKeyEnc: enc('old-invite'), maxPeers: 8 });
+    t.after(() => store.deleteNetwork(network.id));
+    const verifiedAttempt = { networkId: network.id, nodeId: '1234abcd', publicKeyHex: 'ab'.repeat(32), joinKeyMatched: true, verifiedJoinKeyEnc: network.joinKeyEnc };
+    const currentKeyEnc = enc('new-invite');
+    await store.rotateNetworkJoinKey(network.id, currentKeyEnc, { inviteMaxUses: 1 });
+    assert.equal(await store.upsertMemberJoinAttempt(verifiedAttempt), null);
+    assert.deepEqual(await store.listMembers(network.id), []);
+    assert.equal((await store.getNetwork(network.id)).joinKeyUses, 0);
+    assert.equal(await store.upsertMemberJoinAttempt({ ...verifiedAttempt, verifiedJoinKeyEnc: undefined }), null);
+    await store.updateNetwork(network.id, { admissionMode: 'both' });
+    assert.equal((await store.upsertMemberJoinAttempt(verifiedAttempt)).status, 'pending');
+    assert.equal((await store.upsertMemberJoinAttempt(verifiedAttempt)).status, 'pending');
+    assert.equal((await store.getNetwork(network.id)).joinKeyUses, 0);
+    assert.equal((await store.upsertMemberJoinAttempt({ ...verifiedAttempt, verifiedJoinKeyEnc: currentKeyEnc })).status, 'authorized');
+    assert.equal((await store.getNetwork(network.id)).joinKeyUses, 1);
+    assert.equal((await store.upsertMemberJoinAttempt({ ...verifiedAttempt, isReconnect: true })).status, 'authorized');
+    assert.equal((await store.getNetwork(network.id)).joinKeyUses, 1);
+  });
+
   test('concurrent invite admissions cannot exceed the usage cap', async (t) => {
     const network = await store.createNetwork({ ownerId: adminId, name: 'Bounded invites', admissionMode: 'key', joinKeyEnc: enc('invite-key'), maxPeers: 64, inviteTtlHours: 1, inviteMaxUses: 2 });
     t.after(() => store.deleteNetwork(network.id));
-    const join = (i, extra = {}) => store.upsertMemberJoinAttempt({ networkId: network.id, nodeId: String(i).padStart(8, '0'), publicKeyHex: `public-${i}`, joinKeyMatched: true, ...extra });
+    const join = async (i, extra = {}) => store.upsertMemberJoinAttempt({ networkId: network.id, nodeId: String(i).padStart(8, '0'), publicKeyHex: `public-${i}`, joinKeyMatched: true, verifiedJoinKeyEnc: (await store.getNetwork(network.id)).joinKeyEnc, ...extra });
     const results = await Promise.allSettled(Array.from({ length: 8 }, (_, i) => join(i)));
     assert.equal(results.filter((r) => r.status === 'fulfilled').length, 2);
     for (const r of results.filter((r) => r.status === 'rejected')) assert.equal(r.reason.code, 'invite-expired');
@@ -402,6 +422,7 @@ function runTestChild(mode, schema, deadlineMs) {
 
     const joined = await store.upsertMemberJoinAttempt({
       networkId: quotaNet.id,
+      verifiedJoinKeyEnc: quotaNet.joinKeyEnc,
       nodeId: pausedNodeId,
       publicKeyHex: 'a1'.repeat(32), // 合同形状：64 位 hex 公钥
       joinKeyMatched: true,
@@ -867,6 +888,7 @@ function runTestChild(mode, schema, deadlineMs) {
 
   async function join10(net, nodeId, { matched = true, pub } = {}) {
     return store.upsertMemberJoinAttempt({
+      verifiedJoinKeyEnc: net.joinKeyEnc,
       networkId: net.id,
       nodeId,
       name: `node-${nodeId}`,
@@ -1066,6 +1088,7 @@ function runTestChild(mode, schema, deadlineMs) {
     });
     for (const nodeId of ['51aaaaaa', '52aaaaaa']) {
       const joined = await store.upsertMemberJoinAttempt({
+        verifiedJoinKeyEnc: net.joinKeyEnc,
         networkId: net.id,
         nodeId,
         name: `node-${nodeId}`,

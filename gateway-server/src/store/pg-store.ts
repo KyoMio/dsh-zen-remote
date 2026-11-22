@@ -1188,12 +1188,13 @@ export class PgStore implements GatewayStore {
         ? Math.min(toNum(networkRow.max_peers), input.maxPeersCap)
         : toNum(networkRow.max_peers);
       const inviteUsable = Date.now() < Date.parse(toIso(networkRow.join_key_expires_at)) && toNum(networkRow.join_key_uses) < toNum(networkRow.join_key_max_uses);
+      const inviteMatched = input.joinKeyMatched && input.verifiedJoinKeyEnc === str(networkRow.join_key_enc);
       const decision = decideJoinAttempt({
         admissionMode: str(networkRow.admission_mode) as AdmissionMode,
         maxPeers: effectiveMax,
         existing: decisionExisting,
         incomingPublicKeyHex: input.publicKeyHex,
-        joinKeyMatched: input.joinKeyMatched && inviteUsable,
+        joinKeyMatched: inviteMatched && inviteUsable,
         capacityUsed,
         isReconnect: input.isReconnect,
       });
@@ -1202,7 +1203,7 @@ export class PgStore implements GatewayStore {
         throw new StoreError('member-removed', `member ${input.nodeId} was removed from network ${input.networkId}`);
       }
       if (decision === 'reject') {
-        if (input.joinKeyMatched && !inviteUsable) throw new StoreError('invite-expired', 'invite link expired or exhausted');
+        if (inviteMatched && !inviteUsable) throw new StoreError('invite-expired', 'invite link expired or exhausted');
         return null;
       }
       if (decision === 'limit-reached') {

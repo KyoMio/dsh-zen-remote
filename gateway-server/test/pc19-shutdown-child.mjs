@@ -114,6 +114,7 @@ try {
   networkId = net.id;
   for (const node of nodes) {
     const joined = await seeder.upsertMemberJoinAttempt({
+      verifiedJoinKeyEnc: net.joinKeyEnc,
       networkId: net.id,
       nodeId: node.nodeId,
       publicKeyHex: node.publicKeyHex,

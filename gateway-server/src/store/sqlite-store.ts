@@ -1072,12 +1072,13 @@ export class SqliteStore implements GatewayStore {
         ? Math.min(toNum(network.max_peers), input.maxPeersCap)
         : toNum(network.max_peers);
       const inviteUsable = Date.now() < Date.parse(str(network.join_key_expires_at)) && toNum(network.join_key_uses) < toNum(network.join_key_max_uses);
+      const inviteMatched = input.joinKeyMatched && input.verifiedJoinKeyEnc === str(network.join_key_enc);
       const decision = decideJoinAttempt({
         admissionMode: str(network.admission_mode) as AdmissionMode,
         maxPeers: effectiveMax,
         existing: decisionExisting,
         incomingPublicKeyHex: input.publicKeyHex,
-        joinKeyMatched: input.joinKeyMatched && inviteUsable,
+        joinKeyMatched: inviteMatched && inviteUsable,
         capacityUsed,
         isReconnect: input.isReconnect,
       });
@@ -1086,7 +1087,7 @@ export class SqliteStore implements GatewayStore {
         throw new StoreError('member-removed', `member ${input.nodeId} was removed from network ${input.networkId}`);
       }
       if (decision === 'reject') {
-        if (input.joinKeyMatched && !inviteUsable) throw new StoreError('invite-expired', 'invite link expired or exhausted');
+        if (inviteMatched && !inviteUsable) throw new StoreError('invite-expired', 'invite link expired or exhausted');
         return null;
       }
       if (decision === 'limit-reached') {

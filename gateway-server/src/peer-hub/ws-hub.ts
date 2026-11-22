@@ -914,6 +914,7 @@ export class PeerWsHub {
         name,
         publicKeyHex,
         joinKeyMatched,
+        verifiedJoinKeyEnc: joinKeyMatched ? network.joinKeyEnc : undefined,
         isReconnect,
         maxPeersCap,
       });
