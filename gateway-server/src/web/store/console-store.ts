@@ -690,6 +690,16 @@ export function applyNetworks(state: ConsoleState, networks: NetworkView[]): Con
   return { ...state, networks };
 }
 
+export function applyNetwork(state: ConsoleState, network: NetworkView): ConsoleState {
+  if (!state.networks.some((entry) => entry.id === network.id)) return state;
+  return { ...state, networks: state.networks.map((entry) => entry.id === network.id ? network : entry) };
+}
+
+export function removeNetwork(state: ConsoleState, networkId: string): ConsoleState {
+  const { [networkId]: removed, ...topology } = state.topology;
+  return { ...state, networks: state.networks.filter((network) => network.id !== networkId), topology };
+}
+
 /**
  * SSE 快照合并（含首载 REST 快照）：只替换 topology[snapshot.network.id]。
  * 其余切片引用原样保留——这是「实时推送不冲掉交互状态」的实现根基。
@@ -740,6 +750,8 @@ export function deriveNetworkCounts(network: NetworkView, snapshot?: TopologySna
 export class ConsoleStore {
   private readonly listeners = new Set<() => void>();
   private state: ConsoleState = createInitialState();
+  private networkRefreshSequence = 0;
+  private readonly topologyRefreshSequences = new Map<string, number>();
 
   readonly getState = (): ConsoleState => this.state;
 
@@ -753,6 +765,11 @@ export class ConsoleStore {
   private setState(next: ConsoleState): void {
     this.state = next;
     for (const listener of [...this.listeners]) listener();
+  }
+
+  private invalidateNetworkRefreshes(): void {
+    this.networkRefreshSequence += 1;
+    for (const id of this.topologyRefreshSequences.keys()) this.beginTopologyRefresh(id);
   }
 
   /**
@@ -780,6 +797,7 @@ export class ConsoleStore {
         quota: me.quota ?? null,
       });
     } else {
+      this.invalidateNetworkRefreshes();
       this.setState({ ...setLoggedOut(this.state, meta), boot: 'ready', publicPolicy });
     }
   }
@@ -802,14 +820,45 @@ export class ConsoleStore {
   };
 
   readonly logout = (meta: SessionMeta): void => {
+    this.invalidateNetworkRefreshes();
     this.setState(setLoggedOut(this.state, meta));
   };
 
   readonly setNetworks = (networks: NetworkView[]): void => {
+    this.networkRefreshSequence += 1;
     this.setState(applyNetworks(this.state, networks));
   };
 
+  readonly beginNetworkRefresh = (): number => ++this.networkRefreshSequence;
+
+  readonly applyNetworkRefresh = (sequence: number, networks: NetworkView[]): void => {
+    if (sequence === this.networkRefreshSequence) this.setNetworks(networks);
+  };
+
+  readonly updateNetwork = (network: NetworkView): void => {
+    this.networkRefreshSequence += 1;
+    this.beginTopologyRefresh(network.id);
+    this.setState(applyNetwork(this.state, network));
+  };
+
+  readonly removeNetwork = (networkId: string): void => {
+    this.networkRefreshSequence += 1;
+    this.beginTopologyRefresh(networkId);
+    this.setState(removeNetwork(this.state, networkId));
+  };
+
+  readonly beginTopologyRefresh = (networkId: string): number => {
+    const sequence = (this.topologyRefreshSequences.get(networkId) ?? 0) + 1;
+    this.topologyRefreshSequences.set(networkId, sequence);
+    return sequence;
+  };
+
+  readonly applyTopologyRefresh = (sequence: number, snapshot: TopologySnapshot): void => {
+    if (sequence === this.topologyRefreshSequences.get(snapshot.network.id)) this.applyTopologySnapshot(snapshot);
+  };
+
   readonly applyTopologySnapshot = (snapshot: TopologySnapshot): void => {
+    this.beginTopologyRefresh(snapshot.network.id);
     this.setState(applyTopologySnapshot(this.state, snapshot));
   };
 

@@ -14,7 +14,7 @@
 // 编辑、建网额度透传（maxPeers / admissionMode）、空态建网 CTA 与配额
 // 门槛，管理变更成功后联动刷新会话配额与网络列表（publicUrl 热改后的
 // joinUri）。
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 
 import { AccountSettingsModal } from './components/AccountSettingsModal';
 import { AdminView } from './components/AdminView';
@@ -138,6 +138,8 @@ export function App() {
   const [theme, setTheme] = useState<Theme>(readStoredTheme);
   const [view, setView] = useState<ViewKind>('networks');
   const [selectedNetworkId, setSelectedNetworkId] = useState<string | null>(null);
+  const selectedNetworkRef = useRef(selectedNetworkId);
+  selectedNetworkRef.current = selectedNetworkId;
   const [homeEpoch, setHomeEpoch] = useState(0);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<LocaleKey | null>(null);
@@ -196,17 +198,19 @@ export function App() {
   }, []);
 
   const refreshNetworks = useCallback(async (): Promise<void> => {
+    const sequence = store.beginNetworkRefresh();
     try {
-      store.setNetworks(await client.listNetworks());
+      store.applyNetworkRefresh(sequence, await client.listNetworks());
     } catch {
       /* 列表拉取失败不打断视图；下一次动作或 SSE 会补 */
     }
   }, []);
 
   const refreshTopology = useCallback(async (networkId: string): Promise<void> => {
+    const sequence = store.beginTopologyRefresh(networkId);
     try {
       const snapshot = await client.fetchTopology(networkId);
-      if (snapshot !== null) store.applyTopologySnapshot(snapshot);
+      if (snapshot !== null) store.applyTopologyRefresh(sequence, snapshot);
     } catch {
       /* SSE 推送会补 */
     }
@@ -237,6 +241,7 @@ export function App() {
   useEffect(() => {
     if (state.session === null) return;
     if (selectedNetworkId !== null && state.networks.some((n) => n.id === selectedNetworkId)) return;
+    if (store.getState().ui.dialog === 'network-settings') store.patchUi({ dialog: null, confirmTarget: null });
     setSelectedNetworkId(state.networks[0]?.id ?? null);
   }, [state.session, state.networks, selectedNetworkId]);
 
@@ -273,12 +278,8 @@ export function App() {
     } catch {
       /* 会话刷新失败不致命：下一次动作或轮询会补 */
     }
-    try {
-      store.setNetworks(await client.listNetworks());
-    } catch {
-      /* 列表刷新失败不致命 */
-    }
-  }, [refreshSession]);
+    await refreshNetworks();
+  }, [refreshSession, refreshNetworks]);
 
   /** 任一管理请求 401：会话已失效或权限被收回——立刻清空全部管理敏感切片
    * （零残留），再回 /auth/me 核对会话态（后端对失效会话返回匿名策略，
@@ -652,15 +653,17 @@ export function App() {
   );
 
   const handlePatchNetwork = useCallback(
-    async (networkId: string, patch: NetworkPatchInput): Promise<void> => {
+    async (networkId: string, patch: NetworkPatchInput): Promise<boolean> => {
       setActionBusy(true);
       try {
-        await client.patchNetwork(networkId, patch);
-        await refreshTopology(networkId);
-        await refreshNetworks();
+        store.updateNetwork(await client.patchNetwork(networkId, patch));
         showToast('toast.saved');
+        void refreshTopology(networkId);
+        void refreshNetworks();
+        return true;
       } catch (err) {
         showToast(authErrorToKey(err));
+        return false;
       } finally {
         setActionBusy(false);
       }
@@ -672,9 +675,8 @@ export function App() {
     async (networkId: string): Promise<void> => {
       setActionBusy(true);
       try {
-        await client.rotateInviteKey(networkId);
-        store.patchUi({ confirmTarget: null });
-        await refreshNetworks();
+        store.updateNetwork(await client.rotateInviteKey(networkId));
+        void refreshNetworks();
         showToast('toast.inviteReset');
       } catch (err) {
         showToast(authErrorToKey(err));
@@ -690,9 +692,12 @@ export function App() {
       setActionBusy(true);
       try {
         await client.deleteNetwork(networkId);
-        store.patchUi({ dialog: null, confirmTarget: null });
-        setSelectedNetworkId(null);
-        await refreshNetworks();
+        store.removeNetwork(networkId);
+        if (selectedNetworkRef.current === networkId) {
+          store.patchUi({ dialog: null, confirmTarget: null });
+          setSelectedNetworkId(null);
+        }
+        void refreshNetworks();
         // 删网后 usedNetworks 变化：/auth/me 落库让顶栏与新建弹窗额度即时刷新
         try {
           await refreshSession();
@@ -838,7 +843,10 @@ export function App() {
         networks={state.networks}
         topology={state.topology}
         selectedNetworkId={selectedNetworkId}
-        onSelectNetwork={setSelectedNetworkId}
+        onSelectNetwork={(id) => {
+          store.patchUi({ dialog: null, confirmTarget: null });
+          setSelectedNetworkId(id);
+        }}
         onCreateNetwork={handleCreateNetworkOpen}
         onGoHome={handleGoHome}
         view={view}
@@ -888,9 +896,9 @@ export function App() {
             quota={state.quota}
             locale={locale}
             latestPluginVersion={state.adminRuntime?.update?.latestPluginVersion ?? null}
-            onPatchNetwork={(patch) => void handlePatchNetwork(selected.id, patch)}
-            onDeleteNetwork={() => void handleDeleteNetwork(selected.id)}
-            onRotateInviteKey={() => void handleRotateInviteKey(selected.id)}
+            onPatchNetwork={(patch) => handlePatchNetwork(selected.id, patch)}
+            onDeleteNetwork={() => handleDeleteNetwork(selected.id)}
+            onRotateInviteKey={() => handleRotateInviteKey(selected.id)}
             onMemberAction={(nodeId, action) => void handleMemberAction(selected.id, nodeId, action)}
             onRenameMember={(nodeId, name) => void handleRenameMember(selected.id, nodeId, name)}
             onEditNote={(nodeId, note) => void handleEditMemberNote(selected.id, nodeId, note)}

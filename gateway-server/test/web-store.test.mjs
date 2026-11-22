@@ -17,6 +17,7 @@ import {
 } from '../dist/web/i18n/locales.js';
 import {
   buildHeadlessJoinCommand,
+  buildNetworkSettingsPatch,
   classifyLinkPath,
   computeUsagePercent,
   derivePeerConnRow,
@@ -31,6 +32,8 @@ import {
   isQuotaExceeded,
   maskInviteUri,
   memberStatusView,
+  missingPluginVersionLabel,
+  validNetworkSettingsDraft,
   quotaUsageLevel,
   resolvePairLink,
   summarizeMemberConnections,
@@ -46,6 +49,7 @@ import {
   applyAdminGroups,
   applyAdminRuntime,
   applyNetworks,
+  applyNetwork,
   applyPublicPolicy,
   applyQuota,
   applySession,
@@ -56,10 +60,190 @@ import {
   markAdminError,
   markAdminLoading,
   patchUiState,
+  removeNetwork,
   setLoggedOut,
 } from '../dist/web/store/console-store.js';
 
 // ---------------------------------------------------------------- 夹具
+
+describe('console settings and device copy', () => {
+  const baseline = { name: 'Home', maxPeers: 8, peerDirectMaxRttMs: 300, admissionMode: 'manual' };
+  const draft = { name: 'Home', maxPeers: '8', peerDirectMaxRttMs: '300', admissionMode: 'manual' };
+
+  test('settings patches include only edits against the opening snapshot', () => {
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, draft, 64), {});
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, name: ' New name ' }, 64), { name: 'New name' });
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, admissionMode: 'both' }, 64), { admissionMode: 'both' });
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, maxPeers: '12', peerDirectMaxRttMs: '0' }, 64), { maxPeers: 12, peerDirectMaxRttMs: 0 });
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, name: ' Home ', maxPeers: '08' }, 64), {});
+    assert.equal(baseline.maxPeers, 8);
+  });
+
+  test('untouched grandfathered fields do not block other edits after the live cap shrinks', () => {
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, name: 'Renamed' }, 4), { name: 'Renamed' });
+    assert.equal(buildNetworkSettingsPatch(baseline, { ...draft, maxPeers: '7' }, 4), null);
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, maxPeers: '4' }, 4), { maxPeers: 4 });
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, maxPeers: '7' }, 8), { maxPeers: 7 });
+    assert.equal(buildNetworkSettingsPatch(baseline, { ...draft, maxPeers: '9' }, 8), null);
+  });
+
+  test('changed settings still reject empty and invalid values', () => {
+    for (const invalid of [
+      { name: '' }, { name: ' '.repeat(4) }, { name: 'x'.repeat(33) },
+      { maxPeers: '' }, { maxPeers: '1' }, { maxPeers: '65' }, { maxPeers: '2.5' },
+      { peerDirectMaxRttMs: '' }, { peerDirectMaxRttMs: '-1' }, { peerDirectMaxRttMs: '10001' },
+    ]) assert.equal(buildNetworkSettingsPatch(baseline, { ...draft, ...invalid }, 64), null);
+    assert.equal(buildNetworkSettingsPatch({ ...baseline, peerDirectMaxRttMs: 0 }, { ...draft, peerDirectMaxRttMs: '' }, 64), null);
+  });
+
+  test('confirmed deletion removes cached data and invalidates pending refreshes and late PATCH results', () => {
+    const store = new ConsoleStore();
+    const home = makeNetworkView('home', 'Home');
+    const work = makeNetworkView('work', 'Work');
+    store.setNetworks([home, work]);
+    store.applyTopologySnapshot(makeSnapshot('home'));
+    store.applyTopologySnapshot(makeSnapshot('work'));
+    const before = store.getState();
+    const list = store.beginNetworkRefresh();
+    const topology = store.beginTopologyRefresh('home');
+    store.removeNetwork('home');
+    store.applyNetworkRefresh(list, [home, work]);
+    store.applyTopologyRefresh(topology, makeSnapshot('home'));
+    store.updateNetwork(home);
+    assert.deepEqual(store.getState().networks, [work]);
+    assert.equal(store.getState().topology.home, undefined);
+    assert.equal(store.getState().topology.work, before.topology.work);
+    assert.equal(before.networks.length, 2);
+    assert.deepEqual(removeNetwork(createInitialState(), 'missing').networks, []);
+  });
+
+  test('logout and anonymous session refresh invalidate pending network reads', () => {
+    for (const logout of [store => store.logout(TEST_META), store => store.init({ authenticated: false })]) {
+      const store = new ConsoleStore();
+      store.setNetworks([makeNetworkView('home', 'Home')]);
+      const list = store.beginNetworkRefresh();
+      const topology = store.beginTopologyRefresh('home');
+      logout(store);
+      store.applyNetworkRefresh(list, [makeNetworkView('home', 'Stale')]);
+      store.applyTopologyRefresh(topology, makeSnapshot('home'));
+      assert.deepEqual(store.getState().networks, []);
+      assert.deepEqual(store.getState().topology, {});
+    }
+  });
+
+  test('only the latest-issued network refresh can replace the list', () => {
+    const store = new ConsoleStore();
+    const first = store.beginNetworkRefresh();
+    const second = store.beginNetworkRefresh();
+    store.applyNetworkRefresh(second, [makeNetworkView('home', 'B')]);
+    const current = store.getState();
+    store.applyNetworkRefresh(first, [makeNetworkView('home', 'A')]);
+    assert.equal(store.getState(), current);
+    const empty = store.beginNetworkRefresh();
+    store.applyNetworkRefresh(empty, []);
+    assert.deepEqual(store.getState().networks, []);
+  });
+
+  test('a failed latest refresh does not let an older response write the cache', () => {
+    const store = new ConsoleStore();
+    store.setNetworks([makeNetworkView('home', 'Cached')]);
+    const old = store.beginNetworkRefresh();
+    store.beginNetworkRefresh();
+    store.applyNetworkRefresh(old, [makeNetworkView('home', 'Stale')]);
+    assert.equal(store.getState().networks[0].name, 'Cached');
+  });
+
+  test('PATCH cache updates invalidate already-issued list and topology refreshes', () => {
+    const store = new ConsoleStore();
+    store.setNetworks([makeNetworkView('home', 'Old')]);
+    const list = store.beginNetworkRefresh();
+    const topology = store.beginTopologyRefresh('home');
+    store.updateNetwork(makeNetworkView('home', 'Confirmed'));
+    const current = store.getState();
+    store.applyNetworkRefresh(list, [makeNetworkView('home', 'Stale')]);
+    store.applyTopologyRefresh(topology, makeSnapshot('home'));
+    assert.equal(store.getState(), current);
+    const fresh = store.beginNetworkRefresh();
+    store.applyNetworkRefresh(fresh, [makeNetworkView('home', 'Confirmed')]);
+    assert.equal(store.getState().networks[0].name, 'Confirmed');
+  });
+
+  test('topology refresh ordering is independent per network and SSE invalidates old REST data', () => {
+    const store = new ConsoleStore();
+    const first = store.beginTopologyRefresh('home');
+    const work = store.beginTopologyRefresh('work');
+    const second = store.beginTopologyRefresh('home');
+    const latest = makeSnapshot('home', { network: { id: 'home', name: 'B', maxPeers: 12 } });
+    store.applyTopologyRefresh(second, latest);
+    store.applyTopologyRefresh(first, makeSnapshot('home'));
+    store.applyTopologyRefresh(work, makeSnapshot('work'));
+    assert.equal(store.getState().topology.home, latest);
+    assert.equal(store.getState().topology.work.network.id, 'work');
+    const pending = store.beginTopologyRefresh('home');
+    const pushed = makeSnapshot('home', { network: { id: 'home', name: 'Pushed', maxPeers: 16 } });
+    store.applyTopologySnapshot(pushed);
+    store.applyTopologyRefresh(pending, latest);
+    assert.equal(store.getState().topology.home, pushed);
+  });
+
+  test('a confirmed PATCH replaces only its cached network without waiting for refresh', async () => {
+    const original = makeNetworkView('home', 'Old');
+    const other = makeNetworkView('work', 'Work');
+    const store = new ConsoleStore();
+    store.setNetworks([original, other]);
+    const state = store.getState();
+    const confirmed = { ...original, name: 'New', maxPeers: 12, peerDirectMaxRttMs: 500 };
+    const client = new ConsoleClient({ fetchImpl: async (_url, init) => {
+      if (init.method === 'PATCH') return { status: 200, json: async () => ({ ok: true, data: confirmed }) };
+      throw new Error('Refresh unavailable');
+    } });
+    store.updateNetwork(await client.patchNetwork('home', { name: 'New', maxPeers: 12, peerDirectMaxRttMs: 500 }));
+    await assert.rejects(client.listNetworks(), /Refresh unavailable/);
+    assert.deepEqual(store.getState().networks[0], confirmed);
+    assert.equal(store.getState().networks[1], other);
+    assert.equal(store.getState().ui, state.ui);
+    assert.equal(store.getState().topology, state.topology);
+    assert.equal(state.networks[0], original);
+    assert.equal(original.name, 'Old');
+  });
+
+  test('a confirmed update does not add missing or removed networks', () => {
+    const state = createInitialState();
+    assert.equal(applyNetwork(state, makeNetworkView('missing', 'New')), state);
+    const populated = applyNetworks(state, [makeNetworkView('home', 'Home')]);
+    assert.equal(applyNetwork(populated, makeNetworkView('missing', 'New')), populated);
+  });
+
+  test('settings drafts validate all fields together, including quota and RTT boundaries', () => {
+    assert.equal(validNetworkSettingsDraft(' Home ', '8', '0', 8), true);
+    assert.equal(validNetworkSettingsDraft('Home', '6', '10000', 12), true);
+    for (const values of [
+      ['', '8', '300', 8], ['   ', '8', '300', 8], ['x'.repeat(33), '8', '300', 8],
+      ['Home', '', '300', 8], ['Home', '9', '300', 8], ['Home', '1', '300', 8],
+      ['Home', '2.5', '300', 8], ['Home', '65', '300', 100],
+      ['Home', '8', '', 8], ['Home', '8', '-1', 8], ['Home', '8', '10001', 8],
+      ['Home', '8', 'NaN', 8], ['Home', '8', '0.5', 8],
+    ]) assert.equal(validNetworkSettingsDraft(...values), false, JSON.stringify(values));
+  });
+
+  for (const locale of ['zh', 'en']) {
+    const t = (key, vars) => translate(locale, key, vars);
+    test(`${locale}: missing versions distinguish offline from online legacy clients`, () => {
+      assert.equal(missingPluginVersionLabel({ online: false }, t), t('devices.pluginVersionOffline'));
+      assert.equal(missingPluginVersionLabel({ online: true }, t), t('devices.pluginVersionUnknown'));
+      assert.notEqual(t('devices.pluginVersionOffline'), t('devices.pluginVersionUnknown'));
+      assert.equal(missingPluginVersionLabel({}, t), t('devices.pluginVersionUnavailable'));
+      const member = { online: false };
+      assert.equal(missingPluginVersionLabel(member, t), t('devices.pluginVersionOffline'));
+      member.online = true;
+      assert.equal(missingPluginVersionLabel(member, t), t('devices.pluginVersionUnknown'));
+    });
+    test(`${locale}: manual approval hint does not assume a desktop layout`, () => {
+      assert.doesNotMatch(t('network.inviteHintManual'), /右侧|右边|on the right/i);
+      assert.match(t('network.inviteHintManual'), /批准|approve/i);
+    });
+  }
+});
 
 function makeNetworkView(id, name, overrides = {}) {
   return {

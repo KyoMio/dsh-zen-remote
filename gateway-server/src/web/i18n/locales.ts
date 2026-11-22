@@ -106,7 +106,7 @@ export const ZH = {
   'network.deviceCount': '{count} / {max} 台设备',
   'network.capacityFull': '· 已满',
   'network.inviteHint': '在新设备的 zen-remote 里粘贴这个链接即可加入',
-  'network.inviteHintManual': '粘贴此链接将提交加入申请，需你在右侧点击批准后入网',
+  'network.inviteHintManual': '粘贴此链接将提交加入申请，需你批准后入网',
   'network.copyPartsSummary': '分项复制（网关地址 / 网络 ID / 口令 / 命令行）',
   'network.partGatewayUrl': '网关地址',
   'network.partNetworkId': '网络 ID',
@@ -498,6 +498,8 @@ export const ZH = {
   'devices.pluginVersion': '插件版本',
   'devices.pluginOutdatedBadge': '待更新插件',
   'devices.pluginVersionUnknown': '未知（旧版客户端）',
+  'devices.pluginVersionOffline': '离线（版本信息不可用）',
+  'devices.pluginVersionUnavailable': '版本信息不可用',
 } as const;
 
 export const EN: Record<LocaleKey, string> = {
@@ -581,7 +583,7 @@ export const EN: Record<LocaleKey, string> = {
   'network.deviceCount': '{count} / {max} devices',
   'network.capacityFull': '· Full',
   'network.inviteHint': 'Paste this link into zen-remote on a new device to join',
-  'network.inviteHintManual': 'Pasting this link submits a join request — approve it on the right to admit the device',
+  'network.inviteHintManual': 'Pasting this link submits a join request — approve the request to admit the device',
   'network.copyPartsSummary': 'Copy individual fields / terminal command',
   'network.partGatewayUrl': 'Gateway URL',
   'network.partNetworkId': 'Network ID',
@@ -965,6 +967,8 @@ export const EN: Record<LocaleKey, string> = {
   'devices.pluginVersion': 'Plugin version',
   'devices.pluginOutdatedBadge': 'Plugin update available',
   'devices.pluginVersionUnknown': 'Unknown (legacy client)',
+  'devices.pluginVersionOffline': 'Offline (version unavailable)',
+  'devices.pluginVersionUnavailable': 'Version unavailable',
 };
 
 export const LOCALES: Record<Locale, Record<LocaleKey, string>> = { zh: ZH, en: EN };

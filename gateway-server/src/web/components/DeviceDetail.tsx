@@ -20,6 +20,7 @@ import {
   highestPluginVersion,
   isMemberPluginOutdated,
   memberStatusView,
+  missingPluginVersionLabel,
   relativeText,
   relativeTime,
 } from '../format';
@@ -272,7 +273,7 @@ export function DeviceDetail(props: DeviceDetailProps) {
             {member.pluginVersion ? (
               <span className="mono">v{member.pluginVersion}</span>
             ) : (
-              <span className="muted">{t('devices.pluginVersionUnknown')}</span>
+              <span className="muted">{missingPluginVersionLabel(member, t)}</span>
             )}
             {pluginOutdated && (
               <span className="badge badge-warn">{t('devices.pluginOutdatedBadge')}</span>
