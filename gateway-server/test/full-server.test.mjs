@@ -284,6 +284,13 @@ describe('静态托管：编译后的控制台', () => {
       assert.match(html, /<!doctype html>/i);
       assert.match(html, /<div id="root">/);
       assert.match(html, /<script [^>]*src="\/assets\/[^"]+\.js"/);
+      const viewport = /<meta name="viewport" content="([^"]+)"/.exec(html)?.[1] ?? '';
+      const viewportOptions = new Map(viewport.toLowerCase().split(',').map((entry) => entry.trim().split(/\s*=\s*/)));
+      assert.equal(viewportOptions.get('width'), 'device-width');
+      assert.equal(Number(viewportOptions.get('initial-scale')), 1);
+      const maximumScale = viewportOptions.get('maximum-scale');
+      assert.ok(maximumScale === undefined || Number(maximumScale) >= 2);
+      assert.ok(!['no', '0'].includes(viewportOptions.get('user-scalable')));
 
       // HEAD 同样 200 且无响应体
       const head = await fetch(gw.base + '/', { method: 'HEAD' });
