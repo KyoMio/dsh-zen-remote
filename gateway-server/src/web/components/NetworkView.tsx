@@ -25,6 +25,7 @@ import { LOCALE_STORAGE_KEY, resolveLocale } from '../i18n/locales';
 import type { Locale, LocaleKey, TranslateFn } from '../i18n/locales';
 import {
   buildHeadlessJoinCommand,
+  buildNetworkSettingsPatch,
   computeUsagePercent,
   displayName,
   effectiveNetworkMaxPeers,
@@ -41,7 +42,6 @@ import {
   relativeTime,
   summarizeMemberConnections,
   summarizeNetworkPairs,
-  validNetworkSettingsDraft,
 } from '../format';
 import type { UsageLevel } from '../format';
 import { Modal } from './Modal';
@@ -84,8 +84,8 @@ export interface NetworkViewProps {
   /** 已知最新插件版本（来自管理员运行态或 Releases）；缺省仅按同网络节点最高版本号比对 */
   latestPluginVersion?: string | null;
   onPatchNetwork: (patch: NetworkPatchInput) => Promise<boolean>;
-  onDeleteNetwork: () => void;
-  onRotateInviteKey: () => void;
+  onDeleteNetwork: () => Promise<void>;
+  onRotateInviteKey: () => Promise<void>;
   onMemberAction: (nodeId: string, action: MemberAction) => void;
   onRenameMember?: (nodeId: string, name: string) => void;
   onEditNote?: (nodeId: string, note: string) => void;
@@ -139,16 +139,23 @@ interface SettingsModalProps {
   quota: UserQuotaSummary | null;
   onClose: () => void;
   onPatch: (patch: NetworkPatchInput) => Promise<boolean>;
-  onDelete: () => void;
-  onRotate: () => void;
+  onDelete: () => Promise<void>;
+  onRotate: () => Promise<void>;
 }
 
 function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPatch, onDelete, onRotate }: SettingsModalProps) {
-  const [name, setName] = useState(network.name);
-  const [maxPeersDraft, setMaxPeersDraft] = useState(String(network.maxPeers));
-  const [rttCapDraft, setRttCapDraft] = useState(String(network.peerDirectMaxRttMs));
-  const [admissionMode, setAdmissionMode] = useState(network.admissionMode);
+  const [baseline] = useState(() => ({ ...network }));
+  const [name, setName] = useState(baseline.name);
+  const [maxPeersDraft, setMaxPeersDraft] = useState(String(baseline.maxPeers));
+  const [rttCapDraft, setRttCapDraft] = useState(String(baseline.peerDirectMaxRttMs));
+  const [admissionMode, setAdmissionMode] = useState(baseline.admissionMode);
   const [saving, setSaving] = useState(false);
+  const inFlight = useRef(false);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   // 危险按钮的两击确认统一走 ui.confirmTarget：同一时刻只有一个处于确认态，
   // 且点弹窗外任何位置都会被 App 的 document 级监听取消
   const confirmingRotate = ui.confirmTarget === 'rotate-key';
@@ -161,30 +168,31 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
   const groupPeerCap = unlimitedPeers || quota === null ? 64 : quota.maxPeersPerNetwork;
   const grandfathered = quota !== null && !unlimitedPeers && network.maxPeers > groupPeerCap;
 
-  const trimmedName = name.trim();
-  const maxPeers = Number(maxPeersDraft);
-  const rttCap = Number(rttCapDraft);
-  const valid = validNetworkSettingsDraft(name, maxPeersDraft, rttCapDraft, Math.max(groupPeerCap, network.maxPeers));
+  const patch = buildNetworkSettingsPatch(baseline, {
+    name, maxPeers: maxPeersDraft, peerDirectMaxRttMs: rttCapDraft, admissionMode,
+  }, Math.max(groupPeerCap, network.maxPeers));
   const close = (): void => {
-    if (!busy && !saving) onClose();
+    if (!busy && !inFlight.current) onClose();
   };
-  const save = async (): Promise<void> => {
-    if (!valid || busy || saving) return;
-    const patch: NetworkPatchInput = {};
-    if (trimmedName !== network.name) patch.name = trimmedName;
-    if (maxPeers !== network.maxPeers) patch.maxPeers = maxPeers;
-    if (rttCap !== network.peerDirectMaxRttMs) patch.peerDirectMaxRttMs = rttCap;
-    if (admissionMode !== network.admissionMode) patch.admissionMode = admissionMode;
+  const runAction = async (action: () => Promise<boolean | void>, closeOnSuccess = false): Promise<void> => {
+    if (busy || inFlight.current) return;
+    inFlight.current = true;
+    setSaving(true);
+    try {
+      const success = await action();
+      if (mounted.current && closeOnSuccess && success === true) onClose();
+    } finally {
+      inFlight.current = false;
+      if (mounted.current) setSaving(false);
+    }
+  };
+  const save = (): void => {
+    if (patch === null || busy || inFlight.current) return;
     if (Object.keys(patch).length === 0) {
       onClose();
       return;
     }
-    setSaving(true);
-    try {
-      if (await onPatch(patch)) onClose();
-    } finally {
-      setSaving(false);
-    }
+    void runAction(() => onPatch(patch), true);
   };
 
   return (
@@ -214,7 +222,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
             className="input input-narrow mono"
             type="number"
             min={2}
-            max={Math.min(64, Math.max(groupPeerCap, network.maxPeers))}
+            max={Math.min(64, Math.max(groupPeerCap, network.maxPeers, baseline.maxPeers))}
             step={1}
             value={maxPeersDraft}
             disabled={busy || saving}
@@ -267,7 +275,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
               <span>{label}</span>
             </label>
           ))}
-          {network.admissionMode === 'key' && <p className="field-hint">{t('network.admissionLegacyKeyHint')}</p>}
+          {admissionMode === 'key' && <p className="field-hint">{t('network.admissionLegacyKeyHint')}</p>}
         </fieldset>
 
         <div className="danger-zone">
@@ -281,11 +289,12 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
               type="button"
               data-confirm-trigger
               className={confirmingRotate ? 'btn danger solid' : 'btn danger'}
-              disabled={busy}
+              disabled={busy || saving}
               onClick={() => {
+                if (busy || inFlight.current) return;
                 if (confirmingRotate) {
                   onUi({ confirmTarget: null });
-                  onRotate();
+                  void runAction(onRotate);
                 } else {
                   onUi({ confirmTarget: 'rotate-key' });
                 }
@@ -303,11 +312,12 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
               type="button"
               data-confirm-trigger
               className={confirmingDelete ? 'btn danger solid' : 'btn danger'}
-              disabled={busy}
+              disabled={busy || saving}
               onClick={() => {
+                if (busy || inFlight.current) return;
                 if (confirmingDelete) {
                   onUi({ confirmTarget: null });
-                  onDelete();
+                  void runAction(onDelete);
                 } else {
                   onUi({ confirmTarget: 'delete-network' });
                 }
@@ -322,7 +332,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
           <button type="button" className="btn" disabled={busy || saving} onClick={close}>
             {t('common.cancel')}
           </button>
-          <button type="button" className="btn primary" disabled={busy || saving || !valid} onClick={() => void save()}>
+          <button type="button" className="btn primary" disabled={busy || saving || patch === null} onClick={save}>
             {t('common.save')}
           </button>
         </div>
@@ -952,6 +962,7 @@ export function NetworkView(props: NetworkViewProps) {
 
       {ui.dialog === 'network-settings' && (
         <NetworkSettingsModal
+          key={network.id}
           t={t}
           network={network}
           busy={busy}

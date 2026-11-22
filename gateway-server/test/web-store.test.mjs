@@ -17,6 +17,7 @@ import {
 } from '../dist/web/i18n/locales.js';
 import {
   buildHeadlessJoinCommand,
+  buildNetworkSettingsPatch,
   classifyLinkPath,
   computeUsagePercent,
   derivePeerConnRow,
@@ -59,12 +60,77 @@ import {
   markAdminError,
   markAdminLoading,
   patchUiState,
+  removeNetwork,
   setLoggedOut,
 } from '../dist/web/store/console-store.js';
 
 // ---------------------------------------------------------------- 夹具
 
 describe('console settings and device copy', () => {
+  const baseline = { name: 'Home', maxPeers: 8, peerDirectMaxRttMs: 300, admissionMode: 'manual' };
+  const draft = { name: 'Home', maxPeers: '8', peerDirectMaxRttMs: '300', admissionMode: 'manual' };
+
+  test('settings patches include only edits against the opening snapshot', () => {
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, draft, 64), {});
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, name: ' New name ' }, 64), { name: 'New name' });
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, admissionMode: 'both' }, 64), { admissionMode: 'both' });
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, maxPeers: '12', peerDirectMaxRttMs: '0' }, 64), { maxPeers: 12, peerDirectMaxRttMs: 0 });
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, name: ' Home ', maxPeers: '08' }, 64), {});
+    assert.equal(baseline.maxPeers, 8);
+  });
+
+  test('untouched grandfathered fields do not block other edits after the live cap shrinks', () => {
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, name: 'Renamed' }, 4), { name: 'Renamed' });
+    assert.equal(buildNetworkSettingsPatch(baseline, { ...draft, maxPeers: '7' }, 4), null);
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, maxPeers: '4' }, 4), { maxPeers: 4 });
+    assert.deepEqual(buildNetworkSettingsPatch(baseline, { ...draft, maxPeers: '7' }, 8), { maxPeers: 7 });
+    assert.equal(buildNetworkSettingsPatch(baseline, { ...draft, maxPeers: '9' }, 8), null);
+  });
+
+  test('changed settings still reject empty and invalid values', () => {
+    for (const invalid of [
+      { name: '' }, { name: ' '.repeat(4) }, { name: 'x'.repeat(33) },
+      { maxPeers: '' }, { maxPeers: '1' }, { maxPeers: '65' }, { maxPeers: '2.5' },
+      { peerDirectMaxRttMs: '' }, { peerDirectMaxRttMs: '-1' }, { peerDirectMaxRttMs: '10001' },
+    ]) assert.equal(buildNetworkSettingsPatch(baseline, { ...draft, ...invalid }, 64), null);
+    assert.equal(buildNetworkSettingsPatch({ ...baseline, peerDirectMaxRttMs: 0 }, { ...draft, peerDirectMaxRttMs: '' }, 64), null);
+  });
+
+  test('confirmed deletion removes cached data and invalidates pending refreshes and late PATCH results', () => {
+    const store = new ConsoleStore();
+    const home = makeNetworkView('home', 'Home');
+    const work = makeNetworkView('work', 'Work');
+    store.setNetworks([home, work]);
+    store.applyTopologySnapshot(makeSnapshot('home'));
+    store.applyTopologySnapshot(makeSnapshot('work'));
+    const before = store.getState();
+    const list = store.beginNetworkRefresh();
+    const topology = store.beginTopologyRefresh('home');
+    store.removeNetwork('home');
+    store.applyNetworkRefresh(list, [home, work]);
+    store.applyTopologyRefresh(topology, makeSnapshot('home'));
+    store.updateNetwork(home);
+    assert.deepEqual(store.getState().networks, [work]);
+    assert.equal(store.getState().topology.home, undefined);
+    assert.equal(store.getState().topology.work, before.topology.work);
+    assert.equal(before.networks.length, 2);
+    assert.deepEqual(removeNetwork(createInitialState(), 'missing').networks, []);
+  });
+
+  test('logout and anonymous session refresh invalidate pending network reads', () => {
+    for (const logout of [store => store.logout(TEST_META), store => store.init({ authenticated: false })]) {
+      const store = new ConsoleStore();
+      store.setNetworks([makeNetworkView('home', 'Home')]);
+      const list = store.beginNetworkRefresh();
+      const topology = store.beginTopologyRefresh('home');
+      logout(store);
+      store.applyNetworkRefresh(list, [makeNetworkView('home', 'Stale')]);
+      store.applyTopologyRefresh(topology, makeSnapshot('home'));
+      assert.deepEqual(store.getState().networks, []);
+      assert.deepEqual(store.getState().topology, {});
+    }
+  });
+
   test('only the latest-issued network refresh can replace the list', () => {
     const store = new ConsoleStore();
     const first = store.beginNetworkRefresh();
@@ -166,6 +232,11 @@ describe('console settings and device copy', () => {
       assert.equal(missingPluginVersionLabel({ online: false }, t), t('devices.pluginVersionOffline'));
       assert.equal(missingPluginVersionLabel({ online: true }, t), t('devices.pluginVersionUnknown'));
       assert.notEqual(t('devices.pluginVersionOffline'), t('devices.pluginVersionUnknown'));
+      assert.equal(missingPluginVersionLabel({}, t), t('devices.pluginVersionUnavailable'));
+      const member = { online: false };
+      assert.equal(missingPluginVersionLabel(member, t), t('devices.pluginVersionOffline'));
+      member.online = true;
+      assert.equal(missingPluginVersionLabel(member, t), t('devices.pluginVersionUnknown'));
     });
     test(`${locale}: manual approval hint does not assume a desktop layout`, () => {
       assert.doesNotMatch(t('network.inviteHintManual'), /右侧|右边|on the right/i);

@@ -14,7 +14,7 @@
 // 编辑、建网额度透传（maxPeers / admissionMode）、空态建网 CTA 与配额
 // 门槛，管理变更成功后联动刷新会话配额与网络列表（publicUrl 热改后的
 // joinUri）。
-import { useCallback, useEffect, useState, useSyncExternalStore } from 'react';
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react';
 
 import { AccountSettingsModal } from './components/AccountSettingsModal';
 import { AdminView } from './components/AdminView';
@@ -138,6 +138,8 @@ export function App() {
   const [theme, setTheme] = useState<Theme>(readStoredTheme);
   const [view, setView] = useState<ViewKind>('networks');
   const [selectedNetworkId, setSelectedNetworkId] = useState<string | null>(null);
+  const selectedNetworkRef = useRef(selectedNetworkId);
+  selectedNetworkRef.current = selectedNetworkId;
   const [homeEpoch, setHomeEpoch] = useState(0);
   const [authBusy, setAuthBusy] = useState(false);
   const [authError, setAuthError] = useState<LocaleKey | null>(null);
@@ -239,6 +241,7 @@ export function App() {
   useEffect(() => {
     if (state.session === null) return;
     if (selectedNetworkId !== null && state.networks.some((n) => n.id === selectedNetworkId)) return;
+    if (store.getState().ui.dialog === 'network-settings') store.patchUi({ dialog: null, confirmTarget: null });
     setSelectedNetworkId(state.networks[0]?.id ?? null);
   }, [state.session, state.networks, selectedNetworkId]);
 
@@ -672,9 +675,8 @@ export function App() {
     async (networkId: string): Promise<void> => {
       setActionBusy(true);
       try {
-        await client.rotateInviteKey(networkId);
-        store.patchUi({ confirmTarget: null });
-        await refreshNetworks();
+        store.updateNetwork(await client.rotateInviteKey(networkId));
+        void refreshNetworks();
         showToast('toast.inviteReset');
       } catch (err) {
         showToast(authErrorToKey(err));
@@ -690,9 +692,12 @@ export function App() {
       setActionBusy(true);
       try {
         await client.deleteNetwork(networkId);
-        store.patchUi({ dialog: null, confirmTarget: null });
-        setSelectedNetworkId(null);
-        await refreshNetworks();
+        store.removeNetwork(networkId);
+        if (selectedNetworkRef.current === networkId) {
+          store.patchUi({ dialog: null, confirmTarget: null });
+          setSelectedNetworkId(null);
+        }
+        void refreshNetworks();
         // 删网后 usedNetworks 变化：/auth/me 落库让顶栏与新建弹窗额度即时刷新
         try {
           await refreshSession();
@@ -838,7 +843,10 @@ export function App() {
         networks={state.networks}
         topology={state.topology}
         selectedNetworkId={selectedNetworkId}
-        onSelectNetwork={setSelectedNetworkId}
+        onSelectNetwork={(id) => {
+          store.patchUi({ dialog: null, confirmTarget: null });
+          setSelectedNetworkId(id);
+        }}
         onCreateNetwork={handleCreateNetworkOpen}
         onGoHome={handleGoHome}
         view={view}
@@ -889,8 +897,8 @@ export function App() {
             locale={locale}
             latestPluginVersion={state.adminRuntime?.update?.latestPluginVersion ?? null}
             onPatchNetwork={(patch) => handlePatchNetwork(selected.id, patch)}
-            onDeleteNetwork={() => void handleDeleteNetwork(selected.id)}
-            onRotateInviteKey={() => void handleRotateInviteKey(selected.id)}
+            onDeleteNetwork={() => handleDeleteNetwork(selected.id)}
+            onRotateInviteKey={() => handleRotateInviteKey(selected.id)}
             onMemberAction={(nodeId, action) => void handleMemberAction(selected.id, nodeId, action)}
             onRenameMember={(nodeId, name) => void handleRenameMember(selected.id, nodeId, name)}
             onEditNote={(nodeId, note) => void handleEditMemberNote(selected.id, nodeId, note)}

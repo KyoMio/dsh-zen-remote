@@ -695,6 +695,11 @@ export function applyNetwork(state: ConsoleState, network: NetworkView): Console
   return { ...state, networks: state.networks.map((entry) => entry.id === network.id ? network : entry) };
 }
 
+export function removeNetwork(state: ConsoleState, networkId: string): ConsoleState {
+  const { [networkId]: removed, ...topology } = state.topology;
+  return { ...state, networks: state.networks.filter((network) => network.id !== networkId), topology };
+}
+
 /**
  * SSE 快照合并（含首载 REST 快照）：只替换 topology[snapshot.network.id]。
  * 其余切片引用原样保留——这是「实时推送不冲掉交互状态」的实现根基。
@@ -762,6 +767,11 @@ export class ConsoleStore {
     for (const listener of [...this.listeners]) listener();
   }
 
+  private invalidateNetworkRefreshes(): void {
+    this.networkRefreshSequence += 1;
+    for (const id of this.topologyRefreshSequences.keys()) this.beginTopologyRefresh(id);
+  }
+
   /**
    * 启动期 /auth/me（fetchMe）回来后的就绪动作：公开策略无论登录与否都写入；
    * 登录态写 session 与 quota，未登录顺手清全部业务与管理员数据。
@@ -787,6 +797,7 @@ export class ConsoleStore {
         quota: me.quota ?? null,
       });
     } else {
+      this.invalidateNetworkRefreshes();
       this.setState({ ...setLoggedOut(this.state, meta), boot: 'ready', publicPolicy });
     }
   }
@@ -809,6 +820,7 @@ export class ConsoleStore {
   };
 
   readonly logout = (meta: SessionMeta): void => {
+    this.invalidateNetworkRefreshes();
     this.setState(setLoggedOut(this.state, meta));
   };
 
@@ -827,6 +839,12 @@ export class ConsoleStore {
     this.networkRefreshSequence += 1;
     this.beginTopologyRefresh(network.id);
     this.setState(applyNetwork(this.state, network));
+  };
+
+  readonly removeNetwork = (networkId: string): void => {
+    this.networkRefreshSequence += 1;
+    this.beginTopologyRefresh(networkId);
+    this.setState(removeNetwork(this.state, networkId));
   };
 
   readonly beginTopologyRefresh = (networkId: string): number => {

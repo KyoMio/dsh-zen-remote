@@ -499,6 +499,7 @@ export const ZH = {
   'devices.pluginOutdatedBadge': '待更新插件',
   'devices.pluginVersionUnknown': '未知（旧版客户端）',
   'devices.pluginVersionOffline': '离线（版本信息不可用）',
+  'devices.pluginVersionUnavailable': '版本信息不可用',
 } as const;
 
 export const EN: Record<LocaleKey, string> = {
@@ -967,6 +968,7 @@ export const EN: Record<LocaleKey, string> = {
   'devices.pluginOutdatedBadge': 'Plugin update available',
   'devices.pluginVersionUnknown': 'Unknown (legacy client)',
   'devices.pluginVersionOffline': 'Offline (version unavailable)',
+  'devices.pluginVersionUnavailable': 'Version unavailable',
 };
 
 export const LOCALES: Record<Locale, Record<LocaleKey, string>> = { zh: ZH, en: EN };
