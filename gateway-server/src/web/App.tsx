@@ -652,20 +652,22 @@ export function App() {
   );
 
   const handlePatchNetwork = useCallback(
-    async (networkId: string, patch: NetworkPatchInput): Promise<void> => {
+    async (networkId: string, patch: NetworkPatchInput): Promise<boolean> => {
       setActionBusy(true);
       try {
         await client.patchNetwork(networkId, patch);
         await refreshTopology(networkId);
-        await refreshNetworks();
+        store.setNetworks(await client.listNetworks());
         showToast('toast.saved');
+        return true;
       } catch (err) {
         showToast(authErrorToKey(err));
+        return false;
       } finally {
         setActionBusy(false);
       }
     },
-    [refreshTopology, refreshNetworks, showToast],
+    [refreshTopology, showToast],
   );
 
   const handleRotateInviteKey = useCallback(
@@ -888,7 +890,7 @@ export function App() {
             quota={state.quota}
             locale={locale}
             latestPluginVersion={state.adminRuntime?.update?.latestPluginVersion ?? null}
-            onPatchNetwork={(patch) => void handlePatchNetwork(selected.id, patch)}
+            onPatchNetwork={(patch) => handlePatchNetwork(selected.id, patch)}
             onDeleteNetwork={() => void handleDeleteNetwork(selected.id)}
             onRotateInviteKey={() => void handleRotateInviteKey(selected.id)}
             onMemberAction={(nodeId, action) => void handleMemberAction(selected.id, nodeId, action)}

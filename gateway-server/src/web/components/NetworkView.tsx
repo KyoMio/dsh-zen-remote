@@ -83,7 +83,7 @@ export interface NetworkViewProps {
   locale?: Locale;
   /** 已知最新插件版本（来自管理员运行态或 Releases）；缺省仅按同网络节点最高版本号比对 */
   latestPluginVersion?: string | null;
-  onPatchNetwork: (patch: NetworkPatchInput) => void;
+  onPatchNetwork: (patch: NetworkPatchInput) => Promise<boolean>;
   onDeleteNetwork: () => void;
   onRotateInviteKey: () => void;
   onMemberAction: (nodeId: string, action: MemberAction) => void;
@@ -138,7 +138,7 @@ interface SettingsModalProps {
   /** 组上限 / 单设备限速展示与 maxPeers 校验边界（GC-9）；缺省维持旧 2..64 行为 */
   quota: UserQuotaSummary | null;
   onClose: () => void;
-  onPatch: (patch: NetworkPatchInput) => void;
+  onPatch: (patch: NetworkPatchInput) => Promise<boolean>;
   onDelete: () => void;
   onRotate: () => void;
 }
@@ -148,6 +148,7 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
   const [maxPeersDraft, setMaxPeersDraft] = useState(String(network.maxPeers));
   const [rttCapDraft, setRttCapDraft] = useState(String(network.peerDirectMaxRttMs));
   const [admissionMode, setAdmissionMode] = useState(network.admissionMode);
+  const [saving, setSaving] = useState(false);
   // 危险按钮的两击确认统一走 ui.confirmTarget：同一时刻只有一个处于确认态，
   // 且点弹窗外任何位置都会被 App 的 document 级监听取消
   const confirmingRotate = ui.confirmTarget === 'rotate-key';
@@ -164,19 +165,30 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
   const maxPeers = Number(maxPeersDraft);
   const rttCap = Number(rttCapDraft);
   const valid = validNetworkSettingsDraft(name, maxPeersDraft, rttCapDraft, Math.max(groupPeerCap, network.maxPeers));
-  const save = (): void => {
-    if (!valid || busy) return;
+  const close = (): void => {
+    if (!busy && !saving) onClose();
+  };
+  const save = async (): Promise<void> => {
+    if (!valid || busy || saving) return;
     const patch: NetworkPatchInput = {};
     if (trimmedName !== network.name) patch.name = trimmedName;
     if (maxPeers !== network.maxPeers) patch.maxPeers = maxPeers;
     if (rttCap !== network.peerDirectMaxRttMs) patch.peerDirectMaxRttMs = rttCap;
     if (admissionMode !== network.admissionMode) patch.admissionMode = admissionMode;
-    if (Object.keys(patch).length > 0) onPatch(patch);
-    onClose();
+    if (Object.keys(patch).length === 0) {
+      onClose();
+      return;
+    }
+    setSaving(true);
+    try {
+      if (await onPatch(patch)) onClose();
+    } finally {
+      setSaving(false);
+    }
   };
 
   return (
-    <Modal title={t('network.settingsTitle')} onClose={onClose}>
+    <Modal title={t('network.settingsTitle')} onClose={close}>
       <div className="modal-body">
         <div className="field">
           <label className="field-label" htmlFor="network-settings-name">
@@ -303,10 +315,10 @@ function NetworkSettingsModal({ t, network, busy, ui, onUi, quota, onClose, onPa
         </div>
 
         <div className="modal-foot">
-          <button type="button" className="btn" onClick={onClose}>
+          <button type="button" className="btn" disabled={busy || saving} onClick={close}>
             {t('common.cancel')}
           </button>
-          <button type="button" className="btn primary" disabled={busy || !valid} onClick={save}>
+          <button type="button" className="btn primary" disabled={busy || saving || !valid} onClick={() => void save()}>
             {t('common.save')}
           </button>
         </div>
