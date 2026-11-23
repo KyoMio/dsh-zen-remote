@@ -8,7 +8,7 @@
 // 字数计数与超长校验提示，支持取消还原），保存经 onEditNote 回调走既有
 // PATCH /api/v1/networks/:id/members/:nodeId（App 接线；未传时只读展示）；
 // 裸 Unicode 箭头（‹ ›）统一换成 Icons.tsx 的 1.5px 细线 ChevronIcon。
-import { useEffect, useState } from 'react';
+import { useEffect, useId, useState } from 'react';
 import type { KeyboardEvent as ReactKeyboardEvent } from 'react';
 
 import type { TranslateFn } from '../i18n/locales';
@@ -125,6 +125,7 @@ export function DeviceDetail(props: DeviceDetailProps) {
   const confirmTarget = `remove-member:${member.nodeId}`;
   const confirmingRemove = ui.confirmTarget === confirmTarget;
   const noteTooLong = draftNote.length > NOTE_MAX_LENGTH;
+  const noteErrorId = useId();
   // 连接表只遍历占席位成员（pending 在申请格、revoked 已移除），固定原因文案下沉在 format.ts
   const rows = filterJoinedMembers(topology.members)
     .filter((m) => m.nodeId !== member.nodeId)
@@ -162,6 +163,7 @@ export function DeviceDetail(props: DeviceDetailProps) {
                 type="text"
                 maxLength={64}
                 autoFocus
+                aria-label={t('devices.rename')}
                 value={draftName}
                 onChange={(e) => setDraftName(e.target.value)}
                 onKeyDown={(e) => {
@@ -289,8 +291,10 @@ export function DeviceDetail(props: DeviceDetailProps) {
                   className="input"
                   type="text"
                   autoFocus
+                  aria-label={t('devices.note')}
                   placeholder={t('devices.notePlaceholder')}
                   aria-invalid={noteTooLong}
+                  aria-describedby={noteTooLong ? noteErrorId : undefined}
                   value={draftNote}
                   onChange={(e) => setDraftNote(e.target.value)}
                   onKeyDown={(e) => {
@@ -313,7 +317,7 @@ export function DeviceDetail(props: DeviceDetailProps) {
                   {t('common.cancel')}
                 </button>
               </div>
-              {noteTooLong && <p className="form-error">{t('error.noteTooLong')}</p>}
+              {noteTooLong && <p id={noteErrorId} className="form-error" role="alert">{t('error.noteTooLong')}</p>}
             </dd>
           ) : (
             <dd style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>

@@ -182,8 +182,12 @@ function ChangePasswordSection(props: {
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     if (busy) return;
-    setBusy(true);
     setSaved(false);
+    if (current.length === 0 || next.length < 10) {
+      setErrorKey('error.passwordIncomplete');
+      return;
+    }
+    setBusy(true);
     setErrorKey(null);
     try {
       await onChangePassword(current, next);
@@ -199,11 +203,12 @@ function ChangePasswordSection(props: {
   };
 
   return (
-    <form key={formKey} onSubmit={(e) => void submit(e)}>
+    <form onSubmit={(e) => void submit(e)} noValidate>
       <p className="section-title" style={{ margin: '0 0 10px' }}>
         {t('accountSettings.changePasswordTitle')}
       </p>
       <PasswordField
+        key={`pw-cur-${formKey}`}
         id="account-current-password"
         label={t('accountSettings.currentPassword')}
         value={current}
@@ -212,10 +217,12 @@ function ChangePasswordSection(props: {
         onChange={(v) => {
           setCurrent(v);
           setSaved(false);
+          setErrorKey(null);
         }}
         t={t}
       />
       <PasswordField
+        key={`pw-new-${formKey}`}
         id="account-new-password"
         label={t('auth.newPassword')}
         value={next}
@@ -225,17 +232,16 @@ function ChangePasswordSection(props: {
         onChange={(v) => {
           setNext(v);
           setSaved(false);
+          setErrorKey(null);
         }}
         t={t}
       />
-      {errorKey !== null && <p className="form-error">{t(errorKey)}</p>}
+      {errorKey !== null && <p className="form-error" role="alert">{t(errorKey)}</p>}
       <div className="modal-foot">
-        {saved && errorKey === null && (
-          <p className="form-status-ok" role="status">
-            {t('toast.saved')}
-          </p>
-        )}
-        <button type="submit" className="btn primary" disabled={busy || current.length === 0 || next.length < 10}>
+        <p className="form-status-ok" role="status">
+          {saved && errorKey === null ? t('toast.saved') : ''}
+        </p>
+        <button type="submit" className="btn primary" disabled={busy}>
           {t('common.save')}
         </button>
       </div>
@@ -283,6 +289,7 @@ function ChangeEmailSection(props: {
   const handleEmailInput = (value: string): void => {
     setNewEmail(value);
     setSaved(false);
+    setErrorKey(null);
     if (otpStep) {
       setOtpStep(false);
       setOtpCode('');
@@ -294,8 +301,20 @@ function ChangeEmailSection(props: {
   const submit = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     if (busy) return;
-    setBusy(true);
     setSaved(false);
+    if (currentPassword.length === 0) {
+      setErrorKey('error.passwordRequired');
+      return;
+    }
+    if (!emailReady) {
+      setErrorKey('error.emailIncomplete');
+      return;
+    }
+    if (smtpConfigured && otpStep && otpCode.length !== 6) {
+      setErrorKey('error.otpIncomplete');
+      return;
+    }
+    setBusy(true);
     setErrorKey(null);
     try {
       if (!smtpConfigured) {
@@ -344,7 +363,7 @@ function ChangeEmailSection(props: {
   };
 
   return (
-    <form key={formKey} onSubmit={(e) => void submit(e)}>
+    <form onSubmit={(e) => void submit(e)} noValidate>
       <p className="section-title" style={{ margin: '0 0 10px' }}>
         {t('accountSettings.changeEmailTitle')}
       </p>
@@ -352,12 +371,17 @@ function ChangeEmailSection(props: {
         {smtpConfigured ? t('accountSettings.emailCodeHint') : t('accountSettings.emailNoSmtpHint')}
       </p>
       <PasswordField
+        key={`email-pw-${formKey}`}
         id="account-email-password"
         label={t('accountSettings.currentPassword')}
         value={currentPassword}
         required
         autoComplete="current-password"
-        onChange={setCurrentPassword}
+        onChange={(v) => {
+          setCurrentPassword(v);
+          setSaved(false);
+          setErrorKey(null);
+        }}
         t={t}
       />
       <div className="field">
@@ -387,7 +411,16 @@ function ChangeEmailSection(props: {
             {t('auth.codeHint')}
           </p>
           <div style={{ display: 'flex', gap: 8 }}>
-            <OtpInput id="account-email-otp" value={otpCode} required onChange={setOtpCode} t={t} />
+            <OtpInput
+              id="account-email-otp"
+              value={otpCode}
+              required
+              onChange={(v) => {
+                setOtpCode(v);
+                setErrorKey(null);
+              }}
+              t={t}
+            />
             <button
               type="button"
               className="btn"
@@ -407,14 +440,12 @@ function ChangeEmailSection(props: {
         </div>
       )}
 
-      {errorKey !== null && <p className="form-error">{t(errorKey)}</p>}
+      {errorKey !== null && <p className="form-error" role="alert">{t(errorKey)}</p>}
       <div className="modal-foot">
-        {saved && errorKey === null && (
-          <p className="form-status-ok" role="status">
-            {t('toast.saved')}
-          </p>
-        )}
-        <button type="submit" className="btn primary" disabled={busy || !emailReady || (otpStep && otpCode.length !== 6)}>
+        <p className="form-status-ok" role="status">
+          {saved && errorKey === null ? t('toast.saved') : ''}
+        </p>
+        <button type="submit" className="btn primary" disabled={busy}>
           {smtpConfigured && !otpStep ? t('auth.sendCode') : t('common.save')}
         </button>
       </div>

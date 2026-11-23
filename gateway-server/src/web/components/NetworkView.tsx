@@ -616,7 +616,7 @@ export function NetworkView(props: NetworkViewProps) {
         {/* 第 1 格：网络 */}
         <section className="overview-cell cell-network">
           <div className="cell-head">
-            <h3 className="network-name">{network.name}</h3>
+            <h1 className="network-name">{network.name}</h1>
             <button type="button" className="btn ghost" onClick={() => onUi({ dialog: 'network-settings' })}>
               <SettingsIcon size={14} /> {t('network.settings')}
             </button>
@@ -800,7 +800,6 @@ export function NetworkView(props: NetworkViewProps) {
                     type="button"
                     className="btn primary"
                     disabled={busy || seatsFull}
-                    title={seatsFull ? t('requests.fullHint') : undefined}
                     onClick={() => {
                       onUi({ confirmTarget: null });
                       onMemberAction(member.nodeId, 'approve');

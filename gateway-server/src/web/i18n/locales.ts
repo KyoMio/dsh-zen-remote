@@ -27,6 +27,8 @@ export const ZH = {
   'error.invalidRequest': '请检查输入内容；需要验证码时，请输入邮件中的 6 位数字验证码',
   'app.title': 'Zen Remote 网关',
   'app.loading': '加载中…',
+  'a11y.skipToContent': '跳到主要内容',
+  'a11y.authMode': '登录或注册',
   'view.networks': '网络管理',
   'view.admin': '网关管理',
 
@@ -151,7 +153,7 @@ export const ZH = {
   // ---- PG-6b：设备列表与详情 ----
   'devices.back': '全部设备',
   'devices.unnamed': '未命名设备',
-  'devices.clickHint': '点击设备，查看它和其他设备怎么连接',
+  'devices.clickHint': '点按设备，查看它和其他设备怎么连接',
   'devices.empty': '还没有设备加入',
   'devices.emptyBody': '在装了 dsh-zen-remote 的电脑上，把角色设为「节点端」，粘贴上面的邀请链接。',
   'devices.emptyHint': '设备入网后会显示在这里',
@@ -484,6 +486,10 @@ export const ZH = {
   'error.groupInUse': '还有用户在这个组里，先把他们移到其他组再删除',
   'error.duplicateGroupCode': '这个标识码已经被别的组用了',
   'error.invalidApiKey': '密钥不对或已被吊销',
+  'error.passwordIncomplete': '请输入当前密码和至少 10 位的新密码',
+  'error.passwordRequired': '请输入当前密码',
+  'error.emailIncomplete': '请输入有效的邮箱地址',
+  'error.otpIncomplete': '请输入 6 位数字验证码',
 
   // ---- GC-7a：底部提示条 ----
   'toast.headlessCommandCopied': '已复制接入命令',
@@ -638,8 +644,10 @@ export const EN: Record<LocaleKey, string> = {
   'error.emailTaken': 'That email is already registered',
   'error.signupFailed': 'Could not create account — check your details or try again later',
   'error.weakPassword': 'Use at least 10 characters (up to 128); avoid common, repetitive or consecutive passwords and your email name',
-  'error.generic': 'Something went wrong, please retry',
+  'error.generic': 'Could not complete the request. Try again.',
   'error.network': 'Cannot reach the gateway, please retry',
+  'a11y.skipToContent': 'Skip to main content',
+  'a11y.authMode': 'Sign in or sign up',
 
   'common.cancel': 'Cancel',
   'common.done': 'Done',
@@ -697,9 +705,9 @@ export const EN: Record<LocaleKey, string> = {
 
   'devices.back': 'All devices',
   'devices.unnamed': 'Unnamed device',
-  'devices.clickHint': 'Click a device to see how it connects to others',
+  'devices.clickHint': 'Select a device to see how it connects to others',
   'devices.empty': 'No devices have joined yet',
-  'devices.emptyBody': 'On a computer with dsh-zen-remote installed, set the role to node and paste the invite link above.',
+  'devices.emptyBody': 'On a computer with dsh-zen-remote installed, set the role to Peer and paste the invite link above.',
   'devices.emptyHint': 'Devices will appear here after they join',
   'devices.directCount': 'Direct {n}',
   'devices.relayCount': 'Relayed {n}',
@@ -1025,6 +1033,10 @@ export const EN: Record<LocaleKey, string> = {
   'error.groupInUse': 'Some users still belong to this group; move them to another group first',
   'error.duplicateGroupCode': 'This code is already used by another group',
   'error.invalidApiKey': 'The API key is invalid or has been revoked',
+  'error.passwordIncomplete': 'Enter your current password and a new password of at least 10 characters',
+  'error.passwordRequired': 'Enter your current password',
+  'error.emailIncomplete': 'Enter a valid email address',
+  'error.otpIncomplete': 'Enter the 6-digit verification code',
 
   // ---- GC-7a：Toasts ----
   'toast.headlessCommandCopied': 'Join command copied',

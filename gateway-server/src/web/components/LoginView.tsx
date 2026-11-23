@@ -13,7 +13,7 @@
 // GC-8 文件白名单只允许改 4 个文件，无法新增共享模块，账号设置弹窗
 // （AccountSettingsModal.tsx）直接从这里 import 同一份实现。
 import { useEffect, useRef, useState } from 'react';
-import type { CSSProperties, FormEvent } from 'react';
+import type { CSSProperties, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 
 import type { Locale, LocaleKey, TranslateFn } from '../i18n/locales';
 import type { PublicAuthMeta, SessionMeta, UiLocalState } from '../store/console-store';
@@ -237,6 +237,23 @@ export function LoginView(props: LoginViewProps) {
     onUi({ loginMode: tab });
   };
 
+  const handleTablistKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+    const order: Array<'login' | 'signup'> = ['login', 'signup'];
+    const current: 'login' | 'signup' = mode === 'signup' ? 'signup' : 'login';
+    let next: 'login' | 'signup';
+    if (event.key === 'ArrowRight' || event.key === 'ArrowLeft') {
+      next = order[(order.indexOf(current) + (event.key === 'ArrowRight' ? 1 : order.length - 1)) % order.length] ?? current;
+    } else if (event.key === 'Home' || event.key === 'End') {
+      next = event.key === 'Home' ? 'login' : 'signup';
+    } else {
+      return;
+    }
+    event.preventDefault();
+    switchTab(next);
+    const target = document.getElementById(`login-tab-${next}`);
+    if (target instanceof HTMLButtonElement) target.focus();
+  };
+
   const enterForgot = (): void => {
     setForgot(true);
     setResetDone(false);
@@ -342,7 +359,7 @@ export function LoginView(props: LoginViewProps) {
         <button
           type="button"
           className="btn ghost"
-          aria-label={t('account.language')}
+          aria-label={locale === 'zh' ? 'EN — Switch to English' : '中文 — 切换为中文'}
           title={t('account.language')}
           onClick={onToggleLocale}
           style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}
@@ -354,6 +371,7 @@ export function LoginView(props: LoginViewProps) {
           type="button"
           className="btn ghost"
           aria-label={t('account.darkMode')}
+          aria-pressed={theme === 'dark'}
           title={t('account.darkMode')}
           onClick={onToggleTheme}
           style={{ display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 32, padding: 0 }}
@@ -404,11 +422,14 @@ export function LoginView(props: LoginViewProps) {
           <form onSubmit={(e) => void handleSubmit(e)}>
             {resetDone && <p className="login-hint">{t('auth.resetDone')}</p>}
             {signupAllowed && (
-              <div className="tabs" role="tablist">
+              <div className="tabs" role="tablist" aria-label={t('a11y.authMode')} onKeyDown={handleTablistKeyDown}>
                 <button
                   type="button"
                   role="tab"
+                  id="login-tab-login"
                   aria-selected={mode === 'login'}
+                  aria-controls="login-panel-login"
+                  tabIndex={mode === 'login' ? 0 : -1}
                   className="tab"
                   onClick={() => switchTab('login')}
                 >
@@ -417,7 +438,10 @@ export function LoginView(props: LoginViewProps) {
                 <button
                   type="button"
                   role="tab"
+                  id="login-tab-signup"
                   aria-selected={mode === 'signup'}
+                  aria-controls="login-panel-signup"
+                  tabIndex={mode === 'signup' ? 0 : -1}
                   className="tab"
                   onClick={() => switchTab('signup')}
                 >
@@ -426,69 +450,75 @@ export function LoginView(props: LoginViewProps) {
               </div>
             )}
 
-            {mode === 'signup' && (
-              <p className="login-hint">
-                {t('auth.signupQuotaHint', { n: meta.maxNetworksPerUser })}
-                {policy.requireEmailVerification ? ` ${t('auth.signupNeedsVerification')}` : ''}
-              </p>
-            )}
+            <div
+              {...(signupAllowed
+                ? { role: 'tabpanel', id: `login-panel-${mode}`, 'aria-labelledby': `login-tab-${mode}` }
+                : {})}
+            >
+              {mode === 'signup' && (
+                <p className="login-hint">
+                  {t('auth.signupQuotaHint', { n: meta.maxNetworksPerUser })}
+                  {policy.requireEmailVerification ? ` ${t('auth.signupNeedsVerification')}` : ''}
+                </p>
+              )}
 
-            {emailField}
+              {emailField}
 
-            {mode === 'login' && (
-              <>
+              {mode === 'login' && (
+                <>
+                  <PasswordField
+                    id="login-password"
+                    label={t('auth.password')}
+                    value={ui.loginPassword}
+                    required
+                    autoComplete="current-password"
+                    onChange={(v) => onUi({ loginPassword: v })}
+                    t={t}
+                  />
+                  {/* 忘记密码入口：未配发信时只给明确提示，不进空转的找回流程（GC-8） */}
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', margin: '-8px 0 14px' }}>
+                    <button
+                      type="button"
+                      className="back-link"
+                      onClick={() => {
+                        if (policy.smtpConfigured) {
+                          enterForgot();
+                        } else {
+                          setForgotNotice('error.smtpNotConfigured');
+                        }
+                      }}
+                    >
+                      {t('auth.forgotPassword')}
+                    </button>
+                  </div>
+                  {forgotNotice !== null && (
+                    <p className="form-error" role="alert" style={{ margin: '0 0 14px' }}>
+                      {t(forgotNotice)}
+                    </p>
+                  )}
+                </>
+              )}
+
+              {mode === 'signup' && (
                 <PasswordField
-                  id="login-password"
+                  id="signup-password"
                   label={t('auth.password')}
                   value={ui.loginPassword}
                   required
-                  autoComplete="current-password"
+                  minLength={10}
+                  autoComplete="new-password"
                   onChange={(v) => onUi({ loginPassword: v })}
                   t={t}
                 />
-                {/* 忘记密码入口：未配发信时只给明确提示，不进空转的找回流程（GC-8） */}
-                <div style={{ display: 'flex', justifyContent: 'flex-end', margin: '-8px 0 14px' }}>
-                  <button
-                    type="button"
-                    className="back-link"
-                    onClick={() => {
-                      if (policy.smtpConfigured) {
-                        enterForgot();
-                      } else {
-                        setForgotNotice('error.smtpNotConfigured');
-                      }
-                    }}
-                  >
-                    {t('auth.forgotPassword')}
-                  </button>
-                </div>
-                {forgotNotice !== null && (
-                  <p className="form-error" style={{ margin: '0 0 14px' }}>
-                    {t(forgotNotice)}
-                  </p>
-                )}
-              </>
-            )}
+              )}
 
-            {mode === 'signup' && (
-              <PasswordField
-                id="signup-password"
-                label={t('auth.password')}
-                value={ui.loginPassword}
-                required
-                minLength={10}
-                autoComplete="new-password"
-                onChange={(v) => onUi({ loginPassword: v })}
-                t={t}
-              />
-            )}
+              {otpSection}
 
-            {otpSection}
-
-            <button type="submit" className="btn primary block" disabled={busy}>
-              {mode === 'signup' ? t('auth.signup') : t('auth.login')}
-            </button>
-            {errorKey !== null && <p className="form-error">{t(errorKey)}</p>}
+              <button type="submit" className="btn primary block" disabled={busy}>
+                {mode === 'signup' ? t('auth.signup') : t('auth.login')}
+              </button>
+              {errorKey !== null && <p className="form-error" role="alert">{t(errorKey)}</p>}
+            </div>
           </form>
         )}
       </div>

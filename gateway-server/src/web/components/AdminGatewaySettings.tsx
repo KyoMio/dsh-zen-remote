@@ -1355,7 +1355,12 @@ export function UpdateSettingsSection(props: {
           )}
           <span className="field-hint">
             {t('admin.updateLastChecked')}:{' '}
-            {updateView?.lastCheckedAt ? new Date(updateView.lastCheckedAt).toLocaleString() : t('admin.updateNeverChecked')}
+            {updateView?.lastCheckedAt
+              ? new Intl.DateTimeFormat(
+                  document.documentElement.lang || (readLocale() === 'zh' ? 'zh-CN' : 'en-US'),
+                  { dateStyle: 'medium', timeStyle: 'short' },
+                ).format(new Date(updateView.lastCheckedAt))
+              : t('admin.updateNeverChecked')}
           </span>
         </div>
 

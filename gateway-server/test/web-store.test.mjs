@@ -1437,14 +1437,14 @@ describe('PG-6c 新增双语词条', () => {
   });
 
   test('设备列表引导、空态、危险区说明与管理页停用标记词条', () => {
-    assert.equal(LOCALES.zh['devices.clickHint'], '点击设备，查看它和其他设备怎么连接');
+    assert.equal(LOCALES.zh['devices.clickHint'], '点按设备，查看它和其他设备怎么连接');
     assert.equal(LOCALES.zh['devices.empty'], '还没有设备加入');
     assert.equal(LOCALES.zh['devices.emptyBody'], '在装了 dsh-zen-remote 的电脑上，把角色设为「节点端」，粘贴上面的邀请链接。');
     assert.equal(LOCALES.zh['network.rotateHint'], '旧链接立即失效，已加入的设备不受影响');
     assert.equal(LOCALES.zh['network.deleteHint'], '所有设备会立即断开，无法恢复');
     assert.equal(LOCALES.zh['admin.disabledTag'], '已停用');
     assert.equal(LOCALES.en['admin.disabledTag'], 'Disabled');
-    assert.equal(LOCALES.en['devices.clickHint'], 'Click a device to see how it connects to others');
+    assert.equal(LOCALES.en['devices.clickHint'], 'Select a device to see how it connects to others');
     assert.equal(LOCALES.zh['nav.goHome'], '返回默认网络');
     assert.equal(LOCALES.en['nav.goHome'], 'Back to primary network');
     assert.equal(LOCALES.zh['common.copied'], '已复制');

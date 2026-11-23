@@ -161,11 +161,10 @@ export function App() {
     }
   }, [theme]);
 
-  // 语言落到 <html lang>（屏幕阅读器发音）与标签页标题
+  // 语言落到 <html lang>（屏幕阅读器发音）
   useEffect(() => {
     document.documentElement.lang = locale === 'zh' ? 'zh-CN' : 'en';
-    document.title = t('app.title');
-  }, [locale, t]);
+  }, [locale]);
 
   // 行内二次确认的「点任意别处即取消」：确认态存在时，凡点击不在带
   // data-confirm-trigger 的按钮上（含确认按钮自己），一律取消确认态。
@@ -278,6 +277,21 @@ export function App() {
   // ------------------------------------------------- 管理四切片（GC-10b 收口）
 
   const isAdmin = state.session !== null && state.session.user.role === 'admin';
+  const selected = state.networks.find((n) => n.id === selectedNetworkId) ?? null;
+
+  useEffect(() => {
+    if (state.session === null) {
+      document.title = t('app.title');
+      return;
+    }
+    const prefix =
+      view === 'admin' && isAdmin
+        ? t('view.admin')
+        : selected !== null
+          ? selected.name
+          : t('view.networks');
+    document.title = `${prefix} — ${t('app.title')}`;
+  }, [state.session, view, isAdmin, selected, t]);
 
   /** 重新拉 /auth/me 落库：换绑邮箱成功后顶栏邮箱、配额摘要与弹窗即时刷新 */
   const refreshSession = useCallback(async (): Promise<void> => {
@@ -845,7 +859,6 @@ export function App() {
     );
   }
 
-  const selected = state.networks.find((n) => n.id === selectedNetworkId) ?? null;
   // 空态建网 CTA 的门槛（GC-10b）：普通用户建网数达所在组上限时禁用；
   // 管理员组上限不限（maxNetworks === null）永远可建
   const quotaCreateBlocked =
@@ -853,6 +866,9 @@ export function App() {
 
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main-content">
+        {t('a11y.skipToContent')}
+      </a>
       <TopBar
         t={t}
         locale={locale}
@@ -877,7 +893,7 @@ export function App() {
         ui={state.ui}
         onUi={handleUi}
       />
-      <main className="app-content">
+      <main id="main-content" className="app-content" tabIndex={-1}>
         {view === 'admin' && isAdmin ? (
           <AdminView
             t={t}
@@ -966,11 +982,9 @@ export function App() {
         />
       )}
 
-      {toast !== null && (
-        <div className="toast" role="status">
-          {t(toast.key)}
-        </div>
-      )}
+      <div className="toast" role="status" aria-live="polite">
+        {toast !== null ? t(toast.key) : ''}
+      </div>
     </div>
   );
 }

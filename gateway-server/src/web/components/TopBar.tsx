@@ -290,12 +290,20 @@ export function TopBar(props: TopBarProps) {
                   不参与 ↑/↓ 焦点循环；管理员上限不限时显示「不限」 */}
               {quota !== null && (
                 <div role="presentation" style={{ padding: '2px 10px 6px', fontSize: 12.5, color: 'var(--ink-3)' }}>
-                  {t('account.networkQuotaSummary', {
-                    used: quota.usedNetworks,
-                    limit: quota.maxNetworks === null ? t('common.unlimited') : quota.maxNetworks,
-                  })}
-                  {' · '}
-                  {quota.groupName}
+                  <div>
+                    {t('account.networkQuotaSummary', {
+                      used: quota.usedNetworks,
+                      limit: quota.maxNetworks === null ? t('common.unlimited') : quota.maxNetworks,
+                    })}
+                    {' · '}
+                    {quota.groupName}
+                  </div>
+                  {quotaCreateBlocked && quota.maxNetworks !== null && (
+                    <div style={{ marginTop: 2, color: 'var(--warn)' }}>
+                      {t('network.groupNetworkCap', { n: quota.maxNetworks })}
+                      {quota.isExpiredFallback ? ` · ${t('account.groupExpired')}` : ''}
+                    </div>
+                  )}
                 </div>
               )}
               <button
@@ -304,11 +312,6 @@ export function TopBar(props: TopBarProps) {
                 data-menu-item
                 className="menu-item"
                 disabled={quotaCreateBlocked}
-                title={
-                  quotaCreateBlocked && quota !== null && quota.maxNetworks !== null
-                    ? `${t('network.groupNetworkCap', { n: quota.maxNetworks })}${quota.isExpiredFallback ? ` · ${t('account.groupExpired')}` : ''}`
-                    : undefined
-                }
                 onClick={() => {
                   onCreateNetwork();
                   closeSwitcher();

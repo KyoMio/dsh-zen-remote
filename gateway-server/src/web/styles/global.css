@@ -24,16 +24,19 @@ html[data-theme='light'] {
 
   --line: #e3e6eb;
   --line-strong: #c9ced6;
+  --control-border: #6f7e96;
 
   --accent: #2f55c6;
   --accent-solid: #2f55c6;
   --accent-solid-hover: #2747a8;
   --accent-tint: #edf1fc;
 
-  --ok: #2e8a57;
-  --warn: #b4761a;
+  --ok: #1e7346;
+  --warn: #8a5508;
   --warn-tint: #fbf5e8;
   --danger: #c23b3b;
+  --danger-solid: #c23b3b;
+  --danger-solid-hover: #a93232;
   --danger-tint: #fbeeed;
 
   --brand-primary: #1b2028;
@@ -53,6 +56,7 @@ html[data-theme='dark'] {
 
   --line: #2a2f37;
   --line-strong: #3a404a;
+  --control-border: #7c89a3;
 
   --accent: #8fa9f2;
   --accent-solid: #3a60d0;
@@ -63,6 +67,8 @@ html[data-theme='dark'] {
   --warn: #d9a14a;
   --warn-tint: #2a2416;
   --danger: #e06666;
+  --danger-solid: #b83333;
+  --danger-solid-hover: #a02b2b;
   --danger-tint: #2e1c1c;
 
   --brand-primary: #f0f4fa;
@@ -79,6 +85,7 @@ html[data-theme='dark'] {
 
 html {
   color-scheme: light;
+  scroll-padding-block-start: 56px;
 }
 
 html[data-theme='dark'] {
@@ -96,7 +103,7 @@ body {
   color: var(--ink);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
     'Microsoft YaHei', sans-serif;
-  font-size: 14px;
+  font-size: 0.875rem;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
@@ -108,6 +115,35 @@ button {
 :focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
+}
+
+.skip-link {
+  position: fixed;
+  top: 12px;
+  left: 12px;
+  z-index: 400;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+.skip-link:focus-visible {
+  width: auto;
+  height: auto;
+  padding: 8px 14px;
+  overflow: visible;
+  clip-path: none;
+  border: 1px solid var(--control-border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 500;
+  text-decoration: none;
 }
 
 /* 数据等宽：设备数、速率、字节数 */
@@ -187,8 +223,10 @@ button {
   flex: none;
 }
 
-.brand-home:hover {
-  background: var(--surface-2);
+@media (hover: hover) {
+  .brand-home:hover {
+    background: var(--surface-2);
+  }
 }
 
 .brand-home:focus-visible {
@@ -252,7 +290,7 @@ button {
   height: 32px;
   max-width: 280px;
   padding: 0 10px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--control-border);
   border-radius: 4px;
   background: var(--surface);
   color: var(--ink);
@@ -260,8 +298,10 @@ button {
   cursor: pointer;
 }
 
-.net-switcher:hover {
-  background: var(--surface-2);
+@media (hover: hover) {
+  .net-switcher:hover {
+    background: var(--surface-2);
+  }
 }
 
 .net-switcher-name {
@@ -322,8 +362,10 @@ button {
   cursor: pointer;
 }
 
-.menu-item:hover {
-  background: var(--surface-2);
+@media (hover: hover) {
+  .menu-item:hover {
+    background: var(--surface-2);
+  }
 }
 
 .menu-item:focus-visible {
@@ -423,8 +465,10 @@ button {
   cursor: pointer;
 }
 
-.account-button:hover {
-  background: var(--surface-2);
+@media (hover: hover) {
+  .account-button:hover {
+    background: var(--surface-2);
+  }
 }
 
 .account-button .account-email {
@@ -455,7 +499,7 @@ button {
   gap: 6px;
   height: 32px;
   padding: 0 14px;
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--control-border);
   border-radius: 4px;
   background: var(--surface);
   color: var(--ink);
@@ -465,8 +509,10 @@ button {
   cursor: pointer;
 }
 
-.btn:hover {
-  background: var(--surface-2);
+@media (hover: hover) {
+  .btn:hover {
+    background: var(--surface-2);
+  }
 }
 
 .btn.primary {
@@ -475,8 +521,10 @@ button {
   color: #fff;
 }
 
-.btn.primary:hover {
-  background: var(--accent-solid-hover);
+@media (hover: hover) {
+  .btn.primary:hover {
+    background: var(--accent-solid-hover);
+  }
 }
 
 .btn.block {
@@ -506,7 +554,7 @@ button {
   width: 100%;
   height: 34px;
   padding: 0 10px;
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--control-border);
   border-radius: 4px;
   background: var(--surface);
   color: var(--ink);
@@ -519,7 +567,6 @@ button {
 }
 
 .input:focus-visible {
-  outline: none;
   border-color: var(--accent);
 }
 
@@ -647,29 +694,35 @@ button {
   color: var(--ink-2);
 }
 
-.btn.ghost:hover {
-  background: var(--surface-2);
+@media (hover: hover) {
+  .btn.ghost:hover {
+    background: var(--surface-2);
+  }
 }
 
 .btn.danger {
-  border-color: var(--line-strong);
+  border-color: var(--control-border);
   background: var(--surface);
   color: var(--danger);
 }
 
-.btn.danger:hover {
-  background: var(--danger-tint);
+@media (hover: hover) {
+  .btn.danger:hover {
+    background: var(--danger-tint);
+  }
 }
 
 .btn.danger.solid {
-  background: var(--danger);
-  border-color: var(--danger);
+  background: var(--danger-solid);
+  border-color: var(--danger-solid);
   color: #fff;
 }
 
-.btn.danger.solid:hover {
-  background: var(--danger);
-  opacity: 0.92;
+@media (hover: hover) {
+  .btn.danger.solid:hover {
+    background: var(--danger-solid-hover);
+    border-color: var(--danger-solid-hover);
+  }
 }
 
 .input-narrow {
@@ -771,8 +824,10 @@ button {
   cursor: pointer;
 }
 
-.invite-parts-summary:hover {
-  color: var(--ink);
+@media (hover: hover) {
+  .invite-parts-summary:hover {
+    color: var(--ink);
+  }
 }
 
 .invite-parts-summary:focus-visible {
@@ -1007,8 +1062,10 @@ tr.device-row {
   cursor: pointer;
 }
 
-tr.device-row:hover {
-  background: var(--surface-2);
+@media (hover: hover) {
+  tr.device-row:hover {
+    background: var(--surface-2);
+  }
 }
 
 .device-name {
@@ -1098,8 +1155,10 @@ tr.device-row:hover {
   cursor: pointer;
 }
 
-.back-link:hover {
-  text-decoration: underline;
+@media (hover: hover) {
+  .back-link:hover {
+    text-decoration: underline;
+  }
 }
 
 .detail-head {
@@ -1214,7 +1273,7 @@ tr.device-row:hover {
   width: 36px;
   height: 20px;
   padding: 0;
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--control-border);
   border-radius: 999px;
   background: var(--surface-2);
   cursor: pointer;
@@ -1228,7 +1287,12 @@ tr.device-row:hover {
   height: 14px;
   border-radius: 50%;
   background: var(--ink-3);
-  transition: left 0.15s ease;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .switch .switch-knob {
+    transition: transform 0.15s ease-out;
+  }
 }
 
 .switch.on {
@@ -1237,7 +1301,7 @@ tr.device-row:hover {
 }
 
 .switch.on .switch-knob {
-  left: 18px;
+  transform: translateX(16px);
   background: #fff;
 }
 
@@ -1425,19 +1489,21 @@ html[data-theme='dark'] dialog.modal::backdrop {
   flex: none;
 }
 
-.modal-close:hover {
-  background: var(--surface-2);
-  color: var(--ink);
+@media (hover: hover) {
+  .modal-close:hover {
+    background: var(--surface-2);
+    color: var(--ink);
+  }
 }
 
 /* 平滑开关过渡；prefers-reduced-motion 下不播动画（尊重前庭无障碍偏好） */
 @media (prefers-reduced-motion: no-preference) {
   dialog.modal[open] {
-    animation: modal-in 0.16s ease;
+    animation: modal-in 0.16s ease-out;
   }
 
   dialog.modal[open]::backdrop {
-    animation: backdrop-in 0.16s ease;
+    animation: backdrop-in 0.16s ease-out;
   }
 }
 
@@ -1507,6 +1573,10 @@ html[data-theme='dark'] dialog.modal::backdrop {
   border-radius: 6px;
   font-size: 13px;
   color: var(--ink);
+}
+
+.toast:empty {
+  display: none;
 }
 
 /* ---------- 空态 ---------- */
@@ -1762,8 +1832,10 @@ html[data-theme='dark'] dialog.modal::backdrop {
   cursor: pointer;
 }
 
-.admin-tab:hover {
-  color: var(--ink);
+@media (hover: hover) {
+  .admin-tab:hover {
+    color: var(--ink);
+  }
 }
 
 .admin-tab[aria-selected='true'] {
@@ -1997,9 +2069,11 @@ html[data-theme='dark'] dialog.modal::backdrop {
   cursor: pointer;
 }
 
-.preset-chip:hover {
-  background: var(--surface-2);
-  color: var(--ink);
+@media (hover: hover) {
+  .preset-chip:hover {
+    background: var(--surface-2);
+    color: var(--ink);
+  }
 }
 
 /* ---------- 设置面板（网关与发信设置） ---------- */
@@ -2114,8 +2188,10 @@ html[data-theme='dark'] dialog.modal::backdrop {
   cursor: pointer;
 }
 
-.tls-file-input::file-selector-button:hover {
-  background: var(--surface-2);
+@media (hover: hover) {
+  .tls-file-input::file-selector-button:hover {
+    background: var(--surface-2);
+  }
 }
 
 .tls-https-cta {
