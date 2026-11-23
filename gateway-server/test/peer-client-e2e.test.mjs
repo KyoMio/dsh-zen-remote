@@ -826,4 +826,53 @@ describe('peer-client-e2e (cross-package PeerEngine + RelayPool + gateway-server
     const virtualAonB = await waitPeerOnline(B, A.identity.nodeId);
     assert.ok((await virtualAonB.client.invoke('session', 'list', { request: {} })).items.some((i) => i.sessionId === 's-1'));
   });
+
+  test('9. Slice 3: live admin PATCH forceRelay switches connected PeerEngines between relay and direct', async (t) => {
+    const net = await createNetwork(gw, { mode: 'key' });
+    const A = await startNode(t, gw, { name: 'fr-a', shared: ['s-fr'], useDefaultWelcomeStun: true });
+    const B = await startNode(t, gw, { name: 'fr-b', useDefaultWelcomeStun: true });
+    await A.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey));
+    await B.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey));
+
+    await waitFor(() => {
+      const p = A.engine.status().peers.find((x) => x.nodeId === B.identity.nodeId);
+      return p?.path === 'lan' || p?.path === 'p2p';
+    }, 'initially promoted to direct', 8000);
+    assert.equal(A.engine.status().forceRelay, false);
+
+    // Enable forceRelay live via admin REST API
+    const onRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+      body: JSON.stringify({ forceRelay: true }),
+    });
+    assert.equal(onRes.status, 200);
+    await waitFor(
+      () =>
+        A.engine.status().forceRelay === true &&
+        B.engine.status().forceRelay === true &&
+        A.engine.status().peers.find((x) => x.nodeId === B.identity.nodeId)?.path === 'relay' &&
+        B.engine.status().peers.find((x) => x.nodeId === A.identity.nodeId)?.path === 'relay',
+      'both nodes switched to relay on live forceRelay=true',
+      5000,
+    );
+    const virtualAonB = await waitPeerOnline(B, A.identity.nodeId);
+    assert.ok((await virtualAonB.client.invoke('session', 'list', { request: {} })).items.some((i) => i.sessionId === 's-fr'));
+
+    // Disable forceRelay live -> re-punches and restores direct
+    const offRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+      body: JSON.stringify({ forceRelay: false }),
+    });
+    assert.equal(offRes.status, 200);
+    await waitFor(
+      () => {
+        const p = A.engine.status().peers.find((x) => x.nodeId === B.identity.nodeId);
+        return A.engine.status().forceRelay === false && (p?.path === 'lan' || p?.path === 'p2p');
+      },
+      'direct restored on live forceRelay=false',
+      8000,
+    );
+  });
 });

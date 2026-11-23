@@ -114,6 +114,8 @@ export interface PeerEngineStatus {
   /** T4：`directCapMs` 的来源——`gateway` = 网关 welcome/network-updated 下发；
    *  `default` = 网关没说过话时的本地值（options 注入或回落 300）。 */
   directCapSource: 'gateway' | 'default'
+  /** 网关下发的全局强制中转标记（welcome / network-updated 现场更新）。 */
+  forceRelay: boolean
   /** T2/T6：与网关及同网对端的版本协调状态。 */
   versionSync: PeerVersionSyncEvaluation
 }
@@ -398,6 +400,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   let gatewayVersionFromGateway: string | null = null
   let recommendedPluginVersionFromGateway: string | null = null
   let gatewayWireCompatLevel: number | null = null
+  let forceRelayFromGateway = false
+  let lastWelcomeStun: unknown = null
   /** 挂载顺序即公告顺序；每项是 pool entryId（= 对端 nodeId）。 */
   const members = new Map<string, MemberRec>()
 
@@ -624,6 +628,15 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     mux.setPeerName(nodeId, member.name)
     if (member.mounted) options.relayPool.updateVirtualName(nodeId, member.name)
     if (!info.deferMount) refreshMounts()
+    if (forceRelayFromGateway) {
+      if (connSeqChanged || selfWsEpochChanged) {
+        resetPeerForReanchor(member, connSeqChanged ? 'connSeq changed' : 'local network changed', true)
+      }
+      member.path = 'relay'
+      applyArqProfile(member, 'relay', true)
+      mux.enableRelayPath(nodeId)
+      return
+    }
     if (info.startPunch && punch !== null) {
       const keepAliveMs = options.punch?.keepAliveMs ?? 5_000
       const pState = punch.peerState(nodeId)
@@ -882,6 +895,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       }
       if (status === 'authorized') {
         gatewayState = 'authorized'
+        forceRelayFromGateway = message['forceRelay'] === true
+        lastWelcomeStun = message['stun'] ?? null
         syncSelfLanKey()
         const livePeerIds = new Set<string>()
         for (const peer of Array.isArray(message['peers']) ? (message['peers'] as Array<Record<string, unknown>>) : []) {
@@ -896,7 +911,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
             reflexiveEndpoint: typeof peer.reflexiveEndpoint === 'string' ? peer.reflexiveEndpoint : null,
             connSeq: parseConnSeq(peer.connSeq),
             pluginVersion: parseSemver(peer.pluginVersion)?.normalized ?? null,
-            startPunch: true,
+            startPunch: !forceRelayFromGateway,
             deferMount: true,
           })
         }
@@ -907,8 +922,10 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         }
         refreshMounts()
         // PC-01b：STUN 端口来自本条 authorized welcome 的 stun 字段（生产缺省
-        // 路径；显式 udpProbe 在引擎内另行覆盖/关闭）。
-        runStunProbeOnce(message['stun'])
+        // 路径；显式 udpProbe 在引擎内另行覆盖/关闭）。强制中转模式下跳过探测。
+        if (!forceRelayFromGateway) {
+          runStunProbeOnce(message['stun'])
+        }
         armPathReport()
         schedulePathReport()
       } else {
@@ -1013,7 +1030,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         reflexiveEndpoint: typeof message['reflexiveEndpoint'] === 'string' ? message['reflexiveEndpoint'] : null,
         connSeq: parseConnSeq(message['connSeq']),
         pluginVersion: parseSemver(message['pluginVersion'])?.normalized ?? null,
-        startPunch: true,
+        startPunch: !forceRelayFromGateway,
       })
       return
     }
@@ -1041,6 +1058,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       return
     }
     if (type === 'punch-coordinate') {
+      if (forceRelayFromGateway) return
       if (typeof message['peerNodeId'] !== 'string' || typeof message['publicKeyHex'] !== 'string') return
       const ver = parseSemver(message['pluginVersion'])?.normalized
       announcePeer({
@@ -1065,8 +1083,60 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       // 调用现场读它，升容后 refreshMounts 立即补位，缩容不踢既有挂载
       // （mountPeer 的上限闸只挡新增），本机显式 maxServers 由 pool 的 min
       // 规则继续压住。RTT 上限现场生效：directCap() 每个样本都重新解析，
-      // 新值从下一个样本起参与判定。
+      // 新值从下一个样本起参与判定。forceRelay 现场切换：开启立即丢弃
+      // UDP 打洞并切回中转，关闭重新探测 STUN 并为在网节点重新发起打洞。
       if (message['networkId'] !== networkId) return
+      if (message['stun'] !== undefined) {
+        lastWelcomeStun = message['stun']
+      }
+      const announcedForceRelay = typeof message['forceRelay'] === 'boolean' ? (message['forceRelay'] as boolean) : undefined
+      const forceRelayChanged = announcedForceRelay !== undefined && announcedForceRelay !== forceRelayFromGateway
+      if (forceRelayChanged) {
+        forceRelayFromGateway = announcedForceRelay
+        if (forceRelayFromGateway) {
+          for (const member of members.values()) {
+            if (member.state !== 'eligible') continue
+            punch?.dropPeer(member.nodeId)
+            applyArqProfile(member, 'relay', true)
+            mux?.setRelayPath(member.nodeId, false)
+            member.path = 'relay'
+            member.directActive = false
+            member.directMode = null
+            member.directSmoothedRtt = null
+            member.directGoodStreak = 0
+            member.directMissedPings = 0
+            member.directDemoted = false
+            member.directDemoteReason = null
+            member.peerRelayHoldUntil = 0
+            member.relayHoldStep = 0
+            member.directPromotedAt = 0
+          }
+          log('peer engine: gateway enabled forceRelay — switching all peers to relay')
+          schedulePathReport()
+        } else {
+          log('peer engine: gateway disabled forceRelay — restoring direct punch')
+          stunProbedAtEpoch = -1
+          if (lastWelcomeStun !== null) {
+            runStunProbeOnce(lastWelcomeStun)
+          }
+          for (const member of members.values()) {
+            if (member.state !== 'eligible') continue
+            if (member.lastLanEndpoints.length > 0 || member.lastReflexive !== null) {
+              try {
+                punch?.beginPunch({
+                  peerNodeId: member.nodeId,
+                  peerPublicKeyHex: member.publicKeyHex,
+                  lanEndpoints: member.lastLanEndpoints,
+                  ...(member.lastReflexive !== null ? { reflexiveEndpoint: member.lastReflexive } : {}),
+                } satisfies PunchPeerInfo)
+                if (punch !== null) {
+                  log(`peer engine: beginPunch(${member.nodeId}) candidates=${member.lastLanEndpoints.length + (member.lastReflexive !== null ? 1 : 0)} ours=${punch.lanEndpoints().length}`)
+                }
+              } catch { /* next coordinate will retry */ }
+            }
+          }
+        }
+      }
       const announced = message['maxPeers']
       const capOk = typeof announced === 'number' && Number.isSafeInteger(announced) && announced >= 2 && announced <= 64
       const announcedRtt = message['peerDirectMaxRttMs']
@@ -1098,7 +1168,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   // ------------------------------------------------------------ STUN 与 path-report
 
   const runStunProbeOnce = (welcomeStun: unknown): void => {
-    if (stopped || punch === null) return
+    if (stopped || punch === null || forceRelayFromGateway) return
     if (options.udpProbe === null) return // 显式关闭：受控调用者的既有语义，welcome 也不看
     if (stunProbedAtEpoch === connEpoch) return // 本连接代次已处理（探测或降级）
     stunProbedAtEpoch = connEpoch
@@ -1239,6 +1309,17 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     log(`peer engine: direct ready ${nodeId} via ${info.mode} ${info.endpoint} rtt=${info.rttMs}`)
     const member = members.get(nodeId)
     if (member === undefined) return
+    if (forceRelayFromGateway) {
+      punch?.dropPeer(nodeId)
+      member.path = 'relay'
+      member.directActive = false
+      member.directMode = null
+      member.directPromotedAt = 0
+      applyArqProfile(member, 'relay', true)
+      mux?.enableRelayPath(nodeId)
+      schedulePathReport()
+      return
+    }
     // T5：新会话重走测量——握手自报 RTT 只反映 HELLO/ACK 单程，不信它；
     // 等保活样本判定。directActive 置 false：上限 >0 时 mux 还没切到 UDP，
     // 切的时候 promoteDirect 自己置 true。
@@ -1360,6 +1441,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
    *  EWMA 永远更新（降级中也采样），降级判断用的是更新前的平滑值——
    *  单个尖峰只把 EWMA 推过线一次，下一次样本前它仍是旧基线。 */
   const onRttSample = (nodeId: string, rtt: number): void => {
+    if (forceRelayFromGateway) return
     const member = members.get(nodeId.toLowerCase())
     if (member === undefined || member.state !== 'eligible') return
     member.directMissedPings = 0 // 匹配 PONG 到达即证明链路活着，连 miss 归零
@@ -1488,7 +1570,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       onEncryptedFrame: (header, plaintext) => {
         const m = members.get(header.srcNodeId.toLowerCase())
         mux?.handleOpenedFrame(header, plaintext)
-        if (m !== undefined) {
+        if (m !== undefined && !forceRelayFromGateway) {
           const cap = directCap()
           if (
             !m.directActive &&
@@ -1600,6 +1682,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     gatewayVersionFromGateway = null
     recommendedPluginVersionFromGateway = null
     gatewayWireCompatLevel = null
+    forceRelayFromGateway = false
+    lastWelcomeStun = null
   }
 
   return {
@@ -1728,7 +1812,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           name: member.name,
           lanEndpoints: member.lastLanEndpoints,
           reflexiveEndpoint: member.lastReflexive,
-          startPunch: true,
+          startPunch: !forceRelayFromGateway,
         })
         if (member.state === 'eligible') mux?.enableRelayPath(id)
         schedulePathReport()
@@ -1757,7 +1841,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         name: member.name,
         lanEndpoints: member.lastLanEndpoints,
         reflexiveEndpoint: member.lastReflexive,
-        startPunch: true,
+        startPunch: !forceRelayFromGateway,
       })
       mux?.enableRelayPath(id)
       schedulePathReport() // PC-16a：blocked→放行是路径事实变化，及时顶掉旧边
@@ -1765,7 +1849,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     },
 
     reprobePunch() {
-      if (punch === null || stopped) return
+      if (punch === null || stopped || forceRelayFromGateway) return
       for (const member of members.values()) {
         if (member.state !== 'eligible') continue
         try {
@@ -1857,6 +1941,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         peers,
         directCapMs: directCap(),
         directCapSource: capFromGateway === null ? 'default' : 'gateway',
+        forceRelay: forceRelayFromGateway,
         versionSync,
       }
     },

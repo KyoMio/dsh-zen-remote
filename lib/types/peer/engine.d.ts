@@ -69,6 +69,8 @@ export interface PeerEngineStatus {
     /** T4：`directCapMs` 的来源——`gateway` = 网关 welcome/network-updated 下发；
      *  `default` = 网关没说过话时的本地值（options 注入或回落 300）。 */
     directCapSource: 'gateway' | 'default';
+    /** 网关下发的全局强制中转标记（welcome / network-updated 现场更新）。 */
+    forceRelay: boolean;
     /** T2/T6：与网关及同网对端的版本协调状态。 */
     versionSync: PeerVersionSyncEvaluation;
 }

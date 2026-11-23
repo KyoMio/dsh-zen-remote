@@ -3005,3 +3005,222 @@ test('Slice 1: exponential backoff (30s -> 60s -> 120s -> 240s -> 300s) and 120s
   assert.equal(env.peerOf().path, 'lan')
   await induceDemoteAndMeasureHold(30_000)
 })
+
+test('Slice 3: welcome forceRelay=true skips STUN & beginPunch and immediately enables relay; live network-updated toggles true/false', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-force-relay-'))
+  const clock = manualClock()
+  const logs = []
+  const stateFileA = path.join(home, 'a-state.json')
+  const socketA = await openUdp()
+  const identityA = ensurePeerIdentity(stateFileA)
+  const socketB = await openUdp()
+  const gateB = makeGate(socketB)
+  gateB.pongDelayMs = 2
+  gateB.dropFirstPing = false
+  const identityB = generatePeerIdentity()
+
+  const stunSock = await openUdp()
+  let stunPackets = 0
+  stunSock.on('message', () => { stunPackets += 1 })
+
+  let sendWelcomeForceRelay = true
+  const wsSockets = []
+  const server = http.createServer()
+  server.on('upgrade', (req, socket) => {
+    wsSockets.push(socket)
+    socket.on('error', () => {})
+    let buf = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      for (;;) {
+        const parsed = readClientFrame(buf)
+        if (parsed === null) break
+        buf = parsed.rest
+        if (parsed.opcode === 8) { socket.end(); return }
+        if (parsed.opcode !== 1) continue
+        let msg
+        try { msg = JSON.parse(parsed.payload.toString('utf8')) } catch { continue }
+        if (msg?.type === 'auth') {
+          socket.write(wsFrame({
+            type: 'welcome',
+            status: 'authorized',
+            maxPeers: 8,
+            peerDirectMaxRttMs: 0,
+            forceRelay: sendWelcomeForceRelay,
+            ...(sendWelcomeForceRelay ? {} : { stun: { primaryPort: stunSock.address().port, altPort: null } }),
+            peers: [{
+              nodeId: identityB.nodeId,
+              publicKeyHex: identityB.publicKeyHex,
+              name: 'peer-B',
+              lanEndpoints: sendWelcomeForceRelay ? [] : [endpointOf(socketB)],
+              reflexiveEndpoint: null,
+              connSeq: 1,
+            }],
+          }))
+        }
+      }
+    })
+    const accept = createHash('sha1').update(String(req.headers['sec-websocket-key']) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    socket.write(Buffer.concat([
+      Buffer.from(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`),
+      wsFrame({ type: 'challenge', challengeHex: 'a1b2c3d4e5f60718' }),
+    ]))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+
+  const engine = createPeerEngine({
+    stateFile: stateFileA,
+    identity: identityA,
+    relayPool: {
+      maxServers: () => 8,
+      mountVirtual: (i) => ({ entryId: i.entryId, serverId: i.serverId, serverName: i.serverName, displayName: i.serverName }),
+      unmountVirtual: () => true,
+      updateVirtualName: () => true,
+      reconnect: () => Promise.resolve(true),
+    },
+    relayHandler: () => undefined,
+    relaySecret: () => 'test',
+    serverName: () => 'node-A',
+    udpSocket: socketA,
+    stunProbeTimeoutMs: 50,
+    clock,
+    log: (line) => logs.push(line),
+    punch: {
+      keepAliveMs: KEEPALIVE_MS,
+      keepAliveLostFrames: 3,
+      reprobeInitialDelaysMs: [5_000, 15_000],
+      reprobeIntervalMs: 800,
+      fastConfirmDelayMs: 0,
+    },
+  })
+  const mgrB = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: identityB,
+    socket: gateB,
+    clock,
+    keepAliveMs: KEEPALIVE_MS,
+    keepAliveLostFrames: 3,
+    reprobeInitialDelaysMs: [5_000, 15_000],
+    reprobeIntervalMs: 800,
+  })
+  await mgrB.ready()
+  writePeerNetwork(stateFileA, {
+    gatewayWsUrl: `ws://127.0.0.1:${port}`,
+    gatewayHttpOrigin: `http://127.0.0.1:${port}`,
+    networkId: NET_ID,
+    joinedAt: 1,
+  })
+  t.after(async () => {
+    const closingB = waitClose(socketB)
+    const closingA = waitClose(socketA)
+    const closingStun = waitClose(stunSock)
+    mgrB.close()
+    engine.stop()
+    try { stunSock.close() } catch {}
+    for (const s of wsSockets) s.destroy()
+    server.closeAllConnections?.()
+    await Promise.all([
+      closingB,
+      closingA,
+      closingStun,
+      new Promise((resolve) => server.close(resolve)),
+    ])
+    fs.rmSync(home, { recursive: true, force: true })
+  })
+
+  // 1. welcome with forceRelay=true skips STUN & beginPunch, exposes status().forceRelay === true, and enables relay path
+  engine.resumeFromState()
+  await waitFor(() => engine.status().gatewayState === 'authorized', 'authorized with forceRelay=true')
+  assert.equal(engine.status().forceRelay, true)
+  assert.equal(engine.status().peers[0]?.path, 'relay')
+  assert.equal(stunPackets, 0, 'forceRelay=true must skip STUN probe')
+  assert.equal(logs.some((l) => l.includes('beginPunch(')), false, 'forceRelay=true must skip beginPunch')
+
+  // Even if punch-coordinate arrives while forceRelay=true, it must not start punching
+  for (const s of wsSockets) {
+    s.write(wsFrame({
+      type: 'punch-coordinate',
+      peerNodeId: identityB.nodeId,
+      publicKeyHex: identityB.publicKeyHex,
+      lanEndpoints: [endpointOf(socketB)],
+      reflexiveEndpoint: null,
+      connSeq: 1,
+    }))
+  }
+  await sleep(30)
+  assert.equal(logs.some((l) => l.includes('beginPunch(')), false, 'punch-coordinate suppressed during forceRelay=true')
+  assert.equal(engine.status().peers[0]?.path, 'relay')
+
+  // 2. Live network-updated forceRelay=false with stun re-runs STUN probe and restores direct punch
+  mgrB.beginPunch({ peerNodeId: identityA.nodeId, peerPublicKeyHex: identityA.publicKeyHex, lanEndpoints: [] })
+  for (const s of wsSockets) {
+    s.write(wsFrame({
+      type: 'network-updated',
+      networkId: NET_ID,
+      maxPeers: 8,
+      peerDirectMaxRttMs: 0,
+      forceRelay: false,
+      stun: { primaryPort: stunSock.address().port, altPort: null },
+    }))
+  }
+  await waitFor(() => engine.status().forceRelay === false, 'forceRelay flipped to false')
+  await waitFor(() => stunPackets >= 1, 'STUN probe triggered after forceRelay=false')
+  // Gateway re-emits punch-coordinate right after network-updated(forceRelay=false)
+  for (const s of wsSockets) {
+    s.write(wsFrame({
+      type: 'punch-coordinate',
+      peerNodeId: identityB.nodeId,
+      publicKeyHex: identityB.publicKeyHex,
+      lanEndpoints: [endpointOf(socketB)],
+      reflexiveEndpoint: null,
+      connSeq: 1,
+    }))
+  }
+  await waitFor(() => logs.some((l) => l.includes('beginPunch(')), 'beginPunch triggered after forceRelay=false')
+  await waitFor(() => engine.status().peers[0]?.path === 'lan', 'promoted to direct lan after forceRelay=false')
+
+  // 3. Live network-updated forceRelay=true drops active UDP punch and switches immediately to relay
+  logs.length = 0
+  for (const s of wsSockets) {
+    s.write(wsFrame({
+      type: 'network-updated',
+      networkId: NET_ID,
+      maxPeers: 8,
+      peerDirectMaxRttMs: 0,
+      forceRelay: true,
+    }))
+  }
+  await waitFor(() => engine.status().forceRelay === true && engine.status().peers[0]?.path === 'relay', 'switched immediately to relay on forceRelay=true')
+  assert.equal(engine.status().peers[0]?.directDemoted, false)
+
+  // Subsequent punch-coordinate while forceRelay=true must remain suppressed
+  for (const s of wsSockets) {
+    s.write(wsFrame({
+      type: 'punch-coordinate',
+      peerNodeId: identityB.nodeId,
+      publicKeyHex: identityB.publicKeyHex,
+      lanEndpoints: [endpointOf(socketB)],
+      reflexiveEndpoint: null,
+      connSeq: 1,
+    }))
+  }
+  await sleep(30)
+  assert.equal(engine.status().peers[0]?.path, 'relay')
+
+  // 4. Live network-updated forceRelay=false again with cached endpoints triggers beginPunch immediately without new punch-coordinate
+  logs.length = 0
+  const stunBefore = stunPackets
+  mgrB.beginPunch({ peerNodeId: identityA.nodeId, peerPublicKeyHex: identityA.publicKeyHex, lanEndpoints: [] })
+  for (const s of wsSockets) {
+    s.write(wsFrame({
+      type: 'network-updated',
+      networkId: NET_ID,
+      forceRelay: false,
+      stun: { primaryPort: stunSock.address().port, altPort: null },
+    }))
+  }
+  await waitFor(() => stunPackets > stunBefore, 'STUN re-probed on second forceRelay=false')
+  await waitFor(() => logs.some((l) => l.includes('beginPunch(')), 'beginPunch triggered directly from cached endpoints')
+  await waitFor(() => engine.status().peers[0]?.path === 'lan', 're-promoted to direct lan')
+})

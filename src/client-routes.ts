@@ -737,6 +737,7 @@ function peerStatusBodyOf(engine: PeerEngine, options: ClientHandlerOptions): Re
     maxPeers: status.maxPeers,
     directCapMs: status.directCapMs,
     directCapSource: status.directCapSource,
+    ...(typeof status.forceRelay === 'boolean' ? { forceRelay: status.forceRelay } : {}),
     maxServers,
     mountedCount,
     limitReached: mountedCount >= maxServers,

@@ -352,6 +352,9 @@ export function renderPeerSection(t: CliTranslator, peer: ServerRow | null): str
   const origin = typeof peer.gatewayOrigin === 'string' && peer.gatewayOrigin !== '' ? peer.gatewayOrigin : '—'
   lines.push(`  ${t('peer.status.joined', { networkId, origin })}`)
   lines.push(`  ${t('peer.status.gatewayState', { state: gatewayStateLabel(t, peer.gatewayState) })}`)
+  if (peer.forceRelay === true) {
+    lines.push(`  ${t('peer.status.forceRelay')}`)
+  }
   lines.push(...peerCapacityLines(t, peer))
   const peers = arrayOf(peer.peers)
     .map((row) => plainOf(row))

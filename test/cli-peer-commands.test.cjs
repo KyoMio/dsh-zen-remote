@@ -2828,3 +2828,36 @@ test('T6 status: prints gentle version sync hints for gateway/plugin outdated an
     cleanup(home)
   }
 })
+
+test('Slice 3: peer status surfaces forceRelay in zh/en text and --json', async () => {
+  const mods = await loadModules(ARGS_URL, I18N_URL, BOOTSTRAP_URL, IPC_SERVER_URL, IPC_CLIENT_URL, STATUS_URL, PEER_URL)
+  const home = makeHome('status-force-relay')
+  let handle
+  try {
+    const { handle: h } = await startIpcServer(home, {
+      role: 'peer',
+      client: {
+        [ROUTES.peerStatus]: {
+          body: peerStatusBody('authorized', { extra: { forceRelay: true } }),
+        },
+      },
+    })
+    handle = h
+    const ipc = mods.createCliIpcClient(handle.socketPath)
+
+    const zh = makeCtx(mods, { argv: ['peer', 'status'], ipc, lang: 'zh' })
+    assert.equal(await mods.runPeerStatusCommand(zh), 0)
+    assert.match(zh.stdout.text(), /强制中转/u)
+
+    const en = makeCtx(mods, { argv: ['peer', 'status'], ipc, lang: 'en' })
+    assert.equal(await mods.runPeerStatusCommand(en), 0)
+    assert.match(en.stdout.text(), /relay-only|force/iu)
+
+    const json = makeCtx(mods, { argv: ['peer', 'status', '--json'], ipc })
+    assert.equal(await mods.runPeerStatusCommand(json), 0)
+    assert.equal(JSON.parse(json.stdout.text()).forceRelay, true)
+  } finally {
+    if (handle !== undefined) await handle.close()
+    cleanup(home)
+  }
+})

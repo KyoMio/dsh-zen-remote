@@ -1267,3 +1267,30 @@ test('T6 status versionSync: exposes sanitized gatewayConsoleUrl without network
     await closeServer(server)
   }
 })
+
+test('Slice 3: CLIENT_PEER_STATUS_ROUTE forwards forceRelay boolean when provided', async () => {
+  const { engine } = makePeerEngine({
+    status: {
+      nodeId: 'abcd1234',
+      gatewayState: 'authorized',
+      networkId: '0123456789abcdef',
+      maxPeers: 8,
+      natType: 'cone',
+      directCapMs: 300,
+      directCapSource: 'gateway',
+      forceRelay: true,
+      peers: [
+        { nodeId: 'aaaa1111', name: '书房电脑', state: 'eligible', path: 'relay', rttMs: null, mounted: true },
+      ],
+    },
+  })
+  const { server, port } = await startClientServer(makeRow(), { getPeerEngine: () => engine })
+  try {
+    const res = await request(port, { method: 'GET', path: PEER_STATUS_PATH })
+    assert.equal(res.status, 200)
+    const parsed = JSON.parse(res.body)
+    assert.equal(parsed.forceRelay, true)
+  } finally {
+    await closeServer(server)
+  }
+})
