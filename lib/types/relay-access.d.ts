@@ -288,28 +288,11 @@ export type HttpDecision = {
  * string alone, never from raw input. Unknown parameters are dropped.
  */
 export declare function decideHttpRoute(route: unknown, query: unknown, isAccessible: (sessionId: string) => boolean): HttpDecision;
-/**
- * The binary upload channel's query (T51), decided with the SAME
- * parse-once discipline as {@link decideHttpRoute}: the wire string is
- * parsed exactly once here, only `sessionId` and `name` are kept, and the
- * caller composes the synthetic Request URL from the RETURNED string alone.
- * `URLSearchParams` keeps `\t` / `\r` / `\n` inside key names while the
- * WHATWG URL parser strips control characters — the differential that was
- * T41b-fix's authorization bypass on the GET routes — so the check and the
- * dispatch must see one parse.
- *
- * `sessionId` exactly once, a non-empty string, and share-checked like any
- * other session id; a repeat is `no-session` (400). `name` (the file's
- * display name — the host route passes it to its own leaf-name sanitizer,
- * RT dsh-client-file-upload lib/index.js `handleFileUploadHttp`) at most
- * once; a repeat is `bad-query` (400) and an empty value is dropped, the
- * same "absent" the host route reads when the browser sent none. Everything
- * else is discarded before an id is read.
- */
 export type UploadQueryDecision = {
     allow: true;
     sessionId: string;
     name: string | undefined;
+    mediaType: string | undefined;
     query: string;
 } | {
     allow: false;

@@ -554,7 +554,7 @@ test('upload: the byte stream rides out, the query carries the original id + nam
     const { client } = makeClient(relay.port)
     await client.connect()
     const bytes = Buffer.from('hello')
-    const result = await client.upload({ sessionId: 'session-a', name: 'note.txt', body: byteStreamOf(bytes), bytes: 5 })
+    const result = await client.upload({ sessionId: 'session-a', name: 'note.txt', mediaType: 'text/plain', body: byteStreamOf(bytes), bytes: 5 })
     assert.equal(result.status, 200)
     assert.equal(result.contentType, 'application/json; charset=utf-8')
     assert.deepEqual(JSON.parse(result.body), { ok: true, value: { receiptId: 'r-1', file: { attachmentId: 'att-1', name: 'note.txt', bytes: 5 } } })
@@ -562,7 +562,7 @@ test('upload: the byte stream rides out, the query carries the original id + nam
     assert.equal(hits.length, 1)
     const hit = hits[0]
     assert.equal(hit.method, 'POST')
-    assert.equal(hit.query, '?sessionId=session-a&name=note.txt')
+    assert.equal(hit.query, '?sessionId=session-a&name=note.txt&mediaType=text%2Fplain')
     assert.equal(hit.headers['content-type'], 'application/octet-stream')
     assert.equal(hit.headers['content-length'], undefined, 'the body goes chunked — a hand-set length breaks DSH undici')
     assert.ok(hit.rawBody.equals(bytes), 'the exact bytes arrived, in order')

@@ -806,10 +806,22 @@ export function decideHttpRoute(
  * display name — the host route passes it to its own leaf-name sanitizer,
  * RT dsh-client-file-upload lib/index.js `handleFileUploadHttp`) at most
  * once; a repeat is `bad-query` (400) and an empty value is dropped, the
- * same "absent" the host route reads when the browser sent none. Everything
- * else is discarded before an id is read.
+ * same "absent" the host route reads when the browser sent none. `mediaType`
+ * (the optional MIME type hint) at most once, trimmed and validated as a
+ * plain `type/subtype` up to 128 chars; repeats or malformed values are
+ * `bad-query` (400), and an empty value is dropped. Everything else is
+ * discarded before an id is read.
  */
-export type UploadQueryDecision = { allow: true; sessionId: string; name: string | undefined; query: string } | {
+const UPLOAD_MEDIA_TYPE_PATTERN = /^[a-z0-9][a-z0-9.+-]*\/[a-z0-9][a-z0-9.+-]*$/i
+const MAX_UPLOAD_MEDIA_TYPE_LEN = 128
+
+export type UploadQueryDecision = {
+  allow: true
+  sessionId: string
+  name: string | undefined
+  mediaType: string | undefined
+  query: string
+} | {
   allow: false
   reason: 'no-session' | 'bad-query' | 'not-shared'
 }
@@ -826,9 +838,22 @@ export function decideUploadQuery(
   const names = raw.getAll('name')
   if (names.length > 1) return { allow: false, reason: 'bad-query' }
   const name = names.length === 1 && names[0] !== '' ? names[0] : undefined
+  const mediaTypes = raw.getAll('mediaType')
+  if (mediaTypes.length > 1) return { allow: false, reason: 'bad-query' }
+  let mediaType: string | undefined
+  if (mediaTypes.length === 1) {
+    const trimmed = mediaTypes[0].trim()
+    if (trimmed !== '') {
+      if (trimmed.length > MAX_UPLOAD_MEDIA_TYPE_LEN || !UPLOAD_MEDIA_TYPE_PATTERN.test(trimmed)) {
+        return { allow: false, reason: 'bad-query' }
+      }
+      mediaType = trimmed
+    }
+  }
   if (!isAccessible(id)) return { allow: false, reason: 'not-shared' }
   const normalized = new URLSearchParams()
   normalized.set('sessionId', id)
   if (name !== undefined) normalized.set('name', name)
-  return { allow: true, sessionId: id, name, query: normalized.toString() }
+  if (mediaType !== undefined) normalized.set('mediaType', mediaType)
+  return { allow: true, sessionId: id, name, mediaType, query: normalized.toString() }
 }

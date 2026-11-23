@@ -11,7 +11,7 @@
 'use strict'
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
-const { decideHttpRoute, decideInvoke, decideStream } = require('../lib/relay-access.js')
+const { decideHttpRoute, decideInvoke, decideStream, decideUploadQuery } = require('../lib/relay-access.js')
 
 const yes = () => true
 const no = () => false
@@ -900,4 +900,50 @@ test('API-6: workspace/insertSessionBefore, session/search, and agentPresets/lis
   )
   assert.deepEqual(decideInvoke('agentPresets', 'list', {}, no), { allow: true })
   assert.deepEqual(decideInvoke('agentPresets', 'read', { agentPreset: 'standard' }, no), { allow: true })
+})
+
+test('decideUploadQuery: whitelists optional single valid MIME mediaType and drops unknown params', () => {
+  assert.deepEqual(
+    decideUploadQuery('sessionId=S-a&name=photo.png&mediaType=image%2Fpng&extra=ignored', only(['S-a'])),
+    {
+      allow: true,
+      sessionId: 'S-a',
+      name: 'photo.png',
+      mediaType: 'image/png',
+      query: 'sessionId=S-a&name=photo.png&mediaType=image%2Fpng',
+    },
+  )
+  assert.deepEqual(
+    decideUploadQuery('sessionId=S-a&mediaType=%20application%2Fvnd.ms-excel%20', only(['S-a'])),
+    {
+      allow: true,
+      sessionId: 'S-a',
+      name: undefined,
+      mediaType: 'application/vnd.ms-excel',
+      query: 'sessionId=S-a&mediaType=application%2Fvnd.ms-excel',
+    },
+  )
+  // Empty mediaType is treated as absent (like empty name)
+  assert.deepEqual(
+    decideUploadQuery('sessionId=S-a&mediaType=', only(['S-a'])),
+    {
+      allow: true,
+      sessionId: 'S-a',
+      name: undefined,
+      mediaType: undefined,
+      query: 'sessionId=S-a',
+    },
+  )
+  // Duplicate or malformed mediaType is refused as bad-query
+  assert.deepEqual(
+    decideUploadQuery('sessionId=S-a&mediaType=image/png&mediaType=image/jpeg', yes),
+    { allow: false, reason: 'bad-query' },
+  )
+  for (const bad of ['image', 'image/', '/png', 'image/png;charset=utf-8', 'image/png\r\nX:1', `${'a'.repeat(120)}/${'b'.repeat(10)}`]) {
+    assert.deepEqual(
+      decideUploadQuery(`sessionId=S-a&mediaType=${encodeURIComponent(bad)}`, yes),
+      { allow: false, reason: 'bad-query' },
+      `bad mediaType ${JSON.stringify(bad)}`,
+    )
+  }
 })

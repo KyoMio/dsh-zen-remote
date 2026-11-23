@@ -111,9 +111,10 @@ function fakeRelay(overrides = {}) {
   }
 }
 
-function uploadRequest(sessionId, bytes = 'hello', name = 'note.txt') {
+function uploadRequest(sessionId, bytes = 'hello', name = 'note.txt', mediaType) {
   const query = new URLSearchParams({ sessionId })
   if (name !== undefined) query.set('name', name)
+  if (mediaType !== undefined) query.set('mediaType', mediaType)
   return new Request(`http://dsh.internal/api/session/uploadFileBinary?${query.toString()}`, {
     method: 'POST',
     headers: { 'content-type': 'application/octet-stream', 'content-length': String(Buffer.byteLength(bytes)) },
@@ -173,7 +174,7 @@ test('wrap: a virtual id forwards the original id, the name and the exact bytes;
   const handle = install(connection, relay)
   try {
     const virtual = toVirtual(SERVER_ID, LOCAL_ID)
-    const response = await connection.fetchRoutes.get(FILE_UPLOAD_PATH).fetch(uploadRequest(virtual))
+    const response = await connection.fetchRoutes.get(FILE_UPLOAD_PATH).fetch(uploadRequest(virtual, 'hello', 'note.txt', 'image/png'))
     assert.equal(response.status, 200)
     assert.deepEqual(JSON.parse(await response.text()), RECEIPT)
     assert.equal(connection.seen.upload.length, 0, 'the local route was never reached')
@@ -181,6 +182,7 @@ test('wrap: a virtual id forwards the original id, the name and the exact bytes;
     const call = relay.calls[0]
     assert.equal(call.options.sessionId, LOCAL_ID, 'the ORIGINAL id rides to the server')
     assert.equal(call.options.name, 'note.txt')
+    assert.equal(call.options.mediaType, 'image/png')
     assert.ok(call.bytes.equals(Buffer.from('hello')), 'the exact bytes were forwarded')
     assert.equal(call.options.bytes, 5, 'the declared content-length sized the budget')
   } finally { handle.uninstall() }

@@ -543,7 +543,7 @@ export function installFetchRouteIntercept(options: InstallFetchRouteInterceptOp
       // browser's abort signal rides along so a cancelled picker closes the
       // relay round-trip too.
       const result = await target.upload(
-        { sessionId: parts.id, name: firstQuery(url, 'name'), body: request.body, bytes: declared },
+        { sessionId: parts.id, name: firstQuery(url, 'name'), mediaType: firstQuery(url, 'mediaType'), body: request.body, bytes: declared },
         request.signal,
       )
       return new Response(result.body, {

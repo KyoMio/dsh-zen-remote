@@ -508,6 +508,8 @@ export interface RelayUploadOptions {
   sessionId: string
   /** The file's display name, when the local request carried one. */
   name?: string
+  /** Optional MIME type hint forwarded when the local upload query carried one. */
+  mediaType?: string
   /** The raw request body. `null` (a bodyless upload — the host route would
    * answer its own empty-stream business failure) forwards as an empty
    * stream. */
@@ -1746,6 +1748,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     const params = new URLSearchParams()
     params.set('sessionId', options.sessionId)
     if (options.name !== undefined) params.set('name', options.name)
+    if (options.mediaType !== undefined) params.set('mediaType', options.mediaType)
     // The empty-body upload still rides a (closed) stream: the wire route
     // always speaks a request body, and a missing one would be a transport
     // error, not the host's own empty-upload business failure.

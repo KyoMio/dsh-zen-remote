@@ -363,6 +363,8 @@ export interface RelayUploadOptions {
     sessionId: string;
     /** The file's display name, when the local request carried one. */
     name?: string;
+    /** Optional MIME type hint forwarded when the local upload query carried one. */
+    mediaType?: string;
     /** The raw request body. `null` (a bodyless upload — the host route would
      * answer its own empty-stream business failure) forwards as an empty
      * stream. */
