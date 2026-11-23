@@ -2397,12 +2397,15 @@ async function buildDualEnginePair(t, { directCap = 300, bHandlerReadyInitially 
 
   engineA.resumeFromState()
   engineB.resumeFromState()
-  await waitFor(() => wsByNode.size === 2, 'both engines connected to gateway')
+  await waitFor(
+    () => wsByNode.size === 2 && logsA.some((l) => l.includes('direct ready')) && logsB.some((l) => l.includes('direct ready')),
+    'both engines connected and direct ready',
+  )
 
   const stepClock = async (totalMs, stepMs = 100) => {
     for (let left = totalMs; left > 0; left -= stepMs) {
       clock.advance(Math.min(stepMs, left))
-      await sleep(3)
+      await sleep(6)
     }
   }
 
@@ -2468,6 +2471,10 @@ test('T5: punch-coordinate preserves pluginVersion, re-anchor suppresses demote 
   assert.equal(env.engineB.status().peers[0].directDemoted, false, 're-anchor on A must not send WS demote beacon that marks B demoted')
   assert.equal(env.logsB.some((l) => l.includes('demoted to relay')), false, 'B must not receive peer relay demotion from A re-anchor')
   // Both sides immediately re-promote within <500ms without a 30s peerRelayHoldUntil cooldown
+  await waitFor(
+    () => env.logsA.filter((l) => l.includes('direct ready')).length >= 2,
+    'A direct ready after re-anchor',
+  )
   await env.stepClock(450, 100)
   await waitFor(
     () => env.engineA.status().peers[0]?.path === 'lan' && env.engineB.status().peers[0]?.path === 'lan',
