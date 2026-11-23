@@ -98,6 +98,8 @@ All optional; defaults apply when omitted. Invalid configuration values fail fas
 | `ZR_GATEWAY_MAX_PEERS` | `8` (`2–64`) | Default max members per **newly created** virtual network |
 | `ZR_GATEWAY_MAX_NETWORKS_PER_USER` | `3` (`1–50`) | Initial max virtual networks per standard account |
 | `ZR_GATEWAY_RELAY_RATE_KBPS` | `4096` (`64–1048576`) | Per-member relay rate cap (KB/s, `1024 B/s`); direct peer traffic does not traverse the gateway |
+| `ZR_GATEWAY_TRUSTED_PROXIES` | *(empty)* | Comma-separated trusted reverse proxy IPs (empty = ignore proxy headers and rate-limit by socket peer IP) |
+| `ZR_GATEWAY_MAX_PRE_AUTH_PER_IP` | `16` (`1–65535`) | Max concurrent pre-auth / authenticating `/peer/v1/ws` connections per client IP |
 
 ---
 
@@ -127,17 +129,24 @@ The console displays locally rejected identities as *"Blocked"* (*已阻断*), u
 
 If you must share port `443` behind an external Nginx/Caddy proxy, keep built-in TLS off and set `ZR_GATEWAY_PUBLIC_URL` to the public `https://…` URL:
 
-1. **Allow WebSocket upgrades (`/peer/v1/ws`)**:
+1. **Allow WebSocket upgrades (`/peer/v1/ws`) and pass `X-Real-IP`**:
    ```nginx
    location /peer/v1/ws {
        proxy_pass http://127.0.0.1:19393;
        proxy_http_version 1.1;
        proxy_set_header Upgrade $http_upgrade;
        proxy_set_header Connection "upgrade";
+       proxy_set_header X-Real-IP $remote_addr; # must unconditionally overwrite client-supplied header
        proxy_read_timeout 3600s;   # keep persistent WS alive past Nginx's 60s default
    }
    ```
-   Caddy's `reverse_proxy` handles WebSockets out of the box.
+   In Caddy, unconditionally overwrite `X-Real-IP` on `reverse_proxy`:
+   ```caddy
+   reverse_proxy 127.0.0.1:19393 {
+       header_up X-Real-IP {remote_host}
+   }
+   ```
+   Configure `ZR_GATEWAY_TRUSTED_PROXIES` (e.g. `127.0.0.1`) so `/peer/v1/ws` per-IP pre-auth limits (`ZR_GATEWAY_MAX_PRE_AUTH_PER_IP`) isolate clients behind the trusted proxy; only a single proxy-overwritten `X-Real-IP` header from a listed proxy IP is accepted.
 2. **Disable proxy buffering on SSE**: live topology updates use `/api/v1/networks/<networkId>/events` (`text/event-stream`). In Nginx, add `proxy_buffering off;` on that location (Caddy streams SSE unbuffered by default).
 3. **Open UDP in the host firewall / cloud security group**: `19393/udp` and `19394/udp` must remain reachable directly (and mapped in Docker) regardless of whether TLS terminates on the gateway or an external proxy — TCP proxies cannot forward UDP STUN probes.
 4. **Set the public URL**: configure `ZR_GATEWAY_PUBLIC_URL` (or set it live under **Gateway Settings**) so generated `zr-net://` links carry the exact external origin and port.

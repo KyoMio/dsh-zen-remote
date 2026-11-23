@@ -99,6 +99,8 @@ node --experimental-sqlite dist/main.js
 | `ZR_GATEWAY_MAX_PEERS` | `8`（范围 2–64） | **新建**虚拟网络的默认成员上限（建网时可在控制台单独调整） |
 | `ZR_GATEWAY_MAX_NETWORKS_PER_USER` | `3`（范围 1–50） | 普通账号可创建的虚拟网络数上限 |
 | `ZR_GATEWAY_RELAY_RATE_KBPS` | `4096`（范围 64–1048576） | 单成员的中转限速（KB/s），只限制经网关中转的流量，直连流量不经过网关 |
+| `ZR_GATEWAY_TRUSTED_PROXIES` | （空） | 逗号分隔的受信任反代 IP 列表（留空则忽略代理头，直接按 socket 对端地址限流） |
+| `ZR_GATEWAY_MAX_PRE_AUTH_PER_IP` | `16`（范围 1–65535） | 单客户端 IP 允许的最大并发未认证 / 认证中 `/peer/v1/ws` 连接数 |
 
 ---
 
@@ -128,7 +130,7 @@ node --experimental-sqlite dist/main.js
 
 如果必须复用宿主机的 443 标准端口共享单一公网域名，也可以在网关前面继续套外置 Nginx / Caddy 反代并保持网关内置 TLS 关闭（`ZR_GATEWAY_PUBLIC_URL` 填外部 `https://…` 地址），注意以下要点：
 
-1. **WebSocket 要放行升级**：节点端连网关走 `/peer/v1/ws`。Nginx 示例：
+1. **WebSocket 要放行升级并无条件覆盖 `X-Real-IP`**：节点端连网关走 `/peer/v1/ws`。Nginx 示例：
 
    ```nginx
    location /peer/v1/ws {
@@ -136,11 +138,20 @@ node --experimental-sqlite dist/main.js
        proxy_http_version 1.1;
        proxy_set_header Upgrade $http_upgrade;
        proxy_set_header Connection "upgrade";
+       proxy_set_header X-Real-IP $remote_addr; # 必须无条件覆盖，禁止透传客户端伪造头
        proxy_read_timeout 3600s;   # 长连接，别让默认 60s 掐断
    }
    ```
 
-   Caddy 的 `reverse_proxy` 天然支持 WebSocket，无需额外配置。
+   Caddy 的 `reverse_proxy` 原生支持 WebSocket，同样应无条件覆盖 `X-Real-IP`：
+
+   ```caddy
+   reverse_proxy 127.0.0.1:19393 {
+       header_up X-Real-IP {remote_host}
+   }
+   ```
+
+   在反向代理后部署时需配置 `ZR_GATEWAY_TRUSTED_PROXIES`（如 `127.0.0.1`），`/peer/v1/ws` 的单 IP 并发限制（`ZR_GATEWAY_MAX_PRE_AUTH_PER_IP`）才会按受信任反代写入的单一 `X-Real-IP` 隔离各客户端（其余代理头一律忽略）。
 
 2. **SSE 别开缓冲**：控制台的实时拓扑走 `/api/v1/networks/<网络id>/events`（`text/event-stream`）。Nginx 对这条路径要 `proxy_buffering off;`，否则状态刷新会卡住不动。Caddy 默认不缓冲，无需处理。
 

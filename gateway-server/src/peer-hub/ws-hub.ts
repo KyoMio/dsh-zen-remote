@@ -22,6 +22,7 @@
 // 拓扑订阅（SSE）在成员变动、path-report、3s 速率跳动时重渲染快照推送。
 import { randomBytes } from 'node:crypto';
 import type { Server as HttpServer, IncomingMessage } from 'node:http';
+import { isIP } from 'node:net';
 import type { Duplex } from 'node:stream';
 
 import { WebSocketServer } from 'ws';
@@ -298,14 +299,15 @@ function parseName(value: unknown): string | null {
   return trimmed;
 }
 
-function normalizeIp(raw: string | null | undefined): string | null {
+function normalizeIp(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
-  let trimmed = raw.trim();
+  const trimmed = raw.trim();
   if (trimmed.length === 0) return null;
   if (trimmed.toLowerCase().startsWith('::ffff:')) {
-    trimmed = trimmed.slice(7);
+    const stripped = trimmed.slice(7);
+    return isIP(stripped) === 4 ? stripped : null;
   }
-  return trimmed;
+  return isIP(trimmed) !== 0 ? trimmed : null;
 }
 
 function resolvePreAuthClientIp(
@@ -316,26 +318,10 @@ function resolvePreAuthClientIp(
   if (socketIp === null || !trustedProxies.has(socketIp)) {
     return socketIp;
   }
-  const cfRaw = req.headers['cf-connecting-ip'];
-  const cfHeader = Array.isArray(cfRaw) ? cfRaw[0] : cfRaw;
-  const cfIp = normalizeIp(cfHeader);
-  if (cfIp !== null) return cfIp;
-
-  const xffRaw = req.headers['x-forwarded-for'];
-  const xffHeader = Array.isArray(xffRaw) ? xffRaw.join(',') : xffRaw;
-  if (typeof xffHeader === 'string' && xffHeader.trim().length > 0) {
-    const parts = xffHeader
-      .split(',')
-      .map((s) => normalizeIp(s))
-      .filter((s): s is string => s !== null);
-    for (let i = parts.length - 1; i >= 0; i--) {
-      const candidate = parts[i] as string;
-      if (!trustedProxies.has(candidate)) {
-        return candidate;
-      }
-    }
-  }
-  return socketIp;
+  const realIpRaw = req.headers['x-real-ip'];
+  if (typeof realIpRaw !== 'string') return socketIp;
+  const realIp = normalizeIp(realIpRaw);
+  return realIp ?? socketIp;
 }
 
 export class PeerWsHub {
@@ -369,9 +355,12 @@ export class PeerWsHub {
   private readonly pausedConns = new Map<string, ConnState>();
   /** 本 hub 接纳的全部 socket（含尚未发 auth 的 preauth），close 时统一 terminate */
   private readonly acceptedSockets = new Set<WebSocket>();
-  /** 尚未完成 auth 挑战应答的 WS 连接集合与按源 IP 计数（防慢速占位耗尽） */
+  /** 尚未发 auth 的空闲连接集合与按源 IP 计数（防慢速占位耗尽） */
   readonly preAuthSockets = new Set<WebSocket>();
   readonly preAuthCountByIp = new Map<string, number>();
+  /** 正在执行异步 handleAuth 验库/验签的在途槽位（超时关闭后仍占位直至 handleAuth settle） */
+  private inFlightAuthGlobal = 0;
+  private readonly inFlightAuthByIp = new Map<string, number>();
   private readonly preAuthTimers = new Map<WebSocket, NodeJS.Timeout>();
   /** SSE 订阅者：networkId → 回调集合 */
   private readonly subscribers = new Map<string, Set<(snapshot: NetworkTopologySnapshot) => void>>();
@@ -642,40 +631,59 @@ export class PeerWsHub {
       return;
     }
     const ipKey = remoteIp ?? 'unknown';
-    const currentIpCount = this.preAuthCountByIp.get(ipKey) ?? 0;
-    if (this.preAuthSockets.size >= this.maxPreAuthSockets || currentIpCount >= this.maxPreAuthPerIp) {
+    const idleIpCount = this.preAuthCountByIp.get(ipKey) ?? 0;
+    const inFlightIpCount = this.inFlightAuthByIp.get(ipKey) ?? 0;
+    if (
+      this.preAuthSockets.size + this.inFlightAuthGlobal >= this.maxPreAuthSockets ||
+      idleIpCount + inFlightIpCount >= this.maxPreAuthPerIp
+    ) {
       ws.close(1013, 'too many pending connections');
       return;
     }
     this.acceptedSockets.add(ws);
     this.preAuthSockets.add(ws);
-    this.preAuthCountByIp.set(ipKey, currentIpCount + 1);
+    this.preAuthCountByIp.set(ipKey, idleIpCount + 1);
     const challengeHex = randomBytes(32).toString('hex');
     /** auth 通过后的连接状态；断开清理据此分流 */
     let conn: ConnState | null = null;
     let phase: 'preauth' | 'authenticating' | 'authed' | 'closed' = 'preauth';
-    let releasedPreAuth = false;
-    const releasePreAuth = (): void => {
-      if (releasedPreAuth) return;
-      releasedPreAuth = true;
+    const clearPreAuthTimer = (): void => {
       const timer = this.preAuthTimers.get(ws);
       if (timer !== undefined) {
         clearTimeout(timer);
         this.preAuthTimers.delete(ws);
       }
+    };
+    let releasedIdle = false;
+    const releaseIdlePreAuth = (): void => {
+      if (releasedIdle) return;
+      releasedIdle = true;
       this.preAuthSockets.delete(ws);
       const count = this.preAuthCountByIp.get(ipKey) ?? 0;
       if (count <= 1) this.preAuthCountByIp.delete(ipKey);
       else this.preAuthCountByIp.set(ipKey, count - 1);
     };
+    let acquiredInFlight = false;
+    let releasedInFlight = false;
+    const acquireInFlightAuth = (): void => {
+      if (acquiredInFlight) return;
+      acquiredInFlight = true;
+      this.inFlightAuthGlobal += 1;
+      this.inFlightAuthByIp.set(ipKey, (this.inFlightAuthByIp.get(ipKey) ?? 0) + 1);
+    };
+    const releaseInFlightAuth = (): void => {
+      if (!acquiredInFlight || releasedInFlight) return;
+      releasedInFlight = true;
+      if (this.inFlightAuthGlobal > 0) this.inFlightAuthGlobal -= 1;
+      const count = this.inFlightAuthByIp.get(ipKey) ?? 0;
+      if (count <= 1) this.inFlightAuthByIp.delete(ipKey);
+      else this.inFlightAuthByIp.set(ipKey, count - 1);
+    };
     const preAuthTimer = setTimeout(() => {
       this.preAuthTimers.delete(ws);
-      if (phase !== 'preauth' && phase !== 'authenticating') {
-        releasePreAuth();
-        return;
-      }
+      if (phase !== 'preauth' && phase !== 'authenticating') return;
       phase = 'closed';
-      releasePreAuth();
+      releaseIdlePreAuth();
       ws.close(1008, 'auth timeout');
     }, this.preAuthTimeoutMs);
     preAuthTimer.unref?.();
@@ -695,7 +703,9 @@ export class PeerWsHub {
       if (message === null) return;
       if (phase === 'preauth') {
         if (message['type'] !== 'auth') return;
-        phase = 'authenticating'; // 一条连接只受理一次 auth；异步认证期间仍受 preAuthTimer 约束
+        phase = 'authenticating'; // 一条连接只受理一次 auth；异步认证期间仍受 preAuthTimer 与在途槽位约束
+        acquireInFlightAuth();
+        releaseIdlePreAuth();
         const isAborted = (): boolean => phase === 'closed' || this.closed || ws.readyState !== ws.OPEN;
         void this.handleAuth(ws, message, challengeHex, remoteIp, isAborted)
           .then((state) => {
@@ -707,7 +717,8 @@ export class PeerWsHub {
             }
           })
           .finally(() => {
-            releasePreAuth();
+            clearPreAuthTimer();
+            releaseInFlightAuth();
           });
         return;
       }
@@ -733,7 +744,8 @@ export class PeerWsHub {
     ws.on('close', () => {
       phase = 'closed';
       this.acceptedSockets.delete(ws);
-      releasePreAuth();
+      clearPreAuthTimer();
+      releaseIdlePreAuth();
       if (conn !== null) this.clearConnHeartbeat(conn);
       this.teardown(conn);
     });
