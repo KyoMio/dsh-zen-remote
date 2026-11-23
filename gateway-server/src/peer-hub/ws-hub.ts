@@ -34,6 +34,12 @@ import {
   PEER_DIRECT_MAX_RTT_MS_MIN,
   currentUtcYearMonth,
 } from '../store/types.js';
+import {
+  DEFAULT_ADVANCED_TUNING,
+  DEFAULT_PEER_TUNING,
+  parseStoredAdvancedTuning,
+} from '../store/advanced-tuning.js';
+import type { AdvancedTuningSettings, PeerTuningSettings } from '../store/advanced-tuning.js';
 import type {
   GatewayStore,
   MemberRecord,
@@ -329,12 +335,19 @@ export class PeerWsHub {
   private readonly store: GatewayStore;
   private readonly masterKey: Buffer;
   private readonly timestampWindowMs: number;
-  private readonly pingIntervalMs: number;
-  private readonly pongTimeoutMs: number;
-  private readonly maxTargetBufferedBytes: number;
-  private readonly preAuthTimeoutMs: number;
-  private readonly maxPreAuthSockets: number;
-  private readonly maxPreAuthPerIp: number;
+  private pingIntervalMs: number;
+  private pongTimeoutMs: number;
+  private maxTargetBufferedBytes: number;
+  private preAuthTimeoutMs: number;
+  private maxPreAuthSockets: number;
+  private maxPreAuthPerIp: number;
+  private controlRateMaxBytesPerSec: number = DEFAULT_ADVANCED_TUNING.gateway.controlRateMaxKbps * 1024;
+  private readonly hasPingIntervalOverride: boolean;
+  private readonly hasPongTimeoutOverride: boolean;
+  private readonly hasMaxTargetBufferedOverride: boolean;
+  private readonly hasPreAuthTimeoutOverride: boolean;
+  private readonly hasMaxPreAuthSocketsOverride: boolean;
+  private readonly hasMaxPreAuthPerIpOverride: boolean;
   private readonly trustedProxies: ReadonlySet<string>;
   private readonly now: () => number;
   private nextConnSeq = 0;
@@ -373,7 +386,10 @@ export class PeerWsHub {
   /** 网关全局强制中转开关；构造时异步加载、handleAuth 惰性等待、onForceRelayChanged 热更新 */
   private forceRelay = false;
   private forceRelayLoaded = false;
-  private forceRelayLoadPromise: Promise<void> | null = null;
+  /** 高级运行参数与节点端调优参数；构造时异步加载、handleAuth 惰性等待、onAdvancedTuningChanged 热更新 */
+  private peerTuning: PeerTuningSettings = { ...DEFAULT_PEER_TUNING };
+  private advancedTuningLoaded = false;
+  private startupSettingsLoadPromise: Promise<void> | null = null;
   private rateTimer: NodeJS.Timeout | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
   // PS-5：单通道刷盘合流——同一时刻至多一个在途 flushTelemetry，重叠调用共享同一 Promise 并通过 flushQueued 续刷一轮。
@@ -425,12 +441,15 @@ export class PeerWsHub {
     if (!Number.isInteger(pongTimeoutMs) || pongTimeoutMs < 1 || pongTimeoutMs > 2_147_483_647) {
       throw new TypeError('PeerWsHub: invalid pongTimeoutMs');
     }
+    this.hasPingIntervalOverride = options.pingIntervalMs !== undefined;
+    this.hasPongTimeoutOverride = options.pongTimeoutMs !== undefined;
     this.pingIntervalMs = pingIntervalMs;
     this.pongTimeoutMs = pongTimeoutMs;
     const maxBuf = options.maxTargetBufferedBytes ?? DEFAULT_MAX_TARGET_BUFFERED_BYTES;
     if (!Number.isInteger(maxBuf) || maxBuf < 0) {
       throw new TypeError('PeerWsHub: invalid maxTargetBufferedBytes');
     }
+    this.hasMaxTargetBufferedOverride = options.maxTargetBufferedBytes !== undefined;
     this.maxTargetBufferedBytes = maxBuf;
     const preAuthTimeoutMs = options.preAuthTimeoutMs ?? DEFAULT_PRE_AUTH_TIMEOUT_MS;
     if (!Number.isInteger(preAuthTimeoutMs) || preAuthTimeoutMs < 1 || preAuthTimeoutMs > 2_147_483_647) {
@@ -444,6 +463,9 @@ export class PeerWsHub {
     if (!Number.isInteger(maxPreAuthPerIp) || maxPreAuthPerIp < 1) {
       throw new TypeError('PeerWsHub: invalid maxPreAuthPerIp');
     }
+    this.hasPreAuthTimeoutOverride = options.preAuthTimeoutMs !== undefined;
+    this.hasMaxPreAuthSocketsOverride = options.maxPreAuthSockets !== undefined;
+    this.hasMaxPreAuthPerIpOverride = options.maxPreAuthPerIp !== undefined;
     this.preAuthTimeoutMs = preAuthTimeoutMs;
     this.maxPreAuthSockets = maxPreAuthSockets;
     this.maxPreAuthPerIp = maxPreAuthPerIp;
@@ -474,17 +496,22 @@ export class PeerWsHub {
         if (!this.closed) this.rateKbps = settings.relayRateKbps;
       })
       .catch(() => {/* 库暂不可用时用默认速率，settings 变更钩子会再喂 */});
-    this.forceRelayLoadPromise = this.store
+    this.startupSettingsLoadPromise = this.store
       .getExtendedSettings()
       .then((ext) => {
-        if (!this.closed && !this.forceRelayLoaded) {
+        if (this.closed) return;
+        if (!this.forceRelayLoaded) {
           this.forceRelay = ext.forceRelay;
           this.forceRelayLoaded = true;
         }
+        if (!this.advancedTuningLoaded) {
+          this.applyStartupAdvancedTuning(parseStoredAdvancedTuning(ext.advancedTuningJson));
+          this.advancedTuningLoaded = true;
+        }
       })
-      .catch(() => {/* 暂不可用时维持 false，handleAuth 再惰性重试 */})
+      .catch(() => {/* 暂不可用时维持默认，handleAuth 再惰性重试 */})
       .finally(() => {
-        this.forceRelayLoadPromise = null;
+        this.startupSettingsLoadPromise = null;
       });
     const rateTickMs = options.rateTickMs === undefined ? 3000 : options.rateTickMs;
     if (rateTickMs !== null && rateTickMs > 0) {
@@ -959,31 +986,61 @@ export class PeerWsHub {
       maxPeers: conn.maxPeers,
       peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
       forceRelay: this.forceRelay,
+      peerTuning: this.peerTuning,
       peers,
       ...this.welcomeVersionFields(conn.networkId, conn.pluginVersion),
       ...(stunPorts !== null ? { stun: stunPorts } : {}),
     });
   }
 
-  private async ensureForceRelayLoaded(): Promise<void> {
-    if (this.forceRelayLoaded) return;
-    if (this.forceRelayLoadPromise !== null) {
-      await this.forceRelayLoadPromise;
+  private applyStartupAdvancedTuning(tuning: AdvancedTuningSettings): void {
+    const gw = tuning.gateway;
+    if (!this.hasMaxTargetBufferedOverride) {
+      this.maxTargetBufferedBytes = gw.wsMaxTargetBufferedKib * 1024;
+    }
+    if (!this.hasPingIntervalOverride) {
+      this.pingIntervalMs = gw.wsPingIntervalMs;
+    }
+    if (!this.hasPongTimeoutOverride) {
+      this.pongTimeoutMs = gw.wsPongTimeoutMs;
+    }
+    if (!this.hasPreAuthTimeoutOverride) {
+      this.preAuthTimeoutMs = gw.preAuthTimeoutMs;
+    }
+    if (!this.hasMaxPreAuthSocketsOverride) {
+      this.maxPreAuthSockets = gw.maxPreAuthSockets;
+    }
+    if (!this.hasMaxPreAuthPerIpOverride) {
+      this.maxPreAuthPerIp = gw.maxPreAuthPerIp;
+    }
+    this.controlRateMaxBytesPerSec = gw.controlRateMaxKbps * 1024;
+    this.peerTuning = { ...tuning.peer };
+  }
+
+  private async ensureStartupSettingsLoaded(): Promise<void> {
+    if (this.forceRelayLoaded && this.advancedTuningLoaded) return;
+    if (this.startupSettingsLoadPromise !== null) {
+      await this.startupSettingsLoadPromise;
       return;
     }
-    this.forceRelayLoadPromise = this.store
+    this.startupSettingsLoadPromise = this.store
       .getExtendedSettings()
       .then((ext) => {
-        if (!this.closed && !this.forceRelayLoaded) {
+        if (this.closed) return;
+        if (!this.forceRelayLoaded) {
           this.forceRelay = ext.forceRelay;
           this.forceRelayLoaded = true;
+        }
+        if (!this.advancedTuningLoaded) {
+          this.applyStartupAdvancedTuning(parseStoredAdvancedTuning(ext.advancedTuningJson));
+          this.advancedTuningLoaded = true;
         }
       })
       .catch(() => {/* 暂不可用维持当前状态 */})
       .finally(() => {
-        this.forceRelayLoadPromise = null;
+        this.startupSettingsLoadPromise = null;
       });
-    await this.forceRelayLoadPromise;
+    await this.startupSettingsLoadPromise;
   }
 
   // ------------------------------------------------------------ 入网判定
@@ -1127,7 +1184,7 @@ export class PeerWsHub {
       return null;
     }
 
-    await this.ensureForceRelayLoaded();
+    await this.ensureStartupSettingsLoaded();
     if (isAborted()) return null;
     // Revalidate after the async join write, before any routing/hanging registration.
     if (!await this.checkOwnerAdmission(ws, network.ownerId, epoch) || isAborted() || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
@@ -1343,7 +1400,7 @@ export class PeerWsHub {
     }
     const effectiveRateKbps = quota === null ? this.rateKbps : quota.relayRateKbps;
     const controlRateBytesPerSec = Math.min(
-      512 * 1024,
+      this.controlRateMaxBytesPerSec,
       Math.max(64 * 1024, Math.ceil(effectiveRateKbps * 1024 * 0.12)),
     );
     const scope = { networkId: conn.networkId, nodeId: conn.nodeId, peerNodeId: header.dstNodeId };
@@ -1613,6 +1670,7 @@ export class PeerWsHub {
       this.ownerQuotaByNetwork.clear();
     },
     onForceRelayChanged: (forceRelay: boolean) => this.onForceRelayChanged(forceRelay),
+    onAdvancedTuningChanged: (tuning: AdvancedTuningSettings) => this.onAdvancedTuningChanged(tuning),
     onUserDisabled: (userId: string) => this.onUserDisabled(userId),
   };
 
@@ -1984,6 +2042,60 @@ export class PeerWsHub {
           }
         }
       }
+    }
+  }
+
+  private onAdvancedTuningChanged(tuning: AdvancedTuningSettings): void {
+    if (this.closed) return;
+    const prevPingIntervalMs = this.pingIntervalMs;
+    const prevPongTimeoutMs = this.pongTimeoutMs;
+    const gw = tuning.gateway;
+    this.maxTargetBufferedBytes = gw.wsMaxTargetBufferedKib * 1024;
+    this.pingIntervalMs = gw.wsPingIntervalMs;
+    this.pongTimeoutMs = gw.wsPongTimeoutMs;
+    this.controlRateMaxBytesPerSec = gw.controlRateMaxKbps * 1024;
+    this.maxPreAuthPerIp = gw.maxPreAuthPerIp;
+    this.maxPreAuthSockets = gw.maxPreAuthSockets;
+    this.preAuthTimeoutMs = gw.preAuthTimeoutMs;
+
+    if (prevPingIntervalMs !== this.pingIntervalMs || prevPongTimeoutMs !== this.pongTimeoutMs) {
+      for (const net of this.conns.values()) {
+        for (const conn of net.values()) {
+          this.clearConnHeartbeat(conn);
+          this.startConnHeartbeat(conn);
+        }
+      }
+      for (const conn of this.hanging.values()) {
+        this.clearConnHeartbeat(conn);
+        this.startConnHeartbeat(conn);
+      }
+      for (const conn of this.pausedConns.values()) {
+        this.clearConnHeartbeat(conn);
+        this.startConnHeartbeat(conn);
+      }
+    }
+
+    const nextPeer = tuning.peer;
+    const peerChanged = !this.advancedTuningLoaded || (Object.keys(DEFAULT_PEER_TUNING) as Array<keyof PeerTuningSettings>).some(
+      (k) => this.peerTuning[k] !== nextPeer[k],
+    );
+    this.peerTuning = { ...nextPeer };
+    this.advancedTuningLoaded = true;
+    if (!peerChanged) return;
+
+    for (const [networkId, net] of this.conns) {
+      const first = net.values().next().value as ConnState | undefined;
+      const cached = this.networkMaxPeers.get(networkId);
+      const maxPeers = first?.maxPeers ?? cached?.maxPeers ?? 8;
+      const peerDirectMaxRttMs = first?.peerDirectMaxRttMs ?? cached?.peerDirectMaxRttMs ?? 300;
+      this.broadcast(networkId, {
+        type: 'network-updated',
+        networkId,
+        maxPeers,
+        peerDirectMaxRttMs,
+        forceRelay: this.forceRelay,
+        peerTuning: this.peerTuning,
+      });
     }
   }
 

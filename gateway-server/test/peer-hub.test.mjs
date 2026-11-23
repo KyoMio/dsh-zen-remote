@@ -13,6 +13,7 @@ import net from 'node:net';
 import { createGatewayApiServer } from '../dist/server.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { currentUtcYearMonth } from '../dist/store/types.js';
+import { DEFAULT_ADVANCED_TUNING, DEFAULT_PEER_TUNING } from '../dist/store/advanced-tuning.js';
 import { deriveMasterKeyFromSecret, encryptSecret } from '../dist/master-key.js';
 import { PeerRateLimiter } from '../dist/peer-hub/rate-limiter.js';
 import { formatRate } from '../dist/web/format.js';
@@ -4343,6 +4344,167 @@ describe('T2 /peer/v1/ws 双向版本握手与拓扑 pluginVersion', () => {
       wsB.close();
     } finally {
       await gw.close();
+    }
+  });
+});
+
+describe('Slice 2 PeerWsHub live advancedTuning & peerTuning broadcast', () => {
+  test('welcome includes peerTuning, live PATCH broadcasts network-updated.peerTuning only on peerTuning change, and updates maxPreAuthPerIp & controlRateMaxKbps', async () => {
+    const clock = { now: Date.now() };
+    const gw = await startGateway({ now: () => clock.now, relayRateKbps: 4096 });
+    try {
+      const net = await createNetwork(gw, { mode: 'key' });
+      const a = identity();
+      const b = identity();
+
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey, name: 'node-a' });
+      const welcomeA = await wsJson(wsA);
+      assert.equal(welcomeA.status, 'authorized');
+      assert.deepEqual(welcomeA.peerTuning, DEFAULT_PEER_TUNING);
+
+      const wsB = await wsOpen(gw.base);
+      await authNode(wsB, b, { networkId: net.id, joinKey: net.joinKey, name: 'node-b' });
+      const welcomeB = await wsJson(wsB);
+      assert.deepEqual(welcomeB.peerTuning, DEFAULT_PEER_TUNING);
+      const joinedA = await wsJson(wsA);
+      assert.equal(joinedA.type, 'peer-joined');
+      const initPunchA = await wsJson(wsA);
+      assert.equal(initPunchA.type, 'punch-coordinate');
+      const initPunchB = await wsJson(wsB);
+      assert.equal(initPunchB.type, 'punch-coordinate');
+
+      // 1. Gateway-only tuning update (maxPreAuthPerIp=4, controlRateMaxKbps=64): NO network-updated broadcast
+      const gwOnlyRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+        body: JSON.stringify({
+          advancedTuning: {
+            gateway: { maxPreAuthPerIp: 4, controlRateMaxKbps: 64 },
+          },
+        }),
+      });
+      assert.equal(gwOnlyRes.status, 200);
+      await wsSilence(wsA, 60);
+      await wsSilence(wsB, 60);
+
+      // Verify maxPreAuthPerIp=4 is live: 4 idle pre-auth sockets accepted, 5th rejected with 1013
+      const preAuthSockets = [];
+      for (let i = 0; i < 4; i += 1) {
+        const s = await wsOpen(gw.base);
+        const challenge = await wsJson(s);
+        assert.equal(challenge.type, 'challenge');
+        preAuthSockets.push(s);
+      }
+      const fifth = new WebSocket(gw.base.replace('http://', 'ws://') + '/peer/v1/ws');
+      const fifthClose = await new Promise((resolve) => {
+        fifth.once('close', (code) => resolve(code));
+      });
+      assert.equal(fifthClose, 1013);
+      for (const s of preAuthSockets) s.close();
+      await Promise.all(preAuthSockets.map((s) => wsClosed(s)));
+
+      // Verify controlRateMaxKbps=64 ceiling is live: 300 * 256B = 75 KiB -> 256 frames (64 KiB) pass, excess dropped
+      for (let i = 0; i < 300; i += 1) {
+        wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 4, totalBytes: 256 }));
+      }
+      for (let i = 0; i < 256; i += 1) {
+        await wsBinary(wsB);
+      }
+      await wsSilence(wsB, 60);
+
+      // Raise controlRateMaxKbps to 512 and advance clock 1s -> larger burst passes
+      clock.now += 1500;
+      const raiseCtrl = await fetch(`${gw.base}/api/v1/admin/settings`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+        body: JSON.stringify({
+          advancedTuning: {
+            gateway: { controlRateMaxKbps: 512 },
+          },
+        }),
+      });
+      assert.equal(raiseCtrl.status, 200);
+      for (let i = 0; i < 400; i += 1) {
+        wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 4, totalBytes: 256 }));
+      }
+      for (let i = 0; i < 400; i += 1) {
+        await wsBinary(wsB);
+      }
+
+      // 2. Peer tuning update broadcasts network-updated with peerTuning
+      const peerPatchRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+        body: JSON.stringify({
+          advancedTuning: {
+            peer: { sackCoalesceFrames: 1, directPromoteStreak: 4, directPromoteRatio: 0.8 },
+          },
+        }),
+      });
+      assert.equal(peerPatchRes.status, 200);
+      const expectedPeerTuning = {
+        ...DEFAULT_PEER_TUNING,
+        sackCoalesceFrames: 1,
+        directPromoteStreak: 4,
+        directPromoteRatio: 0.8,
+      };
+      const updA = await wsJson(wsA);
+      const updB = await wsJson(wsB);
+      assert.equal(updA.type, 'network-updated');
+      assert.deepEqual(updA.peerTuning, expectedPeerTuning);
+      assert.equal(updB.type, 'network-updated');
+      assert.deepEqual(updB.peerTuning, expectedPeerTuning);
+
+      wsA.close();
+      wsB.close();
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('explicit PeerWsHub constructor overrides are preserved across startup DB load until live onAdvancedTuningChanged', async () => {
+    const store = new SqliteStore();
+    const masterKey = deriveMasterKeyFromSecret('override-test');
+    const hub = new PeerWsHub({
+      store,
+      masterKey,
+      rateTickMs: null,
+      flushMs: null,
+      pingIntervalMs: 50,
+      pongTimeoutMs: 120,
+      maxTargetBufferedBytes: 128,
+      preAuthTimeoutMs: 80,
+      maxPreAuthSockets: 32,
+      maxPreAuthPerIp: 4,
+    });
+    try {
+      // Wait past initial async store.getExtendedSettings() load
+      await sleep(30);
+      const net = await store.createUser({ email: 'ov@local', passwordHash: 'hash', role: 'admin' })
+        .then((u) => store.createNetwork({ ownerId: u.id, name: 'ov', admissionMode: 'both', joinKeyEnc: 'enc', maxPeers: 4 }));
+      assert.ok(net.id);
+      // Constructor overrides must not be overwritten by DB defaults (which have wsPingIntervalMs=10000, maxPreAuthPerIp=16, etc.)
+      assert.equal(hub.pingIntervalMs, 50);
+      assert.equal(hub.pongTimeoutMs, 120);
+      assert.equal(hub.maxTargetBufferedBytes, 128);
+      assert.equal(hub.preAuthTimeoutMs, 80);
+      assert.equal(hub.maxPreAuthSockets, 32);
+      assert.equal(hub.maxPreAuthPerIp, 4);
+
+      // Explicit live onAdvancedTuningChanged updates them unconditionally
+      const next = {
+        gateway: { ...DEFAULT_ADVANCED_TUNING.gateway, wsPingIntervalMs: 12000, wsPongTimeoutMs: 25000, maxPreAuthPerIp: 9, wsMaxTargetBufferedKib: 1024 },
+        peer: { ...DEFAULT_PEER_TUNING },
+      };
+      await hub.hooks.onAdvancedTuningChanged?.(next);
+      assert.equal(hub.pingIntervalMs, 12000);
+      assert.equal(hub.pongTimeoutMs, 25000);
+      assert.equal(hub.maxTargetBufferedBytes, 1024 * 1024);
+      assert.equal(hub.maxPreAuthPerIp, 9);
+    } finally {
+      await hub.close();
+      await store.close();
     }
   });
 });
