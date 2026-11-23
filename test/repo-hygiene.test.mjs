@@ -179,3 +179,21 @@ test('upload-limits stays single-sourced across docs, nginx snippet, and repo co
 
   assert.deepEqual(failures, [], `upload-limits drift:\n  ${failures.join('\n  ')}`)
 })
+
+test('Task 6: gatewayVersion sync, release-check gating, and publish.yml gateway tag guard', () => {
+  const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+  const gwPkg = JSON.parse(readFileSync(join(root, 'gateway-server', 'package.json'), 'utf8'))
+  assert.match(gwPkg.version, /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/, 'gateway-server/package.json#version must be a valid semver')
+  assert.equal(pkg.gatewayVersion, gwPkg.version, 'root package.json#gatewayVersion must match gateway-server')
+
+  const syncScript = readFileSync(join(root, 'scripts', 'sync-doc-version.mjs'), 'utf8')
+  assert.match(syncScript, /--release-check/, 'sync-doc-version must gate warnings behind --release-check / npm version')
+
+  const publishYml = readFileSync(join(root, '.github', 'workflows', 'publish.yml'), 'utf8')
+  const guardIdx = publishYml.indexOf('gateway-v')
+  const publishIdx = publishYml.indexOf('pnpm publish')
+  assert.ok(guardIdx !== -1 && publishIdx !== -1 && guardIdx < publishIdx,
+    'publish.yml must check gateway-v<gatewayVersion> before pnpm publish')
+  assert.match(publishYml, /git rev-parse[^\n]*refs\/tags\//,
+    'publish.yml must verify refs/tags/ for gateway tag guard')
+})

@@ -15,6 +15,7 @@ import {
   IdleAutoUpdateScheduler,
   UpdateManager,
   buildDownloadCandidates,
+  createGatewayUpdateBridge,
   ensureReleasesNodeModulesLink,
   readReleaseState,
   writeReleaseState,
@@ -882,5 +883,66 @@ describe('T5 IdleAutoUpdateScheduler', () => {
     scheduler2.stop();
     await new Promise((r) => setTimeout(r, 90));
     assert.equal(releaseCalls, beforeCalls, 'stop() cancels pending initialTimer');
+  });
+
+  test('Task 6: createGatewayUpdateBridge#getRuntimeSummary filters offlinePeerRecommendedVersion against currentVersion and latestRelease', () => {
+    let currentVersion = '0.2.0';
+    let latestRelease = null;
+    let observed = null;
+
+    const fakeManager = {
+      getState: () => ({
+        activeVersion: currentVersion,
+        activeEntry: null,
+        previousVersion: null,
+        previousEntry: null,
+        pendingVerify: false,
+        baseVersionSeen: '0.2.0',
+        lastRollback: null,
+      }),
+      getCurrentVersion: () => currentVersion,
+      getBaseVersion: () => '0.2.0',
+      getLatestRelease: () => latestRelease,
+      getLatestPluginVersion: () => null,
+      getCompatibilityForLatest: () => ({ compatibility: 'compatible', reason: null }),
+      isUpdateAvailable: () => latestRelease !== null && currentVersion !== null && latestRelease.version > currentVersion,
+      getLastCheckedAt: () => null,
+      getLastCheckError: () => null,
+      checkForUpdates: async () => {},
+      prepareUpdate: async () => ({ status: 'up-to-date', version: currentVersion }),
+    };
+
+    const bridge = createGatewayUpdateBridge({
+      updateManager: fakeManager,
+      supervisorManaged: false,
+      activeSource: 'base',
+      getOfflinePeerRecommendedVersion: () => observed,
+    });
+
+    // 1. observed < current -> null
+    currentVersion = '0.2.1';
+    observed = '0.2.0';
+    assert.equal(bridge.getRuntimeSummary(false).offlinePeerRecommendedVersion, null);
+
+    // 2. observed === current -> null
+    observed = '0.2.1';
+    assert.equal(bridge.getRuntimeSummary(false).offlinePeerRecommendedVersion, null);
+
+    // 3. observed > current and no latestRelease -> returns observed
+    currentVersion = '0.2.0';
+    observed = '0.2.1';
+    assert.equal(bridge.getRuntimeSummary(false).offlinePeerRecommendedVersion, '0.2.1');
+
+    // 4. latestRelease >= observed -> superseded -> null
+    latestRelease = { version: '0.2.1', tagName: 'gateway-v0.2.1', downloadUrl: 'https://example/gw.tgz', sha256: null, notesSummary: null, publishedAt: null };
+    assert.equal(bridge.getRuntimeSummary(false).offlinePeerRecommendedVersion, null);
+
+    // 5. observed > latestRelease -> returns observed
+    observed = '0.2.2';
+    assert.equal(bridge.getRuntimeSummary(false).offlinePeerRecommendedVersion, '0.2.2');
+
+    // 6. currentVersion === null -> null
+    currentVersion = null;
+    assert.equal(bridge.getRuntimeSummary(false).offlinePeerRecommendedVersion, null);
   });
 });

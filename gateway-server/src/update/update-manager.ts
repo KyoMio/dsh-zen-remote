@@ -771,14 +771,23 @@ export function createGatewayUpdateBridge(options: {
 
   const getRuntimeSummary = (autoUpdateEnabled: boolean): AdminUpdateRuntimeSummary => {
     const state = updateManager.getState();
+    const currentVersion = updateManager.getCurrentVersion();
     const latestRelease = updateManager.getLatestRelease();
     const compat = updateManager.getCompatibilityForLatest();
     const latestPluginVersion = maxSemver(
       updateManager.getLatestPluginVersion(),
       getHighestObservedPluginVersion?.() ?? null,
     );
+    const rawObserved = getOfflinePeerRecommendedVersion?.() ?? null;
+    const offlinePeerRecommendedVersion =
+      rawObserved !== null &&
+      currentVersion !== null &&
+      compareSemver(rawObserved, currentVersion) > 0 &&
+      (latestRelease === null || compareSemver(rawObserved, latestRelease.version) > 0)
+        ? rawObserved
+        : null;
     return {
-      currentVersion: updateManager.getCurrentVersion(),
+      currentVersion,
       baseVersion: updateManager.getBaseVersion(),
       activeSource,
       supervisorManaged,
@@ -787,7 +796,7 @@ export function createGatewayUpdateBridge(options: {
       latestVersion: latestRelease?.version ?? null,
       latestPluginVersion,
       compatibility: compat.compatibility,
-      offlinePeerRecommendedVersion: getOfflinePeerRecommendedVersion?.() ?? null,
+      offlinePeerRecommendedVersion,
       rollbackReason: state.lastRollback?.reason ?? null,
     };
   };

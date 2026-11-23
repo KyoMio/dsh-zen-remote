@@ -51,6 +51,18 @@ jobs:
             exit 1
           fi
 
+      # gatewayVersion tag 守卫（npm 发布之前就挡住）：package.json#gatewayVersion
+      # 对应的 gateway-v<ver> tag 必须已在仓库中存在，防止提前 bump gatewayVersion
+      # 却尚未发布对应网关镜像/热更包时切主包发版。
+      - name: gatewayVersion tag guard
+        run: |
+          gw_ver="$(node -p "require('./package.json').gatewayVersion")"
+          gw_tag="gateway-v${gw_ver}"
+          if ! git rev-parse --verify --quiet "refs/tags/${gw_tag}" >/dev/null; then
+            echo "缺少网关 tag ${gw_tag}（package.json#gatewayVersion=${gw_ver}），请先发网关版本再打主包 tag。" >&2
+            exit 1
+          fi
+
       # CHANGELOG 守卫（npm 发布之前就挡住）：本次 tag 的版本段必须已存在且非空。
       # 发版纪律是「未发布」标题在打 tag 前改成该版本号 + 日期；忘了改，这里非零
       # 退出，不会默默发一个 Release 正文为空的版本（守卫只认 tag，与上一条的

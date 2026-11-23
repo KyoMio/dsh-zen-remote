@@ -53,8 +53,9 @@ if (existsSync(gatewayPkgPath)) {
       nextRootPkgRaw = JSON.stringify(updated, null, 2) + trailingNl
     }
 
-    // Warn in non-check mode if gateway-v<ver> already exists locally and gateway-server/src has unreleased commits
-    if (!checkOnly) {
+    // Warn only during explicit release checks / `npm version` if gateway-v<ver> is missing or has unreleased commits
+    const releaseCheck = process.argv.includes('--release-check') || process.env.npm_lifecycle_event === 'version'
+    if (releaseCheck) {
       const inRepo = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: root, encoding: 'utf8' })
       if (inRepo.status === 0) {
         const tagName = `gateway-v${gwVersion}`
@@ -62,7 +63,11 @@ if (existsSync(gatewayPkgPath)) {
           cwd: root,
           encoding: 'utf8',
         })
-        if (tagCheck.status === 0) {
+        if (tagCheck.status !== 0) {
+          console.warn(
+            `\x1b[33msync-doc-version: WARNING — tag ${tagName} does not exist locally yet (gateway-server/package.json#version is ${gwVersion}). Tag and push ${tagName} before cutting a main plugin release.\x1b[0m`,
+          )
+        } else {
           const revCount = spawnSync('git', ['rev-list', '--count', `${tagName}..HEAD`, '--', 'gateway-server/src'], {
             cwd: root,
             encoding: 'utf8',
