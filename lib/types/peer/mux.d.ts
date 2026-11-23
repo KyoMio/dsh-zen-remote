@@ -85,9 +85,11 @@ export declare class PeerMux {
     ensureSession(nodeId: string, peerPublicKeyHex: string, peerName: string): void;
     /** 更新已建会话记录的对端设备名（入站虚拟请求 x-zen-remote-device-name 跟随最新名称）。 */
     setPeerName(nodeId: string, peerName: string): void;
-    /** 动态调整对端 ARQ 发送档案（p2p 收窄窗口、提升初始 RTO 防突发拥塞）。 */
+    /** 动态调整对端 ARQ 发送档案（p2p/relay AIMD、lan 固定大窗口）。 */
     setPeerTransportProfile(nodeId: string, profile: {
         windowSize?: number;
+        initialWindowSize?: number;
+        minWindowSize?: number;
         rtoMs?: number;
     }): void;
     private teardownSession;

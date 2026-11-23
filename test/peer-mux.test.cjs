@@ -320,8 +320,8 @@ for (const contentLength of [true, false]) {
     const response = await p.fetch('http://peer/large')
     for (let i = 0; i < 100; i++) await immediate()
     assert.equal(largeFinished, false, 'unread consumer propagates backpressure to producer')
-    assert.ok(p.sb.arq.bufferedSendBytes() <= 256 * 1024)
-    assert.ok(p.sa.arq.bufferedReceiveBytes() <= 4 * 1024 * 1024)
+    assert.ok(p.sb.arq.bufferedSendBytes() <= 1024 * 1024)
+    assert.ok(p.sa.arq.bufferedReceiveBytes() <= 8 * 1024 * 1024)
     assert.equal(await (await p.fetch('http://peer/small')).text(), 'small')
     const digest = createHash('sha256')
     let bytes = 0
@@ -1463,4 +1463,82 @@ test('Task 3: PeerMux inbound req Readable._read() admits chunk during pull so b
   const res = await responseWithin(pendingRes)
   assert.equal(res.status, 200)
   assert.equal(await res.text(), String(payload.byteLength))
+})
+
+test('Slice 1: PeerMux enables sackCoalesceFrames=6 on ARQ and forwards AIMD fields in setPeerTransportProfile', async (t) => {
+  const clock = makeFakeClock(9_000_000)
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const aToBSent = []
+  const bToASent = []
+
+  const A = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: a,
+    clock,
+    sendGatewayBinary: null,
+    relayHandler: () => undefined,
+    relaySecret: () => 'test-secret',
+  })
+  const B = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: b,
+    clock,
+    sendGatewayBinary: null,
+    relayHandler: () => async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.end('ok')
+    },
+    relaySecret: () => 'test-secret',
+  })
+  t.after(() => { A.close(); B.close() })
+
+  A.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+  B.ensureSession(a.nodeId, a.publicKeyHex, 'A')
+  A.setDirectPath(b.nodeId, (ft, sid, p, ack) => {
+    aToBSent.push({ ft, sid })
+    setImmediate(() => B.handleOpenedFrame({ srcNodeId: a.nodeId, frameType: ft, streamId: sid, ack }, p))
+  })
+  B.setDirectPath(a.nodeId, (ft, sid, p, ack) => {
+    bToASent.push({ ft, sid })
+    setImmediate(() => A.handleOpenedFrame({ srcNodeId: b.nodeId, frameType: ft, streamId: sid, ack }, p))
+  })
+
+  // setPeerTransportProfile forwards initialWindowSize=32 & minWindowSize=16 (AIMD)
+  A.setPeerTransportProfile(b.nodeId, { windowSize: 160, initialWindowSize: 32, minWindowSize: 16, rtoMs: 120 })
+  const sessionA = A.sessions.get(b.nodeId)
+  // Send 60 chunks without forwarding to B so inflight count reflects initialWindowSize=32
+  const holdB = A.createFetchForPeer(b.nodeId)('http://peer/hold-aimd', {
+    method: 'POST',
+    body: Buffer.alloc(60 * 1100, 0x11),
+  })
+  holdB.catch(() => {})
+  await immediate()
+  assert.equal(sessionA.arq.inflightTotal(), 32, 'setPeerTransportProfile forwards initialWindowSize=32 to ARQ')
+
+  // Verify B coalesces in-order SACKs when 4 consecutive in-order DATA frames arrive on a new stream
+  const sessionB = B.sessions.get(a.nodeId)
+  bToASent.length = 0
+  const reqHead = Buffer.from(JSON.stringify({ t: 'req', m: 'POST', p: '/coalesce', h: {} }))
+  const frame0 = Buffer.alloc(5 + 4 + reqHead.length)
+  frame0.writeUInt32BE(0, 1)
+  frame0.writeUInt32BE(reqHead.length, 5)
+  reqHead.copy(frame0, 9)
+  sessionB.arq.handleFrame(PeerFrameType.DATA, 99, frame0, 0)
+  for (let seq = 1; seq <= 3; seq++) {
+    const f = Buffer.alloc(5 + 10, 0x22)
+    f.writeUInt32BE(seq, 1)
+    sessionB.arq.handleFrame(PeerFrameType.DATA, 99, f, 0)
+  }
+  assert.equal(
+    bToASent.filter((f) => f.ft === PeerFrameType.SACK && f.sid === 99).length,
+    0,
+    'PeerMux ARQ coalesces first 4 in-order frames without immediate SACK',
+  )
+  clock.advance(2)
+  assert.equal(
+    bToASent.filter((f) => f.ft === PeerFrameType.SACK && f.sid === 99).length,
+    1,
+    'PeerMux ARQ flushes coalesced SACK after 2ms',
+  )
 })

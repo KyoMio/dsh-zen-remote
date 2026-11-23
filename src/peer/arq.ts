@@ -63,7 +63,7 @@ export const ARQ_DEFAULT_CHUNK_BYTES = 1100
 /** Default send window: unconfirmed fragments in flight per stream. */
 export const ARQ_DEFAULT_WINDOW = 64
 /** Upper send window bound for high-BDP relay paths (zero wire break; < RX_BUFFER_MAX). */
-export const ARQ_MAX_WINDOW = 160
+export const ARQ_MAX_WINDOW = 384
 /** Default retransmission timeout. */
 export const ARQ_DEFAULT_RTO_MS = 120
 /** RTO exponential backoff ceiling. */
@@ -75,7 +75,7 @@ export const DEFAULT_STALL_SUSPECT_MS = 3_500
 const SACK_BITMAP_BYTES = 8
 const SACK_BITMAP_BITS = SACK_BITMAP_BYTES * 8
 /** Upper bound on out-of-order fragments buffered per receive stream. */
-const RX_BUFFER_MAX = 256
+const RX_BUFFER_MAX = 512
 
 /**
  * Injectable clock so tests can drive RTO/window timing deterministically.
@@ -128,6 +128,10 @@ export interface PeerArqOptions {
   windowSize?: number
   rtoMs?: number
   rtoMaxMs?: number
+  /** Coalesce strictly in-order SACKs up to N frames (0/1 disables coalescing). Default 0. */
+  sackCoalesceFrames?: number
+  /** Maximum delay in ms before flushing a coalesced in-order SACK. Default 2. */
+  sackCoalesceMs?: number
 }
 
 interface TxWaiter {
@@ -185,6 +189,8 @@ interface RxStream {
   buffered: Map<number, RxBuffered>
   gotFin: boolean
   flushing: boolean
+  pendingAckFrames: number
+  sackTimer: unknown
 }
 
 function makeWaiter(): TxWaiter {
@@ -247,8 +253,14 @@ export class PeerArqSession {
   private readonly clock: ArqClock
   private readonly chunkSize: number
   private windowSize: number
+  private cwnd: number
+  private ssthresh: number
+  private minWindow: number
+  private lastLossAt = -Infinity
   private rtoMs: number
   private readonly rtoMaxMs: number
+  private readonly sackCoalesceFrames: number
+  private readonly sackCoalesceMs: number
   private readonly onStreamData: PeerArqOptions['onStreamData']
   private readonly onStreamReset: PeerArqOptions['onStreamReset']
   private readonly txStreams = new Map<number, TxStream>()
@@ -294,8 +306,21 @@ export class PeerArqSession {
     this.clock = options.clock ?? realClock
     this.chunkSize = chunkSize
     this.windowSize = windowSize
+    this.cwnd = windowSize
+    this.ssthresh = windowSize
+    this.minWindow = windowSize
     this.rtoMs = rtoMs
     this.rtoMaxMs = rtoMaxMs
+    const sackCoalesceFrames = options.sackCoalesceFrames ?? 0
+    if (!Number.isSafeInteger(sackCoalesceFrames) || sackCoalesceFrames < 0) {
+      throw new RangeError('sackCoalesceFrames must be a non-negative integer')
+    }
+    const sackCoalesceMs = options.sackCoalesceMs ?? 2
+    if (!Number.isSafeInteger(sackCoalesceMs) || sackCoalesceMs < 0) {
+      throw new RangeError('sackCoalesceMs must be a non-negative integer')
+    }
+    this.sackCoalesceFrames = sackCoalesceFrames
+    this.sackCoalesceMs = sackCoalesceMs
     this.onStreamData = options.onStreamData
     this.onStreamReset = options.onStreamReset
     this.onStreamClosed = options.onStreamClosed
@@ -311,8 +336,8 @@ export class PeerArqSession {
     this.maxStreams = options.maxStreams ?? 128
     this.maxRetiredRanges = options.maxRetiredRanges ?? 4096
     this.maxTerminalRecords = options.maxTerminalRecords ?? 4096
-    this.maxStreamBytes = options.maxStreamBytes ?? 256 * 1024
-    this.maxSessionBytes = options.maxSessionBytes ?? 4 * 1024 * 1024
+    this.maxStreamBytes = options.maxStreamBytes ?? 1024 * 1024
+    this.maxSessionBytes = options.maxSessionBytes ?? 8 * 1024 * 1024
     for (const value of [this.retryTimeoutMs, this.terminalTtlMs, this.maxStreams, this.maxRetiredRanges, this.maxTerminalRecords, this.maxStreamBytes, this.maxSessionBytes]) {
       if (!Number.isSafeInteger(value) || value < 1) throw new RangeError('ARQ limits must be positive integers')
     }
@@ -471,6 +496,7 @@ export class PeerArqSession {
     this.terminal.clear()
     this.retired[0].length = this.retired[1].length = 0
     this.txStreams.clear()
+    for (const rx of this.rxStreams.values()) this.clearSackTimer(rx)
     this.rxStreams.clear()
   }
 
@@ -494,10 +520,16 @@ export class PeerArqSession {
   }
 
   /**
-   * Dynamically adjust send window [1..ARQ_MAX_WINDOW] and initial RTO [120..rtoMaxMs]
+   * Dynamically adjust send window [1..ARQ_MAX_WINDOW], optional AIMD bounds
+   * (`initialWindowSize`, `minWindowSize`), and initial RTO [120..rtoMaxMs]
    * for the active transport leg without tearing down in-flight frames.
    */
-  setTransportProfile(profile: { windowSize?: number; rtoMs?: number }): void {
+  setTransportProfile(profile: {
+    windowSize?: number
+    initialWindowSize?: number
+    minWindowSize?: number
+    rtoMs?: number
+  }): void {
     if (this.closed) return
     let nextWindow = this.windowSize
     let nextRto = this.rtoMs
@@ -507,6 +539,18 @@ export class PeerArqSession {
       }
       nextWindow = Math.min(ARQ_MAX_WINDOW, Math.max(1, profile.windowSize))
     }
+    if (
+      profile.initialWindowSize !== undefined &&
+      (!Number.isInteger(profile.initialWindowSize) || profile.initialWindowSize < 1)
+    ) {
+      throw new RangeError('initialWindowSize must be an integer >= 1')
+    }
+    if (
+      profile.minWindowSize !== undefined &&
+      (!Number.isInteger(profile.minWindowSize) || profile.minWindowSize < 1)
+    ) {
+      throw new RangeError('minWindowSize must be an integer >= 1')
+    }
     if (profile.rtoMs !== undefined) {
       if (!Number.isInteger(profile.rtoMs)) {
         throw new RangeError('rtoMs must be a finite integer')
@@ -514,11 +558,24 @@ export class PeerArqSession {
       const floor = Math.min(ARQ_DEFAULT_RTO_MS, this.rtoMaxMs)
       nextRto = Math.min(this.rtoMaxMs, Math.max(floor, profile.rtoMs))
     }
-    const grew = nextWindow > this.windowSize
+    const prevEffective = Math.min(this.windowSize, Math.max(1, Math.floor(this.cwnd)))
     this.windowSize = nextWindow
     this.rtoMs = nextRto
     this.srttMs = null
-    if (grew) {
+    this.lastLossAt = -Infinity
+    if (profile.initialWindowSize !== undefined) {
+      const minWindow = Math.min(nextWindow, Math.max(1, profile.minWindowSize ?? 16))
+      const initialCwnd = Math.min(nextWindow, Math.max(minWindow, profile.initialWindowSize))
+      this.minWindow = minWindow
+      this.cwnd = initialCwnd
+      this.ssthresh = nextWindow
+    } else {
+      this.minWindow = nextWindow
+      this.cwnd = nextWindow
+      this.ssthresh = nextWindow
+    }
+    const nextEffective = Math.min(this.windowSize, Math.max(1, Math.floor(this.cwnd)))
+    if (nextEffective > prevEffective) {
       for (const [sid, tx] of this.txStreams) {
         this.pump(sid, tx)
       }
@@ -596,7 +653,7 @@ export class PeerArqSession {
     const beforeBuffered = rx.buffered.size
     this.flush(streamId, rx)
     if (rx.expected !== beforeExpected || rx.buffered.size !== beforeBuffered) {
-      this.sendSack(streamId, rx)
+      this.sendImmediateSack(streamId, rx)
     }
   }
 
@@ -622,7 +679,10 @@ export class PeerArqSession {
     const ack = error ? 0 : this.currentAck(id)
     this.teardownTx(id, this.txStreams.get(id), error ?? new Error('stream finished'))
     const rx = this.rxStreams.get(id)
-    if (rx) for (const fragment of rx.buffered.values()) this.receiveBytes -= fragment.data.length
+    if (rx) {
+      this.clearSackTimer(rx)
+      for (const fragment of rx.buffered.values()) this.receiveBytes -= fragment.data.length
+    }
     this.rxStreams.delete(id)
     const pending = this.writable.get(id)
     this.writable.delete(id)
@@ -734,9 +794,21 @@ export class PeerArqSession {
     this.srttMs = this.srttMs === null ? sample : this.srttMs * 0.75 + sample * 0.25
   }
 
+  private onCleanAck(frag: TxFragment, now: number): void {
+    if (frag.retransmitted) return
+    this.recordRttSample(frag, now)
+    if (this.minWindow >= this.windowSize) return
+    if (this.cwnd < this.ssthresh) {
+      this.cwnd = Math.min(this.windowSize, this.cwnd + 1)
+    } else {
+      this.cwnd = Math.min(this.windowSize, this.cwnd + 1 / Math.max(1, Math.floor(this.cwnd)))
+    }
+  }
+
   private pump(streamId: number, tx: TxStream): void {
     if (this.closed) return
-    while (tx.inflight.size < this.windowSize && tx.nextSeq - tx.cumulative < this.windowSize && tx.queue.length > 0) {
+    const effectiveWindow = Math.min(this.windowSize, Math.max(1, Math.floor(this.cwnd)))
+    while (tx.inflight.size < effectiveWindow && tx.nextSeq - tx.cumulative < effectiveWindow && tx.queue.length > 0) {
       const queued = tx.queue.shift() as QueuedFragment
       const seq = tx.nextSeq++
       const subheader = Buffer.alloc(STREAM_HEADER_BYTES)
@@ -793,6 +865,11 @@ export class PeerArqSession {
         return
       }
     }
+    if (this.minWindow < this.windowSize && now - this.lastLossAt >= this.effectiveInitialRto()) {
+      this.ssthresh = Math.max(this.minWindow, Math.floor(this.cwnd / 2))
+      this.cwnd = this.ssthresh
+      this.lastLossAt = now
+    }
     frag.retransmitted = true
     frag.rto = Math.min(frag.rto * 2, this.rtoMaxMs)
     frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
@@ -821,27 +898,67 @@ export class PeerArqSession {
     const fin = (flags & STREAM_FLAG_FIN) !== 0
     let rx = this.rxStreams.get(streamId)
     if (!rx) {
-      rx = { expected: 0, buffered: new Map(), gotFin: false, flushing: false }
+      rx = { expected: 0, buffered: new Map(), gotFin: false, flushing: false, pendingAckFrames: 0, sackTimer: null }
       this.rxStreams.set(streamId, rx)
     }
     if (rx.gotFin || seq < rx.expected) {
       // Post-FIN junk or an old duplicate: just re-advertise our progress.
-      this.sendSack(streamId, rx)
+      this.sendImmediateSack(streamId, rx)
       return
     }
-    if (!rx.buffered.has(seq)) {
+    const expectedBefore = rx.expected
+    const isDuplicate = rx.buffered.has(seq)
+    if (!isDuplicate) {
       // Out-of-order SACKed bytes cannot be discarded. Reserve headroom for
       // every stream's missing head so aggregate buffering cannot deadlock.
       const reserve = seq === rx.expected ? 0 : Math.min(this.maxSessionBytes, this.maxStreams * ARQ_CHUNK_MAX_BYTES)
       if (rx.buffered.size >= RX_BUFFER_MAX - (seq === rx.expected ? 0 : 1) ||
           this.receiveBytes + data.length > this.maxSessionBytes - reserve) {
-        this.sendSack(streamId, rx)
+        this.sendImmediateSack(streamId, rx)
         return
       }
       rx.buffered.set(seq, { data: Buffer.from(data), fin })
       this.receiveBytes += data.length
     }
     this.flush(streamId, rx)
+    if (
+      this.sackCoalesceFrames > 1 &&
+      !isDuplicate &&
+      seq === expectedBefore &&
+      rx.expected > expectedBefore &&
+      rx.buffered.size === 0 &&
+      !rx.gotFin &&
+      this.rxStreams.get(streamId) === rx &&
+      rx.pendingAckFrames + 1 < this.sackCoalesceFrames
+    ) {
+      rx.pendingAckFrames += 1
+      if (rx.sackTimer === null) {
+        rx.sackTimer = this.clock.setTimeout(() => {
+          this.flushPendingSack(streamId, rx)
+        }, this.sackCoalesceMs)
+      }
+      return
+    }
+    this.sendImmediateSack(streamId, rx)
+  }
+
+  private clearSackTimer(rx: RxStream): void {
+    if (rx.sackTimer !== null) {
+      this.clock.clearTimeout(rx.sackTimer)
+      rx.sackTimer = null
+    }
+    rx.pendingAckFrames = 0
+  }
+
+  private flushPendingSack(streamId: number, rx: RxStream): void {
+    if (this.closed || this.rxStreams.get(streamId) !== rx) return
+    rx.sackTimer = null
+    rx.pendingAckFrames = 0
+    this.sendSack(streamId, rx)
+  }
+
+  private sendImmediateSack(streamId: number, rx: RxStream): void {
+    this.clearSackTimer(rx)
     this.sendSack(streamId, rx)
   }
 
@@ -921,7 +1038,7 @@ export class PeerArqSession {
     for (const [seq, frag] of tx.inflight) {
       if (seq < ack) {
         this.clock.clearTimeout(frag.timer)
-        this.recordRttSample(frag, now)
+        this.onCleanAck(frag, now)
         tx.inflight.delete(seq)
         this.settle(tx, frag)
       }
@@ -943,7 +1060,7 @@ export class PeerArqSession {
     const frag = tx?.inflight.get(seq)
     if (!tx || !frag || frag.finWaiter) return // FIN needs cumulative delivery confirmation
     this.clock.clearTimeout(frag.timer)
-    this.recordRttSample(frag, this.clock.now())
+    this.onCleanAck(frag, this.clock.now())
     tx.inflight.delete(seq)
     this.settle(tx, frag)
     this.pump(streamId, tx)

@@ -241,6 +241,8 @@ interface MemberRec {
   reanchoredAtSelfLanEpoch: number
   /** 最近一次下发给 PeerMux/ARQ 的发送窗口与初始 RTO（防抖用）。 */
   lastArqWindow: number | null
+  lastArqInitialWindow: number | null
+  lastArqMinWindow: number | null
   lastArqRtoMs: number | null
   /** 对端在 welcome.peers / peer-joined 携带的插件版本号。 */
   pluginVersion: string | null
@@ -288,15 +290,24 @@ const hasRemovedOrReplacedEndpoint = (
 const parseConnSeq = (value: unknown): number | null =>
   typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : null
 
-const arqProfileForPath = (
+export interface ArqTransportProfile {
+  windowSize: number
+  initialWindowSize?: number
+  minWindowSize?: number
+  rtoMs: number
+}
+
+export const arqProfileForPath = (
   mode: 'lan' | 'p2p' | 'relay',
   smoothedRttMs: number | null,
-): { windowSize: number; rtoMs: number } => {
-  if (mode === 'relay') return { windowSize: 160, rtoMs: 120 }
-  if (mode !== 'p2p') return { windowSize: 64, rtoMs: 120 }
+): ArqTransportProfile => {
+  if (mode === 'relay') {
+    return { windowSize: 384, initialWindowSize: 160, minWindowSize: 32, rtoMs: 120 }
+  }
+  if (mode !== 'p2p') return { windowSize: 160, rtoMs: 120 }
   const rtt = smoothedRttMs ?? 50
   const rtoMs = Math.min(1000, Math.max(120, Math.ceil(rtt * 2 + 50)))
-  return { windowSize: 16, rtoMs }
+  return { windowSize: 160, initialWindowSize: 32, minWindowSize: 16, rtoMs }
 }
 
 /**
@@ -491,6 +502,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directActive = false
     member.directMissedPings = 0
     member.lastArqWindow = null
+    member.lastArqInitialWindow = null
+    member.lastArqMinWindow = null
     member.lastArqRtoMs = null
     member.peerRelayHoldUntil = 0
     if (resetMux) {
@@ -550,6 +563,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         reanchoredAtSelfWsEpoch: selfWsReanchorEpoch,
         reanchoredAtSelfLanEpoch: selfLanReanchorEpoch,
         lastArqWindow: null,
+        lastArqInitialWindow: null,
+        lastArqMinWindow: null,
         lastArqRtoMs: null,
         pluginVersion: null,
         peerRelayHoldUntil: 0,
@@ -1191,15 +1206,21 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   const applyArqProfile = (member: MemberRec, mode: 'lan' | 'p2p' | 'relay', force = false): void => {
     if (mux === null) return
     const profile = arqProfileForPath(mode, member.directSmoothedRtt)
+    const initialWindow = profile.initialWindowSize ?? null
+    const minWindow = profile.minWindowSize ?? null
     if (
       !force
       && member.lastArqWindow === profile.windowSize
+      && member.lastArqInitialWindow === initialWindow
+      && member.lastArqMinWindow === minWindow
       && member.lastArqRtoMs !== null
       && Math.abs(profile.rtoMs - member.lastArqRtoMs) < 25
     ) {
       return
     }
     member.lastArqWindow = profile.windowSize
+    member.lastArqInitialWindow = initialWindow
+    member.lastArqMinWindow = minWindow
     member.lastArqRtoMs = profile.rtoMs
     mux.setPeerTransportProfile(member.nodeId, profile)
   }
@@ -1219,6 +1240,8 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directActive = false
     member.directMissedPings = 0
     member.lastArqWindow = null
+    member.lastArqInitialWindow = null
+    member.lastArqMinWindow = null
     member.lastArqRtoMs = null
     member.peerRelayHoldUntil = 0
     if (directCap() <= 0) {

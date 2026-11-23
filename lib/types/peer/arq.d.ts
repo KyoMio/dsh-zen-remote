@@ -60,7 +60,7 @@ export declare const ARQ_DEFAULT_CHUNK_BYTES = 1100;
 /** Default send window: unconfirmed fragments in flight per stream. */
 export declare const ARQ_DEFAULT_WINDOW = 64;
 /** Upper send window bound for high-BDP relay paths (zero wire break; < RX_BUFFER_MAX). */
-export declare const ARQ_MAX_WINDOW = 160;
+export declare const ARQ_MAX_WINDOW = 384;
 /** Default retransmission timeout. */
 export declare const ARQ_DEFAULT_RTO_MS = 120;
 /** RTO exponential backoff ceiling. */
@@ -110,6 +110,10 @@ export interface PeerArqOptions {
     windowSize?: number;
     rtoMs?: number;
     rtoMaxMs?: number;
+    /** Coalesce strictly in-order SACKs up to N frames (0/1 disables coalescing). Default 0. */
+    sackCoalesceFrames?: number;
+    /** Maximum delay in ms before flushing a coalesced in-order SACK. Default 2. */
+    sackCoalesceMs?: number;
 }
 /**
  * One ARQ session: many bidirectional streams over one frame-sending
@@ -127,8 +131,14 @@ export declare class PeerArqSession {
     private readonly clock;
     private readonly chunkSize;
     private windowSize;
+    private cwnd;
+    private ssthresh;
+    private minWindow;
+    private lastLossAt;
     private rtoMs;
     private readonly rtoMaxMs;
+    private readonly sackCoalesceFrames;
+    private readonly sackCoalesceMs;
     private readonly onStreamData;
     private readonly onStreamReset;
     private readonly txStreams;
@@ -190,11 +200,14 @@ export declare class PeerArqSession {
     /** Whether the inbound side of `streamId` has delivered its FIN. */
     isRxComplete(streamId: number): boolean;
     /**
-     * Dynamically adjust send window [1..ARQ_MAX_WINDOW] and initial RTO [120..rtoMaxMs]
+     * Dynamically adjust send window [1..ARQ_MAX_WINDOW], optional AIMD bounds
+     * (`initialWindowSize`, `minWindowSize`), and initial RTO [120..rtoMaxMs]
      * for the active transport leg without tearing down in-flight frames.
      */
     setTransportProfile(profile: {
         windowSize?: number;
+        initialWindowSize?: number;
+        minWindowSize?: number;
         rtoMs?: number;
     }): void;
     /**
@@ -228,9 +241,13 @@ export declare class PeerArqSession {
     private currentAck;
     private effectiveInitialRto;
     private recordRttSample;
+    private onCleanAck;
     private pump;
     private onRto;
     private onData;
+    private clearSackTimer;
+    private flushPendingSack;
+    private sendImmediateSack;
     private flush;
     private sendSack;
     private onSack;

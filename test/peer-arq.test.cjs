@@ -31,6 +31,7 @@ const {
   ARQ_CHUNK_MAX_BYTES,
   ARQ_DEFAULT_CHUNK_BYTES,
   ARQ_DEFAULT_WINDOW,
+  ARQ_MAX_WINDOW,
   ARQ_DEFAULT_RTO_MS,
   ARQ_DEFAULT_RTO_MAX_MS,
 } = require('../lib/peer/arq.js')
@@ -1403,5 +1404,191 @@ test('Task 4: resume() omits duplicate SACK on no-op flush, Karn SRTT adapts ini
     clock.advance(120)
     assert.ok(sent.length > sentBefore120, 'setTransportProfile resets srttMs so 120ms RTO applies immediately')
     session.closeAll()
+  }
+})
+
+test('Slice 1: expanded limits (ARQ_MAX_WINDOW=384, 1MiB stream / 8MiB session) and AIMD cwnd ramp/backoff', async () => {
+  // 1. Constants & expanded stream/session admission budgets
+  assert.equal(ARQ_MAX_WINDOW, 384)
+  {
+    const { session, clock } = makeSession({ chunkSize: 1000 })
+    // 1 MiB fits on a single stream; > 1 MiB overflows single stream
+    assert.equal(session.tryWrite(1, Buffer.alloc(1024 * 1024, 0x11)), true, '1 MiB fits default maxStreamBytes')
+    assert.equal(session.tryWrite(1, Buffer.alloc(1, 0x11)), false, 'exceeding 1 MiB on one stream is rejected')
+    // Subsequent streams can reach up to 8 MiB session budget
+    for (let sid = 3; sid <= 15; sid += 2) {
+      assert.equal(session.tryWrite(sid, Buffer.alloc(1024 * 1024, 0x22)), true, `stream ${sid} admitted within 8 MiB session cap`)
+    }
+    assert.equal(session.tryWrite(17, Buffer.alloc(1, 0x22)), false, 'exceeding 8 MiB session cap is rejected')
+    session.closeAll()
+    assert.equal(clock.pendingCount(), 0)
+  }
+
+  // 2. Window accepts up to ARQ_MAX_WINDOW=384 (clamped above 384)
+  {
+    const { session } = makeSession({ chunkSize: 100 })
+    session.setTransportProfile({ windowSize: 500, rtoMs: 120 })
+    const p = session.write(1, Buffer.alloc(400 * 100, 0x33))
+    p.catch(() => {})
+    assert.equal(session.inflightTotal(), 384, 'windowSize clamps at ARQ_MAX_WINDOW=384')
+    assert.equal(session.queuedTotal(), 16)
+    session.closeAll()
+  }
+
+  // 3. Fixed-window mode (no initialWindowSize) preserves fixed window even after RTO loss
+  {
+    const { session, sent, clock } = makeSession({ chunkSize: 100 })
+    session.setTransportProfile({ windowSize: 160, rtoMs: 120 })
+    const p = session.write(1, Buffer.alloc(200 * 100, 0x44))
+    p.catch(() => {})
+    assert.equal(session.inflightTotal(), 160)
+    clock.advance(120) // RTO loss triggers, must NOT shrink fixed window
+    session.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), 10)
+    assert.equal(session.inflightTotal(), 160, 'fixed window stays 160 after loss when initialWindowSize is omitted')
+    session.closeAll()
+  }
+
+  // 4. AIMD mode: slow-start ramp 32 -> 160 on clean ACKs, RTO halves once per RTT down to minWindowSize=16
+  {
+    const { session, sent, clock } = makeSession({ chunkSize: 100, rtoMs: 120, rtoMaxMs: 1000 })
+    session.setTransportProfile({ windowSize: 160, initialWindowSize: 32, minWindowSize: 16, rtoMs: 120 })
+    assert.throws(() => session.setTransportProfile({ initialWindowSize: 0 }), RangeError)
+    assert.throws(() => session.setTransportProfile({ minWindowSize: 0 }), RangeError)
+
+    const p = session.write(1, Buffer.alloc(300 * 100, 0x55))
+    p.catch(() => {})
+    assert.equal(session.inflightTotal(), 32, 'AIMD starts inflight at initialWindowSize=32')
+
+    // Ack 32 clean fragments one by one at t=20ms -> slow start doubles cwnd to 64
+    clock.advance(20)
+    for (let ack = 1; ack <= 32; ack++) {
+      session.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), ack)
+    }
+    assert.equal(session.inflightTotal(), 64, 'slow start grows cwnd 32 -> 64 after 32 clean ACKs')
+
+    // Ack another 64 clean fragments (32..95) -> cwnd grows 64 -> 128 (nextSeq=224)
+    clock.advance(20)
+    session.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), 96)
+    assert.equal(session.inflightTotal(), 128, 'slow start grows cwnd 64 -> 128')
+
+    // Ack another 32 clean fragments (96..127) -> cwnd reaches windowSize=160 (inflight 128..287)
+    clock.advance(20)
+    session.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), 128)
+    assert.equal(session.inflightTotal(), 160, 'slow start caps cwnd at windowSize=160')
+
+    // Induce a single RTO loss episode across all 160 inflight packets at t+120ms:
+    // cwnd must halve ONCE (160 -> 80), NOT once per fragment!
+    const sentBeforeLoss = sent.length
+    clock.advance(120)
+    assert.equal(sent.length, sentBeforeLoss + 160, 'all 160 inflight fragments hit single RTO')
+    // Acknowledge 100 packets (128..227) -> remaining 60 + 12 queued (288..299) = 72 <= cwnd=80 pump immediately
+    session.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), 228)
+    assert.equal(session.inflightTotal(), 72, 'only 72 fragments remain (228..299) <= cwnd=80 after single-RTT halving')
+    session.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), 300)
+    await p
+
+    // Verify minWindow floor: repeated losses floor cwnd at minWindowSize=16
+    // cwnd is currently 80, so write 100 fragments (80 inflight 0..79, 20 queued 80..99).
+    const p2 = session.write(3, Buffer.alloc(100 * 100, 0x66))
+    p2.catch(() => {})
+    for (let round = 0; round < 5; round++) {
+      clock.advance(1000)
+    }
+    session.handleFrame(PeerFrameType.ACK, 3, Buffer.alloc(0), 80)
+    // Out of the 20 queued fragments (80..99), only minWindowSize=16 pump into inflight
+    assert.equal(session.inflightTotal(), 16, 'AIMD floors cwnd at minWindowSize=16')
+    assert.equal(session.queuedTotal(), 4)
+    session.closeAll()
+  }
+})
+
+test('Slice 1: coalesced in-order SACK coalesces up to N frames, flushes on timer/FIN/OOO/duplicate/backpressure/resume, zero leaks', async () => {
+  const dataFrame = (seq, size = 10, fin = false) => {
+    const b = Buffer.alloc(5 + size, 0x77)
+    b[0] = fin ? STREAM_FLAG_FIN : 0
+    b.writeUInt32BE(seq, 1)
+    return b
+  }
+
+  // 1. Coalesces 5 in-order frames, emits 1 SACK on 6th, and flushes tail after sackCoalesceMs=2
+  {
+    const delivered = []
+    const { session, sent, clock } = makeSession({
+      sackCoalesceFrames: 6,
+      sackCoalesceMs: 2,
+      onStreamData: (_sid, chunk, fin) => { delivered.push({ len: chunk.length, fin }); return true },
+    })
+    for (let seq = 0; seq < 5; seq++) {
+      session.handleFrame(PeerFrameType.DATA, 1, dataFrame(seq), 0)
+    }
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 0, 'first 5 in-order frames coalesce SACK')
+    assert.equal(clock.pendingCount(), 1, 'coalesce timer armed')
+
+    // 6th frame hits sackCoalesceFrames=6 -> immediate SACK, timer cleared
+    session.handleFrame(PeerFrameType.DATA, 1, dataFrame(5), 0)
+    const sacksAfter6 = sent.filter((f) => f.frameType === PeerFrameType.SACK)
+    assert.equal(sacksAfter6.length, 1, '6th frame emits coalesced SACK')
+    assert.equal(sacksAfter6[0].ack, 6)
+    assert.equal(clock.pendingCount(), 0, 'coalesce timer cleared after frame-threshold flush')
+
+    // 2 more frames -> timer fires at +2ms
+    session.handleFrame(PeerFrameType.DATA, 1, dataFrame(6), 0)
+    session.handleFrame(PeerFrameType.DATA, 1, dataFrame(7), 0)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 1)
+    clock.advance(1)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 1)
+    clock.advance(1)
+    const sacksAfterTimer = sent.filter((f) => f.frameType === PeerFrameType.SACK)
+    assert.equal(sacksAfterTimer.length, 2, 'tail timer emits SACK after 2ms')
+    assert.equal(sacksAfterTimer[1].ack, 8)
+    assert.equal(clock.pendingCount(), 0)
+
+    // FIN flushes pending coalesced SACK immediately
+    session.handleFrame(PeerFrameType.DATA, 1, dataFrame(8), 0)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 2)
+    session.handleFrame(PeerFrameType.DATA, 1, dataFrame(9, 0, true), 0)
+    const sacksAfterFin = sent.filter((f) => f.frameType === PeerFrameType.SACK)
+    assert.equal(sacksAfterFin.length, 3, 'FIN flushes SACK immediately')
+    assert.equal(sacksAfterFin[2].ack, 10)
+    assert.equal(clock.pendingCount(), 0)
+    session.closeAll()
+  }
+
+  // 2. Out-of-order, duplicate, backpressure, and resume() flush immediately
+  {
+    let allowDeliver = true
+    const { session, sent, clock } = makeSession({
+      sackCoalesceFrames: 6,
+      sackCoalesceMs: 2,
+      onStreamData: () => allowDeliver,
+    })
+    session.handleFrame(PeerFrameType.DATA, 1, dataFrame(0), 0)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 0)
+
+    // OOO seq 2 -> immediate SACK with bitmap
+    session.handleFrame(PeerFrameType.DATA, 1, dataFrame(2), 0)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 1, 'OOO triggers immediate SACK')
+    assert.equal(clock.pendingCount(), 0)
+
+    // Duplicate seq 0 -> immediate SACK
+    session.handleFrame(PeerFrameType.DATA, 1, dataFrame(0), 0)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 2, 'duplicate triggers immediate SACK')
+
+    // Fill gap seq 1 while backpressured -> immediate SACK
+    allowDeliver = false
+    session.handleFrame(PeerFrameType.DATA, 1, dataFrame(1), 0)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 3, 'backpressure triggers immediate SACK')
+
+    // resume() progresses -> immediate SACK
+    allowDeliver = true
+    session.resume(1)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 4, 'resume() progress triggers immediate SACK')
+    assert.equal(clock.pendingCount(), 0)
+
+    // Verify zero timer leak when stream reset/closed with pending coalesced SACK
+    session.handleFrame(PeerFrameType.DATA, 1, dataFrame(3), 0)
+    assert.equal(clock.pendingCount(), 1)
+    session.closeAll()
+    assert.equal(clock.pendingCount(), 0, 'closeAll() clears pending coalesce SACK timer')
   }
 })

@@ -10,7 +10,7 @@ const crypto = require('node:crypto')
 const { createHash } = require('node:crypto')
 const { pathToFileURL } = require('node:url')
 
-const { createPeerEngine } = require('../lib/peer/engine.js')
+const { createPeerEngine, arqProfileForPath } = require('../lib/peer/engine.js')
 const { PeerPunchManager } = require('../lib/peer/punch.js')
 const { generatePeerIdentity } = require('../lib/peer/crypto.js')
 const { PeerFrameType, decodeFrameHeader } = require('../lib/peer/wire.js')
@@ -2735,4 +2735,27 @@ test('Task 5: demoteDirect enforces 30s local cooldown and ACK(0) probe does not
   await env.sample(40)
   if (env.peerOf().path !== 'lan') await env.sample(40)
   assert.equal(env.peerOf().path, 'lan', 'must allow recovery once 30s cooldown expires')
+})
+
+test('Slice 1: arqProfileForPath sets p2p AIMD (160/32/16), lan fixed (160), and relay AIMD (384/160/32)', () => {
+  assert.equal(typeof arqProfileForPath, 'function', 'arqProfileForPath exported for profile contract')
+  assert.deepEqual(arqProfileForPath('lan', 25), { windowSize: 160, rtoMs: 120 })
+  assert.deepEqual(arqProfileForPath('relay', 80), {
+    windowSize: 384,
+    initialWindowSize: 160,
+    minWindowSize: 32,
+    rtoMs: 120,
+  })
+  assert.deepEqual(arqProfileForPath('p2p', null), {
+    windowSize: 160,
+    initialWindowSize: 32,
+    minWindowSize: 16,
+    rtoMs: 150,
+  })
+  assert.deepEqual(arqProfileForPath('p2p', 100), {
+    windowSize: 160,
+    initialWindowSize: 32,
+    minWindowSize: 16,
+    rtoMs: 250,
+  })
 })

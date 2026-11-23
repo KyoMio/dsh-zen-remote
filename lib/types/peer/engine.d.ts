@@ -171,5 +171,12 @@ export interface PeerEngine {
     status(): PeerEngineStatus;
     stop(): void;
 }
+export interface ArqTransportProfile {
+    windowSize: number;
+    initialWindowSize?: number;
+    minWindowSize?: number;
+    rtoMs: number;
+}
+export declare const arqProfileForPath: (mode: "lan" | "p2p" | "relay", smoothedRttMs: number | null) => ArqTransportProfile;
 export declare function createPeerEngine(options: PeerEngineOptions): PeerEngine;
 //# sourceMappingURL=engine.d.ts.map

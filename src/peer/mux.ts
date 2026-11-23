@@ -256,6 +256,8 @@ export class PeerMux {
         sendFrame: (frameType, streamId, payload, ack) => this.dispatchFrame(session, frameType, streamId, payload, ack),
         onStreamData: (streamId, chunk, final) => this.onStreamData(session, streamId, chunk, final),
         clock: this.clock,
+        sackCoalesceFrames: 6,
+        sackCoalesceMs: 2,
         stallSuspectMs: this.options.stallSuspectMs ?? DEFAULT_STALL_SUSPECT_MS,
         onStallSuspected: () => this.onArqStallSuspected(session),
         onAdmissionClosed: error => this.options.log?.(`mux: ${session.nodeId}: ${error.message}`),
@@ -287,8 +289,11 @@ export class PeerMux {
     if (session && peerName.trim() !== '') session.peerName = peerName.trim()
   }
 
-  /** 动态调整对端 ARQ 发送档案（p2p 收窄窗口、提升初始 RTO 防突发拥塞）。 */
-  setPeerTransportProfile(nodeId: string, profile: { windowSize?: number; rtoMs?: number }): void {
+  /** 动态调整对端 ARQ 发送档案（p2p/relay AIMD、lan 固定大窗口）。 */
+  setPeerTransportProfile(
+    nodeId: string,
+    profile: { windowSize?: number; initialWindowSize?: number; minWindowSize?: number; rtoMs?: number },
+  ): void {
     const session = this.sessions.get(nodeId.toLowerCase())
     if (!session || session.closed || this.closed) return
     session.arq.setTransportProfile(profile)
