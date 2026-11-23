@@ -31,6 +31,7 @@ import type {
   UiLocalState,
   UserGroup,
 } from '../store/console-store';
+import { AdminAdvancedSettings } from './AdminAdvancedSettings';
 import {
   ApiKeySection,
   HotConfigForm,
@@ -330,7 +331,7 @@ function SecurityAdvisories(props: { t: TranslateFn; warnings: SecurityWarning[]
 
 // ---------------------------------------------------------------- 多标签页
 
-const TAB_ORDER = ['users', 'groups', 'gateway', 'tls', 'email', 'apiKey'] as const;
+const TAB_ORDER = ['users', 'groups', 'gateway', 'advanced', 'tls', 'email', 'apiKey'] as const;
 type AdminTab = (typeof TAB_ORDER)[number];
 
 // ---------------------------------------------------------------- 主视图
@@ -512,6 +513,7 @@ export function AdminView(props: AdminViewProps) {
     { id: 'users', label: t('admin.tabUsers') },
     { id: 'groups', label: t('admin.tabGroups') },
     { id: 'gateway', label: t('admin.tabGateway') },
+    { id: 'advanced', label: t('admin.tabAdvanced') },
     { id: 'tls', label: t('admin.tabTls') },
     { id: 'email', label: t('admin.tabEmail') },
     { id: 'apiKey', label: t('admin.tabApiKey') },
@@ -698,6 +700,23 @@ export function AdminView(props: AdminViewProps) {
               />
             </section>
           </div>
+        ) : adminLoad.settings === 'error' ? (
+          <p className="empty-hint">{t('admin.sliceError')}</p>
+        ) : (
+          <p className="empty-hint">{t('app.loading')}</p>
+        )}
+      </div>
+
+      <div className="admin-tabpanel" role="tabpanel" id="admin-panel-advanced" aria-labelledby="admin-tab-advanced" hidden={tab !== 'advanced'}>
+        {settings !== null ? (
+          <AdminAdvancedSettings
+            t={t}
+            client={client}
+            settings={settings}
+            ui={ui}
+            onUi={onUi}
+            onSettingsChanged={onSettingsChanged}
+          />
         ) : adminLoad.settings === 'error' ? (
           <p className="empty-hint">{t('admin.sliceError')}</p>
         ) : (

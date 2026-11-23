@@ -20,7 +20,7 @@
 
 // ---------------------------------------------------------------- 数据形态（镜像服务端）
 
-import type { Locale } from '../i18n/locales.js';
+import type { Locale, LocaleKey } from '../i18n/locales.js';
 
 export type UserRole = 'admin' | 'user';
 
@@ -364,6 +364,265 @@ export interface AdminApiKeyView {
   createdAt: string | null;
 }
 
+export interface GatewayTuningSettings {
+  defaultPeerDirectMaxRttMs: number;
+  wsMaxTargetBufferedKib: number;
+  wsPingIntervalMs: number;
+  wsPongTimeoutMs: number;
+  controlRateMaxKbps: number;
+  maxPreAuthPerIp: number;
+  maxPreAuthSockets: number;
+  preAuthTimeoutMs: number;
+  maxSseStreamsPerUser: number;
+}
+
+export interface PeerTuningSettings {
+  p2pWindowMax: number;
+  p2pWindowInitial: number;
+  p2pWindowMin: number;
+  lanWindowMax: number;
+  relayWindowMax: number;
+  relayWindowInitial: number;
+  sackCoalesceFrames: number;
+  directStallSuspectMs: number;
+  relayHoldBaseMs: number;
+  relayHoldMaxMs: number;
+  directPromoteStreak: number;
+  directPromoteRatio: number;
+  wsReorderGraceMs: number;
+}
+
+export interface AdvancedTuningSettings {
+  gateway: GatewayTuningSettings;
+  peer: PeerTuningSettings;
+}
+
+export interface AdvancedTuningPatch {
+  gateway?: Partial<GatewayTuningSettings>;
+  peer?: Partial<PeerTuningSettings>;
+}
+
+export const DEFAULT_WEB_ADVANCED_TUNING: AdvancedTuningSettings = {
+  gateway: {
+    defaultPeerDirectMaxRttMs: 300,
+    wsMaxTargetBufferedKib: 4096,
+    wsPingIntervalMs: 10000,
+    wsPongTimeoutMs: 15000,
+    controlRateMaxKbps: 512,
+    maxPreAuthPerIp: 16,
+    maxPreAuthSockets: 256,
+    preAuthTimeoutMs: 15000,
+    maxSseStreamsPerUser: 5,
+  },
+  peer: {
+    p2pWindowMax: 160,
+    p2pWindowInitial: 32,
+    p2pWindowMin: 16,
+    lanWindowMax: 160,
+    relayWindowMax: 384,
+    relayWindowInitial: 160,
+    sackCoalesceFrames: 6,
+    directStallSuspectMs: 3500,
+    relayHoldBaseMs: 30000,
+    relayHoldMaxMs: 300000,
+    directPromoteStreak: 2,
+    directPromoteRatio: 0.7,
+    wsReorderGraceMs: 2000,
+  },
+};
+
+export interface TuningFieldSpec<K extends string = string> {
+  key: K;
+  min: number;
+  max: number;
+  defaultValue: number;
+  step: number;
+  isFloat?: boolean;
+  labelKey: LocaleKey;
+  hintKey: LocaleKey;
+}
+
+export const GATEWAY_TUNING_SPECS: ReadonlyArray<TuningFieldSpec<keyof GatewayTuningSettings>> = [
+  { key: 'defaultPeerDirectMaxRttMs', min: 0, max: 10000, defaultValue: 300, step: 10, labelKey: 'admin.adv.defaultPeerDirectMaxRttMs.label', hintKey: 'admin.adv.defaultPeerDirectMaxRttMs.hint' },
+  { key: 'wsMaxTargetBufferedKib', min: 512, max: 32768, defaultValue: 4096, step: 512, labelKey: 'admin.adv.wsMaxTargetBufferedKib.label', hintKey: 'admin.adv.wsMaxTargetBufferedKib.hint' },
+  { key: 'wsPingIntervalMs', min: 5000, max: 60000, defaultValue: 10000, step: 1000, labelKey: 'admin.adv.wsPingIntervalMs.label', hintKey: 'admin.adv.wsPingIntervalMs.hint' },
+  { key: 'wsPongTimeoutMs', min: 10000, max: 120000, defaultValue: 15000, step: 1000, labelKey: 'admin.adv.wsPongTimeoutMs.label', hintKey: 'admin.adv.wsPongTimeoutMs.hint' },
+  { key: 'controlRateMaxKbps', min: 64, max: 2048, defaultValue: 512, step: 64, labelKey: 'admin.adv.controlRateMaxKbps.label', hintKey: 'admin.adv.controlRateMaxKbps.hint' },
+  { key: 'maxPreAuthPerIp', min: 4, max: 256, defaultValue: 16, step: 1, labelKey: 'admin.adv.maxPreAuthPerIp.label', hintKey: 'admin.adv.maxPreAuthPerIp.hint' },
+  { key: 'maxPreAuthSockets', min: 32, max: 4096, defaultValue: 256, step: 16, labelKey: 'admin.adv.maxPreAuthSockets.label', hintKey: 'admin.adv.maxPreAuthSockets.hint' },
+  { key: 'preAuthTimeoutMs', min: 5000, max: 60000, defaultValue: 15000, step: 1000, labelKey: 'admin.adv.preAuthTimeoutMs.label', hintKey: 'admin.adv.preAuthTimeoutMs.hint' },
+  { key: 'maxSseStreamsPerUser', min: 1, max: 32, defaultValue: 5, step: 1, labelKey: 'admin.adv.maxSseStreamsPerUser.label', hintKey: 'admin.adv.maxSseStreamsPerUser.hint' },
+];
+
+export const PEER_WINDOW_SPECS: ReadonlyArray<TuningFieldSpec<keyof PeerTuningSettings>> = [
+  { key: 'lanWindowMax', min: 32, max: 384, defaultValue: 160, step: 16, labelKey: 'admin.adv.lanWindowMax.label', hintKey: 'admin.adv.lanWindowMax.hint' },
+  { key: 'p2pWindowMax', min: 16, max: 384, defaultValue: 160, step: 16, labelKey: 'admin.adv.p2pWindowMax.label', hintKey: 'admin.adv.p2pWindowMax.hint' },
+  { key: 'p2pWindowInitial', min: 8, max: 160, defaultValue: 32, step: 8, labelKey: 'admin.adv.p2pWindowInitial.label', hintKey: 'admin.adv.p2pWindowInitial.hint' },
+  { key: 'p2pWindowMin', min: 8, max: 64, defaultValue: 16, step: 4, labelKey: 'admin.adv.p2pWindowMin.label', hintKey: 'admin.adv.p2pWindowMin.hint' },
+  { key: 'relayWindowMax', min: 64, max: 384, defaultValue: 384, step: 16, labelKey: 'admin.adv.relayWindowMax.label', hintKey: 'admin.adv.relayWindowMax.hint' },
+  { key: 'relayWindowInitial', min: 32, max: 384, defaultValue: 160, step: 16, labelKey: 'admin.adv.relayWindowInitial.label', hintKey: 'admin.adv.relayWindowInitial.hint' },
+  { key: 'sackCoalesceFrames', min: 1, max: 16, defaultValue: 6, step: 1, labelKey: 'admin.adv.sackCoalesceFrames.label', hintKey: 'admin.adv.sackCoalesceFrames.hint' },
+];
+
+export const PEER_SWITCH_SPECS: ReadonlyArray<TuningFieldSpec<keyof PeerTuningSettings>> = [
+  { key: 'directStallSuspectMs', min: 1500, max: 15000, defaultValue: 3500, step: 500, labelKey: 'admin.adv.directStallSuspectMs.label', hintKey: 'admin.adv.directStallSuspectMs.hint' },
+  { key: 'relayHoldBaseMs', min: 10000, max: 120000, defaultValue: 30000, step: 5000, labelKey: 'admin.adv.relayHoldBaseMs.label', hintKey: 'admin.adv.relayHoldBaseMs.hint' },
+  { key: 'relayHoldMaxMs', min: 30000, max: 1800000, defaultValue: 300000, step: 10000, labelKey: 'admin.adv.relayHoldMaxMs.label', hintKey: 'admin.adv.relayHoldMaxMs.hint' },
+  { key: 'directPromoteStreak', min: 1, max: 10, defaultValue: 2, step: 1, labelKey: 'admin.adv.directPromoteStreak.label', hintKey: 'admin.adv.directPromoteStreak.hint' },
+  { key: 'directPromoteRatio', min: 0.5, max: 0.95, defaultValue: 0.7, step: 0.05, isFloat: true, labelKey: 'admin.adv.directPromoteRatio.label', hintKey: 'admin.adv.directPromoteRatio.hint' },
+  { key: 'wsReorderGraceMs', min: 500, max: 10000, defaultValue: 2000, step: 250, labelKey: 'admin.adv.wsReorderGraceMs.label', hintKey: 'admin.adv.wsReorderGraceMs.hint' },
+];
+
+export const ALL_PEER_TUNING_SPECS: ReadonlyArray<TuningFieldSpec<keyof PeerTuningSettings>> = [
+  ...PEER_WINDOW_SPECS,
+  ...PEER_SWITCH_SPECS,
+];
+
+export interface AdvancedTuningDraft {
+  forceRelay: boolean;
+  gateway: Record<keyof GatewayTuningSettings, string>;
+  peer: Record<keyof PeerTuningSettings, string>;
+}
+
+export type AdvancedTuningValidationResult =
+  | { ok: true; gateway: GatewayTuningSettings; peer: PeerTuningSettings }
+  | {
+      ok: false;
+      errorKey: LocaleKey;
+      errorFieldKey?: LocaleKey;
+      errorParams?: Record<string, string | number>;
+    };
+
+export function normalizeAdminSettingsData(raw: AdminSettingsData): AdminSettingsData {
+  const gw = raw.advancedTuning?.gateway;
+  const peer = raw.advancedTuning?.peer;
+  return {
+    ...raw,
+    advancedTuning: {
+      gateway: { ...DEFAULT_WEB_ADVANCED_TUNING.gateway, ...(gw ?? {}) },
+      peer: { ...DEFAULT_WEB_ADVANCED_TUNING.peer, ...(peer ?? {}) },
+    },
+  };
+}
+
+export function createAdvancedTuningDraft(settings: AdminSettingsData): AdvancedTuningDraft {
+  const normalized = normalizeAdminSettingsData(settings);
+  const gateway = {} as Record<keyof GatewayTuningSettings, string>;
+  for (const spec of GATEWAY_TUNING_SPECS) {
+    gateway[spec.key] = String(normalized.advancedTuning.gateway[spec.key]);
+  }
+  const peer = {} as Record<keyof PeerTuningSettings, string>;
+  for (const spec of ALL_PEER_TUNING_SPECS) {
+    peer[spec.key] = String(normalized.advancedTuning.peer[spec.key]);
+  }
+  return {
+    forceRelay: normalized.forceRelay,
+    gateway,
+    peer,
+  };
+}
+
+export function validateAdvancedTuningDraft(draft: AdvancedTuningDraft): AdvancedTuningValidationResult {
+  const gateway = { ...DEFAULT_WEB_ADVANCED_TUNING.gateway };
+  for (const spec of GATEWAY_TUNING_SPECS) {
+    const raw = draft.gateway[spec.key].trim();
+    const num = raw.length === 0 ? NaN : Number(raw);
+    if (!Number.isInteger(num) || num < spec.min || num > spec.max) {
+      return {
+        ok: false,
+        errorKey: 'admin.advErrInvalidInt',
+        errorFieldKey: spec.labelKey,
+        errorParams: { min: spec.min, max: spec.max },
+      };
+    }
+    gateway[spec.key] = num;
+  }
+
+  const peer = { ...DEFAULT_WEB_ADVANCED_TUNING.peer };
+  for (const spec of ALL_PEER_TUNING_SPECS) {
+    const raw = draft.peer[spec.key].trim();
+    const num = raw.length === 0 ? NaN : Number(raw);
+    if (spec.isFloat) {
+      if (!Number.isFinite(num) || num < spec.min || num > spec.max) {
+        return {
+          ok: false,
+          errorKey: 'admin.advErrInvalidRatio',
+          errorFieldKey: spec.labelKey,
+          errorParams: { min: spec.min, max: spec.max },
+        };
+      }
+      peer[spec.key] = Math.round(num * 100) / 100;
+    } else {
+      if (!Number.isInteger(num) || num < spec.min || num > spec.max) {
+        return {
+          ok: false,
+          errorKey: 'admin.advErrInvalidInt',
+          errorFieldKey: spec.labelKey,
+          errorParams: { min: spec.min, max: spec.max },
+        };
+      }
+      peer[spec.key] = num;
+    }
+  }
+
+  if (gateway.wsPongTimeoutMs <= gateway.wsPingIntervalMs) {
+    return { ok: false, errorKey: 'admin.advErrPongGtPing' };
+  }
+  if (peer.p2pWindowMin > peer.p2pWindowInitial || peer.p2pWindowInitial > peer.p2pWindowMax) {
+    return { ok: false, errorKey: 'admin.advErrP2pWindowOrder' };
+  }
+  if (peer.relayWindowInitial > peer.relayWindowMax) {
+    return { ok: false, errorKey: 'admin.advErrRelayWindowOrder' };
+  }
+  if (peer.relayHoldMaxMs < peer.relayHoldBaseMs) {
+    return { ok: false, errorKey: 'admin.advErrHoldOrder' };
+  }
+
+  return { ok: true, gateway, peer };
+}
+
+export function buildAdvancedTuningPatch(
+  baseline: AdminSettingsData,
+  draft: AdvancedTuningDraft,
+):
+  | { ok: true; patch: AdminSettingsPatch | null }
+  | { ok: false; errorKey: LocaleKey; errorFieldKey?: LocaleKey; errorParams?: Record<string, string | number> } {
+  const validated = validateAdvancedTuningDraft(draft);
+  if (!validated.ok) return validated;
+
+  const base = normalizeAdminSettingsData(baseline);
+  const patch: AdminSettingsPatch = {};
+  if (draft.forceRelay !== base.forceRelay) {
+    patch.forceRelay = draft.forceRelay;
+  }
+
+  const gwDiff: Partial<GatewayTuningSettings> = {};
+  for (const spec of GATEWAY_TUNING_SPECS) {
+    if (validated.gateway[spec.key] !== base.advancedTuning.gateway[spec.key]) {
+      gwDiff[spec.key] = validated.gateway[spec.key];
+    }
+  }
+
+  const peerDiff: Partial<PeerTuningSettings> = {};
+  for (const spec of ALL_PEER_TUNING_SPECS) {
+    if (validated.peer[spec.key] !== base.advancedTuning.peer[spec.key]) {
+      peerDiff[spec.key] = validated.peer[spec.key];
+    }
+  }
+
+  if (Object.keys(gwDiff).length > 0 || Object.keys(peerDiff).length > 0) {
+    patch.advancedTuning = {
+      ...(Object.keys(gwDiff).length > 0 ? { gateway: gwDiff } : {}),
+      ...(Object.keys(peerDiff).length > 0 ? { peer: peerDiff } : {}),
+    };
+  }
+
+  if (Object.keys(patch).length === 0) {
+    return { ok: true, patch: null };
+  }
+  return { ok: true, patch };
+}
+
 /**
  * GET/PATCH /api/v1/admin/settings 的完整脱敏视图（镜像 routes-admin
  * buildSettingsView，GC-6b 扩展形态）。是旧 SystemSettings 四键的超集。
@@ -381,6 +640,7 @@ export interface AdminSettingsData {
   defaultGroupId: string;
   autoUpdateEnabled: boolean;
   forceRelay: boolean;
+  advancedTuning: AdvancedTuningSettings;
   smtp: AdminSmtpView;
   adminApiKey: AdminApiKeyView;
 }
@@ -397,7 +657,7 @@ export interface AdminSmtpDraft {
   rejectUnauthorized?: boolean;
 }
 
-/** PATCH /api/v1/admin/settings 接受的部分更新（全部字段可选；smtp 传 null = 清空发信配置） */
+/** PATCH /api/v1/admin/settings 接受的部分更新（全部字段可选；smtp / advancedTuning 传 null = 清空/恢复默认） */
 export interface AdminSettingsPatch {
   allowSignup?: boolean;
   requireEmailVerification?: boolean;
@@ -410,6 +670,7 @@ export interface AdminSettingsPatch {
   defaultGroupId?: string;
   autoUpdateEnabled?: boolean;
   forceRelay?: boolean;
+  advancedTuning?: AdvancedTuningPatch | null;
   smtp?: AdminSmtpDraft | null;
 }
 
@@ -1285,7 +1546,8 @@ export class ConsoleClient {
   }
 
   async adminPatchSettings(patch: Partial<SystemSettings>): Promise<AdminSettingsData> {
-    return this.request('PATCH', '/api/v1/admin/settings', patch);
+    const raw = await this.request<AdminSettingsData>('PATCH', '/api/v1/admin/settings', patch);
+    return normalizeAdminSettingsData(raw);
   }
 
   /** signal：管理页轮询的取消信号（PC-20 fix1——停表时 abort 在途拍），缺省行为不变 */
@@ -1303,12 +1565,14 @@ export class ConsoleClient {
   }
 
   async getAdminSettings(signal?: AbortSignal): Promise<AdminSettingsData> {
-    return this.request('GET', '/api/v1/admin/settings', undefined, signal);
+    const raw = await this.request<AdminSettingsData>('GET', '/api/v1/admin/settings', undefined, signal);
+    return normalizeAdminSettingsData(raw);
   }
 
-  /** 部分更新系统设置（smtp 传 null = 清空发信配置）；返回更新后的脱敏视图 */
+  /** 部分更新系统设置（smtp / advancedTuning 传 null = 清空/恢复默认）；返回更新后的脱敏视图 */
   async updateAdminSettings(patch: AdminSettingsPatch): Promise<AdminSettingsData> {
-    return this.request('PATCH', '/api/v1/admin/settings', patch);
+    const raw = await this.request<AdminSettingsData>('PATCH', '/api/v1/admin/settings', patch);
+    return normalizeAdminSettingsData(raw);
   }
 
   /** 真实连接发一封双语测试邮件（失败 → 502 SMTP_SEND_FAILED，附脱敏诊断码） */

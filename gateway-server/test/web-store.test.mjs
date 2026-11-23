@@ -47,12 +47,16 @@ import {
   ConsoleApiError,
   ConsoleClient,
   ConsoleStore,
+  DEFAULT_WEB_ADVANCED_TUNING,
   ManagedRefreshCycle,
   applyAdminGroups,
   applyAdminRuntime,
   applyNetworks,
   applyNetwork,
   applyPublicPolicy,
+  buildAdvancedTuningPatch,
+  createAdvancedTuningDraft,
+  validateAdvancedTuningDraft,
   applyQuota,
   applySession,
   applySessionPayload,
@@ -368,6 +372,34 @@ function makeAdminSettings(overrides = {}) {
     sessionTtlDays: 7,
     autoUpdateEnabled: true,
     forceRelay: false,
+    advancedTuning: {
+      gateway: {
+        defaultPeerDirectMaxRttMs: 300,
+        wsMaxTargetBufferedKib: 4096,
+        wsPingIntervalMs: 10000,
+        wsPongTimeoutMs: 15000,
+        controlRateMaxKbps: 512,
+        maxPreAuthPerIp: 16,
+        maxPreAuthSockets: 256,
+        preAuthTimeoutMs: 15000,
+        maxSseStreamsPerUser: 5,
+      },
+      peer: {
+        p2pWindowMax: 160,
+        p2pWindowInitial: 32,
+        p2pWindowMin: 16,
+        lanWindowMax: 160,
+        relayWindowMax: 384,
+        relayWindowInitial: 160,
+        sackCoalesceFrames: 6,
+        directStallSuspectMs: 3500,
+        relayHoldBaseMs: 30000,
+        relayHoldMaxMs: 300000,
+        directPromoteStreak: 2,
+        directPromoteRatio: 0.7,
+        wsReorderGraceMs: 2000,
+      },
+    },
     defaultGroupId: 'grp_default',
     smtp: {
       configured: false,
@@ -3025,5 +3057,100 @@ describe('T5 ConsoleClient 更新接口与插件版本提示判定', () => {
     const res = await client.updateAdminSettings({ forceRelay: true });
     assert.equal(res.forceRelay, true);
     assert.equal(JSON.parse(calls[0].init.body).forceRelay, true);
+  });
+
+  test('Slice 3 AdminAdvancedSettings helpers, ConsoleClient fallback, and i18n keys', async () => {
+    const requiredKeys = [
+      'admin.tabAdvanced',
+      'admin.advSectionGateway',
+      'admin.advSectionWindow',
+      'admin.advSectionSwitch',
+      'admin.advResetDefaults',
+      'admin.advResetConfirm',
+      'admin.advErrPongGtPing',
+      'admin.advErrP2pWindowOrder',
+      'admin.advErrRelayWindowOrder',
+      'admin.advErrHoldOrder',
+    ];
+    for (const k of requiredKeys) {
+      assert.ok(k in LOCALES.zh, `zh missing ${k}`);
+      assert.ok(k in LOCALES.en, `en missing ${k}`);
+    }
+    for (const field of [
+      ...Object.keys(DEFAULT_WEB_ADVANCED_TUNING.gateway),
+      ...Object.keys(DEFAULT_WEB_ADVANCED_TUNING.peer),
+    ]) {
+      assert.ok(`admin.adv.${field}.label` in LOCALES.zh, `zh missing label for ${field}`);
+      assert.ok(`admin.adv.${field}.hint` in LOCALES.zh, `zh missing hint for ${field}`);
+      assert.ok(`admin.adv.${field}.label` in LOCALES.en, `en missing label for ${field}`);
+      assert.ok(`admin.adv.${field}.hint` in LOCALES.en, `en missing hint for ${field}`);
+    }
+
+    // Legacy server omitting advancedTuning falls back cleanly to defaults
+    const legacyPayload = makeAdminSettings();
+    delete legacyPayload.advancedTuning;
+    const { impl: legacyImpl } = fakeFetch(() => jsonEnvelope(200, { ok: true, data: legacyPayload }));
+    const legacyClient = new ConsoleClient({ fetchImpl: legacyImpl });
+    const loaded = await legacyClient.getAdminSettings();
+    assert.deepEqual(loaded.advancedTuning, DEFAULT_WEB_ADVANCED_TUNING);
+
+    // Draft validation & dirty-diff builder
+    const baseline = makeAdminSettings();
+    const draft = createAdvancedTuningDraft(baseline);
+    assert.deepEqual(buildAdvancedTuningPatch(baseline, draft), { ok: true, patch: null });
+
+    const dirty = {
+      ...draft,
+      forceRelay: true,
+      gateway: { ...draft.gateway, maxPreAuthPerIp: '24' },
+      peer: { ...draft.peer, directPromoteRatio: '0.725' },
+    };
+    const patchRes = buildAdvancedTuningPatch(baseline, dirty);
+    assert.deepEqual(patchRes, {
+      ok: true,
+      patch: {
+        forceRelay: true,
+        advancedTuning: {
+          gateway: { maxPreAuthPerIp: 24 },
+          peer: { directPromoteRatio: 0.73 },
+        },
+      },
+    });
+
+    // Invalid range & cross-field validations
+    const badRange = validateAdvancedTuningDraft({
+      ...draft,
+      gateway: { ...draft.gateway, maxSseStreamsPerUser: '99' },
+    });
+    assert.equal(badRange.ok, false);
+    assert.equal(badRange.errorKey, 'admin.advErrInvalidInt');
+
+    const badPing = validateAdvancedTuningDraft({
+      ...draft,
+      gateway: { ...draft.gateway, wsPingIntervalMs: '15000', wsPongTimeoutMs: '15000' },
+    });
+    assert.equal(badPing.ok, false);
+    assert.equal(badPing.errorKey, 'admin.advErrPongGtPing');
+
+    const badP2p = validateAdvancedTuningDraft({
+      ...draft,
+      peer: { ...draft.peer, p2pWindowMin: '40' },
+    });
+    assert.equal(badP2p.ok, false);
+    assert.equal(badP2p.errorKey, 'admin.advErrP2pWindowOrder');
+
+    const badRelayWin = validateAdvancedTuningDraft({
+      ...draft,
+      peer: { ...draft.peer, relayWindowMax: '128' },
+    });
+    assert.equal(badRelayWin.ok, false);
+    assert.equal(badRelayWin.errorKey, 'admin.advErrRelayWindowOrder');
+
+    const badHold = validateAdvancedTuningDraft({
+      ...draft,
+      peer: { ...draft.peer, relayHoldBaseMs: '60000', relayHoldMaxMs: '40000' },
+    });
+    assert.equal(badHold.ok, false);
+    assert.equal(badHold.errorKey, 'admin.advErrHoldOrder');
   });
 });
