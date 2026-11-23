@@ -16,6 +16,8 @@ node --experimental-sqlite --test gateway-server/test/<file>    # 网关单文�
 
 完成判据：改动 src 后 build 产物已随提交入库、verify 与 test 全绿；动了 `gateway-server/` 就单独跑完它的三件套。
 
+**动手前先查远端状态**：开始修改或提交前，先执行 `git fetch --all --prune` 与 `git status -sb`，核对当前分支与目标基线（如 `origin/main` / `origin/dev`）的领先/落后状态及是否已被 squash 合入，避免在旧分支上继续追加提交引发合并冲突。
+
 ## 按任务找入口
 
 | 做什么 | 先读 |
