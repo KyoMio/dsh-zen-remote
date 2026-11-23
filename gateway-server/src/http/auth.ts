@@ -189,7 +189,11 @@ export interface RouteDef {
 
 export function sendOk(res: ServerResponse, data: unknown, status = 200): void {
   if (res.headersSent) return;
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  });
   res.end(JSON.stringify({ ok: true, data }));
 }
 
@@ -198,7 +202,11 @@ export function sendError(res: ServerResponse, status: number, code: string, mes
     res.destroy(); // 头已发出无法改写状态码，只能断开
     return;
   }
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+  res.writeHead(status, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  });
   res.end(JSON.stringify({ ok: false, error: { code, message } }));
 }
 
@@ -633,6 +641,15 @@ export const LOGIN_ACCOUNT_MAX_ATTEMPTS = 10;
 export const loginIpRateLimiter = new SlidingWindowRateLimiter(LOGIN_RATE_WINDOW_MS, LOGIN_IP_MAX_ATTEMPTS);
 export const loginAccountRateLimiter = new SlidingWindowRateLimiter(LOGIN_RATE_WINDOW_MS, LOGIN_ACCOUNT_MAX_ATTEMPTS);
 
+export const OTP_EMAIL_DAILY_WINDOW_MS = 24 * 60 * 60_000;
+export const OTP_EMAIL_DAILY_MAX = 10;
+export const OTP_GLOBAL_HOURLY_WINDOW_MS = 60 * 60_000;
+export const OTP_GLOBAL_HOURLY_MAX = 200;
+
+/** 跨目的单邮箱 24h 发信上限与全局 1h 熔断器（仅在真实发信前检查并消耗） */
+export const otpEmailDailyRateLimiter = new SlidingWindowRateLimiter(OTP_EMAIL_DAILY_WINDOW_MS, OTP_EMAIL_DAILY_MAX);
+export const otpGlobalHourlyRateLimiter = new SlidingWindowRateLimiter(OTP_GLOBAL_HOURLY_WINDOW_MS, OTP_GLOBAL_HOURLY_MAX);
+
 /** Signup delivery is detached; other purposes report sanitized SMTP failures. */
 export async function issueAndSendOtp(
   ctx: RouteContext,
@@ -653,6 +670,12 @@ export async function issueAndSendOtp(
     cooldownMs: OTP_COOLDOWN_MS,
   });
   if (!deliver) return;
+  const emailKey = email.trim().toLowerCase();
+  if (!otpEmailDailyRateLimiter.canConsume(emailKey) || !otpGlobalHourlyRateLimiter.canConsume('global')) {
+    throw new ApiError(429, 'RATE_LIMITED', 'too many verification code requests, try again later');
+  }
+  otpEmailDailyRateLimiter.tryConsume(emailKey);
+  otpGlobalHourlyRateLimiter.tryConsume('global');
   const rendered = renderOtpEmail({
     locale,
     purpose,
@@ -966,16 +989,13 @@ async function handleSendOtp(ctx: RouteContext): Promise<void> {
     sendOk(ctx.res, { sent: true, cooldownSec: OTP_COOLDOWN_MS / 1000 });
     return;
   } else {
-    const existing = await ctx.store.findUserByEmail(email);
-    if (existing === null || !existing.active) {
-      // 防枚举：不做任何写操作，现算一次 scrypt 抹平与真实路径的时长差（每次都跑，
-      // 非缓存），照样报成功
+    try {
+      const existing = await ctx.store.findUserByEmail(email);
+      await issueAndSendOtp(ctx, env, env.smtp, email, purpose, locale, existing !== null && existing.active);
+    } finally {
       await equalizeAuthTiming();
-      sendOk(ctx.res, { sent: true, cooldownSec: OTP_COOLDOWN_MS / 1000 });
-      return;
     }
   }
-  await issueAndSendOtp(ctx, env, env.smtp, email, purpose, locale);
   sendOk(ctx.res, { sent: true, cooldownSec: OTP_COOLDOWN_MS / 1000 });
 }
 
@@ -984,6 +1004,11 @@ async function handleSendOtp(ctx: RouteContext): Promise<void> {
  * keepTokenHash——该用户全部会话立即吊销；响应恒为成功，不暴露邮箱是否存在。
  */
 async function handleResetPassword(ctx: RouteContext): Promise<void> {
+  const clientIp = requestClientIp(ctx.req);
+  if (!loginIpRateLimiter.canConsume(clientIp)) {
+    ctx.res.setHeader('retry-after', String(Math.ceil(LOGIN_RATE_WINDOW_MS / 1000)));
+    throw new ApiError(429, 'RATE_LIMITED', 'too many reset attempts, try again later');
+  }
   const body = await readJsonObjectBody(ctx.req);
   const email = typeof body['email'] === 'string' ? body['email'].trim().toLowerCase() : '';
   const newPassword = typeof body['newPassword'] === 'string' ? body['newPassword'] : '';
@@ -994,12 +1019,17 @@ async function handleResetPassword(ctx: RouteContext): Promise<void> {
   if (!checkPassword(newPassword, email)) {
     throw new ApiError(400, 'WEAK_PASSWORD', PASSWORD_POLICY_MESSAGE);
   }
-  await ctx.store.verifyAndConsumeEmailOtp({
-    email,
-    purpose: 'reset_password',
-    codeHash: hashOtpCode(ctx.masterKey, 'reset_password', email, code),
-    maxAttempts: OTP_MAX_ATTEMPTS,
-  });
+  try {
+    await ctx.store.verifyAndConsumeEmailOtp({
+      email,
+      purpose: 'reset_password',
+      codeHash: hashOtpCode(ctx.masterKey, 'reset_password', email, code),
+      maxAttempts: OTP_MAX_ATTEMPTS,
+    });
+  } catch (err) {
+    loginIpRateLimiter.tryConsume(clientIp);
+    throw err;
+  }
   const user = await ctx.store.findUserByEmail(email);
   if (user !== null && user.active) {
     await ctx.store.updateUserPassword(user.id, await hashPassword(newPassword));

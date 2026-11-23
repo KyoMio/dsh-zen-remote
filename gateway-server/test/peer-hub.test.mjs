@@ -487,6 +487,9 @@ async function startGateway(opts = {}) {
     ...(opts.pingIntervalMs !== undefined ? { pingIntervalMs: opts.pingIntervalMs } : {}),
     ...(opts.pongTimeoutMs !== undefined ? { pongTimeoutMs: opts.pongTimeoutMs } : {}),
     ...(opts.maxTargetBufferedBytes !== undefined ? { maxTargetBufferedBytes: opts.maxTargetBufferedBytes } : {}),
+    ...(opts.preAuthTimeoutMs !== undefined ? { preAuthTimeoutMs: opts.preAuthTimeoutMs } : {}),
+    ...(opts.maxPreAuthSockets !== undefined ? { maxPreAuthSockets: opts.maxPreAuthSockets } : {}),
+    ...(opts.maxPreAuthPerIp !== undefined ? { maxPreAuthPerIp: opts.maxPreAuthPerIp } : {}),
     ...(opts.gatewayVersion !== undefined ? { gatewayVersion: opts.gatewayVersion } : {}),
     ...(opts.getLatestKnownPluginVersion !== undefined ? { getLatestKnownPluginVersion: opts.getLatestKnownPluginVersion } : {}),
     ...(opts.wireCompatRange !== undefined ? { wireCompatRange: opts.wireCompatRange } : {}),
@@ -1170,6 +1173,38 @@ describe('双 UDP 端口 STUN 与 NAT 判定', () => {
     } finally {
       await gw.close();
     }
+  });
+
+  test('STUN 准入与时间戳窗口先于 Ed25519 验签执行（未准入或过窗请求不触发验签）', async (t) => {
+    let admitCalls = 0;
+    const stun = new UdpStunService({
+      primaryPort: 0,
+      host: '127.0.0.1',
+      onNatDetected: () => {},
+      admitProbe: () => {
+        admitCalls += 1;
+        return null;
+      },
+    });
+    const { primaryPort } = await stun.bind();
+    const s = await udpSocket();
+    t.after(async () => {
+      s.close();
+      await stun.close();
+    });
+    const a = identity();
+    const netId = '0123456789abcdef';
+
+    // 1) Expired timestamp -> dropped before admitProbe and signature verification
+    udpProbe(s, primaryPort, a, { networkId: netId, timestamp: Date.now() - 10 * 60_000 });
+    await udpSilence(s, 80);
+    assert.equal(admitCalls, 0, 'out-of-window timestamp must drop before admitProbe');
+
+    // 2) In-window timestamp + forged signature -> admitProbe runs BEFORE verifyStunProbeSignature
+    udpProbe(s, primaryPort, a, { networkId: netId, timestamp: Date.now(), signIt: false });
+    await waitFor(() => admitCalls === 1, 'admitProbe should run before signature verification');
+    await udpSilence(s, 80);
+    assert.equal(admitCalls, 1);
   });
 
   test('FIX-3/PC-02：反射端点首次确定或变化时向同网同伴补发 punch-coordinate', async () => {
@@ -2170,6 +2205,50 @@ describe('path-report 与 /topology、SSE 联动', () => {
       assert.equal(resSseAnon.status, 401);
       await resSseAnon.body?.cancel();
     } finally {
+      await gw.close();
+    }
+  });
+
+  test('SSE 响应携带 x-accel-buffering: no，且单用户并发 SSE 流上限 5 条（第 6 条 429，关闭后释放）', async () => {
+    const gw = await startGateway();
+    const streams = [];
+    try {
+      const net = await createNetwork(gw, { mode: 'key' });
+      for (let i = 0; i < 5; i++) {
+        const res = await fetch(gw.base + `/api/v1/networks/${net.id}/events`, {
+          headers: { cookie: gw.tenantCookie },
+        });
+        assert.equal(res.status, 200);
+        assert.equal(res.headers.get('x-accel-buffering'), 'no');
+        streams.push(res);
+      }
+
+      const sixth = await fetch(gw.base + `/api/v1/networks/${net.id}/events`, {
+        headers: { cookie: gw.tenantCookie },
+      });
+      assert.equal(sixth.status, 429);
+      const sixthJson = await sixth.json();
+      assert.equal(sixthJson.ok, false);
+      assert.equal(sixthJson.error.code, 'RATE_LIMITED');
+
+      // Closing one stream frees a slot for a new connection
+      const first = streams.shift();
+      await first.body?.cancel();
+      let reopened = null;
+      await waitFor(async () => {
+        const attempt = await fetch(gw.base + `/api/v1/networks/${net.id}/events`, {
+          headers: { cookie: gw.tenantCookie },
+        });
+        if (attempt.status === 200) {
+          reopened = attempt;
+          return true;
+        }
+        await attempt.body?.cancel();
+        return false;
+      }, 'SSE slot should release on client close');
+      streams.push(reopened);
+    } finally {
+      await Promise.all(streams.map((r) => r.body?.cancel().catch(() => {})));
       await gw.close();
     }
   });
@@ -3739,6 +3818,131 @@ describe('T8：gateway-relay-backpressure-perf（控制帧免限速、背压、�
       wsB.close();
     } finally {
       await gw.close();
+    }
+  });
+
+  test('控制帧大小上限（非 HELLO <= 256B，HELLO 可 > 256B）、64 KiB/s 控制桶与高水位背压丢弃', async () => {
+    const clock = { now: 1_000_000 };
+    const lim = new PeerRateLimiter({ now: () => clock.now });
+    const scope = { networkId: 'n1', nodeId: 'aaaa', peerNodeId: 'bbbb' };
+    assert.equal(lim.tryRelayControl(scope, 64 * 1024), true, '64 KiB/s control burst succeeds');
+    assert.equal(lim.tryRelayControl(scope, 1), false, 'control bucket drops above 64 KiB/s');
+
+    const gw = await startGateway({ maxTargetBufferedBytes: 128 });
+    try {
+      const { net, a, b, wsA, wsB } = await setupPair(gw);
+
+      // 1) Non-DATA, non-HELLO control frames > 256B are dropped; <= 256B pass; HELLO (0x01) > 256B passes
+      wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 4, totalBytes: 257 }));
+      await wsSilence(wsB, 80);
+
+      const smallSack = frame({ src: a.nodeId, dst: b.nodeId, type: 4, totalBytes: 256 });
+      wsA.send(smallSack);
+      assert.deepEqual(await wsBinary(wsB), smallSack);
+
+      const largeHello = frame({ src: a.nodeId, dst: b.nodeId, type: 1, totalBytes: 600 });
+      wsA.send(largeHello);
+      assert.deepEqual(await wsBinary(wsB), largeHello);
+
+      // 2) Control frames drop when bufferedAmount > Math.max(maxTargetBufferedBytes * 2, 1 MiB)
+      const targetConn = gw.hub.conns.get(net.id).get(b.nodeId);
+      Object.defineProperty(targetConn.ws, 'bufferedAmount', {
+        configurable: true,
+        get: () => 1024 * 1024 + 1,
+      });
+      wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 4, totalBytes: 52 }));
+      wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 1, totalBytes: 52 }));
+      await wsSilence(wsB, 80);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('WS /peer/v1/ws pre-auth 超时（1008 auth timeout）、全局/单 IP 并发上限（1013）与零泄漏清理', async () => {
+    const gw = await startGateway({
+      preAuthTimeoutMs: 60,
+      maxPreAuthSockets: 3,
+      maxPreAuthPerIp: 2,
+    });
+    try {
+      const net = await createNetwork(gw, { mode: 'key' });
+
+      // 1) Pre-auth timeout closes with 1008 'auth timeout' and cleans up tracking
+      const idleWs = await wsOpen(gw.base);
+      const idleClosed = new Promise((resolve) => {
+        idleWs.once('close', (code, reason) => resolve({ code, reason: reason.toString('utf8') }));
+      });
+      const timeoutRes = await idleClosed;
+      assert.equal(timeoutRes.code, 1008);
+      assert.equal(timeoutRes.reason, 'auth timeout');
+      assert.equal(gw.hub.preAuthSockets.size, 0);
+      assert.equal(gw.hub.preAuthCountByIp.size, 0);
+
+      // 2) Authenticated connection releases pre-auth tracking and stays open past preAuthTimeoutMs
+      const a = identity();
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, { networkId: net.id, joinKey: net.joinKey });
+      assert.equal((await wsJson(wsA)).status, 'authorized');
+      assert.equal(gw.hub.preAuthSockets.size, 0);
+      assert.equal(gw.hub.preAuthCountByIp.size, 0);
+      await wsSilence(wsA, 100);
+      assert.equal(wsA.__closed, false, 'authenticated socket must outlive preAuthTimeoutMs');
+      wsA.close();
+      await wsClosed(wsA);
+    } finally {
+      await gw.close();
+    }
+
+    // 3) Per-IP pre-auth cap (1013) + doClose cleanup
+    const gwCap = await startGateway({
+      preAuthTimeoutMs: 5_000,
+      maxPreAuthSockets: 3,
+      maxPreAuthPerIp: 2,
+    });
+    try {
+      const p1 = await wsOpen(gwCap.base);
+      const p2 = await wsOpen(gwCap.base);
+      assert.equal(gwCap.hub.preAuthSockets.size, 2);
+
+      const third = new WebSocket(gwCap.base.replace(/^http/, 'ws') + '/peer/v1/ws');
+      const thirdClose = await new Promise((resolve, reject) => {
+        third.once('close', (code, reason) => resolve({ code, reason: reason.toString('utf8') }));
+        third.once('error', reject);
+      });
+      assert.equal(thirdClose.code, 1013);
+      assert.equal(thirdClose.reason, 'too many pending connections');
+      assert.equal(gwCap.hub.preAuthSockets.size, 2);
+
+      p1.close();
+      await wsClosed(p1);
+      await waitFor(() => gwCap.hub.preAuthSockets.size === 1);
+      // p2 left open for gwCap.close() to verify clean shutdown with active pre-auth socket/timer
+      assert.equal(p2.readyState <= WebSocket.OPEN, true);
+    } finally {
+      await gwCap.close();
+      assert.equal(gwCap.hub.preAuthSockets.size, 0);
+      assert.equal(gwCap.hub.preAuthCountByIp.size, 0);
+    }
+
+    // 4) Global pre-auth cap (maxPreAuthSockets: 1 < maxPreAuthPerIp: 5)
+    const gwGlobalCap = await startGateway({
+      preAuthTimeoutMs: 5_000,
+      maxPreAuthSockets: 1,
+      maxPreAuthPerIp: 5,
+    });
+    try {
+      const first = await wsOpen(gwGlobalCap.base);
+      const second = new WebSocket(gwGlobalCap.base.replace(/^http/, 'ws') + '/peer/v1/ws');
+      const secondClose = await new Promise((resolve, reject) => {
+        second.once('close', (code, reason) => resolve({ code, reason: reason.toString('utf8') }));
+        second.once('error', reject);
+      });
+      assert.equal(secondClose.code, 1013);
+      assert.equal(secondClose.reason, 'too many pending connections');
+      first.close();
+      await wsClosed(first);
+    } finally {
+      await gwGlobalCap.close();
     }
   });
 });

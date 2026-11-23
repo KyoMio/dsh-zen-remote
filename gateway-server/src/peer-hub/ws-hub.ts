@@ -55,7 +55,11 @@ import {
   verifyGatewayChallengeSignature,
   verifyJoinKeyProofHex,
 } from './peer-crypto.js';
-import { readRelayHeader } from './relay-frame.js';
+import {
+  RELAY_FRAME_TYPE_HELLO,
+  RELAY_MAX_NON_HELLO_CONTROL_FRAME_BYTES,
+  readRelayHeader,
+} from './relay-frame.js';
 import { PeerRateLimiter } from './rate-limiter.js';
 import type { NatObservation } from './udp-stun.js';
 import {
@@ -79,6 +83,9 @@ const MAX_CLOSE_FLUSH_ROUNDS = 8;
 const RELAY_FRAME_TYPE_DATA = 0x03;
 /** T8：目标 WS 发送缓冲上限（默认 4 MiB），超限丢弃 DATA 帧以防慢接收端拖垮网关内存 */
 const DEFAULT_MAX_TARGET_BUFFERED_BYTES = 4 * 1024 * 1024;
+const DEFAULT_PRE_AUTH_TIMEOUT_MS = 15_000;
+const DEFAULT_MAX_PRE_AUTH_SOCKETS = 256;
+const DEFAULT_MAX_PRE_AUTH_PER_IP = 16;
 
 /**
  * GC-3：网络属主的有效配额快照（内存缓存）。relayBinary 是同步热路径，月度
@@ -138,6 +145,12 @@ export interface PeerWsHubOptions {
   pongTimeoutMs?: number;
   /** 目标 WS 接收缓冲上限（bytes，默认 4 MiB），超限丢弃 DATA 帧 */
   maxTargetBufferedBytes?: number;
+  /** 未认证 WS 连接超时时间（ms，默认 15_000） */
+  preAuthTimeoutMs?: number;
+  /** 全局最大并发未认证 WS 连接数（默认 256） */
+  maxPreAuthSockets?: number;
+  /** 单 IP 最大并发未认证 WS 连接数（默认 16） */
+  maxPreAuthPerIp?: number;
   now?: () => number;
   /** 生产实例的真实 UDP STUN 端口供给器：组合根在 UdpStunService.bind() 完成后才返回
    * 实际绑定值（不得用配置值或 HTTP 端口冒充）；返回 null 或缺省时 welcome 不带 stun 字段 */
@@ -291,6 +304,9 @@ export class PeerWsHub {
   private readonly pingIntervalMs: number;
   private readonly pongTimeoutMs: number;
   private readonly maxTargetBufferedBytes: number;
+  private readonly preAuthTimeoutMs: number;
+  private readonly maxPreAuthSockets: number;
+  private readonly maxPreAuthPerIp: number;
   private readonly now: () => number;
   private nextConnSeq = 0;
   /** 真实 UDP STUN 端口供给器；null 表示组合根未接入（welcome 不带 stun 字段） */
@@ -310,6 +326,10 @@ export class PeerWsHub {
   private readonly pausedConns = new Map<string, ConnState>();
   /** 本 hub 接纳的全部 socket（含尚未发 auth 的 preauth），close 时统一 terminate */
   private readonly acceptedSockets = new Set<WebSocket>();
+  /** 尚未完成 auth 挑战应答的 WS 连接集合与按源 IP 计数（防慢速占位耗尽） */
+  readonly preAuthSockets = new Set<WebSocket>();
+  readonly preAuthCountByIp = new Map<string, number>();
+  private readonly preAuthTimers = new Map<WebSocket, NodeJS.Timeout>();
   /** SSE 订阅者：networkId → 回调集合 */
   private readonly subscribers = new Map<string, Set<(snapshot: NetworkTopologySnapshot) => void>>();
   /** 上一次速率跳动推走的每网总速率（恒零不推） */
@@ -376,6 +396,21 @@ export class PeerWsHub {
       throw new TypeError('PeerWsHub: invalid maxTargetBufferedBytes');
     }
     this.maxTargetBufferedBytes = maxBuf;
+    const preAuthTimeoutMs = options.preAuthTimeoutMs ?? DEFAULT_PRE_AUTH_TIMEOUT_MS;
+    if (!Number.isInteger(preAuthTimeoutMs) || preAuthTimeoutMs < 1 || preAuthTimeoutMs > 2_147_483_647) {
+      throw new TypeError('PeerWsHub: invalid preAuthTimeoutMs');
+    }
+    const maxPreAuthSockets = options.maxPreAuthSockets ?? DEFAULT_MAX_PRE_AUTH_SOCKETS;
+    if (!Number.isInteger(maxPreAuthSockets) || maxPreAuthSockets < 1) {
+      throw new TypeError('PeerWsHub: invalid maxPreAuthSockets');
+    }
+    const maxPreAuthPerIp = options.maxPreAuthPerIp ?? DEFAULT_MAX_PRE_AUTH_PER_IP;
+    if (!Number.isInteger(maxPreAuthPerIp) || maxPreAuthPerIp < 1) {
+      throw new TypeError('PeerWsHub: invalid maxPreAuthPerIp');
+    }
+    this.preAuthTimeoutMs = preAuthTimeoutMs;
+    this.maxPreAuthSockets = maxPreAuthSockets;
+    this.maxPreAuthPerIp = maxPreAuthPerIp;
     this.now = options.now ?? Date.now;
     this.stunPorts = options.stunPorts ?? null;
     if (typeof options.gatewayVersion === 'function') {
@@ -454,8 +489,13 @@ export class PeerWsHub {
     this.flushTimer = null;
     // preauth socket 不在路由表/挂起池里，必须单独 terminate，
     // 否则 wss.close 会等它永远不触发回调
+    for (const timer of this.preAuthTimers.values()) clearTimeout(timer);
+    this.preAuthTimers.clear();
+    this.preAuthSockets.clear();
+    this.preAuthCountByIp.clear();
     for (const ws of this.acceptedSockets) ws.terminate();
     this.acceptedSockets.clear();
+    for (const client of this.wss.clients) client.terminate();
     for (const net of this.conns.values()) {
       for (const conn of net.values()) {
         this.clearConnHeartbeat(conn);
@@ -553,14 +593,45 @@ export class PeerWsHub {
       ws.close(1013, 'gateway shutting down');
       return;
     }
+    const ipKey = remoteIp ?? 'unknown';
+    const currentIpCount = this.preAuthCountByIp.get(ipKey) ?? 0;
+    if (this.preAuthSockets.size >= this.maxPreAuthSockets || currentIpCount >= this.maxPreAuthPerIp) {
+      ws.close(1013, 'too many pending connections');
+      return;
+    }
     this.acceptedSockets.add(ws);
-    ws.on('close', () => {
-      this.acceptedSockets.delete(ws);
-    });
+    this.preAuthSockets.add(ws);
+    this.preAuthCountByIp.set(ipKey, currentIpCount + 1);
     const challengeHex = randomBytes(32).toString('hex');
     /** auth 通过后的连接状态；断开清理据此分流 */
     let conn: ConnState | null = null;
     let phase: 'preauth' | 'authed' | 'closed' = 'preauth';
+    let releasedPreAuth = false;
+    const releasePreAuth = (): void => {
+      if (releasedPreAuth) return;
+      releasedPreAuth = true;
+      const timer = this.preAuthTimers.get(ws);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        this.preAuthTimers.delete(ws);
+      }
+      this.preAuthSockets.delete(ws);
+      const count = this.preAuthCountByIp.get(ipKey) ?? 0;
+      if (count <= 1) this.preAuthCountByIp.delete(ipKey);
+      else this.preAuthCountByIp.set(ipKey, count - 1);
+    };
+    const preAuthTimer = setTimeout(() => {
+      this.preAuthTimers.delete(ws);
+      if (phase !== 'preauth') {
+        releasePreAuth();
+        return;
+      }
+      phase = 'closed';
+      releasePreAuth();
+      ws.close(1008, 'auth timeout');
+    }, this.preAuthTimeoutMs);
+    preAuthTimer.unref?.();
+    this.preAuthTimers.set(ws, preAuthTimer);
     sendJson(ws, { type: 'challenge', challengeHex });
 
     ws.on('message', (data: RawData, isBinary: boolean) => {
@@ -576,9 +647,13 @@ export class PeerWsHub {
       if (phase === 'preauth') {
         if (message['type'] !== 'auth') return;
         phase = 'authed'; // 一条连接只受理一次 auth
-        void this.handleAuth(ws, message, challengeHex, remoteIp).then((state) => {
-          if (state !== null) conn = state;
-        });
+        void this.handleAuth(ws, message, challengeHex, remoteIp)
+          .then((state) => {
+            if (state !== null) conn = state;
+          })
+          .finally(() => {
+            releasePreAuth();
+          });
         return;
       }
       if (conn !== null && conn.state === 'authorized' && message['type'] === 'path-report') {
@@ -601,6 +676,8 @@ export class PeerWsHub {
 
     ws.on('close', () => {
       phase = 'closed';
+      this.acceptedSockets.delete(ws);
+      releasePreAuth();
       if (conn !== null) this.clearConnHeartbeat(conn);
       this.teardown(conn);
     });
@@ -1119,8 +1196,18 @@ export class PeerWsHub {
     if (target === undefined) return; // 目标不在线（或非 authorized）
     const quota = this.currentOwnerQuota(conn.networkId);
     const isDataFrame = header.frameType === RELAY_FRAME_TYPE_DATA;
+    const isHelloFrame = header.frameType === RELAY_FRAME_TYPE_HELLO;
+    if (!isDataFrame && !isHelloFrame && buf.length > RELAY_MAX_NON_HELLO_CONTROL_FRAME_BYTES) {
+      return;
+    }
     if (isDataFrame && target.ws.bufferedAmount > this.maxTargetBufferedBytes) {
       return;
+    }
+    if (!isDataFrame) {
+      const maxControlBufferedBytes = Math.max(this.maxTargetBufferedBytes * 2, 1024 * 1024);
+      if (target.ws.bufferedAmount > maxControlBufferedBytes) {
+        return;
+      }
     }
     // 受月度配额约束的属主视图（非 admin 且组设了 monthlyRelayQuotaBytes）；null = 不受约束
     const meteredQuota =

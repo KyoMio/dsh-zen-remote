@@ -36,7 +36,7 @@ after(() => {
   fs.rmSync(DATA_ROOT, { recursive: true, force: true });
 });
 const CSP_EXPECTED =
-  "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'";
+  "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
 
 // ---------------------------------------------------------------- 实例组装
 
@@ -358,6 +358,18 @@ describe('静态托管：编译后的控制台', () => {
       // 这里用带 %2f 的整段编码保住穿越形态，服务端解码后才现出 `/../..`
       const traversal = await fetch(gw.base + '/%2e%2e%2f%2e%2e%2fpackage.json');
       assert.equal(traversal.status, 404, '路径穿越必须被拒绝');
+
+      // 点文件与带扩展名缺失路径一律 404，绝不回落成 index.html；中间段含点号的无扩展名 SPA 路由仍回退 index.html
+      for (const p of ['/.env', '/.git/config', '/._ds_store', '/site.webmanifest', '/missing.js', '/sub/missing.css']) {
+        const res = await fetch(gw.base + p);
+        assert.equal(res.status, 404, `${p} must return 404`);
+        assert.equal(res.headers.get('x-content-type-options'), 'nosniff');
+        assert.doesNotMatch(await res.text(), /<div id="root">/, `${p} must not fall back to HTML`);
+      }
+
+      const dottedRoute = await fetch(gw.base + '/networks/net.1/devices');
+      assert.equal(dottedRoute.status, 200);
+      assert.equal(await dottedRoute.text(), index);
       assert.doesNotMatch(await traversal.text(), /"name"/);
     } finally {
       await gw.close();

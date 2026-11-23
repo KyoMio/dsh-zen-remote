@@ -50,8 +50,8 @@ const memberKey = (m: MemberKey): string => `${m.networkId}|${m.nodeId}`;
 const pairKey = (networkId: string, a: string, b: string): string =>
   a < b ? `${networkId}|${a}|${b}` : `${networkId}|${b}|${a}`;
 
-/** 控制帧（HELLO/ACK/SACK/PING/PONG/RST）独立宽松限速：512 KiB/s 防恶意洪水，正常 SACK/握手永不误丢 */
-const CONTROL_BUCKET_RATE_BYTES_PER_SEC = 512 * 1024;
+/** 控制帧（HELLO/ACK/SACK/PING/PONG/RST）独立宽松限速：64 KiB/s 防恶意洪水，正常 SACK/握手永不误丢 */
+const CONTROL_BUCKET_RATE_BYTES_PER_SEC = 64 * 1024;
 /** 惰性桶清理窗口：超过此时长无流量的桶在周期扫表时淘汰，防长跑内存膨胀 */
 const BUCKET_STALE_MS = 10 * 60_000;
 const BUCKET_SWEEP_INTERVAL = 256;

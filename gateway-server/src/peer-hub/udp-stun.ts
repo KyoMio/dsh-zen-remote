@@ -144,6 +144,13 @@ export class UdpStunService {
     const signatureHex = typeof parsed['signatureHex'] === 'string' ? parsed['signatureHex'] : null;
     if (networkId === null || nodeId === null || publicKeyHex === null) return;
     if (nonce === null || timestamp === null || signatureHex === null) return;
+    if (!Number.isFinite(timestamp) || Math.abs(this.now() - timestamp) > this.timestampWindowMs) return;
+
+    const admitted = () => this.options.admitProbe === undefined
+      ? this.standaloneAdmission : this.options.admitProbe(networkId, nodeId, publicKeyHex);
+    const admission = admitted();
+    if (admission === null) return;
+
     if (!verifyStunProbeSignature({
       networkId,
       nodeId,
@@ -152,12 +159,6 @@ export class UdpStunService {
       timestamp,
       signatureHex,
     })) return;
-    if (Math.abs(this.now() - timestamp) > this.timestampWindowMs) return;
-
-    const admitted = () => this.options.admitProbe === undefined
-      ? this.standaloneAdmission : this.options.admitProbe(networkId, nodeId, publicKeyHex);
-    const admission = admitted();
-    if (admission === null) return;
 
     // 先原路回包再分类——反射应答不依赖对方是否探测过另一个端口
     const reply = Buffer.from(JSON.stringify({

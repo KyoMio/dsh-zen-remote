@@ -16,7 +16,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 
 /** 控制台 HTML 的严格自包含 CSP：全部资源仅允许同源（full-server.test.mjs 钉住逐字一致） */
 export const CONSOLE_CSP =
-  "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'";
+  "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'";
 
 const ASSET_CACHE_CONTROL = 'public, max-age=31536000, immutable';
 const HTML_CACHE_CONTROL = 'no-cache';
@@ -140,6 +140,10 @@ export function createStaticHost(root: string): StaticHost {
     }
 
     const decoded = safeDecode(pathname) ?? pathname;
+    if (decoded.split('/').some((seg) => seg.startsWith('.'))) {
+      sendNotFound(res, headOnly);
+      return true;
+    }
     if (decoded.startsWith(ASSET_PREFIX) || decoded === ASSET_PREFIX.slice(0, -1)) {
       // 哈希资源：存在即 immutable 长缓存，缺失即 404（绝不回落成 HTML）
       const stats = await stat(filePath).catch(() => null);
@@ -158,6 +162,11 @@ export function createStaticHost(root: string): StaticHost {
           ? { 'cache-control': HTML_CACHE_CONTROL, 'content-security-policy': CONSOLE_CSP }
           : { 'cache-control': HTML_CACHE_CONTROL };
       await sendFile(res, filePath, headOnly, headers);
+      return true;
+    }
+
+    if ((stats === null || !stats.isDirectory()) && path.extname(decoded) !== '') {
+      sendNotFound(res, headOnly);
       return true;
     }
 

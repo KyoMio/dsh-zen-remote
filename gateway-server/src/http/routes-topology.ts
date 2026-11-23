@@ -13,7 +13,9 @@
 import type { ServerResponse } from 'node:http';
 
 import { ApiError, requireUser, sendOk } from './auth.js';
-import type { RouteContext, RouteDef, TopologyProvider } from './auth.js';
+import type { NetworkTopologySnapshot, RouteContext, RouteDef, TopologyProvider } from './auth.js';
+
+const MAX_SSE_STREAMS_PER_USER = 5;
 
 async function loadOwnedNetworkForTopology(ctx: RouteContext, userId: string, networkId: string): Promise<void> {
   const network = await ctx.store.getNetwork(networkId);
@@ -46,38 +48,67 @@ function writeSseEvent(res: ServerResponse, event: string, data: unknown): void 
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-async function handleStreamTopology(ctx: RouteContext, params: Record<string, string>): Promise<void> {
-  const user = await requireUser(ctx);
-  const networkId = params['id'] ?? '';
-  await loadOwnedNetworkForTopology(ctx, user.id, networkId);
-  const provider = requireTopology(ctx);
-  const snapshot = await provider.renderTopology(networkId);
-  if (snapshot === null) {
-    throw new ApiError(404, 'NOT_FOUND', 'network not found');
-  }
-  ctx.res.writeHead(200, {
-    'content-type': 'text/event-stream; charset=utf-8',
-    'cache-control': 'no-store',
-    connection: 'keep-alive',
-  });
-  ctx.res.write('retry: 3000\n\n');
-  writeSseEvent(ctx.res, 'snapshot', snapshot);
-  const unsubscribe = provider.subscribe(networkId, (updated) => {
-    writeSseEvent(ctx.res, 'topology-updated', updated);
-  });
-  // 注意：req 的 'close' 在「请求消息读完整」时就触发（Node ≥16 语义），
-  // dispatcher 的 req.resume() 一跑它就 fire——退订会挂在这里导致后续推送
-  // 全部丢失。res 的 'close' 才是「连接断开」。
-  const cleanup = (): void => {
-    unsubscribe();
-    ctx.res.off('close', cleanup);
-  };
-  ctx.res.on('close', cleanup);
-}
-
 export function buildTopologyRoutes(): RouteDef[] {
+  const activeSseByUser = new Map<string, number>();
+
+  async function handleStreamTopologyWithLimit(ctx: RouteContext, params: Record<string, string>): Promise<void> {
+    const user = await requireUser(ctx);
+    const networkId = params['id'] ?? '';
+    await loadOwnedNetworkForTopology(ctx, user.id, networkId);
+    const activeCount = activeSseByUser.get(user.id) ?? 0;
+    if (activeCount >= MAX_SSE_STREAMS_PER_USER) {
+      throw new ApiError(429, 'RATE_LIMITED', 'too many active event streams');
+    }
+    const provider = requireTopology(ctx);
+    activeSseByUser.set(user.id, activeCount + 1);
+    let released = false;
+    const releaseSlot = (): void => {
+      if (released) return;
+      released = true;
+      const cur = activeSseByUser.get(user.id) ?? 0;
+      if (cur <= 1) activeSseByUser.delete(user.id);
+      else activeSseByUser.set(user.id, cur - 1);
+    };
+
+    let snapshot: NetworkTopologySnapshot | null;
+    try {
+      snapshot = await provider.renderTopology(networkId);
+    } catch (err) {
+      releaseSlot();
+      throw err;
+    }
+    if (snapshot === null) {
+      releaseSlot();
+      throw new ApiError(404, 'NOT_FOUND', 'network not found');
+    }
+    if (ctx.res.writableEnded || ctx.res.destroyed) {
+      releaseSlot();
+      return;
+    }
+    ctx.res.writeHead(200, {
+      'content-type': 'text/event-stream; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-accel-buffering': 'no',
+      connection: 'keep-alive',
+    });
+    ctx.res.write('retry: 3000\n\n');
+    writeSseEvent(ctx.res, 'snapshot', snapshot);
+    const unsubscribe = provider.subscribe(networkId, (updated) => {
+      writeSseEvent(ctx.res, 'topology-updated', updated);
+    });
+    // 注意：req 的 'close' 在「请求消息读完整」时就触发（Node ≥16 语义），
+    // dispatcher 的 req.resume() 一跑它就 fire——退订会挂在这里导致后续推送
+    // 全部丢失。res 的 'close' 才是「连接断开」。
+    const cleanup = (): void => {
+      unsubscribe();
+      releaseSlot();
+      ctx.res.off('close', cleanup);
+    };
+    ctx.res.on('close', cleanup);
+  }
+
   return [
     { method: 'GET', path: '/api/v1/networks/:id/topology', handler: handleGetTopology },
-    { method: 'GET', path: '/api/v1/networks/:id/events', handler: handleStreamTopology },
+    { method: 'GET', path: '/api/v1/networks/:id/events', handler: handleStreamTopologyWithLimit },
   ];
 }

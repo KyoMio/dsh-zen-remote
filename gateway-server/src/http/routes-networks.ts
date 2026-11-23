@@ -17,7 +17,16 @@ import {
   normalizePublicKeyHex,
   verifyGatewayLeaveSignature,
 } from '../peer-hub/peer-crypto.js';
-import { ApiError, readJsonObjectBody, requestIsHttps, requireUser, runHook, sendOk } from './auth.js';
+import {
+  ApiError,
+  SlidingWindowRateLimiter,
+  readJsonObjectBody,
+  requestClientIp,
+  requestIsHttps,
+  requireUser,
+  runHook,
+  sendOk,
+} from './auth.js';
 import type { RouteContext, RouteDef } from './auth.js';
 import { PEER_DIRECT_MAX_RTT_MS_MAX, PEER_DIRECT_MAX_RTT_MS_MIN } from '../store/types.js';
 import type {
@@ -441,9 +450,19 @@ async function handlePeerPing(ctx: RouteContext): Promise<void> {
   sendOk(ctx.res, { gateway: true });
 }
 
+const PEER_LEAVE_RATE_WINDOW_MS = 15 * 60_000;
+const PEER_LEAVE_RATE_MAX = 60;
+
 /** 节点主动退网注销端点（PAS-1b）：Ed25519 自证签名 + 时间窗 + 有界防重放 + createdAt 防过期踢人 */
-function makeHandlePeerLeave(seenLeaveSignatures: Map<string, number>) {
+function makeHandlePeerLeave(
+  seenLeaveSignatures: Map<string, number>,
+  leaveRateLimiter: SlidingWindowRateLimiter,
+) {
   return async function handlePeerLeave(ctx: RouteContext): Promise<void> {
+    if (!leaveRateLimiter.tryConsume(requestClientIp(ctx.req))) {
+      ctx.res.setHeader('retry-after', String(Math.ceil(PEER_LEAVE_RATE_WINDOW_MS / 1000)));
+      throw new ApiError(429, 'RATE_LIMITED', 'too many leave requests, try again later');
+    }
     const body = await readJsonObjectBody(ctx.req);
     const networkId = normalizeNetworkId(body['networkId']);
     const nodeId = normalizeNodeId(body['nodeId']);
@@ -513,9 +532,10 @@ function makeHandlePeerLeave(seenLeaveSignatures: Map<string, number>) {
 
 export function buildNetworkRoutes(): RouteDef[] {
   const seenLeaveSignatures = createLeaveReplayCache();
+  const leaveRateLimiter = new SlidingWindowRateLimiter(PEER_LEAVE_RATE_WINDOW_MS, PEER_LEAVE_RATE_MAX);
   return [
     { method: 'GET', path: '/peer/v1/ping', handler: handlePeerPing },
-    { method: 'POST', path: '/peer/v1/leave', handler: makeHandlePeerLeave(seenLeaveSignatures) },
+    { method: 'POST', path: '/peer/v1/leave', handler: makeHandlePeerLeave(seenLeaveSignatures, leaveRateLimiter) },
     { method: 'GET', path: '/api/v1/networks', handler: handleListNetworks },
     { method: 'POST', path: '/api/v1/networks', handler: handleCreateNetwork },
     { method: 'PATCH', path: '/api/v1/networks/:id', handler: handlePatchNetwork },

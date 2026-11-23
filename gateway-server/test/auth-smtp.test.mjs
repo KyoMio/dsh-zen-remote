@@ -14,7 +14,13 @@ import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { PgStore } from '../dist/store/pg-store.js';
 import { deriveMasterKeyFromSecret, hashPassword } from '../dist/master-key.js';
 import {
+  ACCOUNT_PASSWORD_MAX_ATTEMPTS,
+  accountPasswordRateLimiter,
+} from '../dist/http/routes-account.js';
+import {
   OTP_COOLDOWN_MS,
+  OTP_EMAIL_DAILY_MAX,
+  OTP_GLOBAL_HOURLY_MAX,
   OTP_IP_MAX_REQUESTS,
   OTP_MAX_ATTEMPTS,
   OTP_TTL_MS,
@@ -22,6 +28,8 @@ import {
   hashOtpCode,
   loginAccountRateLimiter,
   loginIpRateLimiter,
+  otpEmailDailyRateLimiter,
+  otpGlobalHourlyRateLimiter,
   otpSendRateLimiter,
   signupRateLimiter,
 } from '../dist/http/auth.js';
@@ -228,8 +236,18 @@ function seedSettings(overrides = {}) {
   return { allowSignup: false, maxNetworksPerUser: 2, defaultMaxPeers: 4, relayRateKbps: 2048, ...overrides };
 }
 
-async function startServer(opts = {}) {
+function resetAllRateLimiters() {
+  otpSendRateLimiter.clear();
   signupRateLimiter.clear();
+  loginIpRateLimiter.clear();
+  loginAccountRateLimiter.clear();
+  otpEmailDailyRateLimiter.clear();
+  otpGlobalHourlyRateLimiter.clear();
+  accountPasswordRateLimiter.clear();
+}
+
+async function startServer(opts = {}) {
+  resetAllRateLimiters();
   const store = opts.store ?? new SqliteStore({ seed: seedSettings(opts.seed) });
   const server = createGatewayApiServer({ store, masterKey: MASTER_KEY, publicUrl: opts.publicUrl });
   await new Promise((resolve, reject) => {
@@ -259,7 +277,12 @@ async function api(base, method, reqPath, { body, headers = {}, cookie } = {}) {
   }
   const res = await fetch(base + reqPath, { method, headers: h, body: payload });
   const text = await res.text();
-  return { status: res.status, json: text.length > 0 ? JSON.parse(text) : null, setCookies: res.headers.getSetCookie() };
+  return {
+    status: res.status,
+    headers: res.headers,
+    json: text.length > 0 ? JSON.parse(text) : null,
+    setCookies: res.headers.getSetCookie(),
+  };
 }
 
 function sessionCookie(res) {
@@ -966,8 +989,7 @@ describe('忘记密码重置、IP 限流、已登录改密与两步换绑邮箱�
     assertEnvelopeError(r4Login.json, 'ACCOUNT_DISABLED');
 
     // T7: Repeated wrong-password login triggers 429 RATE_LIMITED with Retry-After.
-    loginIpRateLimiter.clear();
-    loginAccountRateLimiter.clear();
+    resetAllRateLimiters();
     try {
       let rateLimited = null;
       for (let i = 0; i < 15; i++) {
@@ -985,8 +1007,134 @@ describe('忘记密码重置、IP 限流、已登录改密与两步换绑邮箱�
       assertEnvelopeError(rateLimited.json, 'RATE_LIMITED');
       assert.ok(Number(rateLimited.retryAfter) > 0, '429 response carries positive Retry-After header');
     } finally {
-      loginIpRateLimiter.clear();
-      loginAccountRateLimiter.clear();
+      resetAllRateLimiters();
     }
+  });
+
+  test('安全加固：reset_password 发码防枚举冷却对称、reset-password/改密/换绑限流、单邮箱日限与全局小时熔断及 nosniff', async (t) => {
+    resetAllRateLimiters();
+    t.after(() => resetAllRateLimiters());
+
+    // 1) sendOk & sendError carry x-content-type-options: nosniff
+    const meRes = await api(handle.base, 'GET', '/api/v1/auth/me');
+    assert.equal(meRes.status, 200);
+    assert.equal(meRes.headers.get('x-content-type-options'), 'nosniff');
+    const errRes = await api(handle.base, 'POST', '/api/v1/auth/login', { body: { email: '', password: '' } });
+    assert.equal(errRes.status, 400);
+    assert.equal(errRes.headers.get('x-content-type-options'), 'nosniff');
+
+    // 2) reset_password send-otp 60s cooldown anti-enumeration parity (existing active vs unregistered vs disabled)
+    const msgBefore = smtp.state.messages.length;
+    const activeEmail = 'parity-active@example.com';
+    const disabledEmail = 'parity-disabled@example.com';
+    const missingEmail = 'parity-missing@example.com';
+    await handle.store.createUser({ email: activeEmail, passwordHash: TENANT_HASH, role: 'user' });
+    const dis = await handle.store.createUser({ email: disabledEmail, passwordHash: TENANT_HASH, role: 'user' });
+    await handle.store.setUserActive(dis.id, false);
+
+    const sendReset = (email) =>
+      api(handle.base, 'POST', '/api/v1/auth/send-otp', { body: { email, purpose: 'reset_password' } });
+
+    const firstActive = await sendReset(activeEmail);
+    const firstDisabled = await sendReset(disabledEmail);
+    const firstMissing = await sendReset(missingEmail);
+    assert.equal(firstActive.status, 200);
+    assert.deepEqual(firstDisabled.json, firstActive.json);
+    assert.deepEqual(firstMissing.json, firstActive.json);
+    await waitFor(() => smtp.state.messages.length === msgBefore + 1);
+
+    const secondActive = await sendReset(activeEmail);
+    const secondDisabled = await sendReset(disabledEmail);
+    const secondMissing = await sendReset(missingEmail);
+    assert.equal(secondActive.status, 429);
+    assertEnvelopeError(secondActive.json, 'OTP_COOLDOWN');
+    assert.equal(secondDisabled.status, 429);
+    assert.deepEqual(secondDisabled.json, secondActive.json);
+    assert.equal(secondMissing.status, 429);
+    assert.deepEqual(secondMissing.json, secondActive.json);
+    assert.equal(smtp.state.messages.length, msgBefore + 1, 'only active user receives email');
+
+    // 3) reset-password is guarded by loginIpRateLimiter
+    resetAllRateLimiters();
+    for (let i = 0; i < 20; i++) {
+      const r = await api(handle.base, 'POST', '/api/v1/auth/reset-password', {
+        body: { email: `rp-${i}@example.com`, otpCode: '000000', newPassword: 'Valid!Password-99' },
+      });
+      assert.equal(r.status, 400);
+    }
+    const rpBlocked = await api(handle.base, 'POST', '/api/v1/auth/reset-password', {
+      body: { email: 'rp-20@example.com', otpCode: '000000', newPassword: 'Valid!Password-99' },
+    });
+    assert.equal(rpBlocked.status, 429);
+    assertEnvelopeError(rpBlocked.json, 'RATE_LIMITED');
+    assert.ok(Number(rpBlocked.headers.get('retry-after')) > 0);
+
+    // 4) accountPasswordRateLimiter protects password verification across password change and email change
+    resetAllRateLimiters();
+    const acctEmail = 'acct-ratelimit@example.com';
+    const acctPass = 'Acct!Password-742';
+    const acctUser = await handle.store.createUser({ email: acctEmail, passwordHash: await hashPassword(acctPass), role: 'user' });
+    const acctCookie = `zr_gw_session=${(await handle.store.createSession(acctUser.id, 86_400_000)).token}`;
+    for (let i = 0; i < ACCOUNT_PASSWORD_MAX_ATTEMPTS; i++) {
+      const bad = await api(handle.base, 'PATCH', '/api/v1/auth/account/password', {
+        cookie: acctCookie,
+        body: { currentPassword: `wrong-${i}`, newPassword: 'Next!Password-742' },
+      });
+      assert.equal(bad.status, 401);
+    }
+    for (const [method, reqPath, body] of [
+      ['PATCH', '/api/v1/auth/account/password', { currentPassword: acctPass, newPassword: 'Next!Password-742' }],
+      ['POST', '/api/v1/auth/account/email/request', { currentPassword: acctPass, newEmail: 'new-acct@example.com' }],
+      ['POST', '/api/v1/auth/account/email', { currentPassword: acctPass, newEmail: 'new-acct@example.com', otpCode: '000000' }],
+    ]) {
+      const blocked = await api(handle.base, method, reqPath, { cookie: acctCookie, body });
+      assert.equal(blocked.status, 429, `${method} ${reqPath} must enforce accountPasswordRateLimiter`);
+      assertEnvelopeError(blocked.json, 'RATE_LIMITED');
+      assert.ok(Number(blocked.headers.get('retry-after')) > 0);
+    }
+
+    // 5) otpEmailDailyRateLimiter (10/24h) and otpGlobalHourlyRateLimiter (200/1h)
+    resetAllRateLimiters();
+    const dailyEmail = 'daily-cap@example.com';
+    await handle.store.createUser({ email: dailyEmail, passwordHash: TENANT_HASH, role: 'user' });
+    for (let i = 0; i < OTP_EMAIL_DAILY_MAX - 1; i++) {
+      assert.equal(otpEmailDailyRateLimiter.tryConsume(dailyEmail), true);
+    }
+    const lastDaily = await sendReset(dailyEmail);
+    assert.equal(lastDaily.status, 200);
+    // Advance past 60s store cooldown via issueEmailOtp override or new purpose — use mocked timers or test global cap directly:
+    resetAllRateLimiters();
+    for (let i = 0; i < OTP_EMAIL_DAILY_MAX; i++) {
+      assert.equal(otpEmailDailyRateLimiter.tryConsume(dailyEmail), true);
+    }
+    // Wait: issueAndSendOtp writes cooldown then checks daily cap on deliver=true (different email bypasses store cooldown when testing global cap)
+    const dailyBlocked = await api(handle.base, 'POST', '/api/v1/auth/send-otp', {
+      body: { email: dailyEmail, purpose: 'reset_password' },
+    });
+    // Wait: previous call put dailyEmail in 60s store cooldown! Use a fresh registered email to verify daily cap cleanly:
+    assert.ok(dailyBlocked.status === 429);
+
+    const dailyEmail2 = 'daily-cap-2@example.com';
+    await handle.store.createUser({ email: dailyEmail2, passwordHash: TENANT_HASH, role: 'user' });
+    for (let i = 0; i < OTP_EMAIL_DAILY_MAX; i++) {
+      assert.equal(otpEmailDailyRateLimiter.tryConsume(dailyEmail2), true);
+    }
+    const dailyCapRes = await sendReset(dailyEmail2);
+    assert.equal(dailyCapRes.status, 429);
+    assertEnvelopeError(dailyCapRes.json, 'RATE_LIMITED');
+
+    // Global 1h cap
+    resetAllRateLimiters();
+    for (let i = 0; i < OTP_GLOBAL_HOURLY_MAX - 1; i++) {
+      assert.equal(otpGlobalHourlyRateLimiter.tryConsume('global'), true);
+    }
+    const g1Email = 'global-cap-1@example.com';
+    const g2Email = 'global-cap-2@example.com';
+    await handle.store.createUser({ email: g1Email, passwordHash: TENANT_HASH, role: 'user' });
+    await handle.store.createUser({ email: g2Email, passwordHash: TENANT_HASH, role: 'user' });
+    assert.equal((await sendReset(g1Email)).status, 200);
+    const g2Res = await sendReset(g2Email);
+    assert.equal(g2Res.status, 429);
+    assertEnvelopeError(g2Res.json, 'RATE_LIMITED');
   });
 });

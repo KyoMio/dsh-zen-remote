@@ -19,6 +19,11 @@ export const RELAY_MIN_FRAME_BYTES = RELAY_HEADER_BYTES + 16;
 /** 单帧硬上限（单加密数据报友好） */
 export const RELAY_MAX_FRAME_BYTES = 1200;
 
+/** PG-1 PeerFrameType：HELLO（0x01）携带 ~500-700B 签名握手 JSON，不受 256B 非 HELLO 控制帧上限约束 */
+export const RELAY_FRAME_TYPE_HELLO = 0x01;
+/** 非 DATA 且非 HELLO 控制帧（ACK/SACK/PING/PONG/RST）单帧硬上限 */
+export const RELAY_MAX_NON_HELLO_CONTROL_FRAME_BYTES = 256;
+
 /** PG-1 PeerFrameType 的合法范围（HELLO..RST），超界即垃圾帧 */
 const FRAME_TYPE_MIN = 0x01;
 const FRAME_TYPE_MAX = 0x07;

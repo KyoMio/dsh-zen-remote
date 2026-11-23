@@ -1204,6 +1204,21 @@ describe('publicUrl 主机与运行时统计注入（独立实例）', () => {
     assert.equal(idemRes.status, 200);
     assert.deepEqual(idemRes.json.data, { networkId: netId, nodeId: node1, removed: false });
   });
+
+  test('POST /peer/v1/leave 独立实例限流（15 分钟 60 次，第 61 次 429 RATE_LIMITED）', async () => {
+    const h = await startServer();
+    try {
+      for (let i = 0; i < 60; i++) {
+        const res = await api(h.base, 'POST', '/peer/v1/leave', { body: {} });
+        assert.equal(res.status, 400);
+      }
+      const limited = await api(h.base, 'POST', '/peer/v1/leave', { body: {} });
+      assert.equal(limited.status, 429);
+      assert.equal(limited.json.error.code, 'RATE_LIMITED');
+    } finally {
+      await stopServer(h);
+    }
+  });
 });
 
 describe('publicUrl 协议与缺省端口映射（HTTP 公网直连与无端口反代）', () => {

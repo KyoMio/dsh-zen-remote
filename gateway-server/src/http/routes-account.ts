@@ -6,6 +6,7 @@ import {
   ApiError,
   OTP_COOLDOWN_MS,
   OTP_MAX_ATTEMPTS,
+  SlidingWindowRateLimiter,
   authUserPayload,
   currentSessionTokenHash,
   hashOtpCode,
@@ -21,7 +22,32 @@ import {
 import type { RouteContext, RouteDef } from './auth.js';
 import { hashPassword, verifyPassword } from '../master-key.js';
 import type { MailLocale } from '../mail/templates.js';
+import type { UserRecord } from '../store/types.js';
 import { checkPassword, PASSWORD_POLICY_MESSAGE } from './password-policy.js';
+
+export const ACCOUNT_PASSWORD_RATE_WINDOW_MS = 15 * 60_000;
+export const ACCOUNT_PASSWORD_MAX_ATTEMPTS = 20;
+/** 已登录改密 / 换绑邮箱的当前密码防爆破限流器：按 `${user.id}:${clientIp}` 记账 */
+export const accountPasswordRateLimiter = new SlidingWindowRateLimiter(
+  ACCOUNT_PASSWORD_RATE_WINDOW_MS,
+  ACCOUNT_PASSWORD_MAX_ATTEMPTS,
+);
+
+async function verifyCurrentPasswordWithRateLimit(
+  ctx: RouteContext,
+  user: UserRecord,
+  currentPassword: string,
+): Promise<void> {
+  const rateKey = `${user.id}:${requestClientIp(ctx.req)}`;
+  if (!accountPasswordRateLimiter.canConsume(rateKey)) {
+    ctx.res.setHeader('retry-after', String(Math.ceil(ACCOUNT_PASSWORD_RATE_WINDOW_MS / 1000)));
+    throw new ApiError(429, 'RATE_LIMITED', 'too many password attempts, try again later');
+  }
+  if (!(await verifyPassword(currentPassword, user.passwordHash))) {
+    accountPasswordRateLimiter.tryConsume(rateKey);
+    throw new ApiError(401, 'INVALID_CREDENTIALS', 'current password is incorrect');
+  }
+}
 
 function readString(body: Record<string, unknown>, key: string): string {
   const value = body[key];
@@ -56,9 +82,7 @@ async function handleChangePassword(ctx: RouteContext): Promise<void> {
   if (!checkPassword(newPassword, user.email)) {
     throw new ApiError(400, 'WEAK_PASSWORD', PASSWORD_POLICY_MESSAGE);
   }
-  if (!(await verifyPassword(currentPassword, user.passwordHash))) {
-    throw new ApiError(401, 'INVALID_CREDENTIALS', 'current password is incorrect');
-  }
+  await verifyCurrentPasswordWithRateLimit(ctx, user, currentPassword);
   const keepTokenHash = currentSessionTokenHash(ctx.req);
   await ctx.store.updateUserPassword(user.id, await hashPassword(newPassword), keepTokenHash ?? undefined);
   sendOk(ctx.res, { changed: true });
@@ -73,9 +97,7 @@ async function handleRequestEmailChange(ctx: RouteContext): Promise<void> {
   const body = await readJsonObjectBody(ctx.req);
   const currentPassword = readString(body, 'currentPassword');
   const newEmail = readString(body, 'newEmail').trim().toLowerCase();
-  if (!(await verifyPassword(currentPassword, user.passwordHash))) {
-    throw new ApiError(401, 'INVALID_CREDENTIALS', 'current password is incorrect');
-  }
+  await verifyCurrentPasswordWithRateLimit(ctx, user, currentPassword);
   if (!isValidEmail(newEmail)) {
     throw new ApiError(400, 'INVALID_REQUEST', 'a valid newEmail is required');
   }
@@ -107,9 +129,7 @@ async function handleConfirmEmailChange(ctx: RouteContext): Promise<void> {
   const body = await readJsonObjectBody(ctx.req);
   const currentPassword = readString(body, 'currentPassword');
   const newEmail = readString(body, 'newEmail').trim().toLowerCase();
-  if (!(await verifyPassword(currentPassword, user.passwordHash))) {
-    throw new ApiError(401, 'INVALID_CREDENTIALS', 'current password is incorrect');
-  }
+  await verifyCurrentPasswordWithRateLimit(ctx, user, currentPassword);
   if (!isValidEmail(newEmail)) {
     throw new ApiError(400, 'INVALID_REQUEST', 'a valid newEmail is required');
   }
