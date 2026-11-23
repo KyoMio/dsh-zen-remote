@@ -79,7 +79,7 @@ test('e2e: a shared session invoke returns the fake gateway value, an unshared o
   } finally { await env.stop() }
 })
 
-test('e2e: workspaceFiles/readBytes rides the JSON relay as a base64 marker (2026-10-14 fix)', async () => {
+test('e2e: workspaceFiles/readBytes rides the binary-envelope relay directly as Uint8Array', async () => {
   const bytes = new Uint8Array([0, 1, 2, 250, 255, 128, 200])
   const env = await boot({
     shared: ['session-a'],
@@ -90,18 +90,17 @@ test('e2e: workspaceFiles/readBytes rides the JSON relay as a base64 marker (202
   })
   try {
     await env.client.connect()
-    // The relay CLIENT sees the wire shape: the server half marked the typed
-    // array (invoke-binary.ts) because JSON.stringify would have collapsed it
-    // into a plain object the caller-side zod rejects. The intercept half
-    // (tested in intercept.test.cjs) restores it above this layer.
+    // Slice 2: relay-client negotiates x-zr-binary-envelope: 1 and decodes the
+    // raw binary-envelope back to a real Uint8Array directly (restoreInvokeBinary
+    // in intercept.ts passes Uint8Array through untouched while keeping $zr-u8 fallback).
     const value = await env.client.invoke('workspaceFiles', 'readBytes', { workspaceFileScopeId: 'session-a', path: 'pic.png' })
     assert.equal(value.path, 'pic.png')
-    assert.equal(typeof value.data['$zr-u8'], 'string', 'the typed array traveled as the base64 marker')
-    assert.deepEqual(Array.from(Buffer.from(value.data['$zr-u8'], 'base64')), Array.from(bytes), 'the bytes round-tripped exactly')
+    assert.ok(value.data instanceof Uint8Array, 'the typed array traveled via binary-envelope as Uint8Array')
+    assert.deepEqual(Array.from(value.data), Array.from(bytes), 'the bytes round-tripped exactly')
   } finally { await env.stop() }
 })
 
-test('e2e: officeToPdf/render is a shared-session read whose PDF bytes ride the binary marker (2.2.6)', async () => {
+test('e2e: officeToPdf/render is a shared-session read whose PDF bytes ride binary-envelope as Uint8Array', async () => {
   const pdf = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0, 1, 254, 255])
   const env = await boot({
     shared: ['session-a'],
@@ -120,8 +119,8 @@ test('e2e: officeToPdf/render is a shared-session read whose PDF bytes ride the 
       priority: 'foreground',
     })
     assert.equal(value.absolutePath, '/srv/a/report.docx')
-    assert.equal(typeof value.data['$zr-u8'], 'string', 'the PDF typed array traveled as the base64 marker')
-    assert.deepEqual(Array.from(Buffer.from(value.data['$zr-u8'], 'base64')), Array.from(pdf), 'the bytes round-tripped exactly')
+    assert.ok(value.data instanceof Uint8Array, 'the PDF typed array traveled via binary-envelope as Uint8Array')
+    assert.deepEqual(Array.from(value.data), Array.from(pdf), 'the bytes round-tripped exactly')
 
     // The registry discipline: the session field is the ONLY authorization,
     // so an unshared scope is refused before the fake gateway sees the call.

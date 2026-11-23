@@ -17,6 +17,7 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const { createRelayHandler, loadServerId, encodeSessionReferenceUri, decodeSessionReferenceUri } = require('../lib/relay-server.js')
+const { decodeBinaryEnvelope, BINARY_ENVELOPE_ENCODING } = require('../lib/invoke-binary.js')
 const { createShareStore } = require('../lib/share-store.js')
 const { MAX_INVOKE_BODY_BYTES } = require('../lib/upload-limits.js')
 
@@ -2451,4 +2452,48 @@ test('T2 /v1/session-snapshot: cross-device global cap = 3 and finally release o
   assert.equal(r1.status, 200)
   assert.equal(r2.status, 200)
   assert.equal(r3.status, 200)
+})
+
+test('Slice 2: POST /v1/invoke serves binary-envelope when x-zr-binary-envelope=1 and falls back to $zr-u8 for legacy callers', async (t) => {
+  const rawBytes = new Uint8Array([0x25, 0x50, 0x44, 0x46, 0x2d, 0x31, 0x2e, 0x37, 0x00, 0xff])
+  const { handler, store } = makeParts('slice2-binary-envelope', {
+    value: { data: rawBytes, mimeType: 'application/pdf', version: 'v-pdf-1' },
+  })
+  store.share('session-a')
+  const server = await startServer(handler)
+  t.after(() => server.stop())
+
+  // 1. With x-zr-binary-envelope: 1 -> raw binary-envelope response (no base64, no gzip)
+  const binRes = await server.fetch(
+    '/_dsh/zen-remote/relay/v1/invoke',
+    post(
+      '/i',
+      { namespace: 'workspaceFiles', method: 'readBytes', args: { workspaceFileScopeId: 'session-a', path: 'doc.pdf' } },
+      { ...AUTH, 'x-zr-accept-encoding': 'gzip', 'x-zr-binary-envelope': '1' },
+    ),
+  )
+  assert.equal(binRes.status, 200)
+  assert.equal(binRes.headers.get('x-zr-content-encoding'), BINARY_ENVELOPE_ENCODING)
+  assert.equal(binRes.headers.get('content-type'), 'application/octet-stream')
+  const binPayload = Buffer.from(await binRes.arrayBuffer())
+  const decoded = decodeBinaryEnvelope(binPayload)
+  assert.equal(decoded.ok, true)
+  assert.equal(decoded.value.mimeType, 'application/pdf')
+  assert.equal(decoded.value.version, 'v-pdf-1')
+  assert.deepEqual(Array.from(decoded.value.data), Array.from(rawBytes))
+
+  // 2. Legacy caller without x-zr-binary-envelope -> JSON with $zr-u8 marker
+  const legacyRes = await server.fetch(
+    '/_dsh/zen-remote/relay/v1/invoke',
+    post(
+      '/i',
+      { namespace: 'workspaceFiles', method: 'readBytes', args: { workspaceFileScopeId: 'session-a', path: 'doc.pdf' } },
+      { ...AUTH },
+    ),
+  )
+  assert.equal(legacyRes.status, 200)
+  assert.equal(legacyRes.headers.get('x-zr-content-encoding'), null)
+  const legacyJson = await legacyRes.json()
+  assert.equal(legacyJson.ok, true)
+  assert.equal(legacyJson.value.data['$zr-u8'], Buffer.from(rawBytes).toString('base64'))
 })

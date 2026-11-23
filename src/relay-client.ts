@@ -51,6 +51,13 @@ import { gunzip } from 'node:zlib'
 
 import { compareFingerprints } from './fingerprint.js'
 import type { RelayCompatVerdict } from './fingerprint.js'
+import {
+  BINARY_ENVELOPE_ENCODING,
+  BINARY_ENVELOPE_REQUEST_HEADER,
+  INVOKE_BINARY_RESULT_METHODS,
+  MAX_BINARY_ENVELOPE_BYTES,
+  decodeBinaryEnvelope,
+} from './invoke-binary.js'
 import type { ServerPluginEntry } from './plugin-bridge.js'
 
 /** The one protocol version this client speaks; the handshake verifies it. */
@@ -648,13 +655,14 @@ async function readPayload(
       if (onAbort !== undefined) abortSignal.removeEventListener('abort', onAbort)
     }
   }
-  const readBodyBytes = async (): Promise<Buffer | undefined> => {
+  const readBodyBytes = async (maxBytes?: number): Promise<Buffer | undefined> => {
     if (response.body === null || response.body === undefined || typeof response.body.getReader !== 'function') {
       return undefined
     }
     if (abortSignal?.aborted) throw new Error('aborted')
     const reader = response.body.getReader()
     const chunks: Uint8Array[] = []
+    let totalBytes = 0
     let cancelled = false
     const cancelReader = (): void => {
       if (cancelled) return
@@ -667,6 +675,11 @@ async function readPayload(
           const { done, value } = await reader.read()
           if (done) break
           if (value !== undefined && value.byteLength > 0) {
+            totalBytes += value.byteLength
+            if (maxBytes !== undefined && totalBytes > maxBytes) {
+              cancelReader()
+              throw new RelayError('bad-response', `binary envelope exceeded ${maxBytes} bytes`, response.status)
+            }
             onProgress?.()
             chunks.push(value)
           }
@@ -676,6 +689,27 @@ async function readPayload(
       reader.releaseLock()
     }
     return Buffer.concat(chunks)
+  }
+
+  if (zrEncoding === BINARY_ENVELOPE_ENCODING) {
+    const raw = (await readBodyBytes(MAX_BINARY_ENVELOPE_BYTES)) ?? Buffer.from(await readWithAbort(() => response.arrayBuffer()))
+    if (raw.byteLength > MAX_BINARY_ENVELOPE_BYTES) {
+      throw new RelayError('bad-response', `binary envelope exceeded ${MAX_BINARY_ENVELOPE_BYTES} bytes`, response.status)
+    }
+    if (raw.byteLength === 0) {
+      if (response.status >= 200 && response.status < 300) {
+        throw new RelayError('bad-response', 'empty binary envelope payload', response.status)
+      }
+      return undefined
+    }
+    try {
+      return decodeBinaryEnvelope(raw)
+    } catch (error) {
+      if (response.status >= 200 && response.status < 300) {
+        throw new RelayError('bad-response', `failed to decode binary envelope: ${messageOf(error)}`, response.status)
+      }
+      return undefined
+    }
   }
 
   let text: string
@@ -1261,7 +1295,12 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
    * The JSON body arrives PRE-SERIALIZED: the invoke caller needs the JSON
    * once for its size-based timeout, so every route stringifies exactly
    * one. */
-  function requestInit(token: string, bodyJson: string, acceptGzip = false): RequestInit {
+  function requestInit(
+    token: string,
+    bodyJson: string,
+    acceptGzip = false,
+    extraHeaders?: Record<string, string>,
+  ): RequestInit {
     return {
       method: 'POST',
       headers: {
@@ -1271,6 +1310,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         // wall arrives as HTML and a revocation cannot be classified.
         accept: 'application/json',
         ...(acceptGzip ? { 'x-zr-accept-encoding': 'gzip' } : {}),
+        ...(extraHeaders ?? {}),
       },
       body: bodyJson,
       // A wrong server must not walk the pairing token through a redirect.
@@ -1524,11 +1564,17 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     signal: AbortSignal | undefined,
     applySuccessState: boolean,
     creds: { url: string; token: string },
-    opts: { timeoutMs?: number; timeoutSetsOffline?: boolean; transportSetsOffline?: boolean; acceptGzip?: boolean } = {},
+    opts: {
+      timeoutMs?: number
+      timeoutSetsOffline?: boolean
+      transportSetsOffline?: boolean
+      acceptGzip?: boolean
+      extraHeaders?: Record<string, string>
+    } = {},
   ): Promise<Record<string, unknown>> {
     return exchangeRequest(
       `${creds.url}${pathName}`,
-      requestInit(creds.token, bodyJson, opts.acceptGzip === true),
+      requestInit(creds.token, bodyJson, opts.acceptGzip === true, opts.extraHeaders),
       signal,
       applySuccessState,
       opts,
@@ -1761,10 +1807,14 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     // round-trip budget scales with. The timeout deliberately does NOT move
     // the connection state — a slow prompt is a slow call, not a dead link.
     const bodyJson = JSON.stringify({ namespace, method, args })
+    const extraHeaders = INVOKE_BINARY_RESULT_METHODS.has(`${namespace}/${method}`)
+      ? { [BINARY_ENVELOPE_REQUEST_HEADER]: '1' }
+      : undefined
     const payload = await exchange(INVOKE_PATH, bodyJson, signal, true, creds, {
       timeoutMs: invokeTimeoutMs(requestTimeoutMs, bodyJson, peerRecoveryMarginMs),
       timeoutSetsOffline: false,
       acceptGzip: true,
+      extraHeaders,
     })
     return payload.value
   }

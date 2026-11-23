@@ -18,6 +18,7 @@ const http = require('node:http')
 const zlib = require('node:zlib')
 const { startResetServer } = require('./util.cjs')
 const { createRelayClient, relayCredentialsDigest, volatileUpdateTouchesServerName, uploadBudgetMs, PEER_UPLOAD_RECOVERY_MARGIN_MS, RelayError } = require('../lib/relay-client.js')
+const { encodeBinaryEnvelope, BINARY_ENVELOPE_REQUEST_HEADER, BINARY_ENVELOPE_ENCODING } = require('../lib/invoke-binary.js')
 
 const HANDSHAKE = '/_dsh/zen-remote/relay/v1/handshake'
 const PING = '/_dsh/zen-remote/relay/ping'
@@ -3469,4 +3470,72 @@ test('Task 2: bodyless pluginRequest GET timeout throws request-timeout without 
     (error) => error instanceof RelayError && error.code === 'offline',
   )
   assert.equal(client.state, 'offline')
+})
+
+test('Slice 2: relay-client negotiates x-zr-binary-envelope=1 for binary methods, decodes binary-envelope, and maps corrupt payloads to bad-response', async (t) => {
+  const sampleBytes = new Uint8Array([10, 20, 30, 40, 250, 255])
+  const capturedHeaders = []
+  let mode = 'binary'
+
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-slice2',
+    requestTimeoutMs: 500,
+    infoRefreshMs: 0,
+    fetchImpl: async (url, init) => {
+      const pathname = new URL(String(url)).pathname
+      if (pathname.endsWith('/v1/handshake')) {
+        return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      capturedHeaders.push({
+        body: JSON.parse(String(init?.body ?? '{}')),
+        headers: init?.headers ?? {},
+      })
+      if (mode === 'binary') {
+        const buf = encodeBinaryEnvelope({ data: sampleBytes, mimeType: 'image/png', version: 'v1' })
+        return new Response(buf, {
+          status: 200,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'x-zr-content-encoding': BINARY_ENVELOPE_ENCODING,
+          },
+        })
+      }
+      if (mode === 'legacy') {
+        return new Response(
+          JSON.stringify({ ok: true, value: { data: { '$zr-u8': Buffer.from(sampleBytes).toString('base64') }, mimeType: 'image/png' } }),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        )
+      }
+      return new Response(Buffer.from([0, 0, 0, 99, 123]), {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-zr-content-encoding': BINARY_ENVELOPE_ENCODING,
+        },
+      })
+    },
+  })
+  t.after(() => client.stop())
+  await client.connect()
+
+  // 1. Binary method sends x-zr-binary-envelope: 1 and decodes binary-envelope to Uint8Array
+  const binOut = await client.invoke('workspaceFiles', 'readBytes', { workspaceFileScopeId: 's1', path: 'a.png' })
+  assert.equal(capturedHeaders[0].headers[BINARY_ENVELOPE_REQUEST_HEADER], '1')
+  assert.ok(binOut.data instanceof Uint8Array)
+  assert.deepEqual(Array.from(binOut.data), Array.from(sampleBytes))
+  assert.equal(binOut.mimeType, 'image/png')
+
+  // 2. Non-binary method does NOT send x-zr-binary-envelope: 1
+  mode = 'legacy'
+  await client.invoke('session', 'page', { id: 's1' })
+  assert.equal(capturedHeaders[1].headers[BINARY_ENVELOPE_REQUEST_HEADER], undefined)
+
+  // 3. Corrupt binary-envelope 200 response maps to bad-response without flipping offline
+  mode = 'corrupt'
+  await assert.rejects(
+    () => client.invoke('officeKit', 'render', { workspaceFileScopeId: 's1', path: 'a.docx' }),
+    (err) => err instanceof RelayError && err.code === 'bad-response',
+  )
+  assert.equal(client.state, 'online')
 })

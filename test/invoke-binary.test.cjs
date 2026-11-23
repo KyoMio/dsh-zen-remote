@@ -14,11 +14,29 @@ const path = require('node:path')
 let markInvokeBinary
 let restoreInvokeBinary
 let extractResultAttachments
+let encodeBinaryEnvelope
+let decodeBinaryEnvelope
 let BINARY_MARKER
+let BINARY_ENVELOPE_REQUEST_HEADER
+let BINARY_ENVELOPE_ENCODING
+let MAX_BINARY_ENVELOPE_BYTES
+let MAX_BINARY_ENVELOPE_ATTACHMENTS
 let INVOKE_BINARY_RESULT_METHODS
 
 before(async () => {
-  ;({ markInvokeBinary, restoreInvokeBinary, extractResultAttachments, BINARY_MARKER, INVOKE_BINARY_RESULT_METHODS } = await import(
+  ;({
+    markInvokeBinary,
+    restoreInvokeBinary,
+    extractResultAttachments,
+    encodeBinaryEnvelope,
+    decodeBinaryEnvelope,
+    BINARY_MARKER,
+    BINARY_ENVELOPE_REQUEST_HEADER,
+    BINARY_ENVELOPE_ENCODING,
+    MAX_BINARY_ENVELOPE_BYTES,
+    MAX_BINARY_ENVELOPE_ATTACHMENTS,
+    INVOKE_BINARY_RESULT_METHODS,
+  } = await import(
     pathToFileURL(path.join(__dirname, '..', 'lib', 'invoke-binary.js')).href
   ))
 })
@@ -114,4 +132,78 @@ test('full round trip: mark → JSON wire → restore → extract matches the en
   const out = extractResultAttachments(restored)
   assert.equal(out.value.data, null)
   assert.deepEqual(Array.from(out.attachments[0].bytes), Array.from(bytes))
+})
+
+test('Slice 2: encodeBinaryEnvelope / decodeBinaryEnvelope round-trips attachments and enforces bounds & prototype safety', () => {
+  assert.equal(BINARY_ENVELOPE_REQUEST_HEADER, 'x-zr-binary-envelope')
+  assert.equal(BINARY_ENVELOPE_ENCODING, 'binary-envelope')
+  assert.equal(MAX_BINARY_ENVELOPE_BYTES, 128 * 1024 * 1024)
+  assert.equal(MAX_BINARY_ENVELOPE_ATTACHMENTS, 64)
+
+  // 1. Non-binary payload returns null (server falls back to JSON/gzip)
+  assert.equal(encodeBinaryEnvelope({ version: 'v1', mimeType: 'text/plain', text: 'hi' }), null)
+
+  // 2. Single image, nested multiple attachments, and empty Uint8Array round-trip
+  const img = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+  const empty = new Uint8Array(0)
+  const extra = new Uint8Array([1, 2, 3, 255])
+  const value = {
+    version: 'mtime:123',
+    mimeType: 'image/png',
+    data: img,
+    extras: [{ empty }, extra],
+  }
+  const encoded = encodeBinaryEnvelope(value)
+  assert.ok(Buffer.isBuffer(encoded))
+  const decoded = decodeBinaryEnvelope(encoded)
+  assert.equal(decoded.ok, true)
+  assert.equal(decoded.value.version, 'mtime:123')
+  assert.equal(decoded.value.mimeType, 'image/png')
+  assert.ok(decoded.value.data instanceof Uint8Array)
+  assert.deepEqual(Array.from(decoded.value.data), Array.from(img))
+  assert.ok(decoded.value.extras[0].empty instanceof Uint8Array)
+  assert.equal(decoded.value.extras[0].empty.byteLength, 0)
+  assert.deepEqual(Array.from(decoded.value.extras[1]), Array.from(extra))
+
+  // 3. Mutating the source encoded buffer after decode does not mutate decoded views
+  encoded.fill(0)
+  assert.deepEqual(Array.from(decoded.value.data), Array.from(img))
+
+  // 4. Malformed header/length checks
+  assert.throws(() => decodeBinaryEnvelope(new Uint8Array(3)), /envelope/)
+  const zeroLen = Buffer.alloc(4)
+  assert.throws(() => decodeBinaryEnvelope(zeroLen), /envelope/)
+  const trunc = Buffer.alloc(8)
+  trunc.writeUInt32BE(100, 0)
+  assert.throws(() => decodeBinaryEnvelope(trunc), /envelope/)
+
+  // 5. Attachment byteLength mismatch & ok!==true rejected
+  const badMeta = Buffer.from(JSON.stringify({ ok: true, value: { data: null }, attachments: [{ path: ['data'], byteLength: 10 }] }))
+  const badBuf = Buffer.alloc(4 + badMeta.length + 3)
+  badBuf.writeUInt32BE(badMeta.length, 0)
+  badMeta.copy(badBuf, 4)
+  assert.throws(() => decodeBinaryEnvelope(badBuf), /byteLength|mismatch/i)
+
+  // 6. Prototype pollution keys in attachment path or JSON header are rejected
+  for (const key of ['__proto__', 'constructor', 'prototype']) {
+    const evilPathJson = Buffer.from(JSON.stringify({
+      ok: true,
+      value: { safe: null },
+      attachments: [{ path: [key], byteLength: 2 }],
+    }))
+    const evilPathBuf = Buffer.alloc(4 + evilPathJson.length + 2)
+    evilPathBuf.writeUInt32BE(evilPathJson.length, 0)
+    evilPathJson.copy(evilPathBuf, 4)
+    assert.throws(() => decodeBinaryEnvelope(evilPathBuf), /forbidden|unsafe|prototype/i)
+
+    const evilObjJson = Buffer.from(`{"ok":true,"value":{"${key}":{"polluted":true},"data":null},"attachments":[{"path":["data"],"byteLength":1}]}`)
+    const evilObjBuf = Buffer.alloc(4 + evilObjJson.length + 1)
+    evilObjBuf.writeUInt32BE(evilObjJson.length, 0)
+    evilObjJson.copy(evilObjBuf, 4)
+    assert.throws(() => decodeBinaryEnvelope(evilObjBuf), /forbidden|unsafe|prototype/i)
+  }
+
+  // 7. Max attachments (64) limit enforced
+  const tooMany = { items: Array.from({ length: 65 }, (_, i) => new Uint8Array([i])) }
+  assert.throws(() => encodeBinaryEnvelope(tooMany), /attachment/i)
 })

@@ -16,6 +16,20 @@
 /** 标记键。线上只会出现服务端写入的标记；客户端只认这个键。 */
 export const BINARY_MARKER = '$zr-u8'
 
+/** 请求头：客户端声明支持 `binary-envelope` 原始二进制响应封包。 */
+export const BINARY_ENVELOPE_REQUEST_HEADER = 'x-zr-binary-envelope'
+
+/** 响应头 `x-zr-content-encoding` 值：二进制封包协议标记。 */
+export const BINARY_ENVELOPE_ENCODING = 'binary-envelope'
+
+/** 二进制封包总字节上限（128 MiB）。 */
+export const MAX_BINARY_ENVELOPE_BYTES = 128 * 1024 * 1024
+
+/** 单次二进制封包允许的最大附件数。 */
+export const MAX_BINARY_ENVELOPE_ATTACHMENTS = 64
+
+const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype'])
+
 /** 结果里带二进制的方法（`namespace/method`）。请求侧参数不带二进制
  * （readBytes 的参数是 scope/paths），故只有结果方向需要标记。
  * `officeToPdf/render`（2.2.6）与其 0.2.2-rc.2 后继 `officeKit/render`
@@ -139,4 +153,196 @@ export function extractResultAttachments(value: unknown): { value: unknown; atta
     return input
   }
   return { value: walk(value, [], 0), attachments }
+}
+
+interface BinaryEnvelopeAttachmentMeta {
+  path: (string | number)[]
+  byteLength: number
+}
+
+const textDecoderFatal = new TextDecoder('utf-8', { fatal: true })
+
+function assertSafeValueStructure(root: unknown): void {
+  const stack: unknown[] = [root]
+  while (stack.length > 0) {
+    const cur = stack.pop()
+    if (cur === null || typeof cur !== 'object') continue
+    if (Array.isArray(cur)) {
+      for (let i = 0; i < cur.length; i++) stack.push(cur[i])
+      continue
+    }
+    for (const key of Object.getOwnPropertyNames(cur)) {
+      if (FORBIDDEN_KEYS.has(key)) {
+        throw new Error(`unsafe forbidden key "${key}" in binary envelope`)
+      }
+      stack.push((cur as Record<string, unknown>)[key])
+    }
+  }
+}
+
+function attachAtPath(root: unknown, path: (string | number)[], bytes: Uint8Array): unknown {
+  if (path.length === 0) return bytes
+  let cur: unknown = root
+  for (let i = 0; i < path.length - 1; i++) {
+    const seg = path[i]!
+    if (typeof seg === 'number') {
+      if (!Array.isArray(cur) || seg < 0 || seg >= cur.length) {
+        throw new Error('invalid array index in binary envelope attachment path')
+      }
+      cur = cur[seg]
+    } else {
+      if (
+        cur === null ||
+        typeof cur !== 'object' ||
+        Array.isArray(cur) ||
+        FORBIDDEN_KEYS.has(seg) ||
+        !Object.prototype.hasOwnProperty.call(cur, seg)
+      ) {
+        throw new Error(`invalid object segment "${seg}" in binary envelope attachment path`)
+      }
+      cur = (cur as Record<string, unknown>)[seg]
+    }
+  }
+  const leaf = path[path.length - 1]!
+  if (typeof leaf === 'number') {
+    if (!Array.isArray(cur) || leaf < 0 || leaf >= cur.length) {
+      throw new Error('invalid leaf array index in binary envelope attachment path')
+    }
+    cur[leaf] = bytes
+  } else {
+    if (
+      cur === null ||
+      typeof cur !== 'object' ||
+      Array.isArray(cur) ||
+      FORBIDDEN_KEYS.has(leaf) ||
+      !Object.prototype.hasOwnProperty.call(cur, leaf)
+    ) {
+      throw new Error(`invalid leaf object segment "${leaf}" in binary envelope attachment path`)
+    }
+    ;(cur as Record<string, unknown>)[leaf] = bytes
+  }
+  return root
+}
+
+/**
+ * 把带 Uint8Array 的响应值编码为 `[4B UInt32BE jsonLen][UTF-8 JSON][raw bytes...]`。
+ * 不含任何 typed array 时返回 `null`（调用方回落普通 JSON / gzip 路径）。
+ */
+export function encodeBinaryEnvelope(value: unknown): Buffer | null {
+  const { value: stripped, attachments } = extractResultAttachments(value)
+  if (attachments.length === 0) return null
+  if (attachments.length > MAX_BINARY_ENVELOPE_ATTACHMENTS) {
+    throw new RangeError(`binary envelope attachment count ${attachments.length} exceeds limit ${MAX_BINARY_ENVELOPE_ATTACHMENTS}`)
+  }
+  const meta: BinaryEnvelopeAttachmentMeta[] = []
+  let binaryBytes = 0
+  for (const att of attachments) {
+    meta.push({ path: att.path, byteLength: att.bytes.byteLength })
+    binaryBytes += att.bytes.byteLength
+  }
+  const jsonBuf = Buffer.from(JSON.stringify({ ok: true, value: stripped, attachments: meta }), 'utf8')
+  const totalBytes = 4 + jsonBuf.byteLength + binaryBytes
+  if (totalBytes > MAX_BINARY_ENVELOPE_BYTES) {
+    throw new RangeError(`binary envelope size ${totalBytes} exceeds limit ${MAX_BINARY_ENVELOPE_BYTES}`)
+  }
+  const out = Buffer.allocUnsafe(totalBytes)
+  out.writeUInt32BE(jsonBuf.byteLength, 0)
+  jsonBuf.copy(out, 4)
+  let offset = 4 + jsonBuf.byteLength
+  for (const att of attachments) {
+    const view = Buffer.from(att.bytes.buffer, att.bytes.byteOffset, att.bytes.byteLength)
+    view.copy(out, offset)
+    offset += view.byteLength
+  }
+  return out
+}
+
+/**
+ * 解码 `[4B UInt32BE jsonLen][UTF-8 JSON][raw bytes...]` 二进制封包并还原
+ * `Uint8Array` 附件；严格校验长度边界、附件计数与原型污染键。
+ */
+export function decodeBinaryEnvelope(bytes: Uint8Array): Record<string, unknown> {
+  if (!(bytes instanceof Uint8Array)) {
+    throw new TypeError('binary envelope payload must be a Uint8Array')
+  }
+  if (bytes.byteLength < 4 || bytes.byteLength > MAX_BINARY_ENVELOPE_BYTES) {
+    throw new RangeError(`invalid binary envelope byteLength: ${bytes.byteLength}`)
+  }
+  const jsonLen = Buffer.from(bytes.buffer, bytes.byteOffset, 4).readUInt32BE(0)
+  if (jsonLen === 0 || 4 + jsonLen > bytes.byteLength) {
+    throw new Error(`invalid binary envelope jsonLen: ${jsonLen}`)
+  }
+  let parsed: unknown
+  try {
+    const jsonText = textDecoderFatal.decode(bytes.subarray(4, 4 + jsonLen))
+    parsed = JSON.parse(jsonText)
+  } catch {
+    throw new Error('invalid binary envelope JSON header')
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('binary envelope header must be a plain object')
+  }
+  const envelope = parsed as Record<string, unknown>
+  if (envelope.ok !== true || !Object.prototype.hasOwnProperty.call(envelope, 'value')) {
+    throw new Error('binary envelope header missing ok:true or value')
+  }
+  if (!Array.isArray(envelope.attachments)) {
+    throw new Error('binary envelope header missing attachments array')
+  }
+  if (envelope.attachments.length > MAX_BINARY_ENVELOPE_ATTACHMENTS) {
+    throw new RangeError(`binary envelope attachment count exceeds limit ${MAX_BINARY_ENVELOPE_ATTACHMENTS}`)
+  }
+  assertSafeValueStructure(envelope.value)
+
+  const attachments: BinaryEnvelopeAttachmentMeta[] = []
+  let expectedBinaryBytes = 0
+  for (const rawAtt of envelope.attachments) {
+    if (rawAtt === null || typeof rawAtt !== 'object' || Array.isArray(rawAtt)) {
+      throw new Error('invalid binary envelope attachment descriptor')
+    }
+    const attObj = rawAtt as Record<string, unknown>
+    if (!Array.isArray(attObj.path)) {
+      throw new Error('binary envelope attachment missing path array')
+    }
+    const cleanPath: (string | number)[] = []
+    for (const seg of attObj.path) {
+      if (typeof seg === 'number') {
+        if (!Number.isSafeInteger(seg) || seg < 0) {
+          throw new Error('invalid numeric path segment in binary envelope')
+        }
+        cleanPath.push(seg)
+      } else if (typeof seg === 'string') {
+        if (FORBIDDEN_KEYS.has(seg)) {
+          throw new Error(`unsafe forbidden key "${seg}" in binary envelope attachment path`)
+        }
+        cleanPath.push(seg)
+      } else {
+        throw new Error('invalid path segment type in binary envelope')
+      }
+    }
+    const byteLength = attObj.byteLength
+    if (typeof byteLength !== 'number' || !Number.isSafeInteger(byteLength) || byteLength < 0) {
+      throw new Error('invalid attachment byteLength in binary envelope')
+    }
+    expectedBinaryBytes += byteLength
+    if (4 + jsonLen + expectedBinaryBytes > bytes.byteLength) {
+      throw new Error('binary envelope attachment byteLength exceeds payload')
+    }
+    attachments.push({ path: cleanPath, byteLength })
+  }
+  if (4 + jsonLen + expectedBinaryBytes !== bytes.byteLength) {
+    throw new Error('binary envelope total length mismatch')
+  }
+  if (attachments.some((att) => att.path.length === 0) && attachments.length !== 1) {
+    throw new Error('root attachment path must be sole attachment')
+  }
+
+  let rootValue = envelope.value
+  let offset = 4 + jsonLen
+  for (const att of attachments) {
+    const sliceCopy = new Uint8Array(bytes.subarray(offset, offset + att.byteLength))
+    offset += att.byteLength
+    rootValue = attachAtPath(rootValue, att.path, sliceCopy)
+  }
+  return { ok: true, value: rootValue }
 }

@@ -14,6 +14,14 @@
  */
 /** 标记键。线上只会出现服务端写入的标记；客户端只认这个键。 */
 export declare const BINARY_MARKER = "$zr-u8";
+/** 请求头：客户端声明支持 `binary-envelope` 原始二进制响应封包。 */
+export declare const BINARY_ENVELOPE_REQUEST_HEADER = "x-zr-binary-envelope";
+/** 响应头 `x-zr-content-encoding` 值：二进制封包协议标记。 */
+export declare const BINARY_ENVELOPE_ENCODING = "binary-envelope";
+/** 二进制封包总字节上限（128 MiB）。 */
+export declare const MAX_BINARY_ENVELOPE_BYTES: number;
+/** 单次二进制封包允许的最大附件数。 */
+export declare const MAX_BINARY_ENVELOPE_ATTACHMENTS = 64;
 /** 结果里带二进制的方法（`namespace/method`）。请求侧参数不带二进制
  * （readBytes 的参数是 scope/paths），故只有结果方向需要标记。
  * `officeToPdf/render`（2.2.6）与其 0.2.2-rc.2 后继 `officeKit/render`
@@ -42,4 +50,14 @@ export declare function extractResultAttachments(value: unknown): {
     value: unknown;
     attachments: ResultAttachment[];
 };
+/**
+ * 把带 Uint8Array 的响应值编码为 `[4B UInt32BE jsonLen][UTF-8 JSON][raw bytes...]`。
+ * 不含任何 typed array 时返回 `null`（调用方回落普通 JSON / gzip 路径）。
+ */
+export declare function encodeBinaryEnvelope(value: unknown): Buffer | null;
+/**
+ * 解码 `[4B UInt32BE jsonLen][UTF-8 JSON][raw bytes...]` 二进制封包并还原
+ * `Uint8Array` 附件；严格校验长度边界、附件计数与原型污染键。
+ */
+export declare function decodeBinaryEnvelope(bytes: Uint8Array): Record<string, unknown>;
 //# sourceMappingURL=invoke-binary.d.ts.map
