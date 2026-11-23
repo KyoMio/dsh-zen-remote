@@ -1367,3 +1367,100 @@ test('T3: relayHandlerWaitMs waits for late-mounted relayHandler without 503, de
     assert.equal(clock.pendingCount(), 0, 'closing mux while waiting must clear all handler wait timers')
   }
 })
+
+test('Task 3: PeerMux inbound req Readable._read() admits chunk during pull so backpressured >64 KiB body drains without stalling', { timeout: 3000 }, async (t) => {
+  const clock = makeFakeClock(8_000_000)
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  // 96 KiB: fits within ARQ window/rx.buffered. With fake clock (no RTO firing),
+  // A sends all DATA frames while B's req hits >= 64 KiB highWaterMark and holds
+  // the rest in rx.buffered. Without reqPulling, B's req.read(32 KiB) calls
+  // _read() before subtracting 32 KiB, sees readableLength >= 64 KiB, refuses
+  // the chunk, and deadlocks state.reading=true with zero future DATA frames.
+  const payload = Buffer.alloc(96 * 1024, 0x61)
+
+  let reqRef
+  let settledBodyResolve
+  const bodyPromise = new Promise((resolve) => { settledBodyResolve = resolve })
+
+  let A, B
+  A = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: a,
+    clock,
+    sendGatewayBinary: null,
+    relayHandler: () => undefined,
+    relaySecret: () => 'test-secret',
+  })
+  B = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: b,
+    clock,
+    sendGatewayBinary: null,
+    relayHandler: () => async (req, res) => {
+      reqRef = req
+      const chunks = await bodyPromise
+      res.writeHead(200, { 'content-type': 'text/plain' })
+      res.end(String(Buffer.concat(chunks).byteLength))
+    },
+    relaySecret: () => 'test-secret',
+  })
+  t.after(() => { A.close(); B.close() })
+
+  A.ensureSession(b.nodeId, b.publicKeyHex, 'B')
+  B.ensureSession(a.nodeId, a.publicKeyHex, 'A')
+  A.setDirectPath(b.nodeId, (ft, sid, p, ack) => setImmediate(() => B.handleOpenedFrame({ srcNodeId: a.nodeId, frameType: ft, streamId: sid, ack }, p)))
+  B.setDirectPath(a.nodeId, (ft, sid, p, ack) => setImmediate(() => A.handleOpenedFrame({ srcNodeId: b.nodeId, frameType: ft, streamId: sid, ack }, p)))
+
+  const pendingRes = A.createFetchForPeer(b.nodeId)('http://peer/upload-backpressure', {
+    method: 'POST',
+    body: payload,
+  })
+  pendingRes.catch(() => {})
+
+  const sessionB = B.sessions.get(a.nodeId)
+  const deadline = Date.now() + 2000
+  while (Date.now() < deadline) {
+    const rx = sessionB.arq.rxStreams.values().next().value
+    if (reqRef && reqRef.readableLength >= 64 * 1024 && rx && rx.buffered.size >= 1) {
+      break
+    }
+    await new Promise((r) => setTimeout(r, 5))
+  }
+  assert.ok(reqRef && reqRef.readableLength >= 64 * 1024, 'expected req to buffer >= 64 KiB before consumer reads')
+
+  // Partial read of 32 KiB: Node Readable calls _read() BEFORE subtracting 32 KiB from state.length!
+  const chunks = []
+  let ended = false
+  const first = reqRef.read(32 * 1024)
+  assert.ok(first !== null && first.byteLength === 32 * 1024)
+  chunks.push(first)
+
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`inbound req stalled with readableLength=${reqRef.readableLength}, ended=${ended}`)), 400)
+    reqRef.on('readable', () => {
+      let c
+      while ((c = reqRef.read(32 * 1024)) !== null) {
+        chunks.push(c)
+      }
+    })
+    reqRef.on('end', () => {
+      ended = true
+      clearTimeout(timer)
+      resolve()
+    })
+    reqRef.on('error', (err) => {
+      clearTimeout(timer)
+      reject(err)
+    })
+    let c
+    while ((c = reqRef.read(32 * 1024)) !== null) {
+      chunks.push(c)
+    }
+  })
+
+  settledBodyResolve(chunks)
+  const res = await responseWithin(pendingRes)
+  assert.equal(res.status, 200)
+  assert.equal(await res.text(), String(payload.byteLength))
+})

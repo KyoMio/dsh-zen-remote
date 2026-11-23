@@ -599,6 +599,148 @@ function headerValue(req: IncomingMessage, name: string): string | undefined {
   return typeof value === 'string' ? value : undefined
 }
 
+const PLUGIN_STREAM_CHUNK_BYTES = 65_536
+
+/**
+ * Pipe an upstream plugin response stream into `res` in <=64 KiB slices with
+ * backpressure, then wait for `res.end()` while renewing the drain stall
+ * watchdog on socket/response drain progress up to a bounded hard cap.
+ */
+async function streamPluginResponse(
+  upstream: import('node:stream').Readable,
+  res: ServerResponse,
+  isClientGone: () => boolean,
+  endDrainTimeoutMs: number,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    let writing = false
+    let upstreamEnded = false
+    let settled = false
+    let cleanupWait: (() => void) | undefined
+
+    const finish = (err?: Error): void => {
+      if (settled) return
+      settled = true
+      cleanupWait?.()
+      res.off('close', onResClose)
+      upstream.off('data', onData)
+      upstream.off('end', onEnd)
+      upstream.off('error', onError)
+      if (err !== undefined) reject(err)
+      else resolve()
+    }
+
+    const onResClose = (): void => {
+      upstream.destroy()
+      finish()
+    }
+
+    const writeSliceLoop = (buf: Buffer, offset: number): void => {
+      while (offset < buf.length) {
+        if (settled || isClientGone() || res.destroyed || res.writableEnded) {
+          upstream.destroy()
+          finish()
+          return
+        }
+        const end = Math.min(offset + PLUGIN_STREAM_CHUNK_BYTES, buf.length)
+        const slice = offset === 0 && end === buf.length ? buf : buf.subarray(offset, end)
+        offset = end
+        if (!res.write(slice)) {
+          upstream.pause()
+          const onDrain = (): void => {
+            cleanupWait?.()
+            cleanupWait = undefined
+            writeSliceLoop(buf, offset)
+          }
+          cleanupWait = () => res.off('drain', onDrain)
+          res.once('drain', onDrain)
+          return
+        }
+      }
+      writing = false
+      if (upstreamEnded) {
+        finish()
+      } else if (!settled) {
+        upstream.resume()
+      }
+    }
+
+    const onData = (chunk: Buffer): void => {
+      if (settled || isClientGone() || res.destroyed || res.writableEnded) {
+        upstream.destroy()
+        finish()
+        return
+      }
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      if (buf.length > PLUGIN_STREAM_CHUNK_BYTES) {
+        writing = true
+        upstream.pause()
+      }
+      writeSliceLoop(buf, 0)
+    }
+
+    const onEnd = (): void => {
+      upstreamEnded = true
+      if (!writing) finish()
+    }
+
+    const onError = (err: Error): void => {
+      finish(err)
+    }
+
+    res.once('close', onResClose)
+    upstream.on('data', onData)
+    upstream.on('end', onEnd)
+    upstream.on('error', onError)
+  })
+
+  await new Promise<void>((resolve) => {
+    if (res.writableEnded || res.destroyed) {
+      resolve()
+      return
+    }
+    const hardCapMs =
+      endDrainTimeoutMs >= 1000 ? Math.max(endDrainTimeoutMs * 12, 120_000) : endDrainTimeoutMs * 12
+    const deadlineAt = Date.now() + hardCapMs
+    const socket = res.socket
+    let watchdog: ReturnType<typeof setTimeout> | undefined
+    const destroyRes = (): void => {
+      try {
+        res.destroy()
+      } catch {
+        // Already gone.
+      }
+    }
+    const armWatchdog = (): void => {
+      if (watchdog !== undefined) clearTimeout(watchdog)
+      const remaining = deadlineAt - Date.now()
+      if (remaining <= 0) {
+        destroyRes()
+        return
+      }
+      watchdog = setTimeout(destroyRes, Math.min(endDrainTimeoutMs, remaining))
+      if (typeof watchdog.unref === 'function') watchdog.unref()
+    }
+    const onDrain = (): void => {
+      if (!res.destroyed) armWatchdog()
+    }
+    const settled = (): void => {
+      if (watchdog !== undefined) clearTimeout(watchdog)
+      res.off('drain', onDrain)
+      if (socket && socket !== (res as unknown)) socket.off('drain', onDrain)
+      res.off('finish', settled)
+      res.off('close', settled)
+      resolve()
+    }
+    res.on('drain', onDrain)
+    if (socket && socket !== (res as unknown)) socket.on('drain', onDrain)
+    res.once('finish', settled)
+    res.once('close', settled)
+    armWatchdog()
+    res.end()
+  })
+}
+
 /** The streaming upload pump behind `v1/upload`: the client's chunks are
  * re-emitted into a
  * synthetic body verbatim, counted on the way through, with real
@@ -692,7 +834,7 @@ function pumpUploadBody(
     cancel: () => {
       req.pause()
     },
-  })
+  }, new ByteLengthQueuingStrategy({ highWaterMark: 65_536 }))
   return {
     body,
     received: () => received,
@@ -2229,42 +2371,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               ...(outbound.cacheControl !== undefined ? { 'Cache-Control': outbound.cacheControl } : {}),
               ...outbound.extraHeaders,
             })
-            await new Promise<void>((resolve, reject) => {
-              const upstream = outbound.stream
-              upstream.on('data', (chunk: Buffer) => {
-                if (adapterGone || res.destroyed || res.writableEnded) {
-                  upstream.destroy()
-                  return
-                }
-                if (!res.write(chunk)) {
-                  upstream.pause()
-                  res.once('drain', () => upstream.resume())
-                }
-              })
-              upstream.on('end', () => resolve())
-              upstream.on('error', reject)
-            })
-            await new Promise<void>((resolve) => {
-              if (res.writableEnded || res.destroyed) {
-                resolve()
-                return
-              }
-              const watchdog = setTimeout(() => {
-                try {
-                  res.destroy()
-                } catch {
-                  // Already gone.
-                }
-              }, endDrainTimeoutMs)
-              if (typeof watchdog.unref === 'function') watchdog.unref()
-              const settled = (): void => {
-                clearTimeout(watchdog)
-                resolve()
-              }
-              res.once('finish', settled)
-              res.once('close', settled)
-              res.end()
-            })
+            await streamPluginResponse(outbound.stream, res, () => adapterGone, endDrainTimeoutMs)
           } catch (error) {
             if (adapterHangUp.signal.aborted) {
               try {
@@ -2465,47 +2572,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         // instead of racing one more write into a dead socket, and a
         // response 'error' (a write racing a destroyed socket surfaces
         // there) reacts exactly like the hang-up.
-        let clientGoneSeen = false
-        await new Promise<void>((resolve, reject) => {
-          const upstream = outbound.stream
-          upstream.on('data', (chunk: Buffer) => {
-            if (clientGone || res.destroyed || res.writableEnded) {
-              upstream.destroy()
-              return
-            }
-            if (!res.write(chunk)) {
-              upstream.pause()
-              res.once('drain', () => upstream.resume())
-            }
-          })
-          upstream.on('end', () => resolve())
-          upstream.on('error', reject)
-        })
-        // The v1/stream finish discipline (T43-A): the tail is in the
-        // kernel's hands now, and a client that stopped reading must not
-        // pin this device slot forever — one watchdog, disarmed by `finish`
-        // (the honest drained signal) or `close`, destroys otherwise.
-        await new Promise<void>((resolve) => {
-          if (res.writableEnded || res.destroyed) {
-            resolve()
-            return
-          }
-          const watchdog = setTimeout(() => {
-            try {
-              res.destroy()
-            } catch {
-              // Already gone.
-            }
-          }, endDrainTimeoutMs)
-          if (typeof watchdog.unref === 'function') watchdog.unref()
-          const settled = (): void => {
-            clearTimeout(watchdog)
-            resolve()
-          }
-          res.once('finish', settled)
-          res.once('close', settled)
-          res.end()
-        })
+        await streamPluginResponse(outbound.stream, res, () => clientGone, endDrainTimeoutMs)
       } catch (error) {
         if (!res.headersSent && bodyGateError !== undefined && bodyGateError.message === 'body-too-large') {
           // The counting gate tripped mid-forward (PB-9): a chunked body

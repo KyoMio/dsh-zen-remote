@@ -114,6 +114,7 @@ interface MuxStream {
   bodyController: ReadableStreamDefaultController<Uint8Array> | null
   /** responder 侧：虚拟请求对象与捕获型响应。 */
   req: Readable | null
+  reqPulling: boolean
   res: ServerResponse | null
   /** 出站方向是否已 FIN（各自方向恰好一次）。 */
   outboundFinished: boolean
@@ -875,7 +876,7 @@ export class PeerMux {
     // accepts bytes, so only the next delivery is stalled.
     if (stream.inboundMetaDone && chunk.byteLength > 0) {
       if (stream.bodyController && (stream.bodyController.desiredSize ?? 0) < chunk.byteLength) return false
-      if (stream.req && stream.req.readableLength >= BODY_HIGH_WATER_BYTES) return false
+      if (stream.req && !stream.reqPulling && stream.req.readableLength >= BODY_HIGH_WATER_BYTES) return false
     }
     this.onFragment(session, stream, chunk, final)
     return true
@@ -955,9 +956,11 @@ export class PeerMux {
       this.materializeInboundRequest(session, stream, meta)
       if (remainder.length > 0 && stream.req !== null) {
         stream.req.push(Buffer.from(remainder))
+        stream.reqPulling = false
       }
     } else if (stream.req !== null && chunk.byteLength > 0) {
       stream.req.push(Buffer.from(chunk))
+      stream.reqPulling = false
     }
     if (final && stream.req !== null && !stream.inboundFinished) {
       stream.inboundFinished = true
@@ -1026,7 +1029,17 @@ export class PeerMux {
     stream: MuxStream,
     meta: RequestMeta,
   ): void {
-    const req = new Readable({ highWaterMark: BODY_HIGH_WATER_BYTES, read: () => { session.arq.resume(stream.streamId) } })
+    const req = new Readable({
+      highWaterMark: BODY_HIGH_WATER_BYTES,
+      read: () => {
+        stream.reqPulling = true
+        try {
+          session.arq.resume(stream.streamId)
+        } finally {
+          stream.reqPulling = false
+        }
+      },
+    })
     Object.assign(req, {
       method: meta.m,
       url: meta.p,
@@ -1245,6 +1258,7 @@ function newStream(streamId: number, initiator: boolean): MuxStream {
     responseReject: null,
     bodyController: null,
     req: null,
+    reqPulling: false,
     res: null,
     outboundFinished: false,
     removeAbortListener: null,

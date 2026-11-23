@@ -780,3 +780,137 @@ test('PB-3: a streamed plugin answer crosses in order with its headers; a mid-st
     await wiring.stop()
   }
 })
+
+test('Task 3: v1/plugin slices >64 KiB chunks and renews endDrainTimeoutMs on drain, while stalled client destroys', { timeout: 4000 }, async () => {
+  const { PassThrough, Writable } = require('node:stream')
+  const largeBuf = Buffer.alloc(1536 * 1024, 0x42) // 1.5 MiB single chunk
+  const smallBuf = Buffer.alloc(32 * 1024, 0x43)
+  const routeDecl = {
+    plugin: 'test-panel',
+    version: '1.0.0',
+    routes: [
+      { path: '/panel/big', scope: 'session' },
+      { path: '/panel/small', scope: 'session' },
+    ],
+  }
+  const bigDigest = normalizeDeclaration(routeDecl).digest
+
+  const home = path.join(ROOT, 'task3-drain')
+  fs.mkdirSync(home, { recursive: true })
+  const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
+  store.share('session-shared')
+  const registry = createBridgeRegistry()
+  registry.register(routeDecl)
+
+  let nextPayload = largeBuf
+  const handler = createRelayHandler({
+    secret: SECRET,
+    store,
+    gateway: { invoke: async () => ({}), stream: async () => (async function* () {})() },
+    serverInfo: { serverId: loadServerId(home), serverName: () => 'test-server', dshVersion: '0.0.0-test' },
+    endDrainTimeoutMs: 40,
+    pluginBridge: {
+      registry,
+      getConsent: () => ({}),
+      loopback: {
+        async request() {
+          const buf = nextPayload
+          const stream = new PassThrough()
+          setImmediate(() => stream.end(buf))
+          return {
+            status: 200,
+            contentType: 'application/octet-stream',
+            contentLength: String(buf.byteLength),
+            stream,
+            extraHeaders: {},
+          }
+        },
+        async openWebSocket() { throw new Error('unused') },
+      },
+    },
+  })
+
+  // 1. Slow actively-draining 1.5 MiB response (>40ms total, <40ms per drain) completes and slices <= 64 KiB
+  nextPayload = largeBuf
+  const req = new PassThrough()
+  req.method = 'POST'
+  req.url = '/_dsh/zen-remote/relay/v1/plugin'
+  req.headers = {
+    ...AUTH,
+    'x-zr-plugin': 'test-panel',
+    'x-zr-plugin-version': '1.0.0',
+    'x-zr-plugin-digest': bigDigest,
+    'x-zr-path': '/panel/big',
+    'x-zr-query': 'sessionId=session-shared',
+    'x-zr-method': 'GET',
+  }
+  req.end()
+  const socketWriteSizes = []
+  const receivedChunks = []
+  let headerParsed = false
+  let rawTail = Buffer.alloc(0)
+  const fakeSocket = new Writable({
+    highWaterMark: 256 * 1024,
+    write(chunk, _enc, cb) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      socketWriteSizes.push(buf.byteLength)
+      if (!headerParsed) {
+        rawTail = Buffer.concat([rawTail, buf])
+        const idx = rawTail.indexOf('\r\n\r\n')
+        if (idx >= 0) {
+          headerParsed = true
+          receivedChunks.push(rawTail.subarray(idx + 4))
+        }
+      } else {
+        receivedChunks.push(buf)
+      }
+      setTimeout(cb, 15)
+    },
+  })
+  const res = new http.ServerResponse(req)
+  res.assignSocket(fakeSocket)
+  // Real http.Server / PeerMux forwards socket drain to ServerResponse while !writableEnded
+  fakeSocket.on('drain', () => {
+    if (!res.destroyed && !res.writableEnded && res.writableLength === 0) {
+      res.emit('drain')
+    }
+  })
+  let finished = false
+  let destroyed = false
+  res.on('finish', () => { finished = true })
+  res.on('close', () => { if (!finished) destroyed = true })
+
+  await handler(req, res)
+  assert.equal(destroyed, false, 'actively draining 1.5 MiB response must not be destroyed by endDrainTimeoutMs')
+  assert.equal(finished, true)
+  assert.equal(Buffer.concat(receivedChunks).byteLength, largeBuf.byteLength)
+  // ServerResponse chunked/raw writes after headers must each be <= 65536 bytes
+  const bodyWrites = socketWriteSizes.slice(1)
+  assert.ok(bodyWrites.length >= 24, `expected >= 24 sliced writes for 1.5 MiB, got ${bodyWrites.length}`)
+  assert.ok(Math.max(...bodyWrites) <= 65536, `expected every write <= 64 KiB, got ${Math.max(...bodyWrites)}`)
+
+  // 2. Stalled client on res.end() that never drains must still be destroyed at endDrainTimeoutMs (40ms)
+  nextPayload = smallBuf
+  const stalledReq = new PassThrough()
+  stalledReq.method = 'POST'
+  stalledReq.url = '/_dsh/zen-remote/relay/v1/plugin'
+  stalledReq.headers = { ...req.headers, 'x-zr-path': '/panel/small' }
+  stalledReq.end()
+  const stalledSocket = new Writable({
+    highWaterMark: 64 * 1024,
+    write(_chunk, _enc, _cb) {
+      // Never invokes cb -> stalled drain on res.end()
+    },
+  })
+  const stalledRes = new http.ServerResponse(stalledReq)
+  stalledRes.assignSocket(stalledSocket)
+  let stalledDestroyed = false
+  stalledRes.on('close', () => { stalledDestroyed = true })
+  const keepAlive = setTimeout(() => {}, 250)
+  try {
+    await handler(stalledReq, stalledRes)
+  } finally {
+    clearTimeout(keepAlive)
+  }
+  assert.equal(stalledDestroyed, true, 'stalled client must still be destroyed by endDrainTimeoutMs watchdog')
+})
