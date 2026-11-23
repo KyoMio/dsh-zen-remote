@@ -155,6 +155,8 @@ export async function startGateway(config: GatewayConfig, options: StartGatewayO
       masterKey,
       stunPorts: () => udpPorts,
       getLatestKnownPluginVersion: () => updateManager.getLatestPluginVersion(),
+      ...(config.trustedProxies !== undefined ? { trustedProxies: config.trustedProxies } : {}),
+      ...(config.maxPreAuthPerIp !== undefined ? { maxPreAuthPerIp: config.maxPreAuthPerIp } : {}),
     });
     const udp = new UdpStunService({
       primaryPort: config.port,

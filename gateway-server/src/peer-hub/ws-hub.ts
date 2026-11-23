@@ -151,6 +151,8 @@ export interface PeerWsHubOptions {
   maxPreAuthSockets?: number;
   /** 单 IP 最大并发未认证 WS 连接数（默认 16） */
   maxPreAuthPerIp?: number;
+  /** 受信任反代 IP 列表（默认空 = 不采信任何代理头，直取 socket.remoteAddress） */
+  trustedProxies?: readonly string[];
   now?: () => number;
   /** 生产实例的真实 UDP STUN 端口供给器：组合根在 UdpStunService.bind() 完成后才返回
    * 实际绑定值（不得用配置值或 HTTP 端口冒充）；返回 null 或缺省时 welcome 不带 stun 字段 */
@@ -296,6 +298,46 @@ function parseName(value: unknown): string | null {
   return trimmed;
 }
 
+function normalizeIp(raw: string | null | undefined): string | null {
+  if (typeof raw !== 'string') return null;
+  let trimmed = raw.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.toLowerCase().startsWith('::ffff:')) {
+    trimmed = trimmed.slice(7);
+  }
+  return trimmed;
+}
+
+function resolvePreAuthClientIp(
+  req: IncomingMessage,
+  trustedProxies: ReadonlySet<string>,
+): string | null {
+  const socketIp = normalizeIp(req.socket.remoteAddress);
+  if (socketIp === null || !trustedProxies.has(socketIp)) {
+    return socketIp;
+  }
+  const cfRaw = req.headers['cf-connecting-ip'];
+  const cfHeader = Array.isArray(cfRaw) ? cfRaw[0] : cfRaw;
+  const cfIp = normalizeIp(cfHeader);
+  if (cfIp !== null) return cfIp;
+
+  const xffRaw = req.headers['x-forwarded-for'];
+  const xffHeader = Array.isArray(xffRaw) ? xffRaw.join(',') : xffRaw;
+  if (typeof xffHeader === 'string' && xffHeader.trim().length > 0) {
+    const parts = xffHeader
+      .split(',')
+      .map((s) => normalizeIp(s))
+      .filter((s): s is string => s !== null);
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const candidate = parts[i] as string;
+      if (!trustedProxies.has(candidate)) {
+        return candidate;
+      }
+    }
+  }
+  return socketIp;
+}
+
 export class PeerWsHub {
   readonly limiter: PeerRateLimiter;
   private readonly store: GatewayStore;
@@ -307,6 +349,7 @@ export class PeerWsHub {
   private readonly preAuthTimeoutMs: number;
   private readonly maxPreAuthSockets: number;
   private readonly maxPreAuthPerIp: number;
+  private readonly trustedProxies: ReadonlySet<string>;
   private readonly now: () => number;
   private nextConnSeq = 0;
   /** 真实 UDP STUN 端口供给器；null 表示组合根未接入（welcome 不带 stun 字段） */
@@ -411,6 +454,11 @@ export class PeerWsHub {
     this.preAuthTimeoutMs = preAuthTimeoutMs;
     this.maxPreAuthSockets = maxPreAuthSockets;
     this.maxPreAuthPerIp = maxPreAuthPerIp;
+    this.trustedProxies = new Set(
+      (options.trustedProxies ?? [])
+        .map((ip) => normalizeIp(ip))
+        .filter((ip): ip is string => ip !== null),
+    );
     this.now = options.now ?? Date.now;
     this.stunPorts = options.stunPorts ?? null;
     if (typeof options.gatewayVersion === 'function') {
@@ -463,7 +511,7 @@ export class PeerWsHub {
         return;
       }
       (socket as { setKeepAlive?: (enable: boolean, initialDelay?: number) => unknown }).setKeepAlive?.(true, 10_000);
-      const remoteIp = req.socket.remoteAddress ?? null;
+      const remoteIp = resolvePreAuthClientIp(req, this.trustedProxies);
       this.wss.handleUpgrade(req, socket, head, (ws) => this.setupConnection(ws, remoteIp));
     });
   }
@@ -605,7 +653,7 @@ export class PeerWsHub {
     const challengeHex = randomBytes(32).toString('hex');
     /** auth 通过后的连接状态；断开清理据此分流 */
     let conn: ConnState | null = null;
-    let phase: 'preauth' | 'authed' | 'closed' = 'preauth';
+    let phase: 'preauth' | 'authenticating' | 'authed' | 'closed' = 'preauth';
     let releasedPreAuth = false;
     const releasePreAuth = (): void => {
       if (releasedPreAuth) return;
@@ -622,7 +670,7 @@ export class PeerWsHub {
     };
     const preAuthTimer = setTimeout(() => {
       this.preAuthTimers.delete(ws);
-      if (phase !== 'preauth') {
+      if (phase !== 'preauth' && phase !== 'authenticating') {
         releasePreAuth();
         return;
       }
@@ -635,10 +683,11 @@ export class PeerWsHub {
     sendJson(ws, { type: 'challenge', challengeHex });
 
     ws.on('message', (data: RawData, isBinary: boolean) => {
-      if (phase !== 'preauth' && phase !== 'authed') return;
+      if (phase === 'closed') return;
       if (conn !== null && conn.state === 'closed') return; // 终态连接（close 握手窗口内）一律拒收
       if (conn !== null) this.touchConnAlive(conn);
       if (isBinary) {
+        if (phase !== 'authed') return;
         this.relayBinary(conn, toBuffer(data));
         return;
       }
@@ -646,16 +695,23 @@ export class PeerWsHub {
       if (message === null) return;
       if (phase === 'preauth') {
         if (message['type'] !== 'auth') return;
-        phase = 'authed'; // 一条连接只受理一次 auth
-        void this.handleAuth(ws, message, challengeHex, remoteIp)
+        phase = 'authenticating'; // 一条连接只受理一次 auth；异步认证期间仍受 preAuthTimer 约束
+        const isAborted = (): boolean => phase === 'closed' || this.closed || ws.readyState !== ws.OPEN;
+        void this.handleAuth(ws, message, challengeHex, remoteIp, isAborted)
           .then((state) => {
-            if (state !== null) conn = state;
+            if (state !== null && !isAborted()) {
+              phase = 'authed';
+              conn = state;
+            } else if (phase === 'authenticating') {
+              phase = 'closed';
+            }
           })
           .finally(() => {
             releasePreAuth();
           });
         return;
       }
+      if (phase !== 'authed') return;
       if (conn !== null && conn.state === 'authorized' && message['type'] === 'path-report') {
         this.handlePathReport(conn, message);
         return;
@@ -886,6 +942,7 @@ export class PeerWsHub {
     message: Record<string, unknown>,
     challengeHex: string,
     remoteIp: string | null,
+    isAborted: () => boolean,
   ): Promise<ConnState | null> {
     const epoch = this.admissionEpoch;
     const networkId = normalizeNetworkId(message['networkId']);
@@ -939,9 +996,10 @@ export class PeerWsHub {
     try {
       network = await this.store.getNetwork(networkId);
     } catch {
-      deny(ws, 'gateway storage unavailable');
+      if (!isAborted()) deny(ws, 'gateway storage unavailable');
       return null;
     }
+    if (isAborted()) return null;
     if (network === null) {
       deny(ws, 'network not found');
       return null;
@@ -954,15 +1012,17 @@ export class PeerWsHub {
     let maxPeersCap: number | undefined;
     try {
       const owner = await this.store.findUserById(network.ownerId);
+      if (isAborted()) return null;
       if (owner !== null && owner.role !== 'admin') {
         const quota = await this.store.resolveEffectiveUserQuota(network.ownerId, this.now());
+        if (isAborted()) return null;
         maxPeersCap = quota.group.maxPeersPerNetwork;
       }
     } catch {
-      deny(ws, 'gateway storage unavailable');
+      if (!isAborted()) deny(ws, 'gateway storage unavailable');
       return null;
     }
-    if (!await this.checkOwnerAdmission(ws, network.ownerId, epoch) || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
+    if (isAborted() || !await this.checkOwnerAdmission(ws, network.ownerId, epoch) || isAborted() || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
     const proof = message['joinKeyProofHex'];
     // PC-03 能力位：节点声明「被暂停时可保留受限控制连接」。旧版节点不带此
     // 字段，维持既有 deny + 关闭语义；多余字段对旧网关无影响（additive）。
@@ -996,6 +1056,7 @@ export class PeerWsHub {
         maxPeersCap,
       });
     } catch (error) {
+      if (isAborted()) return null;
       const code = (error as { code?: string }).code;
       if (code === 'invite-expired') {
         deny(ws, 'invite link expired or exhausted');
@@ -1008,13 +1069,14 @@ export class PeerWsHub {
       deny(ws, code === 'limit-reached' ? 'network is full' : 'join attempt rejected by gateway');
       return null;
     }
+    if (isAborted()) return null;
     if (member === null) {
       deny(ws, 'join key rejected');
       return null;
     }
 
     // Revalidate after the async join write, before any routing/hanging registration.
-    if (!await this.checkOwnerAdmission(ws, network.ownerId, epoch) || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
+    if (!await this.checkOwnerAdmission(ws, network.ownerId, epoch) || isAborted() || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
     // PC-03 fix2：成员代次同步复核——这是最后一个 await 之后的闸，到这里与
     // 注册之间没有任何 await。认证中途落下的状态变化使 member 快照过期：不按
     // 旧状态注册/放行/挂起，直接关闭连接。刻意不发 denied——节点把一切
@@ -1025,6 +1087,7 @@ export class PeerWsHub {
       ws.close(1013, 'membership changed during authentication');
       return null;
     }
+    if (isAborted()) return null;
     const limits = this.resolveNetworkLimits(networkId, preReadSeq, network, {
       maxPeers: network.maxPeers,
       peerDirectMaxRttMs: network.peerDirectMaxRttMs,

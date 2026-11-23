@@ -585,7 +585,7 @@ const RATE_LIMITER_SWEEP_INTERVAL = 64;
  * 每次消费惰性剔除过期时间戳，并低频全表清扫空键，长期运行内存不无限增长。
  */
 export class SlidingWindowRateLimiter {
-  private readonly hits = new Map<string, number[]>();
+  private readonly hits = new Map<string, Array<{ at: number }>>();
   private calls = 0;
 
   constructor(
@@ -595,22 +595,42 @@ export class SlidingWindowRateLimiter {
 
   /** 仅检视当前窗口是否仍有余量（不消耗计数，用于先验防爆破拦截） */
   canConsume(key: string, now: number = Date.now()): boolean {
-    const fresh = (this.hits.get(key) ?? []).filter((t) => t > now - this.windowMs);
+    const fresh = (this.hits.get(key) ?? []).filter((e) => e.at > now - this.windowMs);
     return fresh.length < this.maxRequests;
+  }
+
+  /**
+   * 预留一次配额并返回精确回滚闭包（仅撤回本次条目）；窗口已满返回 null。
+   * 供「先占配额、后写库/发信，失败精确退还」路径使用。
+   */
+  reserve(key: string, now: number = Date.now()): (() => void) | null {
+    this.calls += 1;
+    if (this.calls % RATE_LIMITER_SWEEP_INTERVAL === 0) this.sweep(now);
+    const fresh = (this.hits.get(key) ?? []).filter((e) => e.at > now - this.windowMs);
+    if (fresh.length >= this.maxRequests) {
+      this.hits.set(key, fresh);
+      return null;
+    }
+    const entry = { at: now };
+    fresh.push(entry);
+    this.hits.set(key, fresh);
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      const current = this.hits.get(key);
+      if (current === undefined) return;
+      const idx = current.indexOf(entry);
+      if (idx >= 0) {
+        current.splice(idx, 1);
+        if (current.length === 0) this.hits.delete(key);
+      }
+    };
   }
 
   /** 窗口内配额未满则记账并放行（true）；已满直接拒绝（false，拒绝不计入窗口） */
   tryConsume(key: string, now: number = Date.now()): boolean {
-    this.calls += 1;
-    if (this.calls % RATE_LIMITER_SWEEP_INTERVAL === 0) this.sweep(now);
-    const fresh = (this.hits.get(key) ?? []).filter((t) => t > now - this.windowMs);
-    if (fresh.length >= this.maxRequests) {
-      this.hits.set(key, fresh);
-      return false;
-    }
-    fresh.push(now);
-    this.hits.set(key, fresh);
-    return true;
+    return this.reserve(key, now) !== null;
   }
 
   /** 清空全部计数（测试隔离用） */
@@ -622,7 +642,7 @@ export class SlidingWindowRateLimiter {
   /** 全表清扫：删空键、缩列表，防止长期运行内存无限增长 */
   private sweep(now: number): void {
     for (const [key, hits] of this.hits) {
-      const fresh = hits.filter((t) => t > now - this.windowMs);
+      const fresh = hits.filter((e) => e.at > now - this.windowMs);
       if (fresh.length === 0) this.hits.delete(key);
       else this.hits.set(key, fresh);
     }
@@ -660,22 +680,35 @@ export async function issueAndSendOtp(
   locale: MailLocale,
   deliver = true,
 ): Promise<void> {
-  // Undelivered codes are outside the six-digit input space.
-  const code = deliver ? generateOtpCode() : randomBytes(32).toString('hex');
-  await ctx.store.issueEmailOtp({
-    email,
-    purpose,
-    codeHash: hashOtpCode(ctx.masterKey, purpose, email, code),
-    ttlMs: OTP_TTL_MS,
-    cooldownMs: OTP_COOLDOWN_MS,
-  });
-  if (!deliver) return;
   const emailKey = email.trim().toLowerCase();
-  if (!otpEmailDailyRateLimiter.canConsume(emailKey) || !otpGlobalHourlyRateLimiter.canConsume('global')) {
+  const releaseEmail = otpEmailDailyRateLimiter.reserve(emailKey);
+  if (releaseEmail === null) {
     throw new ApiError(429, 'RATE_LIMITED', 'too many verification code requests, try again later');
   }
-  otpEmailDailyRateLimiter.tryConsume(emailKey);
-  otpGlobalHourlyRateLimiter.tryConsume('global');
+  const releaseGlobal = otpGlobalHourlyRateLimiter.reserve('global');
+  if (releaseGlobal === null) {
+    releaseEmail();
+    throw new ApiError(429, 'RATE_LIMITED', 'too many verification code requests, try again later');
+  }
+  // Undelivered codes are outside the six-digit input space.
+  const code = deliver ? generateOtpCode() : randomBytes(32).toString('hex');
+  try {
+    await ctx.store.issueEmailOtp({
+      email,
+      purpose,
+      codeHash: hashOtpCode(ctx.masterKey, purpose, email, code),
+      ttlMs: OTP_TTL_MS,
+      cooldownMs: OTP_COOLDOWN_MS,
+    });
+  } catch (err) {
+    releaseGlobal();
+    releaseEmail();
+    throw err;
+  }
+  if (!deliver) {
+    releaseGlobal();
+    return;
+  }
   const rendered = renderOtpEmail({
     locale,
     purpose,

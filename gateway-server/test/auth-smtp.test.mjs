@@ -1137,4 +1137,66 @@ describe('忘记密码重置、IP 限流、已登录改密与两步换绑邮箱�
     assert.equal(g2Res.status, 429);
     assertEnvelopeError(g2Res.json, 'RATE_LIMITED');
   });
+
+  test('OTP 限流预留回滚：429 不作废未过期旧码、OTP_COOLDOWN 不耗日/小时配额、deliver=false 保持 429 均等且不消耗全局 SMTP 配额', async (t) => {
+    resetAllRateLimiters();
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    t.after(() => resetAllRateLimiters());
+
+    const preserveEmail = 'preserve-otp@example.com';
+    await handle.store.createUser({ email: preserveEmail, passwordHash: TENANT_HASH, role: 'user' });
+    const sendReset = (email) =>
+      api(handle.base, 'POST', '/api/v1/auth/send-otp', { body: { email, purpose: 'reset_password' } });
+
+    // 1) Issue initial OTP (consumes 1 daily + 1 global)
+    const msgBefore = smtp.state.messages.length;
+    assert.equal((await sendReset(preserveEmail)).status, 200);
+    await waitFor(() => smtp.state.messages.length === msgBefore + 1);
+    const code1 = otpFromMessage(smtp.state.messages.at(-1));
+
+    // 2) Immediate resend hits OTP_COOLDOWN and MUST NOT consume daily or global quota
+    const cd = await sendReset(preserveEmail);
+    assert.equal(cd.status, 429);
+    assertEnvelopeError(cd.json, 'OTP_COOLDOWN');
+    for (let i = 0; i < OTP_EMAIL_DAILY_MAX - 1; i++) {
+      assert.equal(otpEmailDailyRateLimiter.tryConsume(preserveEmail), true, `daily slot ${i + 1} must still be free`);
+    }
+    assert.equal(otpEmailDailyRateLimiter.canConsume(preserveEmail), false);
+    for (let i = 0; i < OTP_GLOBAL_HOURLY_MAX - 1; i++) {
+      assert.equal(otpGlobalHourlyRateLimiter.tryConsume('global'), true, `global slot ${i + 1} must still be free`);
+    }
+    assert.equal(otpGlobalHourlyRateLimiter.canConsume('global'), false);
+
+    // 3) Advance past 60s cooldown while code1 is still valid (<10m); resend fails with 429 RATE_LIMITED,
+    //    and code1 MUST remain valid and consumable for reset-password
+    t.mock.timers.tick(OTP_COOLDOWN_MS + 1000);
+    const rejectedResend = await sendReset(preserveEmail);
+    assert.equal(rejectedResend.status, 429);
+    assertEnvelopeError(rejectedResend.json, 'RATE_LIMITED');
+
+    const resetOk = await api(handle.base, 'POST', '/api/v1/auth/reset-password', {
+      body: { email: preserveEmail, otpCode: code1, newPassword: 'Preserved!Code-742' },
+    });
+    assert.equal(resetOk.status, 200, 'earlier valid OTP must remain consumable after 429 quota rejection');
+
+    // 4) deliver=false (unregistered email): does NOT drain global SMTP quota on 200,
+    //    and still returns uniform 429 RATE_LIMITED when daily or global quota is full
+    resetAllRateLimiters();
+    assert.equal((await sendReset('ghost-nodrain@example.com')).status, 200);
+    for (let i = 0; i < OTP_GLOBAL_HOURLY_MAX; i++) {
+      assert.equal(otpGlobalHourlyRateLimiter.tryConsume('global'), true, 'deliver=false must not drain global quota');
+    }
+    const ghostGlobalBlocked = await sendReset('ghost-global-blocked@example.com');
+    assert.equal(ghostGlobalBlocked.status, 429);
+    assertEnvelopeError(ghostGlobalBlocked.json, 'RATE_LIMITED');
+
+    resetAllRateLimiters();
+    const ghostDailyEmail = 'ghost-daily-blocked@example.com';
+    for (let i = 0; i < OTP_EMAIL_DAILY_MAX; i++) {
+      assert.equal(otpEmailDailyRateLimiter.tryConsume(ghostDailyEmail), true);
+    }
+    const ghostDailyBlocked = await sendReset(ghostDailyEmail);
+    assert.equal(ghostDailyBlocked.status, 429);
+    assertEnvelopeError(ghostDailyBlocked.json, 'RATE_LIMITED');
+  });
 });

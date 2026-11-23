@@ -490,6 +490,7 @@ async function startGateway(opts = {}) {
     ...(opts.preAuthTimeoutMs !== undefined ? { preAuthTimeoutMs: opts.preAuthTimeoutMs } : {}),
     ...(opts.maxPreAuthSockets !== undefined ? { maxPreAuthSockets: opts.maxPreAuthSockets } : {}),
     ...(opts.maxPreAuthPerIp !== undefined ? { maxPreAuthPerIp: opts.maxPreAuthPerIp } : {}),
+    ...(opts.trustedProxies !== undefined ? { trustedProxies: opts.trustedProxies } : {}),
     ...(opts.gatewayVersion !== undefined ? { gatewayVersion: opts.gatewayVersion } : {}),
     ...(opts.getLatestKnownPluginVersion !== undefined ? { getLatestKnownPluginVersion: opts.getLatestKnownPluginVersion } : {}),
     ...(opts.wireCompatRange !== undefined ? { wireCompatRange: opts.wireCompatRange } : {}),
@@ -3943,6 +3944,111 @@ describe('T8：gateway-relay-backpressure-perf（控制帧免限速、背压、�
       await wsClosed(first);
     } finally {
       await gwGlobalCap.close();
+    }
+  });
+
+  test('慢速存储认证超时（authenticating 阶段 1008 断开且晚到 DB 结果绝不注册）与 trustedProxies 门控', async () => {
+    // 1) Slow DB during handleAuth exceeds preAuthTimeoutMs -> 1008 timeout & no late registration
+    const gwSlow = await startGateway({ preAuthTimeoutMs: 50 });
+    let releaseLookup;
+    try {
+      const net = await createNetwork(gwSlow, { mode: 'key' });
+      const origGetNetwork = gwSlow.store.getNetwork.bind(gwSlow.store);
+      const gate = new Promise((resolve) => {
+        releaseLookup = resolve;
+      });
+      gwSlow.store.getNetwork = async (id) => {
+        await gate;
+        return origGetNetwork(id);
+      };
+
+      const a = identity();
+      const ws = await wsOpen(gwSlow.base);
+      const closedPromise = new Promise((resolve) => {
+        ws.once('close', (code, reason) => resolve({ code, reason: reason.toString('utf8') }));
+      });
+      await authNode(ws, a, { networkId: net.id, joinKey: net.joinKey });
+      const closeRes = await closedPromise;
+      assert.equal(closeRes.code, 1008);
+      assert.equal(closeRes.reason, 'auth timeout');
+
+      releaseLookup();
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      assert.equal(gwSlow.hub.getOnlineCountByNetwork(net.id), 0, 'late DB result must not register conn');
+      assert.equal(gwSlow.hub.preAuthSockets.size, 0);
+      assert.equal(gwSlow.hub.preAuthCountByIp.size, 0);
+    } finally {
+      releaseLookup?.();
+      await gwSlow.close();
+    }
+
+    // 2a) Without trustedProxies, spoofed X-Forwarded-For still shares the socket IP limit
+    const gwUntrusted = await startGateway({
+      preAuthTimeoutMs: 5_000,
+      maxPreAuthSockets: 10,
+      maxPreAuthPerIp: 1,
+    });
+    try {
+      const ws1 = new WebSocket(gwUntrusted.base.replace(/^http/, 'ws') + '/peer/v1/ws', {
+        headers: { 'x-forwarded-for': '203.0.113.10' },
+      });
+      await new Promise((resolve, reject) => {
+        ws1.once('open', resolve);
+        ws1.once('error', reject);
+      });
+      const ws2 = new WebSocket(gwUntrusted.base.replace(/^http/, 'ws') + '/peer/v1/ws', {
+        headers: { 'x-forwarded-for': '203.0.113.11' },
+      });
+      const ws2Close = await new Promise((resolve, reject) => {
+        ws2.once('close', (code, reason) => resolve({ code, reason: reason.toString('utf8') }));
+        ws2.once('error', reject);
+      });
+      assert.equal(ws2Close.code, 1013);
+      assert.equal(ws2Close.reason, 'too many pending connections');
+      ws1.close();
+      await new Promise((resolve) => ws1.once('close', resolve));
+    } finally {
+      await gwUntrusted.close();
+    }
+
+    // 2b) With trustedProxies, distinct X-Forwarded-For clients behind one proxy get separate buckets
+    const gwTrusted = await startGateway({
+      preAuthTimeoutMs: 5_000,
+      maxPreAuthSockets: 10,
+      maxPreAuthPerIp: 1,
+      trustedProxies: ['127.0.0.1'],
+    });
+    try {
+      const openWithXff = (xff) => new Promise((resolve, reject) => {
+        const client = new WebSocket(gwTrusted.base.replace(/^http/, 'ws') + '/peer/v1/ws', {
+          headers: { 'x-forwarded-for': xff },
+        });
+        attachWsDispatcher(client);
+        client.once('open', () => resolve(client));
+        client.once('error', reject);
+      });
+
+      const c1 = await openWithXff('198.51.100.1');
+      const c2 = await openWithXff('198.51.100.2');
+      assert.equal(gwTrusted.hub.preAuthSockets.size, 2);
+      assert.equal(gwTrusted.hub.preAuthCountByIp.get('198.51.100.1'), 1);
+      assert.equal(gwTrusted.hub.preAuthCountByIp.get('198.51.100.2'), 1);
+
+      const c3 = new WebSocket(gwTrusted.base.replace(/^http/, 'ws') + '/peer/v1/ws', {
+        headers: { 'x-forwarded-for': '198.51.100.1' },
+      });
+      const c3Close = await new Promise((resolve, reject) => {
+        c3.once('close', (code, reason) => resolve({ code, reason: reason.toString('utf8') }));
+        c3.once('error', reject);
+      });
+      assert.equal(c3Close.code, 1013);
+      assert.equal(c3Close.reason, 'too many pending connections');
+
+      c1.close();
+      c2.close();
+      await Promise.all([wsClosed(c1), wsClosed(c2)]);
+    } finally {
+      await gwTrusted.close();
     }
   });
 });

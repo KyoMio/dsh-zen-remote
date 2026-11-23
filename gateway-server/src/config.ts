@@ -33,6 +33,10 @@ export interface GatewayConfig {
   relayRateKbps: number;
   /** 容器内自动更新初始开关，env `ZR_GATEWAY_AUTO_UPDATE`（仅 'false'/'0' 为 false），默认 true */
   autoUpdateEnabled?: boolean;
+  /** 受信任反代 IP 列表（env `ZR_GATEWAY_TRUSTED_PROXIES`，逗号分隔），未配则不采信代理头 */
+  trustedProxies?: string[];
+  /** 单 IP 最大并发未认证 WS 连接数（env `ZR_GATEWAY_MAX_PRE_AUTH_PER_IP`），缺省用 hub 默认值 16 */
+  maxPreAuthPerIp?: number;
 }
 
 type Env = Record<string, string | undefined>;
@@ -68,6 +72,16 @@ export function resolveGatewayConfig(env: Env = process.env, cwd: string = proce
   const certDirRaw = optionalNonEmpty(env, 'ZR_GATEWAY_CERT_DIR');
   const allowSignupRaw = env['ZR_GATEWAY_ALLOW_SIGNUP'];
   const autoUpdateRaw = env['ZR_GATEWAY_AUTO_UPDATE'];
+  const trustedProxiesRaw = optionalNonEmpty(env, 'ZR_GATEWAY_TRUSTED_PROXIES');
+  const trustedProxies =
+    trustedProxiesRaw !== undefined
+      ? trustedProxiesRaw.split(',').map((s) => s.trim()).filter((s) => s.length > 0)
+      : undefined;
+  const maxPreAuthPerIpRaw = optionalNonEmpty(env, 'ZR_GATEWAY_MAX_PRE_AUTH_PER_IP');
+  const maxPreAuthPerIp =
+    maxPreAuthPerIpRaw !== undefined
+      ? intInRange(env, 'ZR_GATEWAY_MAX_PRE_AUTH_PER_IP', 16, 1, 65535)
+      : undefined;
 
   return {
     port,
@@ -83,5 +97,7 @@ export function resolveGatewayConfig(env: Env = process.env, cwd: string = proce
     maxNetworksPerUser: intInRange(env, 'ZR_GATEWAY_MAX_NETWORKS_PER_USER', 3, 1, 50),
     relayRateKbps: intInRange(env, 'ZR_GATEWAY_RELAY_RATE_KBPS', 4096, 64, 1048576),
     autoUpdateEnabled: autoUpdateRaw !== 'false' && autoUpdateRaw !== '0',
+    ...(trustedProxies !== undefined ? { trustedProxies } : {}),
+    ...(maxPreAuthPerIp !== undefined ? { maxPreAuthPerIp } : {}),
   };
 }
