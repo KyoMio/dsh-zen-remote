@@ -1300,10 +1300,14 @@ export class PeerWsHub {
       return;
     }
     const effectiveRateKbps = quota === null ? this.rateKbps : quota.relayRateKbps;
+    const controlRateBytesPerSec = Math.min(
+      512 * 1024,
+      Math.max(64 * 1024, Math.ceil(effectiveRateKbps * 1024 * 0.12)),
+    );
     const scope = { networkId: conn.networkId, nodeId: conn.nodeId, peerNodeId: header.dstNodeId };
     const allowed = isDataFrame
       ? this.limiter.tryRelay(scope, buf.length, effectiveRateKbps)
-      : this.limiter.tryRelayControl(scope, buf.length);
+      : this.limiter.tryRelayControl(scope, buf.length, controlRateBytesPerSec);
     if (!allowed) {
       return;
     }

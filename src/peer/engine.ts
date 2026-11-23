@@ -291,6 +291,7 @@ const arqProfileForPath = (
   mode: 'lan' | 'p2p' | 'relay',
   smoothedRttMs: number | null,
 ): { windowSize: number; rtoMs: number } => {
+  if (mode === 'relay') return { windowSize: 160, rtoMs: 120 }
   if (mode !== 'p2p') return { windowSize: 64, rtoMs: 120 }
   const rtt = smoothedRttMs ?? 50
   const rtoMs = Math.min(1000, Math.max(120, Math.ceil(rtt * 2 + 50)))
@@ -1243,6 +1244,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     const member = members.get(nodeId)
     if (member === undefined) return
     member.path = 'relay'
+    applyArqProfile(member, 'relay', true)
     mux?.enableRelayPath(nodeId)
     schedulePathReport()
   }

@@ -2542,8 +2542,8 @@ test('T5: one-way UDP blackhole and Ping-ok/Data-blackhole both demote symmetric
     // Now drop only UDP DATA frames (PING/PONG continue passing)
     env.netFilter.dropUdpData = true
     const stalledReq = env.getFetchAtoB()('http://peer/data-blackhole')
-    // Advance ~3.9s for ARQ zero-SACK stall detection (stallSuspectMs=3500, RTO step at 3720ms)
-    await env.stepClock(3_900, 100)
+    // Advance ~4.2s for ARQ zero-SACK stall detection (stallSuspectMs=3500; with Karn SRTT ~50ms stepClock granularity RTO=160->4120ms)
+    await env.stepClock(4_200, 100)
     await waitFor(
       () => env.engineA.status().peers[0]?.path === 'relay' && env.engineB.status().peers[0]?.path === 'relay',
       'ARQ stall on A demotes both A and B to relay within ~3.8s',
@@ -2555,4 +2555,136 @@ test('T5: one-way UDP blackhole and Ping-ok/Data-blackhole both demote symmetric
     const reverseRes = await env.getFetchBtoA()('http://peer/reverse-after-stall')
     assert.equal(await reverseRes.text(), 'ok-from-a')
   }
+})
+
+test('Task 4: relay ARQ profile uses window=160 (p2p stays 16) and onPunchFallback applies relay profile', async (t) => {
+  const clock = manualClock(Date.now())
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-t4-fallback-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const stateFile = path.join(dir, 'peer.json')
+  const identityA = ensurePeerIdentity(stateFile)
+  const identityB = generatePeerIdentity()
+
+  const wsSockets = []
+  let wsDataFrames = 0
+  let muxB
+  const server = http.createServer()
+  server.on('upgrade', (req, socket) => {
+    wsSockets.push(socket)
+    socket.on('error', () => {})
+    let buf = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      for (;;) {
+        const parsed = readClientFrame(buf)
+        if (!parsed) break
+        buf = parsed.rest
+        if (parsed.opcode === 8) { socket.end(); return }
+        if (parsed.opcode === 2) {
+          const frameBuf = Buffer.from(parsed.payload)
+          const hdr = decodeFrameHeader(frameBuf)
+          if (hdr !== null && hdr.frameType === PeerFrameType.HELLO) {
+            muxB?.handleGatewayFrame(frameBuf)
+          } else if (hdr !== null && hdr.frameType === PeerFrameType.DATA) {
+            wsDataFrames += 1
+          }
+          continue
+        }
+        if (parsed.opcode !== 1) continue
+        let msg
+        try { msg = JSON.parse(parsed.payload.toString('utf8')) } catch { continue }
+        if (msg?.type === 'auth') {
+          socket.write(wsFrame({
+            type: 'welcome',
+            status: 'authorized',
+            connSeq: 1,
+            maxPeers: 8,
+            gatewayVersion: '0.2.0',
+            wireCompatLevel: 1,
+            directMaxRttMs: 300,
+            peers: [{
+              nodeId: identityB.nodeId,
+              publicKeyHex: identityB.publicKeyHex,
+              name: 'B',
+              lanEndpoints: ['203.0.113.99:19999'],
+              reflexiveEndpoint: null,
+              connSeq: 1,
+            }],
+          }))
+        }
+      }
+    })
+    const accept = createHash('sha1').update(String(req.headers['sec-websocket-key']) + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64')
+    socket.write(Buffer.concat([
+      Buffer.from(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`),
+      wsFrame({ type: 'challenge', challengeHex: 'a1b2c3d4e5f60718' }),
+    ]))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  writePeerNetwork(stateFile, {
+    networkId: NET_ID,
+    gatewayWsUrl: `ws://127.0.0.1:${port}`,
+    gatewayHttpOrigin: `http://127.0.0.1:${port}`,
+    joinedAt: 1,
+  })
+  t.after(async () => {
+    for (const s of wsSockets) s.destroy()
+    await new Promise((resolve) => server.close(resolve))
+  })
+
+  muxB = new PeerMux({
+    networkId: NET_ID,
+    identity: identityB,
+    clock,
+    sendGatewayBinary: (bytes) => {
+      const payload = Buffer.from(bytes)
+      const hdr = payload.length < 126
+        ? Buffer.from([0x82, payload.length])
+        : Buffer.from([0x82, 126, (payload.length >> 8) & 0xff, payload.length & 0xff])
+      for (const s of wsSockets) if (!s.destroyed) s.write(Buffer.concat([hdr, payload]))
+    },
+    relayHandler: () => async (_req, res) => { res.end('ok') },
+    relaySecret: () => 'secret',
+  })
+  muxB.ensureSession(identityA.nodeId, identityA.publicKeyHex, 'node-A')
+  t.after(() => muxB.close())
+
+  let mountedFetch
+  const engine = createPeerEngine({
+    stateFile,
+    identity: identityA,
+    clock,
+    relayHandler: () => async (_req, res) => { res.end('ok') },
+    relaySecret: () => 'secret',
+    serverName: () => 'node-A',
+    udpProbe: null,
+    relayPool: {
+      maxServers: () => 8,
+      mountVirtual: (input) => {
+        mountedFetch = input.fetchImpl
+        return { entryId: input.entryId, serverId: input.serverId, serverName: input.serverName, displayName: input.serverName }
+      },
+      unmountVirtual: () => true,
+      updateVirtualName: () => true,
+      reconnect: () => Promise.resolve(true),
+    },
+    punch: { punchWindowMs: 200 },
+  })
+  t.after(() => engine.stop())
+  engine.resumeFromState()
+  await waitFor(() => wsSockets.length >= 1 && mountedFetch !== undefined, 'engine mounted peer')
+
+  // Advance past punchWindowMs so onPunchFallback fires and applies relay ARQ profile (window=160)
+  clock.advance(250)
+  await waitFor(() => engine.status().peers[0]?.path === 'relay', 'punch fallback to relay')
+  await waitFor(() => muxB.sessions.get(identityA.nodeId)?.ciphers !== null, 'WS handshake completed')
+
+  // Burst 100 chunks (~110 KiB) without forwarding DATA frames to muxB (no SACKs).
+  // Old window=64 caps at 64 DATA frames; relay window=160 pumps >=100 DATA frames!
+  wsDataFrames = 0
+  const burstPromise = mountedFetch('http://peer/burst-160', { method: 'POST', body: Buffer.alloc(100 * 1100, 0x55) })
+  burstPromise.catch(() => {})
+  await sleep(60)
+  assert.ok(wsDataFrames >= 100, `expected >=100 inflight DATA frames under relay window=160, got ${wsDataFrames}`)
 })

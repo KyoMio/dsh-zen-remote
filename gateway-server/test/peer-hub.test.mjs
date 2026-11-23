@@ -474,7 +474,7 @@ async function openSse(base, path, cookie) {
 
 async function startGateway(opts = {}) {
   const store = new SqliteStore({
-    seed: { allowSignup: false, maxNetworksPerUser: 4, defaultMaxPeers: 8, relayRateKbps: 64 },
+    seed: { allowSignup: false, maxNetworksPerUser: 4, defaultMaxPeers: 8, relayRateKbps: opts.relayRateKbps ?? 64 },
   });
   const masterKey = deriveMasterKeyFromSecret('peer-hub-test');
   const hub = new PeerWsHub({
@@ -4167,6 +4167,39 @@ describe('T2 /peer/v1/ws 双向版本握手与拓扑 pluginVersion', () => {
       wsC.close();
     } finally {
       await gw.close();
+    }
+  });
+
+  test('Task 4: 自适应控制帧桶按配额 12% 扩容（上限 512 KiB/s），低配额仍守 64 KiB/s', async () => {
+    const clock = { now: Date.now() };
+    // High-rate owner: 4096 KB/s -> 4096 * 1024 * 0.12 = 503,317 B/s (> 64 KiB/s)
+    const gwHigh = await startGateway({ now: () => clock.now, relayRateKbps: 4096 });
+    try {
+      const { a, b, wsA, wsB } = await setupPair(gwHigh);
+      // Send 600 x 256B SACK frames = 153,600 B (> 64 KiB/s, < 503,317 B/s)
+      for (let i = 0; i < 600; i += 1) {
+        wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 4, totalBytes: 256 }));
+      }
+      for (let i = 0; i < 600; i += 1) {
+        await wsBinary(wsB);
+      }
+    } finally {
+      await gwHigh.close();
+    }
+
+    // Low-rate owner: 64 KB/s -> floor stays 64 KiB/s -> drops after 64 KiB burst
+    const gwLow = await startGateway({ now: () => clock.now, relayRateKbps: 64 });
+    try {
+      const { a, b, wsA, wsB } = await setupPair(gwLow);
+      for (let i = 0; i < 300; i += 1) { // 300 * 256B = 75 KiB > 64 KiB
+        wsA.send(frame({ src: a.nodeId, dst: b.nodeId, type: 4, totalBytes: 256 }));
+      }
+      for (let i = 0; i < 256; i += 1) {
+        await wsBinary(wsB);
+      }
+      await wsSilence(wsB, 80);
+    } finally {
+      await gwLow.close();
     }
   });
 

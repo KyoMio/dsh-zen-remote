@@ -59,6 +59,8 @@ export declare const ARQ_CHUNK_MAX_BYTES: number;
 export declare const ARQ_DEFAULT_CHUNK_BYTES = 1100;
 /** Default send window: unconfirmed fragments in flight per stream. */
 export declare const ARQ_DEFAULT_WINDOW = 64;
+/** Upper send window bound for high-BDP relay paths (zero wire break; < RX_BUFFER_MAX). */
+export declare const ARQ_MAX_WINDOW = 160;
 /** Default retransmission timeout. */
 export declare const ARQ_DEFAULT_RTO_MS = 120;
 /** RTO exponential backoff ceiling. */
@@ -132,6 +134,7 @@ export declare class PeerArqSession {
     private readonly txStreams;
     private readonly rxStreams;
     private closed;
+    private srttMs;
     private readonly onStreamClosed;
     private readonly onAdmissionClosed;
     private readonly onStallSuspected;
@@ -187,7 +190,7 @@ export declare class PeerArqSession {
     /** Whether the inbound side of `streamId` has delivered its FIN. */
     isRxComplete(streamId: number): boolean;
     /**
-     * Dynamically adjust send window [1..64] and initial RTO [120..rtoMaxMs]
+     * Dynamically adjust send window [1..ARQ_MAX_WINDOW] and initial RTO [120..rtoMaxMs]
      * for the active transport leg without tearing down in-flight frames.
      */
     setTransportProfile(profile: {
@@ -223,6 +226,8 @@ export declare class PeerArqSession {
     private trySendFrame;
     private ensureTx;
     private currentAck;
+    private effectiveInitialRto;
+    private recordRttSample;
     private pump;
     private onRto;
     private onData;

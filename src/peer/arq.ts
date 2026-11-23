@@ -62,6 +62,8 @@ export const ARQ_CHUNK_MAX_BYTES = PEER_MAX_PLAINTEXT_BYTES - STREAM_HEADER_BYTE
 export const ARQ_DEFAULT_CHUNK_BYTES = 1100
 /** Default send window: unconfirmed fragments in flight per stream. */
 export const ARQ_DEFAULT_WINDOW = 64
+/** Upper send window bound for high-BDP relay paths (zero wire break; < RX_BUFFER_MAX). */
+export const ARQ_MAX_WINDOW = 160
 /** Default retransmission timeout. */
 export const ARQ_DEFAULT_RTO_MS = 120
 /** RTO exponential backoff ceiling. */
@@ -143,6 +145,8 @@ interface TxFragment {
   waiters: TxWaiter[]
   finWaiter: TxWaiter | null
   rto: number
+  sentAt: number
+  retransmitted: boolean
   timer: unknown
 }
 
@@ -250,6 +254,7 @@ export class PeerArqSession {
   private readonly txStreams = new Map<number, TxStream>()
   private readonly rxStreams = new Map<number, RxStream>()
   private closed = false
+  private srttMs: number | null = null
   private readonly onStreamClosed: PeerArqOptions['onStreamClosed']
   private readonly onAdmissionClosed: PeerArqOptions['onAdmissionClosed']
   private readonly onStallSuspected: PeerArqOptions['onStallSuspected']
@@ -489,7 +494,7 @@ export class PeerArqSession {
   }
 
   /**
-   * Dynamically adjust send window [1..64] and initial RTO [120..rtoMaxMs]
+   * Dynamically adjust send window [1..ARQ_MAX_WINDOW] and initial RTO [120..rtoMaxMs]
    * for the active transport leg without tearing down in-flight frames.
    */
   setTransportProfile(profile: { windowSize?: number; rtoMs?: number }): void {
@@ -500,7 +505,7 @@ export class PeerArqSession {
       if (!Number.isInteger(profile.windowSize)) {
         throw new RangeError('windowSize must be a finite integer')
       }
-      nextWindow = Math.min(ARQ_DEFAULT_WINDOW, Math.max(1, profile.windowSize))
+      nextWindow = Math.min(ARQ_MAX_WINDOW, Math.max(1, profile.windowSize))
     }
     if (profile.rtoMs !== undefined) {
       if (!Number.isInteger(profile.rtoMs)) {
@@ -512,6 +517,7 @@ export class PeerArqSession {
     const grew = nextWindow > this.windowSize
     this.windowSize = nextWindow
     this.rtoMs = nextRto
+    this.srttMs = null
     if (grew) {
       for (const [sid, tx] of this.txStreams) {
         this.pump(sid, tx)
@@ -537,6 +543,7 @@ export class PeerArqSession {
       for (const [seq, frag] of tx.inflight) {
         this.clock.clearTimeout(frag.timer)
         frag.rto = this.rtoMs
+        frag.retransmitted = true
         frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
         this.trySendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
       }
@@ -585,8 +592,12 @@ export class PeerArqSession {
   resume(streamId: number): void {
     const rx = this.rxStreams.get(streamId)
     if (!rx) return
+    const beforeExpected = rx.expected
+    const beforeBuffered = rx.buffered.size
     this.flush(streamId, rx)
-    this.sendSack(streamId, rx)
+    if (rx.expected !== beforeExpected || rx.buffered.size !== beforeBuffered) {
+      this.sendSack(streamId, rx)
+    }
   }
 
   private isRetired(id: number): boolean {
@@ -712,6 +723,17 @@ export class PeerArqSession {
     return this.rxStreams.get(streamId)?.expected ?? 0
   }
 
+  private effectiveInitialRto(): number {
+    if (this.srttMs === null) return this.rtoMs
+    return Math.min(this.rtoMaxMs, Math.max(this.rtoMs, Math.ceil(this.srttMs * 2 + 60)))
+  }
+
+  private recordRttSample(frag: TxFragment, now: number): void {
+    if (frag.retransmitted) return
+    const sample = Math.max(0, now - frag.sentAt)
+    this.srttMs = this.srttMs === null ? sample : this.srttMs * 0.75 + sample * 0.25
+  }
+
   private pump(streamId: number, tx: TxStream): void {
     if (this.closed) return
     while (tx.inflight.size < this.windowSize && tx.nextSeq - tx.cumulative < this.windowSize && tx.queue.length > 0) {
@@ -720,25 +742,27 @@ export class PeerArqSession {
       const subheader = Buffer.alloc(STREAM_HEADER_BYTES)
       subheader[0] = queued.fin ? STREAM_FLAG_FIN : 0
       subheader.writeUInt32BE(seq, 1)
+      const now = this.clock.now()
       const frag: TxFragment = {
         seq,
         payload: Buffer.concat([subheader, queued.data]),
         waiters: queued.waiters,
         finWaiter: queued.finWaiter,
-        rto: this.rtoMs,
+        rto: this.effectiveInitialRto(),
+        sentAt: now,
+        retransmitted: false,
         timer: null,
       }
       frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
       const wasEmpty = tx.inflight.size === 0
       tx.inflight.set(seq, frag)
       if (wasEmpty) {
-        const now = this.clock.now()
         tx.inflightSince = now
         tx.lastAckOrSackAt = now
         tx.stallReported = false
       }
       if (tx.progressTimer === null) {
-        tx.lastProgressAt = this.clock.now()
+        tx.lastProgressAt = now
         this.armProgress(streamId, tx)
       }
       this.trySendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
@@ -769,6 +793,7 @@ export class PeerArqSession {
         return
       }
     }
+    frag.retransmitted = true
     frag.rto = Math.min(frag.rto * 2, this.rtoMaxMs)
     frag.timer = this.clock.setTimeout(() => this.onRto(streamId, seq), frag.rto)
     this.trySendFrame(PeerFrameType.DATA, streamId, frag.payload, this.currentAck(streamId))
@@ -885,16 +910,18 @@ export class PeerArqSession {
     if (ack <= 0) return
     const tx = this.txStreams.get(streamId)
     if (!tx || ack < tx.cumulative || ack > tx.nextSeq) return
-    tx.lastAckOrSackAt = this.clock.now()
+    const now = this.clock.now()
+    tx.lastAckOrSackAt = now
     tx.stallReported = false
     if (ack > tx.cumulative) {
       tx.cumulative = ack
-      tx.lastProgressAt = this.clock.now()
+      tx.lastProgressAt = now
       this.armProgress(streamId, tx)
     }
     for (const [seq, frag] of tx.inflight) {
       if (seq < ack) {
         this.clock.clearTimeout(frag.timer)
+        this.recordRttSample(frag, now)
         tx.inflight.delete(seq)
         this.settle(tx, frag)
       }
@@ -916,6 +943,7 @@ export class PeerArqSession {
     const frag = tx?.inflight.get(seq)
     if (!tx || !frag || frag.finWaiter) return // FIN needs cumulative delivery confirmation
     this.clock.clearTimeout(frag.timer)
+    this.recordRttSample(frag, this.clock.now())
     tx.inflight.delete(seq)
     this.settle(tx, frag)
     this.pump(streamId, tx)

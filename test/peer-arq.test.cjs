@@ -847,7 +847,7 @@ test('T4: setTransportProfile dynamically bounds inflight window and initial RTO
     // Clamping bounds and invalid inputs:
     assert.throws(() => session.setTransportProfile({ windowSize: 1.5 }), RangeError)
     assert.throws(() => session.setTransportProfile({ rtoMs: NaN }), RangeError)
-    session.setTransportProfile({ windowSize: 200, rtoMs: 2500 }) // clamps to [1..64] and [120..1000]
+    session.setTransportProfile({ windowSize: 200, rtoMs: 2500 }) // clamps to [1..160] and [120..1000]
     assert.equal(session.inflightTotal(), 64, 'widening window back to 64 immediately pumps queued fragments')
     assert.equal(session.queuedTotal(), 0)
     session.closeAll()
@@ -1325,4 +1325,83 @@ test('T2.4: synchronous flushInflight() inside onStallSuspected neither double-s
   session.closeAll()
   r.session.closeAll()
   throwing.session.closeAll()
+})
+
+test('Task 4: resume() omits duplicate SACK on no-op flush, Karn SRTT adapts initial RTO, and window scales to ARQ_MAX_WINDOW=160', async () => {
+  // 1. resume() omits SACK when rx.expected and rx.buffered.size do not change
+  {
+    let allowDeliver = false
+    const { session, sent } = makeSession({
+      chunkSize: 100,
+      onStreamData: () => allowDeliver,
+    })
+    // Deliver seq 0 while consumer rejects -> buffered at seq 0, 1 SACK emitted by onData
+    const h0 = Buffer.alloc(5 + 10)
+    h0.writeUInt32BE(0, 1)
+    session.handleFrame(PeerFrameType.DATA, 1, h0, 0)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 1)
+
+    // Calling resume() while consumer still refuses must NOT emit a duplicate SACK
+    session.resume(1)
+    session.resume(1)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 1, 'no-op resume() must not emit duplicate SACK')
+
+    // Once consumer accepts, resume() advances rx.expected and emits 1 SACK
+    allowDeliver = true
+    session.resume(1)
+    assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 2)
+    session.closeAll()
+  }
+
+  // 2. Karn SRTT adapts initial RTO at 350ms RTT, ignores retransmitted samples, and resets on setTransportProfile
+  {
+    const { session, sent, clock } = makeSession({ chunkSize: 100, rtoMs: 120, rtoMaxMs: 1000 })
+    const p1 = session.write(1, Buffer.alloc(100, 0x11))
+    assert.equal(sent.length, 1)
+
+    // First transmission retransmits at 120ms and 120+240=360ms (retransmitted = true)
+    clock.advance(120)
+    assert.equal(sent.length, 2)
+    // ACK arrives at 350ms for retransmitted frag -> Karn's rule ignores RTT sample, srttMs stays null
+    clock.advance(230)
+    session.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), 1)
+    await p1
+
+    // Verify Karn's rule: srttMs stayed null, so a fresh fragment at rtoMs=120 still retransmits at 120ms
+    const beforeKarnCheck = sent.length
+    const pCheck = session.write(1, Buffer.alloc(100, 0x1a))
+    clock.advance(119)
+    assert.equal(sent.length, beforeKarnCheck + 1)
+    clock.advance(1)
+    assert.equal(sent.length, beforeKarnCheck + 2, 'Karn rule: retransmitted ACK must not inflate srttMs')
+    session.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), 2)
+    await pCheck
+
+    // Sample clean 350ms first-tx RTT with rtoMs: 400 -> srtt adapts to ceil(350*2+60)=760ms
+    session.setTransportProfile({ rtoMs: 400 })
+    const beforeP2 = sent.length
+    const p2 = session.write(1, Buffer.alloc(100, 0x22))
+    clock.advance(350) // < 400ms, so NOT retransmitted
+    session.handleFrame(PeerFrameType.ACK, 1, Buffer.alloc(0), 3)
+    await p2
+
+    // Now srttMs = 350ms -> adapted RTO = Math.ceil(350 * 2 + 60) = 760ms
+    const p3 = session.write(1, Buffer.alloc(100, 0x33))
+    p3.catch(() => {})
+    assert.equal(sent.length, beforeP2 + 2) // 1 for p2, 1 for p3
+    clock.advance(759)
+    assert.equal(sent.length, beforeP2 + 2, 'adapted 760ms RTO must not retransmit at 759ms')
+    clock.advance(1)
+    assert.equal(sent.length, beforeP2 + 3, 'retransmits at adapted 760ms RTO')
+
+    // setTransportProfile resets srttMs -> next fragment uses profile rtoMs=120 again
+    session.setTransportProfile({ windowSize: 160, rtoMs: 120 })
+    const p4 = session.write(3, Buffer.alloc(160 * 100, 0x44))
+    p4.catch(() => {})
+    assert.equal(session.inflightTotal(), 161, '160 fragments on stream 3 + 1 on stream 1')
+    const sentBefore120 = sent.length
+    clock.advance(120)
+    assert.ok(sent.length > sentBefore120, 'setTransportProfile resets srttMs so 120ms RTO applies immediately')
+    session.closeAll()
+  }
 })
