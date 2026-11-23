@@ -1121,6 +1121,7 @@ test('RTT cap: two unanswered PINGs demote; loss wipes flag and re-gates re-esta
   env.gateB.dropAll = true
   await env.drain(14000)
   await env.waitLost()
+  const lostAt = env.clock.now()
   assert.equal(env.peerOf().path, 'relay')
   assert.equal(env.peerOf().directDemoted, false)
   assert.equal(env.peerOf().directDemoteReason, null)
@@ -1132,9 +1133,16 @@ test('RTT cap: two unanswered PINGs demote; loss wipes flag and re-gates re-esta
   env.clock.advance(5000)
   await env.waitReady()
   assert.equal(env.peerOf().path, 'relay')
-  await env.sample(150)
-  assert.equal(env.peerOf().path, 'relay')
-  await env.sample(150)
+  // Slice 1: demoteDirect (30s) + onDirectLost (60s) arms exponential relay hold; stay relay until hold expires
+  while (env.clock.now() + KEEPALIVE_MS + 100 < lostAt + 55_000) {
+    await env.sample(150)
+    assert.equal(env.peerOf().path, 'relay')
+  }
+  while (env.clock.now() < lostAt + 65_000) {
+    await env.sample(150)
+  }
+  if (env.peerOf().path !== 'lan') await env.sample(150)
+  if (env.peerOf().path !== 'lan') await env.sample(150)
   assert.equal(env.peerOf().path, 'lan')
   assert.equal(env.peerOf().directRttMs, 150)
 })
@@ -2758,4 +2766,242 @@ test('Slice 1: arqProfileForPath sets p2p AIMD (160/32/16), lan fixed (160), and
     minWindowSize: 16,
     rtoMs: 250,
   })
+})
+
+test('Slice 1: onDirectLost arms relay hold and onDirectReady preserves cooldown', async (t) => {
+  const env = await buildRttPair(t, { cap: 300 })
+  await env.waitReady()
+  await env.sample(50)
+  await env.sample(50)
+  assert.equal(env.peerOf().path, 'lan')
+
+  // Drop all UDP traffic so keepalive times out -> demoteDirect (30s) then onDirectLost (60s)
+  env.gateB.dropAll = true
+  await env.drain(14_000)
+  await env.waitLost()
+  const lostAt = env.clock.now()
+  assert.equal(env.peerOf().path, 'relay')
+
+  // Restore UDP; onDirectReady fires while hold from onDirectLost is active
+  env.gateB.dropAll = false
+  env.gateB.dropFirstPing = true
+  env.logs.length = 0
+  env.clock.advance(5_000)
+  await env.waitReady()
+  assert.equal(env.peerOf().path, 'relay', 'onDirectReady during onDirectLost hold must stay relay')
+
+  // Good RTT samples before hold expires must NOT promote (onDirectReady must not wipe peerRelayHoldUntil)
+  while (env.clock.now() + KEEPALIVE_MS + 100 < lostAt + 55_000) {
+    await env.sample(40)
+    assert.equal(env.peerOf().path, 'relay', 'must stay relay until hold expires')
+  }
+
+  // Advance past hold expiry, then 2 good samples promote back to lan
+  while (env.clock.now() < lostAt + 65_000) {
+    await env.sample(40)
+  }
+  if (env.peerOf().path !== 'lan') await env.sample(40)
+  if (env.peerOf().path !== 'lan') await env.sample(40)
+  assert.equal(env.peerOf().path, 'lan', 'must promote once hold from onDirectLost expires')
+})
+
+test('Slice 1: directCap() === 0 honors active peerRelayHoldUntil in onDirectReady and onRttSample', async (t) => {
+  const env = await buildRttPair(t, { cap: 300 })
+  await env.waitReady()
+  await env.sample(50)
+  await env.sample(50)
+  assert.equal(env.peerOf().path, 'lan')
+
+  // Induce demoteDirect -> 30s hold, then switch cap to 0 (unlimited)
+  await env.sample(2000)
+  await env.sample(2000)
+  assert.equal(env.peerOf().path, 'relay')
+  env.capRef.value = 0
+
+  // Sample during active 30s hold must still stay on relay even though directCap() === 0
+  await env.sample(40)
+  assert.equal(env.peerOf().path, 'relay', 'cap=0 must still honor active peerRelayHoldUntil in onRttSample')
+
+  // Trigger onDirectLost + onDirectReady while hold active and cap=0 -> must remain relay
+  env.gateB.dropAll = true
+  await env.drain(14_000)
+  await env.waitLost()
+  const lostAt = env.clock.now()
+  env.gateB.dropAll = false
+  env.gateB.dropFirstPing = true
+  env.logs.length = 0
+  env.clock.advance(5_000)
+  await env.waitReady()
+  assert.equal(env.peerOf().path, 'relay', 'onDirectReady with cap=0 during hold must stay relay')
+
+  // Samples while inside 60s hold stay relay; once 60s hold expires, cap=0 promotes immediately on next sample
+  while (env.clock.now() + KEEPALIVE_MS + 100 < lostAt + 55_000) {
+    await env.sample(40)
+    assert.equal(env.peerOf().path, 'relay', 'cap=0 must stay relay during onDirectLost hold')
+  }
+  while (env.clock.now() < lostAt + 65_000) {
+    await env.sample(40)
+  }
+  if (env.peerOf().path !== 'lan') await env.sample(40)
+  assert.equal(env.peerOf().path, 'lan', 'cap=0 promotes once hold expires')
+})
+
+test('Slice 1: onEncryptedFrame triggers fast-probe when cap <= 0 after cooldown expires', async (t) => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-fast-probe-cap0-'))
+  const clock = manualClock()
+  const logs = []
+  const capRef = { value: 300 }
+  const stateFileA = path.join(home, 'a-state.json')
+  const socketA = await openUdp()
+  const identityA = ensurePeerIdentity(stateFileA)
+  const socketB = await openUdp()
+  const gateB = makeGate(socketB)
+  gateB.pongDelayMs = 2
+  gateB.dropFirstPing = false
+  const identityB = generatePeerIdentity()
+  const gateway = await startRttGateway({
+    peers: () => [{
+      nodeId: identityB.nodeId,
+      publicKeyHex: identityB.publicKeyHex,
+      name: 'peer-B',
+      lanEndpoints: [endpointOf(socketB)],
+    }],
+  })
+  const engine = createPeerEngine({
+    stateFile: stateFileA,
+    identity: identityA,
+    relayPool: {
+      maxServers: () => 8,
+      mountVirtual: (i) => ({ entryId: i.entryId, serverId: i.serverId, serverName: i.serverName, displayName: i.serverName }),
+      unmountVirtual: () => true,
+      updateVirtualName: () => true,
+      reconnect: () => Promise.resolve(true),
+    },
+    relayHandler: () => undefined,
+    relaySecret: () => 'test',
+    serverName: () => 'node-A',
+    udpSocket: socketA,
+    udpProbe: null,
+    clock,
+    log: (line) => logs.push(line),
+    directMaxRttMs: () => capRef.value,
+    punch: {
+      keepAliveMs: KEEPALIVE_MS,
+      keepAliveLostFrames: 4,
+      reprobeInitialDelaysMs: [5_000, 15_000],
+      reprobeIntervalMs: 800,
+      fastConfirmDelayMs: 50,
+    },
+  })
+  const mgrB = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: identityB,
+    socket: gateB,
+    clock,
+    keepAliveMs: KEEPALIVE_MS,
+    keepAliveLostFrames: 4,
+    reprobeInitialDelaysMs: [5_000, 15_000],
+    reprobeIntervalMs: 800,
+  })
+  await mgrB.ready()
+  writePeerNetwork(stateFileA, {
+    gatewayWsUrl: gateway.wsUrl,
+    gatewayHttpOrigin: `http://127.0.0.1:${gateway.httpPort}`,
+    networkId: NET_ID,
+    joinedAt: 1,
+  })
+  t.after(async () => {
+    const closingB = waitClose(socketB)
+    const closingA = waitClose(socketA)
+    mgrB.close()
+    engine.stop()
+    await closingB
+    await closingA
+    await gateway.close()
+    fs.rmSync(home, { recursive: true, force: true })
+  })
+  engine.resumeFromState()
+  mgrB.beginPunch({ peerNodeId: identityA.nodeId, peerPublicKeyHex: identityA.publicKeyHex, lanEndpoints: [] })
+  const peerOf = () => engine.status().peers.find((p) => p.nodeId === identityB.nodeId)
+  await waitFor(() => logs.some((l) => l.includes('direct ready')), 'ready')
+
+  // Advance keepalives with real PONGs flowing so it promotes to lan
+  for (let i = 0; i < 4 && peerOf()?.path !== 'lan'; i++) {
+    clock.advance(KEEPALIVE_MS)
+    await sleep(15)
+  }
+  assert.equal(peerOf()?.path, 'lan', 'promoted to lan initially')
+
+  // Drop PONGs for 2 keepalives (< 4 keepAliveLostFrames) -> demoteDirect (30s hold)
+  gateB.dropPongs = true
+  for (let i = 0; i < 3 && peerOf()?.path === 'lan'; i++) {
+    clock.advance(KEEPALIVE_MS)
+    await sleep(15)
+  }
+  assert.equal(peerOf()?.path, 'relay', 'demoted to relay via missed pings')
+  gateB.dropPongs = false
+  capRef.value = 0
+
+  // Keep keepalives answered for 8 ticks (28s < 30s hold; next keepalive is at 31.5s)
+  for (let i = 0; i < 8; i++) {
+    clock.advance(KEEPALIVE_MS)
+    await sleep(10)
+  }
+  assert.equal(peerOf()?.path, 'relay', 'cap=0 stays relay during 30s hold')
+  // Advance 2.5s to 30.5s (past 30s hold, before 31.5s keepalive)
+  clock.advance(2_500)
+  assert.equal(peerOf()?.path, 'relay', 'still relay before ACK(0) fast-probe')
+
+  let fastProbePing = false
+  gateB.onPing = () => { fastProbePing = true }
+  mgrB.frameSenderFor(identityA.nodeId)(PeerFrameType.ACK, 0, Buffer.alloc(0), 0)
+  await waitFor(() => fastProbePing, 'onEncryptedFrame triggers fast-probe with cap=0 after cooldown', 500)
+  gateB.onPing = null
+  await waitFor(() => peerOf()?.path === 'lan', 'cap=0 promotes from fast-probe PONG', 500)
+})
+
+test('Slice 1: exponential backoff (30s -> 60s -> 120s -> 240s -> 300s) and 120s stable direct reset', async (t) => {
+  const env = await buildRttPair(t, { cap: 300 })
+  await env.waitReady()
+
+  const induceDemoteAndMeasureHold = async (expectedHoldMs) => {
+    // Promote to lan first
+    while (env.peerOf().path !== 'lan') {
+      await env.sample(40)
+    }
+    // Demote via sustained high RTT
+    await env.sample(2000)
+    await env.sample(2000)
+    assert.equal(env.peerOf().path, 'relay')
+    const demotedAt = env.clock.now()
+
+    // Stay in relay right up to expectedHoldMs - KEEPALIVE_MS
+    while (env.clock.now() + KEEPALIVE_MS + 100 < demotedAt + expectedHoldMs) {
+      await env.sample(40)
+      assert.equal(env.peerOf().path, 'relay', `must stay relay before ${expectedHoldMs}ms hold expires`)
+    }
+
+    // Cross expectedHoldMs and verify recovery
+    while (env.clock.now() < demotedAt + expectedHoldMs) {
+      await env.sample(40)
+    }
+    await env.sample(40)
+    if (env.peerOf().path !== 'lan') await env.sample(40)
+    assert.equal(env.peerOf().path, 'lan', `must recover after ${expectedHoldMs}ms hold`)
+  }
+
+  // Step 0 -> 30s, Step 1 -> 60s, Step 2 -> 120s, Step 3 -> 240s, Step 4 -> 300s
+  await induceDemoteAndMeasureHold(30_000)
+  await induceDemoteAndMeasureHold(60_000)
+  await induceDemoteAndMeasureHold(120_000)
+  await induceDemoteAndMeasureHold(240_000)
+  await induceDemoteAndMeasureHold(300_000)
+
+  // Stay stable in direct mode >= 120s (keepalive pings keep direct alive) -> resets step back to 0 (30s)
+  const promotedAt = env.clock.now()
+  while (env.clock.now() - promotedAt < 125_000) {
+    await env.sample(40)
+  }
+  assert.equal(env.peerOf().path, 'lan')
+  await induceDemoteAndMeasureHold(30_000)
 })
