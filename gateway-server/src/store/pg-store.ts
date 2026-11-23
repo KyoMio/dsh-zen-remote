@@ -1092,7 +1092,18 @@ export class PgStore implements GatewayStore {
       const id = randomBytes(8).toString('hex');
       const inserted = await tx(
         'INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, peer_direct_max_rtt_ms, created_at, join_key_expires_at, join_key_max_uses) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *',
-        [id, input.ownerId, input.name, input.admissionMode, input.joinKeyEnc, input.maxPeers, PEER_DIRECT_MAX_RTT_MS_DEFAULT, new Date(), new Date(Date.now() + (input.inviteTtlHours ?? 168) * 3600_000), input.inviteMaxUses ?? 10],
+        [
+          id,
+          input.ownerId,
+          input.name,
+          input.admissionMode,
+          input.joinKeyEnc,
+          input.maxPeers,
+          input.peerDirectMaxRttMs ?? PEER_DIRECT_MAX_RTT_MS_DEFAULT,
+          new Date(),
+          new Date(Date.now() + (input.inviteTtlHours ?? 168) * 3600_000),
+          input.inviteMaxUses ?? 10,
+        ],
       );
       return mapNetworkRow(inserted.rows[0] as Row);
     });

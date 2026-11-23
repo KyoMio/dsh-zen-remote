@@ -21,6 +21,7 @@ import { ZR_NATIVE_TLS_SYMBOL } from '../dist/tls/dual-protocol-server.js';
 import { decodeSmtpConfig, encodeSmtpConfig, hashToken } from '../dist/http/auth.js';
 import { gatewayLeaveMessage } from '../dist/peer-hub/peer-crypto.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
+import { DEFAULT_ADVANCED_TUNING } from '../dist/store/advanced-tuning.js';
 import { deriveMasterKeyFromSecret, decryptSecret, encryptSecret } from '../dist/master-key.js';
 import { maskInviteUri } from '../dist/web/format.js';
 import {
@@ -43,19 +44,21 @@ function seedSettings(overrides = {}) {
 
 async function startServer(opts = {}) {
   const store = opts.store ?? new SqliteStore({ seed: opts.seed ?? seedSettings() });
-  const hooks = { memberChanged: [], networkDeleted: [], settingsChanged: [], forceRelayChanged: [], userDisabled: [], quotaChanged: [], userDeleted: [] };
+  const hooks = { memberChanged: [], networkDeleted: [], settingsChanged: [], forceRelayChanged: [], advancedTuningChanged: [], userDisabled: [], quotaChanged: [], userDeleted: [] };
   const server = createGatewayApiServer({
     store,
     masterKey: MASTER_KEY,
     publicUrl: opts.publicUrl,
     runtimeMeta: opts.runtimeMeta,
     runtime: opts.runtime,
+    topology: opts.topology,
     update: opts.update,
     hooks: {
       onMemberChanged: (event) => hooks.memberChanged.push(event),
       onNetworkDeleted: (networkId) => hooks.networkDeleted.push(networkId),
       onSettingsChanged: (settings) => hooks.settingsChanged.push(settings),
       onForceRelayChanged: (next) => hooks.forceRelayChanged.push(next),
+      onAdvancedTuningChanged: (tuning) => hooks.advancedTuningChanged.push(tuning),
       onUserDisabled: (userId) => hooks.userDisabled.push(userId),
       onQuotaChanged: (userId) => hooks.quotaChanged.push(userId ?? null),
       onUserDeleted: (userId) => hooks.userDeleted.push(userId),
@@ -792,6 +795,7 @@ describe('REST API /api/v1（主服务器）', () => {
         sessionTtlDays: 7,
         autoUpdateEnabled: true,
         forceRelay: false,
+        advancedTuning: DEFAULT_ADVANCED_TUNING,
         defaultGroupId: 'grp_default',
         smtp: {
           configured: false,
@@ -3098,6 +3102,158 @@ describe('Slice 2 GET/PATCH /api/v1/admin/settings forceRelay', () => {
       assert.equal(offRes.json.data.forceRelay, false);
       assert.deepEqual(h.hooks.forceRelayChanged, [true, false]);
     } finally {
+      await stopServer(h);
+    }
+  });
+});
+
+describe('Slice 1 GET/PATCH /api/v1/admin/settings advancedTuning & inheritance', () => {
+  test('validates bounds/cross-field invariants, fires onAdvancedTuningChanged, resets on null, and seeds new networks', async () => {
+    const h = await startServer();
+    try {
+      await seedUsers(h.store);
+      const adminCookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const userCookie = await login(h.base, TENANT_EMAIL, TENANT_PASSWORD);
+
+      const initial = await api(h.base, 'GET', '/api/v1/admin/settings', { cookie: adminCookie });
+      assert.equal(initial.status, 200);
+      assert.deepEqual(initial.json.data.advancedTuning, DEFAULT_ADVANCED_TUNING);
+
+      // Reject unknown keys, out-of-range, and cross-field violations with 400
+      const invalidPayloads = [
+        { advancedTuning: 'bad' },
+        { advancedTuning: { extra: {} } },
+        { advancedTuning: { gateway: { unknownKey: 1 } } },
+        { advancedTuning: { peer: { unknownKey: 1 } } },
+        { advancedTuning: { gateway: { defaultPeerDirectMaxRttMs: -1 } } },
+        { advancedTuning: { gateway: { wsPingIntervalMs: 20000 } } }, // <= default wsPongTimeoutMs (15000)
+        { advancedTuning: { peer: { p2pWindowMin: 40 } } }, // > default p2pWindowInitial (32)
+        { advancedTuning: { peer: { p2pWindowInitial: 170 } } }, // > p2pWindowMax (160) & > 160 max
+        { advancedTuning: { peer: { relayWindowMax: 128 } } }, // < default relayWindowInitial (160)
+        { advancedTuning: { peer: { relayHoldBaseMs: 60000, relayHoldMaxMs: 40000 } } },
+        { advancedTuning: { peer: { directPromoteRatio: 0.49 } } },
+      ];
+      for (const payload of invalidPayloads) {
+        const res = await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+          cookie: adminCookie,
+          body: payload,
+        });
+        assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(payload)}`);
+      }
+      assert.equal(h.hooks.advancedTuningChanged.length, 0);
+
+      // Partial valid update
+      const patched = await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: {
+          advancedTuning: {
+            gateway: { defaultPeerDirectMaxRttMs: 450, wsPingIntervalMs: 12000, wsPongTimeoutMs: 25000 },
+            peer: { directPromoteRatio: 0.725, sackCoalesceFrames: 1 },
+          },
+        },
+      });
+      assert.equal(patched.status, 200);
+      assert.equal(patched.json.data.advancedTuning.gateway.defaultPeerDirectMaxRttMs, 450);
+      assert.equal(patched.json.data.advancedTuning.gateway.wsPingIntervalMs, 12000);
+      assert.equal(patched.json.data.advancedTuning.gateway.wsPongTimeoutMs, 25000);
+      assert.equal(patched.json.data.advancedTuning.peer.directPromoteRatio, 0.73);
+      assert.equal(patched.json.data.advancedTuning.peer.sackCoalesceFrames, 1);
+      assert.equal(h.hooks.advancedTuningChanged.length, 1);
+      assert.equal(h.hooks.advancedTuningChanged[0].gateway.defaultPeerDirectMaxRttMs, 450);
+
+      // Newly created network inherits defaultPeerDirectMaxRttMs (450, and 0 when updated to 0)
+      const net1 = await api(h.base, 'POST', '/api/v1/networks', {
+        cookie: userCookie,
+        body: { name: 'net-inherit-450', admissionMode: 'both' },
+      });
+      assert.equal(net1.status, 200);
+      assert.equal(net1.json.data.peerDirectMaxRttMs, 450);
+
+      const zeroPatch = await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { advancedTuning: { gateway: { defaultPeerDirectMaxRttMs: 0 } } },
+      });
+      assert.equal(zeroPatch.status, 200);
+      const net2 = await api(h.base, 'POST', '/api/v1/networks', {
+        cookie: userCookie,
+        body: { name: 'net-inherit-0', admissionMode: 'both' },
+      });
+      assert.equal(net2.status, 200);
+      assert.equal(net2.json.data.peerDirectMaxRttMs, 0);
+
+      // Reset to defaults via null
+      const resetRes = await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { advancedTuning: null },
+      });
+      assert.equal(resetRes.status, 200);
+      assert.deepEqual(resetRes.json.data.advancedTuning, DEFAULT_ADVANCED_TUNING);
+      assert.equal((await h.store.getExtendedSettings()).advancedTuningJson, null);
+      assert.deepEqual(h.hooks.advancedTuningChanged.at(-1), DEFAULT_ADVANCED_TUNING);
+    } finally {
+      await stopServer(h);
+    }
+  });
+
+  test('topology SSE enforces dynamic maxSseStreamsPerUser from advancedTuning', async () => {
+    const h = await startServer({
+      topology: {
+        renderTopology: async (networkId) => ({
+          network: { id: networkId, name: 'sse-net', admissionMode: 'both', maxPeers: 4 },
+          summary: { onlineDevices: 0, pendingCount: 0, totalLiveRelayKbps: 0 },
+          pending: [],
+          members: [],
+          links: [],
+        }),
+        subscribe: () => () => {},
+      },
+    });
+    const controllers = [];
+    try {
+      await seedUsers(h.store);
+      const adminCookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+      const userCookie = await login(h.base, TENANT_EMAIL, TENANT_PASSWORD);
+      const net = await api(h.base, 'POST', '/api/v1/networks', {
+        cookie: userCookie,
+        body: { name: 'sse-net', admissionMode: 'both' },
+      });
+      assert.equal(net.status, 200);
+      const netId = net.json.data.id;
+
+      await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { advancedTuning: { gateway: { maxSseStreamsPerUser: 2 } } },
+      });
+
+      const openStream = async () => {
+        const ac = new AbortController();
+        controllers.push(ac);
+        const res = await fetch(h.base + `/api/v1/networks/${netId}/events`, {
+          headers: { cookie: userCookie },
+          signal: ac.signal,
+        });
+        return res;
+      };
+
+      const s1 = await openStream();
+      const s2 = await openStream();
+      assert.equal(s1.status, 200);
+      assert.equal(s2.status, 200);
+
+      const thirdBlocked = await fetch(h.base + `/api/v1/networks/${netId}/events`, {
+        headers: { cookie: userCookie },
+      });
+      assert.equal(thirdBlocked.status, 429);
+
+      // Increase limit to 3 dynamically and open 3rd stream without closing existing 2
+      await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { advancedTuning: { gateway: { maxSseStreamsPerUser: 3 } } },
+      });
+      const s3 = await openStream();
+      assert.equal(s3.status, 200);
+    } finally {
+      for (const ac of controllers) ac.abort();
       await stopServer(h);
     }
   });

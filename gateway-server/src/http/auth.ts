@@ -22,6 +22,7 @@ import type { SmtpSecurityMode } from '../mail/smtp-client.js';
 import { renderOtpEmail } from '../mail/templates.js';
 import type { MailLocale } from '../mail/templates.js';
 import { StoreError, constantTimeEqualText, DEFAULT_GROUP_ID } from '../store/types.js';
+import type { AdvancedTuningSettings } from '../store/advanced-tuning.js';
 import type { GatewayTlsBridge } from '../tls/dual-protocol-server.js';
 import { ZR_NATIVE_TLS_SYMBOL } from '../tls/dual-protocol-server.js';
 import type { GatewayUpdateBridge } from '../update/update-manager.js';
@@ -105,6 +106,7 @@ export interface GatewayHooks {
   onNetworkUpdated?: (networkId: string, maxPeers: number, peerDirectMaxRttMs: number) => void | Promise<void>;
   onSettingsChanged?: (settings: SystemSettings) => void | Promise<void>;
   onForceRelayChanged?: (forceRelay: boolean) => void | Promise<void>;
+  onAdvancedTuningChanged?: (tuning: AdvancedTuningSettings) => void | Promise<void>;
   onUserDisabled?: (userId: string) => void | Promise<void>;
   /** GC-6a：配额变化（默认组创建/切换/更新）后通知实时层；userId 缺省 = 全量失效 */
   onQuotaChanged?: (userId?: string) => void | Promise<void>;

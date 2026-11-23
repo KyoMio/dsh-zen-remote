@@ -20,6 +20,11 @@ import {
 import { createHash, generateKeyPairSync, sign } from 'node:crypto';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
 import { PgStore } from '../dist/store/pg-store.js';
+import {
+  DEFAULT_ADVANCED_TUNING,
+  mergeAndValidateAdvancedTuning,
+  parseStoredAdvancedTuning,
+} from '../dist/store/advanced-tuning.js';
 import { decideJoinAttempt, StoreError } from '../dist/store/types.js';
 import { gatewayLeaveMessage, verifyGatewayLeaveSignature } from '../dist/peer-hub/peer-crypto.js';
 import { TENANT_HASH } from './helpers/fixtures.mjs';
@@ -1092,6 +1097,7 @@ describe('SqliteStore GC-2 扩展', () => {
         tlsKeyFile: 'privkey.pem',
         autoUpdateEnabled: true,
         forceRelay: false,
+        advancedTuningJson: null,
       });
       // 扩展键部分更新（含可空字符串、时间戳与 TLS 三态字段往返）；未在 patch 里的键不受影响
       const updated = await store.updateExtendedSettings({
@@ -1865,6 +1871,110 @@ describe('Slice 2 forceRelay store persistence', () => {
       assert.equal(ext2.forceRelay, true);
       await s2.updateExtendedSettings({ forceRelay: false });
       assert.equal((await s2.getExtendedSettings()).forceRelay, false);
+    } finally {
+      await s2.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Slice 1 advancedTuning store persistence & validation', () => {
+  test('parseStoredAdvancedTuning falls back on null, corrupt JSON, out-of-range, and cross-field violations', () => {
+    assert.deepEqual(parseStoredAdvancedTuning(null), DEFAULT_ADVANCED_TUNING);
+    assert.deepEqual(parseStoredAdvancedTuning('{not-json'), DEFAULT_ADVANCED_TUNING);
+    assert.deepEqual(parseStoredAdvancedTuning('[]'), DEFAULT_ADVANCED_TUNING);
+
+    const badFields = parseStoredAdvancedTuning(JSON.stringify({
+      gateway: { defaultPeerDirectMaxRttMs: -5, maxSseStreamsPerUser: 99, wsMaxTargetBufferedKib: 1024 },
+      peer: { directPromoteRatio: 0.755, sackCoalesceFrames: 0 },
+    }));
+    assert.equal(badFields.gateway.defaultPeerDirectMaxRttMs, DEFAULT_ADVANCED_TUNING.gateway.defaultPeerDirectMaxRttMs);
+    assert.equal(badFields.gateway.maxSseStreamsPerUser, DEFAULT_ADVANCED_TUNING.gateway.maxSseStreamsPerUser);
+    assert.equal(badFields.gateway.wsMaxTargetBufferedKib, 1024);
+    assert.equal(badFields.peer.directPromoteRatio, 0.76);
+    assert.equal(badFields.peer.sackCoalesceFrames, DEFAULT_ADVANCED_TUNING.peer.sackCoalesceFrames);
+
+    const badCross = parseStoredAdvancedTuning(JSON.stringify({
+      gateway: { wsPingIntervalMs: 20000, wsPongTimeoutMs: 15000 },
+      peer: {
+        p2pWindowMax: 64,
+        p2pWindowInitial: 80,
+        p2pWindowMin: 32,
+        relayWindowMax: 128,
+        relayWindowInitial: 256,
+        relayHoldBaseMs: 60000,
+        relayHoldMaxMs: 30000,
+      },
+    }));
+    assert.equal(badCross.gateway.wsPingIntervalMs, DEFAULT_ADVANCED_TUNING.gateway.wsPingIntervalMs);
+    assert.equal(badCross.gateway.wsPongTimeoutMs, DEFAULT_ADVANCED_TUNING.gateway.wsPongTimeoutMs);
+    assert.equal(badCross.peer.p2pWindowMax, DEFAULT_ADVANCED_TUNING.peer.p2pWindowMax);
+    assert.equal(badCross.peer.p2pWindowInitial, DEFAULT_ADVANCED_TUNING.peer.p2pWindowInitial);
+    assert.equal(badCross.peer.p2pWindowMin, DEFAULT_ADVANCED_TUNING.peer.p2pWindowMin);
+    assert.equal(badCross.peer.relayWindowMax, DEFAULT_ADVANCED_TUNING.peer.relayWindowMax);
+    assert.equal(badCross.peer.relayWindowInitial, DEFAULT_ADVANCED_TUNING.peer.relayWindowInitial);
+    assert.equal(badCross.peer.relayHoldBaseMs, DEFAULT_ADVANCED_TUNING.peer.relayHoldBaseMs);
+    assert.equal(badCross.peer.relayHoldMaxMs, DEFAULT_ADVANCED_TUNING.peer.relayHoldMaxMs);
+  });
+
+  test('mergeAndValidateAdvancedTuning enforces bounds, rounding, cross-field invariants, and null reset', () => {
+    const merged = mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, {
+      gateway: { wsPingIntervalMs: 12000, wsPongTimeoutMs: 25000, maxSseStreamsPerUser: 8 },
+      peer: { directPromoteRatio: 0.725, sackCoalesceFrames: 1 },
+    });
+    assert.equal(merged.gateway.wsPingIntervalMs, 12000);
+    assert.equal(merged.gateway.wsPongTimeoutMs, 25000);
+    assert.equal(merged.gateway.maxSseStreamsPerUser, 8);
+    assert.equal(merged.peer.directPromoteRatio, 0.73);
+    assert.equal(merged.peer.sackCoalesceFrames, 1);
+
+    assert.deepEqual(mergeAndValidateAdvancedTuning(merged, null), DEFAULT_ADVANCED_TUNING);
+
+    assert.throws(() => mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, { unknown: {} }));
+    assert.throws(() => mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, { gateway: { nope: 1 } }));
+    assert.throws(() => mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, { gateway: { toString: 1 } }), /unknown field/);
+    assert.throws(() => mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, { peer: { constructor: 1 } }), /unknown field/);
+    assert.throws(() => mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, { gateway: { wsPingIntervalMs: 15000 } }));
+    assert.throws(() => mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, { peer: { p2pWindowMin: 40 } }));
+    assert.throws(() => mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, { peer: { p2pWindowInitial: 180 } }));
+    assert.throws(() => mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, { peer: { relayWindowMax: 128 } }));
+    assert.throws(() => mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, { peer: { relayHoldBaseMs: 100000, relayHoldMaxMs: 60000 } }));
+    assert.throws(() => mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, { peer: { directPromoteRatio: 0.49 } }));
+  });
+
+  test('SqliteStore advancedTuningJson persists across reopens (no DDL migration) and createNetwork honors peerDirectMaxRttMs', async () => {
+    const dir = tmpDir('advanced-tuning-store');
+    const dbPath = path.join(dir, 'gw.sqlite');
+    const s1 = new SqliteStore({ path: dbPath });
+    try {
+      const ext1 = await s1.getExtendedSettings();
+      assert.equal(ext1.advancedTuningJson, null);
+      const custom = mergeAndValidateAdvancedTuning(DEFAULT_ADVANCED_TUNING, {
+        gateway: { defaultPeerDirectMaxRttMs: 450, maxSseStreamsPerUser: 2 },
+        peer: { directPromoteStreak: 4 },
+      });
+      await s1.updateExtendedSettings({ advancedTuningJson: JSON.stringify(custom) });
+      const user = await s1.createUser({ email: 'adv@local', passwordHash: 'hash', role: 'admin' });
+      const net = await s1.createNetwork({
+        ownerId: user.id,
+        name: 'adv-net',
+        admissionMode: 'both',
+        joinKeyEnc: 'enc',
+        maxPeers: 4,
+        peerDirectMaxRttMs: 450,
+      });
+      assert.equal(net.peerDirectMaxRttMs, 450);
+    } finally {
+      await s1.close();
+    }
+
+    const s2 = new SqliteStore({ path: dbPath });
+    try {
+      const ext2 = await s2.getExtendedSettings();
+      const parsed = parseStoredAdvancedTuning(ext2.advancedTuningJson);
+      assert.equal(parsed.gateway.defaultPeerDirectMaxRttMs, 450);
+      assert.equal(parsed.gateway.maxSseStreamsPerUser, 2);
+      assert.equal(parsed.peer.directPromoteStreak, 4);
     } finally {
       await s2.close();
       fs.rmSync(dir, { recursive: true, force: true });

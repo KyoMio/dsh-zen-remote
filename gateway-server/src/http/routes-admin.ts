@@ -14,6 +14,12 @@ import { renderSmtpTestEmail } from '../mail/templates.js';
 import type { MailLocale } from '../mail/templates.js';
 import { generatePassword, hashPassword } from '../master-key.js';
 import { DEFAULT_GROUP_ID, validateGroupInput } from '../store/types.js';
+import {
+  DEFAULT_ADVANCED_TUNING,
+  mergeAndValidateAdvancedTuning,
+  parseStoredAdvancedTuning,
+} from '../store/advanced-tuning.js';
+import type { AdvancedTuningSettings } from '../store/advanced-tuning.js';
 import type {
   AdminUserPatch,
   CreateUserGroupInput,
@@ -136,6 +142,7 @@ async function buildSettingsView(ctx: RouteContext): Promise<Record<string, unkn
     sessionTtlDays: ext.sessionTtlDays,
     autoUpdateEnabled: ext.autoUpdateEnabled,
     forceRelay: ext.forceRelay,
+    advancedTuning: parseStoredAdvancedTuning(ext.advancedTuningJson),
     // 当前 is_default 组的 id；无默认组行时兜底内置 id（正常初始化流程不会发生）
     defaultGroupId: groups.find((g) => g.isDefault)?.id ?? DEFAULT_GROUP_ID,
     smtp: {
@@ -319,6 +326,26 @@ async function handlePatchSettings(ctx: RouteContext): Promise<void> {
     extPatch.forceRelay = body['forceRelay'];
   }
   const ext = await ctx.store.getExtendedSettings();
+  let nextAdvancedTuning: AdvancedTuningSettings | undefined;
+  if (body['advancedTuning'] !== undefined) {
+    if (body['advancedTuning'] === null) {
+      extPatch.advancedTuningJson = null;
+      nextAdvancedTuning = {
+        gateway: { ...DEFAULT_ADVANCED_TUNING.gateway },
+        peer: { ...DEFAULT_ADVANCED_TUNING.peer },
+      };
+    } else {
+      try {
+        nextAdvancedTuning = mergeAndValidateAdvancedTuning(
+          parseStoredAdvancedTuning(ext.advancedTuningJson),
+          body['advancedTuning'],
+        );
+      } catch (err) {
+        throw new ApiError(400, 'INVALID_REQUEST', err instanceof Error ? err.message : 'invalid advancedTuning');
+      }
+      extPatch.advancedTuningJson = JSON.stringify(nextAdvancedTuning);
+    }
+  }
   const savedSmtp = decodeSmtpConfig(ext.smtpConfigEnc, ctx.masterKey);
   let smtpProvided = false;
   if (body['smtp'] !== undefined) {
@@ -370,6 +397,9 @@ async function handlePatchSettings(ctx: RouteContext): Promise<void> {
   await runHook(ctx.hooks.onQuotaChanged);
   if (extPatch.forceRelay !== undefined) {
     await runHook(ctx.hooks.onForceRelayChanged, extPatch.forceRelay);
+  }
+  if (nextAdvancedTuning !== undefined) {
+    await runHook(ctx.hooks.onAdvancedTuningChanged, nextAdvancedTuning);
   }
   sendOk(ctx.res, await buildSettingsView(ctx));
 }

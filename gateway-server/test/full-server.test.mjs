@@ -16,6 +16,7 @@ import { startGateway } from '../dist/main.js';
 import { createGatewayApiServer } from '../dist/server.js';
 import { resolveGatewayConfig } from '../dist/config.js';
 import { SqliteStore } from '../dist/store/sqlite-store.js';
+import { DEFAULT_ADVANCED_TUNING } from '../dist/store/advanced-tuning.js';
 import { SETTINGS_KEYS } from '../dist/store/types.js';
 import { deriveMasterKeyFromSecret } from '../dist/master-key.js';
 import { PeerWsHub } from '../dist/peer-hub/ws-hub.js';
@@ -1149,6 +1150,7 @@ describe('PC-07 部署配置播种：resolveGatewayConfig → startGateway 生�
     sessionTtlDays: 7,
     autoUpdateEnabled: true,
     forceRelay: false,
+    advancedTuning: DEFAULT_ADVANCED_TUNING,
     defaultGroupId: 'grp_default',
     smtp: {
       configured: false,

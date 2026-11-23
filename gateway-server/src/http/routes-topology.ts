@@ -14,8 +14,7 @@ import type { ServerResponse } from 'node:http';
 
 import { ApiError, requireUser, sendOk } from './auth.js';
 import type { NetworkTopologySnapshot, RouteContext, RouteDef, TopologyProvider } from './auth.js';
-
-const MAX_SSE_STREAMS_PER_USER = 5;
+import { parseStoredAdvancedTuning } from '../store/advanced-tuning.js';
 
 async function loadOwnedNetworkForTopology(ctx: RouteContext, userId: string, networkId: string): Promise<void> {
   const network = await ctx.store.getNetwork(networkId);
@@ -55,8 +54,10 @@ export function buildTopologyRoutes(): RouteDef[] {
     const user = await requireUser(ctx);
     const networkId = params['id'] ?? '';
     await loadOwnedNetworkForTopology(ctx, user.id, networkId);
+    const ext = await ctx.store.getExtendedSettings();
+    const maxSseStreamsPerUser = parseStoredAdvancedTuning(ext.advancedTuningJson).gateway.maxSseStreamsPerUser;
     const activeCount = activeSseByUser.get(user.id) ?? 0;
-    if (activeCount >= MAX_SSE_STREAMS_PER_USER) {
+    if (activeCount >= maxSseStreamsPerUser) {
       throw new ApiError(429, 'RATE_LIMITED', 'too many active event streams');
     }
     const provider = requireTopology(ctx);

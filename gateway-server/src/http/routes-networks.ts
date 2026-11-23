@@ -29,6 +29,7 @@ import {
 } from './auth.js';
 import type { RouteContext, RouteDef } from './auth.js';
 import { PEER_DIRECT_MAX_RTT_MS_MAX, PEER_DIRECT_MAX_RTT_MS_MIN } from '../store/types.js';
+import { parseStoredAdvancedTuning } from '../store/advanced-tuning.js';
 import type {
   AdmissionMode,
   MemberProfilePatch,
@@ -249,6 +250,8 @@ async function handleCreateNetwork(ctx: RouteContext): Promise<void> {
       }
     }
   }
+  const ext = await ctx.store.getExtendedSettings();
+  const defaultPeerDirectMaxRttMs = parseStoredAdvancedTuning(ext.advancedTuningJson).gateway.defaultPeerDirectMaxRttMs;
   const joinKey = generateJoinKey();
   const network = await ctx.store.createNetwork({
     ownerId: user.id,
@@ -257,6 +260,7 @@ async function handleCreateNetwork(ctx: RouteContext): Promise<void> {
     joinKeyEnc: encryptSecret(joinKey, ctx.masterKey),
     ...readInviteOptions(body),
     maxPeers,
+    peerDirectMaxRttMs: defaultPeerDirectMaxRttMs,
   });
   sendOk(ctx.res, await networkView(ctx, network));
 }

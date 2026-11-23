@@ -974,7 +974,18 @@ export class SqliteStore implements GatewayStore {
         .prepare(
           'INSERT INTO networks (id, owner_id, name, admission_mode, join_key_enc, max_peers, peer_direct_max_rtt_ms, created_at, join_key_expires_at, join_key_max_uses) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         )
-        .run(id, input.ownerId, input.name, input.admissionMode, input.joinKeyEnc, input.maxPeers, PEER_DIRECT_MAX_RTT_MS_DEFAULT, nowIso(), new Date(now + (input.inviteTtlHours ?? 168) * 3600_000).toISOString(), input.inviteMaxUses ?? 10);
+        .run(
+          id,
+          input.ownerId,
+          input.name,
+          input.admissionMode,
+          input.joinKeyEnc,
+          input.maxPeers,
+          input.peerDirectMaxRttMs ?? PEER_DIRECT_MAX_RTT_MS_DEFAULT,
+          nowIso(),
+          new Date(now + (input.inviteTtlHours ?? 168) * 3600_000).toISOString(),
+          input.inviteMaxUses ?? 10,
+        );
     });
     const row = this.getNetworkRow(id);
     if (row === undefined) throw new StoreError('network-not-found', 'created network disappeared');

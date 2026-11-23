@@ -31,6 +31,7 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 
 import { PgStore } from '../dist/store/pg-store.js';
+import { DEFAULT_ADVANCED_TUNING } from '../dist/store/advanced-tuning.js';
 import { StoreError, SETTINGS_KEYS } from '../dist/store/types.js';
 import { encryptSecret, hashPassword } from '../dist/master-key.js';
 import { resolveGatewayConfig } from '../dist/config.js';
@@ -706,6 +707,7 @@ function runTestChild(mode, schema, deadlineMs) {
     sessionTtlDays: 7,
     autoUpdateEnabled: true,
     forceRelay: false,
+    advancedTuning: DEFAULT_ADVANCED_TUNING,
     defaultGroupId: 'grp_default',
     smtp: {
       configured: false,
