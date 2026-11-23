@@ -73,7 +73,7 @@ const AUTO_HELLO_COOLDOWN_MS = 2_000
 /** 刚切上 UDP 直连时吸收对端半个 RTT 错峰晋升 WS 帧的宽限期（ms）。 */
 const DEFAULT_DIRECT_PROMOTE_GRACE_MS = 400
 /** 收到首个 UDP 帧后继续吸收晋升前在途乱序旧 WS 帧的排空窗口（ms）。 */
-const WS_REORDER_GRACE_MS = 500
+const WS_REORDER_GRACE_MS = 2_000
 /** ARQ 零 SACK 停滞上报去重冷却时间（ms）。 */
 const DIRECT_STALL_COOLDOWN_MS = 10_000
 /** 默认 ARQ 零 SACK 停滞判定阈值（ms）。 */
@@ -152,7 +152,7 @@ interface MuxSession {
   directPromotedAt: number
   /** 本次切上 UDP 后是否已收到对端发来的解密 UDP 帧（确认双方均已切换直连）。 */
   peerConfirmedDirect: boolean
-  /** 本次切上 UDP 后收到首个解密 UDP 帧的时间戳（ms），用于 500ms 乱序排空窗。 */
+  /** 本次切上 UDP 后收到首个解密 UDP 帧的时间戳（ms），用于 2000ms 乱序排空窗。 */
   firstDirectRxAt: number | null
   /** 最近一次向 engine 上报直连 ARQ 停滞的时间戳（ms），用于 10s 冷却门控。 */
   lastStallReportAt: number | null

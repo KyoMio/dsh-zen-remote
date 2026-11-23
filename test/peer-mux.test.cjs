@@ -889,9 +889,9 @@ for (const status of [503, 413]) {
   })
 }
 
-// -- 5. T3 WS demote beacon, 500ms reorder drain, safe HELLO, ARQ stall & handler wait --
+// -- 5. T3 WS demote beacon, 2000ms reorder drain, safe HELLO, ARQ stall & handler wait --
 
-test('T3: 500ms reorder drain absorbs old WS frames after UDP confirm, >500ms normal WS frame demotes for legacy peers', { timeout: 3000 }, async (t) => {
+test('T3: 2000ms reorder drain absorbs old WS frames after UDP confirm, >2000ms normal WS frame demotes for legacy peers', { timeout: 3000 }, async (t) => {
   const clock = makeFakeClock(1_000_000)
   const a = generatePeerIdentity()
   const b = generatePeerIdentity()
@@ -953,14 +953,14 @@ test('T3: 500ms reorder drain absorbs old WS frames after UDP confirm, >500ms no
   A.handleOpenedFrame({ srcNodeId: b.nodeId, frameType: PeerFrameType.ACK, streamId: 0, ack: 0 }, Buffer.alloc(0))
   assert.equal(A.sessions.get(b.nodeId).peerConfirmedDirect, true)
 
-  // t = 30ms (25ms after firstDirectRxAt, within 500ms reorder window): old WS DATA frame arrives -> absorbed!
-  clock.advance(25)
+  // t = 1000ms (995ms after firstDirectRxAt, within 2000ms reorder window): old WS DATA frame arrives -> absorbed!
+  clock.advance(995)
   A.handleGatewayFrame(prePromoteWsData)
-  assert.equal(A.sessionPath(b.nodeId), 'udp', 'old WS frame within 500ms of firstDirectRxAt must not demote')
+  assert.equal(A.sessionPath(b.nodeId), 'udp', 'old WS frame within 2000ms of firstDirectRxAt must not demote')
   assert.deepEqual(aDemoted, [])
 
-  // t = 600ms (595ms after firstDirectRxAt, still inside 6s graceMs): normal WS DATA frame arrives -> demotes for legacy compatibility
-  clock.advance(570)
+  // t = 2100ms (2095ms after firstDirectRxAt, still inside 6s graceMs): normal WS DATA frame arrives -> demotes for legacy compatibility
+  clock.advance(1100)
   const lateWsData = packEncryptedFrame({
     frameType: PeerFrameType.ACK,
     srcNodeId: b.nodeId,
@@ -971,7 +971,7 @@ test('T3: 500ms reorder drain absorbs old WS frames after UDP confirm, >500ms no
   }, Buffer.alloc(0), sb.ciphers)
   sb.seq += 1n
   A.handleGatewayFrame(lateWsData)
-  assert.equal(A.sessionPath(b.nodeId), 'ws', 'normal WS frame after 500ms reorder window must demote even within 6s grace')
+  assert.equal(A.sessionPath(b.nodeId), 'ws', 'normal WS frame after 2000ms reorder window must demote even within 6s grace')
   assert.deepEqual(aDemoted, [b.nodeId])
 })
 

@@ -2422,7 +2422,7 @@ async function buildDualEnginePair(t, { directCap = 300, bHandlerReadyInitially 
   }
 }
 
-test('T5: punch-coordinate preserves pluginVersion, re-anchor suppresses demote beacon, and 0-byte UDP unlock + triggerFastProbe converges asymmetric 30s hold in <1s', async (t) => {
+test('T5: punch-coordinate preserves pluginVersion, re-anchor suppresses demote beacon, and local/peer 30s cooldown prevents ping-pong until expiry', async (t) => {
   const env = await buildDualEnginePair(t, { directCap: 300 })
 
   // Both engines converge to direct 'lan' within < 600ms virtual time
@@ -2482,13 +2482,18 @@ test('T5: punch-coordinate preserves pluginVersion, re-anchor suppresses demote 
   )
   assert.equal(env.engineB.status().peers[0].directDemoted, true)
 
-  // Restore UDP and advance to the next keepalive tick for A (t=10500ms) + <600ms fast convergence, with ZERO application HTTP traffic
+  // Restore UDP and advance 10s (still well inside 30s PEER_RELAY_HOLD_MS cooldown):
+  // Neither A nor B may ping-pong back to direct during the 30s cooldown.
   env.netFilter.dropBtoAPongs = false
-  await env.stepClock(2_400, 100)
-  // Within <1s after A's keepalive tick: A fast-probes to promote -> sends 0-byte UDP (ACK, streamId=0) -> unlocks B's 30s hold -> B fast-probes to promote
+  await env.stepClock(10_000, 150)
+  assert.equal(env.engineA.status().peers[0]?.path, 'relay', 'A must remain on relay during 30s local cooldown')
+  assert.equal(env.engineB.status().peers[0]?.path, 'relay', 'B must remain on relay during 30s peer cooldown')
+
+  // Advance past the remaining 30s hold (~25s + keepalive + fast probe): both recover to lan
+  await env.stepClock(25_000, 150)
   await waitFor(
     () => env.engineA.status().peers[0]?.path === 'lan' && env.engineB.status().peers[0]?.path === 'lan',
-    'both A and B converge back to lan within <1s without waiting out 30s peerRelayHoldUntil',
+    'both A and B recover to lan once 30s cooldown expires',
   )
   assert.equal(env.engineA.status().peers[0].directDemoted, false)
   assert.equal(env.engineB.status().peers[0].directDemoted, false)
@@ -2687,4 +2692,47 @@ test('Task 4: relay ARQ profile uses window=160 (p2p stays 16) and onPunchFallba
   burstPromise.catch(() => {})
   await sleep(60)
   assert.ok(wsDataFrames >= 100, `expected >=100 inflight DATA frames under relay window=160, got ${wsDataFrames}`)
+})
+
+test('Task 5: demoteDirect enforces 30s local cooldown and ACK(0) probe does not clear peerRelayHoldUntil or triggerFastProbe', async (t) => {
+  const env = await buildRttPair(t, { cap: 300 })
+  await env.waitReady()
+  await env.sample(50)
+  await env.sample(50)
+  assert.equal(env.peerOf().path, 'lan')
+
+  // Induce local demoteDirect via sustained RTT > cap
+  await env.sample(2000)
+  await env.sample(2000)
+  assert.equal(env.peerOf().path, 'relay')
+  assert.equal(env.peerOf().directDemoteReason, 'rtt-cap')
+  const demotedAt = env.clock.now()
+
+  // Simulate peer sending an encrypted ACK(streamId=0) probe while local 30s cooldown is active:
+  // onEncryptedFrame must NOT clear peerRelayHoldUntil or trigger fast probe, and good RTT samples
+  // inside 30s must NOT promote.
+  let fastProbePing = false
+  env.gateB.onPing = () => { fastProbePing = true }
+  const senderB = env.mgrB.frameSenderFor(env.identityA.nodeId)
+  senderB(PeerFrameType.ACK, 0, Buffer.alloc(0), 0)
+  await sleep(30)
+  env.gateB.onPing = null
+  assert.equal(fastProbePing, false, 'ACK(0) probe during active cooldown must not triggerFastProbe')
+
+  // Good RTT samples strictly inside the 30s hold must keep path on relay
+  let insideHoldSamples = 0
+  while (env.clock.now() + KEEPALIVE_MS + 100 < demotedAt + 30_000) {
+    await env.sample(40)
+    insideHoldSamples += 1
+    assert.equal(env.peerOf().path, 'relay', `must stay on relay during 30s hold (sample ${insideHoldSamples})`)
+  }
+  assert.ok(insideHoldSamples >= 5, `expected >= 5 samples inside 30s hold, got ${insideHoldSamples}`)
+
+  // Cross demotedAt + 30s, then 2 good RTT samples promote back to lan
+  while (env.clock.now() < demotedAt + 30_000) {
+    await env.sample(40)
+  }
+  await env.sample(40)
+  if (env.peerOf().path !== 'lan') await env.sample(40)
+  assert.equal(env.peerOf().path, 'lan', 'must allow recovery once 30s cooldown expires')
 })

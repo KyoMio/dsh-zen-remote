@@ -259,6 +259,7 @@ const realClock = {
 const DIRECT_EWMA_ALPHA = 0.3
 const DIRECT_PROMOTE_RATIO = 0.7
 const DIRECT_PROMOTE_STREAK = 2
+const PEER_RELAY_HOLD_MS = 30_000
 
 /** 公告端点集的可比形态：lanEndpoints ∪ reflexiveEndpoint，排序去重成串。 */
 const canonicalEndpoints = (lan: string[], reflexive: string | null): string => {
@@ -1289,6 +1290,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     member.directDemoted = true
     member.directDemoteReason = reason
     member.directGoodStreak = 0
+    member.peerRelayHoldUntil = clock.now() + PEER_RELAY_HOLD_MS
     log(`peer engine: direct ${member.nodeId} ${why} — relaying`)
     schedulePathReport()
   }
@@ -1436,13 +1438,13 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       onPingUnanswered,
       onEncryptedFrame: (header, plaintext) => {
         const m = members.get(header.srcNodeId.toLowerCase())
-        if (m !== undefined) m.peerRelayHoldUntil = 0
         mux?.handleOpenedFrame(header, plaintext)
         if (m !== undefined) {
           const cap = directCap()
           if (
             cap > 0 &&
             !m.directActive &&
+            clock.now() >= m.peerRelayHoldUntil &&
             (m.directSmoothedRtt === null || m.directSmoothedRtt <= cap * DIRECT_PROMOTE_RATIO)
           ) {
             punch?.triggerFastProbe(m.nodeId, true)
@@ -1489,7 +1491,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         member.directDemoted = true
         member.directDemoteReason = 'peer-relay'
         member.directGoodStreak = 0
-        member.peerRelayHoldUntil = clock.now() + 30_000
+        member.peerRelayHoldUntil = clock.now() + PEER_RELAY_HOLD_MS
         applyArqProfile(member, 'relay', true)
         schedulePathReport()
         log(`peer engine: peer ${member.nodeId} demoted to relay — syncing local path`)
