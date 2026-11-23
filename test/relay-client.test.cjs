@@ -700,13 +700,13 @@ test('PC-05 contract: uploadBudgetMs adds ONE recovery margin to KNOWN lengths, 
   // The production margin figure comes from the pool's virtual mount (the
   // peer transport's direct-loss detection plus the WS relay handshake plus
   // the relayed leg). The base budget itself stays the T31-fix size rule.
-  assert.equal(uploadBudgetMs(15_000, 2 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 39_000, '2 MiB known length: the 15+4 s size budget + one 20 s margin')
-  assert.equal(uploadBudgetMs(15_000, 2 * MIB, 0), 19_000, 'a zero margin is the plain size budget')
-  assert.equal(uploadBudgetMs(15_000, 2 * MIB), 19_000, 'a plain client: the size budget alone — unchanged')
+  assert.equal(uploadBudgetMs(15_000, 2 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 55_000, '2 MiB known length: the 15+20 s size budget + one 20 s margin')
+  assert.equal(uploadBudgetMs(15_000, 2 * MIB, 0), 35_000, 'a zero margin is the plain size budget')
+  assert.equal(uploadBudgetMs(15_000, 2 * MIB), 35_000, 'a plain client: the size budget alone — unchanged')
   assert.equal(uploadBudgetMs(15_000, undefined, PEER_UPLOAD_RECOVERY_MARGIN_MS), 900_000, 'unknown length: the cap, marginless — the honest budget for an end not in sight')
   assert.equal(uploadBudgetMs(15_000, 0, PEER_UPLOAD_RECOVERY_MARGIN_MS), 35_000, 'a declared 0 keeps the base + margin (the floor keeps 0 MiB)')
-  assert.equal(uploadBudgetMs(15_000, 430 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 895_000, 'just under the cap the margin shows in full (875 s + 20 s)')
-  assert.equal(uploadBudgetMs(15_000, 435 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 900_000, 'the margin never lifts the 900 s total cap')
+  assert.equal(uploadBudgetMs(15_000, 86 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 895_000, 'just under the cap the margin shows in full (875 s + 20 s)')
+  assert.equal(uploadBudgetMs(15_000, 87 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 900_000, 'the margin never lifts the 900 s total cap')
   assert.equal(uploadBudgetMs(15_000, 500 * MIB, PEER_UPLOAD_RECOVERY_MARGIN_MS), 900_000, 'a size budget already at the cap stays there')
 })
 
@@ -3226,4 +3226,247 @@ test('T4 probeHealth: remains capped at 8_000ms without adding peerRecoveryMargi
   t.mock.timers.tick(1)
   assert.equal(capturedSignal.aborted, true, 'aborted at exact 8_000ms cap')
   assert.equal(await probing, false)
+})
+
+test('Task 2: invoke scales at 10s/MiB and body-read timeout with timeoutSetsOffline:false preserves online state', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  t.after(() => t.mock.timers.reset())
+
+  let mode = 'scale'
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t2-body',
+    requestTimeoutMs: 100,
+    infoRefreshMs: 0,
+    fetchImpl: async (url, init) => {
+      if (new URL(String(url)).pathname.endsWith('/v1/handshake')) {
+        return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (mode === 'scale') {
+        // Answer at 5_000 ms: exceeds old 100 + 2_000 ms budget, fits 100 + 10_000 ms budget
+        return await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            resolve(new Response(JSON.stringify({ ok: true, value: 'ok-10s-per-mib' }), {
+              status: 200,
+              headers: { 'content-type': 'application/json' },
+            }))
+          }, 5_000)
+          init?.signal?.addEventListener('abort', () => {
+            clearTimeout(timer)
+            reject(new Error('aborted'))
+          }, { once: true })
+        })
+      }
+      // mode === 'stalled-body': headers arrive immediately with small Content-Length, body never finishes
+      const body = new ReadableStream({
+        start(controller) {
+          controller.enqueue(Buffer.from('{"ok":'))
+        },
+      })
+      return new Response(body, {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'content-length': '20' },
+      })
+    },
+  })
+  t.after(() => client.stop())
+
+  await client.connect()
+  assert.equal(client.state, 'online')
+
+  // 1 MiB serialized JSON payload -> 10_000 ms/MiB allows 5_000 ms response
+  const bigPromise = client.invoke('session', 'prompt', { data: 'A'.repeat(1024 * 1024) })
+  await Promise.resolve()
+  t.mock.timers.tick(5_000)
+  assert.equal(await bigPromise, 'ok-10s-per-mib')
+  assert.equal(client.state, 'online')
+
+  // Body-read timeout on invoke (timeoutSetsOffline: false) must throw request-timeout and stay online
+  mode = 'stalled-body'
+  const stalledPromise = client.invoke('session', 'page', {})
+  await Promise.resolve()
+  t.mock.timers.tick(100)
+  await assert.rejects(
+    () => stalledPromise,
+    (error) => error instanceof RelayError && error.code === 'request-timeout',
+  )
+  assert.equal(client.state, 'online', 'body-read timeout on timeoutSetsOffline:false must not flip offline')
+  assert.equal(client.lastError, 'request-timeout')
+})
+
+test('Task 2: Content-Length response extends body budget beyond header timeout and handles caller abort cleanly', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  t.after(() => t.mock.timers.reset())
+
+  const largePayload = JSON.stringify({ ok: true, value: 'X'.repeat(2 * 1024 * 1024) })
+  const contentLength = Buffer.byteLength(largePayload, 'utf8')
+  const externalAbort = new AbortController()
+  let abortDuringHeaders = false
+
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t2-cl',
+    requestTimeoutMs: 100,
+    infoRefreshMs: 0,
+    fetchImpl: async (url) => {
+      if (new URL(String(url)).pathname.endsWith('/v1/handshake')) {
+        return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (abortDuringHeaders) {
+        externalAbort.abort()
+        const stalled = new ReadableStream({ start() {} })
+        return new Response(stalled, {
+          status: 200,
+          headers: { 'content-type': 'application/json', 'content-length': '64' },
+        })
+      }
+      let controllerRef
+      const stream = new ReadableStream({
+        start(controller) {
+          controllerRef = controller
+        },
+      })
+      setTimeout(() => {
+        controllerRef.enqueue(Buffer.from(largePayload))
+        controllerRef.close()
+      }, 5_000)
+      return new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'content-length': String(contentLength) },
+      })
+    },
+  })
+  t.after(() => client.stop())
+  await client.connect()
+
+  // 2 MiB Content-Length response arrives at 5_000 ms (> 100 ms header timeout, < 20_100 ms body budget)
+  const pending = client.invoke('workspaceFiles', 'read', { path: '/2mb.bin' })
+  await Promise.resolve()
+  t.mock.timers.tick(5_000)
+  const value = await pending
+  assert.equal(value.length, 2 * 1024 * 1024)
+  assert.equal(client.state, 'online')
+
+  // Abort fired right as headers resolve enters readPayload with already-aborted signal cleanly (no unhandled rejection)
+  abortDuringHeaders = true
+  await assert.rejects(
+    () => client.invoke('session', 'page', {}, externalAbort.signal),
+    (error) => error instanceof RelayError && error.code === 'aborted',
+  )
+  assert.equal(client.state, 'online')
+})
+
+test('Task 2: chunked invoke response resets idle timer on chunk progress while stalled chunked stream times out as request-timeout', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  t.after(() => t.mock.timers.reset())
+
+  let controllerRef
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t2-chunked',
+    requestTimeoutMs: 100,
+    infoRefreshMs: 0,
+    fetchImpl: async (url) => {
+      if (new URL(String(url)).pathname.endsWith('/v1/handshake')) {
+        return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      const stream = new ReadableStream({
+        start(controller) {
+          controllerRef = controller
+        },
+      })
+      // Chunked response: no Content-Length header
+      return new Response(stream, { status: 200, headers: { 'content-type': 'application/json' } })
+    },
+  })
+  t.after(() => client.stop())
+  await client.connect()
+
+  // 1. Trickling chunks every 20_000 ms for 60_000 ms total (> 30_000 ms idle, > 100 ms header budget) succeeds
+  const slowStreamPromise = client.invoke('workspaceFiles', 'read', { path: '/big.txt' })
+  await Promise.resolve()
+  controllerRef.enqueue(Buffer.from('{"ok":true,'))
+  await Promise.resolve()
+  t.mock.timers.tick(20_000)
+  controllerRef.enqueue(Buffer.from('"value":"chunked-ok"'))
+  await Promise.resolve()
+  t.mock.timers.tick(20_000)
+  controllerRef.enqueue(Buffer.from('}'))
+  controllerRef.close()
+  assert.equal(await slowStreamPromise, 'chunked-ok')
+  assert.equal(client.state, 'online')
+
+  // 2. Stalled chunked response (no progress for 30_000 ms) times out as request-timeout without flipping offline
+  const stalledChunkedPromise = client.invoke('workspaceFiles', 'read', { path: '/hang.txt' })
+  await Promise.resolve()
+  controllerRef.enqueue(Buffer.from('{"ok":'))
+  await Promise.resolve()
+  t.mock.timers.tick(29_999)
+  // Still alive just before 30s idle deadline
+  t.mock.timers.tick(1)
+  await assert.rejects(
+    () => stalledChunkedPromise,
+    (error) => error instanceof RelayError && error.code === 'request-timeout',
+  )
+  assert.equal(client.state, 'online')
+})
+
+test('Task 2: bodyless pluginRequest GET timeout throws request-timeout without flipping offline, while real transport error sets offline', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  t.after(() => t.mock.timers.reset())
+
+  let mode = 'timeout'
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-t2-plugin',
+    requestTimeoutMs: 120,
+    infoRefreshMs: 0,
+    fetchImpl: async (url, init) => {
+      if (new URL(String(url)).pathname.endsWith('/v1/handshake')) {
+        return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      if (mode === 'network-error') {
+        throw new Error('ECONNRESET')
+      }
+      return await new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')), { once: true })
+      })
+    },
+  })
+  t.after(() => client.stop())
+  await client.connect()
+  assert.equal(client.state, 'online')
+
+  // Bodyless GET timeout must throw request-timeout and keep client online
+  const pendingTimeout = client.pluginRequest({
+    plugin: 'better-sidebar',
+    version: '1.0.0',
+    digest: 'd',
+    path: '/sidebar/file',
+    query: 'path=a.txt',
+    method: 'GET',
+  })
+  await Promise.resolve()
+  t.mock.timers.tick(120)
+  await assert.rejects(
+    () => pendingTimeout,
+    (error) => error instanceof RelayError && error.code === 'request-timeout',
+  )
+  assert.equal(client.state, 'online', 'bodyless pluginRequest timeout must not mark link offline')
+  assert.equal(client.lastError, 'request-timeout')
+
+  // Real transport failure still marks link offline
+  mode = 'network-error'
+  await assert.rejects(
+    () => client.pluginRequest({
+      plugin: 'better-sidebar',
+      version: '1.0.0',
+      digest: 'd',
+      path: '/sidebar/file',
+      query: 'path=a.txt',
+      method: 'GET',
+    }),
+    (error) => error instanceof RelayError && error.code === 'offline',
+  )
+  assert.equal(client.state, 'offline')
 })

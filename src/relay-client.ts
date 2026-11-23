@@ -97,7 +97,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
  * encoded — so a full-size picture over a slow link gets minutes, not the
  * base seconds. The cap never lands below the configured base timeout.
  */
-const INVOKE_TIMEOUT_PER_MIB_MS = 2_000
+const INVOKE_TIMEOUT_PER_MIB_MS = 10_000
 const INVOKE_TIMEOUT_CAP_MS = 900_000
 
 /**
@@ -617,11 +617,72 @@ function messageOf(error: unknown): string {
  * non-JSON body becomes `undefined`, which the classifier then treats as
  * "no usable body".
  */
-async function readPayload(response: Response): Promise<unknown> {
+async function readPayload(
+  response: Response,
+  onProgress?: () => void,
+  abortSignal?: AbortSignal,
+): Promise<unknown> {
   const zrEncoding = response.headers.get('x-zr-content-encoding')?.trim().toLowerCase()
+  const readWithAbort = async <T>(startWork: () => Promise<T>, onAbortCancel?: () => void): Promise<T> => {
+    if (abortSignal?.aborted) {
+      onAbortCancel?.()
+      throw new Error('aborted')
+    }
+    const work = startWork()
+    if (abortSignal === undefined) return work
+    // Prevent unhandled rejection if abort wins the race and `work` rejects later.
+    work.catch(() => {})
+    let onAbort: (() => void) | undefined
+    try {
+      return await Promise.race([
+        work,
+        new Promise<never>((_resolve, reject) => {
+          onAbort = () => {
+            onAbortCancel?.()
+            reject(new Error('aborted'))
+          }
+          abortSignal.addEventListener('abort', onAbort, { once: true })
+        }),
+      ])
+    } finally {
+      if (onAbort !== undefined) abortSignal.removeEventListener('abort', onAbort)
+    }
+  }
+  const readBodyBytes = async (): Promise<Buffer | undefined> => {
+    if (response.body === null || response.body === undefined || typeof response.body.getReader !== 'function') {
+      return undefined
+    }
+    if (abortSignal?.aborted) throw new Error('aborted')
+    const reader = response.body.getReader()
+    const chunks: Uint8Array[] = []
+    let cancelled = false
+    const cancelReader = (): void => {
+      if (cancelled) return
+      cancelled = true
+      void reader.cancel().catch(() => {})
+    }
+    try {
+      await readWithAbort(async () => {
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          if (value !== undefined && value.byteLength > 0) {
+            onProgress?.()
+            chunks.push(value)
+          }
+        }
+      }, cancelReader)
+    } finally {
+      reader.releaseLock()
+    }
+    return Buffer.concat(chunks)
+  }
+
   let text: string
   if (zrEncoding === 'gzip') {
-    const raw = Buffer.from(await response.arrayBuffer())
+    const raw = (abortSignal !== undefined || onProgress !== undefined)
+      ? (await readBodyBytes()) ?? Buffer.from(await readWithAbort(() => response.arrayBuffer()))
+      : Buffer.from(await response.arrayBuffer())
     if (raw.byteLength === 0) return undefined
     try {
       const plain = await gunzipAsync(raw, { maxOutputLength: MAX_GUNZIP_BYTES })
@@ -634,6 +695,9 @@ async function readPayload(response: Response): Promise<unknown> {
       }
       return undefined
     }
+  } else if (abortSignal !== undefined || onProgress !== undefined) {
+    const raw = await readBodyBytes()
+    text = raw !== undefined ? raw.toString('utf8') : await readWithAbort(() => response.text())
   } else {
     text = await response.text()
   }
@@ -1349,15 +1413,33 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       controller.abort()
     }
     let timedOut = false
+    let activeTimeoutMs = timeoutMs
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let hardTimer: ReturnType<typeof setTimeout> | undefined
+    const clearTimers = (): void => {
+      if (timer !== undefined) {
+        clearTimeout(timer)
+        timer = undefined
+      }
+      if (hardTimer !== undefined) {
+        clearTimeout(hardTimer)
+        hardTimer = undefined
+      }
+    }
+    const armTimeout = (ms: number): void => {
+      if (timer !== undefined) clearTimeout(timer)
+      activeTimeoutMs = ms
+      timer = setTimeout(() => {
+        timedOut = true
+        controller.abort()
+      }, ms)
+      if (typeof timer.unref === 'function') timer.unref()
+    }
     if (signal !== undefined) {
       if (signal.aborted) controller.abort()
       else signal.addEventListener('abort', onExternalAbort)
     }
-    const timer = setTimeout(() => {
-      timedOut = true
-      controller.abort()
-    }, timeoutMs)
-    if (typeof timer.unref === 'function') timer.unref()
+    armTimeout(timeoutMs)
     try {
       let response: Response
       try {
@@ -1366,21 +1448,60 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         if (signal?.aborted) throw abortedError()
         if (timedOut && !timeoutSetsOffline) {
           noteFailure('request-timeout')
-          throw new RelayError('request-timeout', `no response within ${timeoutMs} ms`)
+          throw new RelayError('request-timeout', `no response within ${activeTimeoutMs} ms`)
         }
         noteFailure('offline')
         if (transportSetsOffline) setState('offline')
-        throw new RelayError('offline', timedOut ? `no response within ${timeoutMs} ms` : messageOf(error))
+        throw new RelayError('offline', timedOut ? `no response within ${activeTimeoutMs} ms` : messageOf(error))
+      }
+      let onProgress: (() => void) | undefined
+      if (!timeoutSetsOffline) {
+        if (timer !== undefined) {
+          clearTimeout(timer)
+          timer = undefined
+        }
+        const rawLength = response.headers.get('content-length')
+        const parsedLength =
+          rawLength !== null && /^\d+$/.test(rawLength.trim()) ? Number(rawLength.trim()) : undefined
+        const contentLength =
+          parsedLength !== undefined && Number.isSafeInteger(parsedLength) && parsedLength >= 0
+            ? parsedLength
+            : undefined
+        const capMs = Math.max(requestTimeoutMs, INVOKE_TIMEOUT_CAP_MS)
+        if (contentLength !== undefined) {
+          const bodyBudgetMs = Math.min(
+            Math.max(timeoutMs, sizeBackedTimeoutMs(requestTimeoutMs, contentLength) + peerRecoveryMarginMs),
+            capMs,
+          )
+          armTimeout(bodyBudgetMs)
+        } else {
+          const idleMs = Math.max(requestTimeoutMs, 30_000)
+          const totalCapMs = Math.max(timeoutMs, capMs)
+          hardTimer = setTimeout(() => {
+            timedOut = true
+            activeTimeoutMs = totalCapMs
+            controller.abort()
+          }, totalCapMs)
+          if (typeof hardTimer.unref === 'function') hardTimer.unref()
+          armTimeout(idleMs)
+          onProgress = () => {
+            if (!timedOut && !controller.signal.aborted) armTimeout(idleMs)
+          }
+        }
       }
       let payload: unknown
       try {
-        payload = await readPayload(response)
+        payload = await readPayload(response, onProgress, controller.signal)
       } catch (error) {
         if (signal?.aborted) throw abortedError()
+        if (timedOut && !timeoutSetsOffline) {
+          noteFailure('request-timeout')
+          throw new RelayError('request-timeout', `no response within ${activeTimeoutMs} ms`)
+        }
         if (error instanceof RelayError) throw error
         noteFailure('offline')
         if (transportSetsOffline) setState('offline')
-        throw new RelayError('offline', messageOf(error))
+        throw new RelayError('offline', timedOut ? `no response within ${activeTimeoutMs} ms` : messageOf(error))
       }
       if (response.status >= 200 && response.status < 300 && isRecord(payload) && payload.ok === true) {
         // A success answers the link question: the last failure is superseded.
@@ -1390,7 +1511,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       }
       throw failureOf(response.status, payload)
     } finally {
-      clearTimeout(timer)
+      clearTimers()
       if (signal !== undefined) signal.removeEventListener('abort', onExternalAbort)
     }
   }
@@ -1814,7 +1935,11 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     const headerTimeoutMs = hasBody
       ? sizeBackedTimeoutMs(requestTimeoutMs, request.contentLength) + peerRecoveryMarginMs
       : requestTimeoutMs + peerRecoveryMarginMs
-    const timer = setTimeout(() => controller.abort(), headerTimeoutMs)
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      controller.abort()
+    }, headerTimeoutMs)
     if (typeof timer.unref === 'function') timer.unref()
     try {
       let response: Response
@@ -1864,10 +1989,10 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
         // the link's. Same discipline as the invoke/upload timeouts
         // (T31-fix/T51-fix): no offline, no failure recorded on the link.
         if (signal?.aborted) throw abortedError()
-        // A body-bearing call keeps the upload route's rule (T51-fix): the
-        // timeout judges THIS call, not the link — but a real transport
-        // death still reads offline (the reconnect ladder hangs off it).
-        if (hasBody && controller.signal.aborted && !signal?.aborted) {
+        // A call timeout judges THIS call, not the link — bodyless GET or
+        // body-bearing calls alike — while a genuine transport failure still
+        // marks the link offline.
+        if (timedOut) {
           noteFailure('request-timeout')
           throw new RelayError('request-timeout', `no response within ${headerTimeoutMs} ms`)
         }
@@ -1879,7 +2004,9 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       // refusal — travels to the caller verbatim, body untouched.
       return response
     } finally {
-      // The header wait is over (or never started): no deadline on the body.
+      // The header wait is over (or never started): no deadline on the body,
+      // and `onExternalAbort` stays registered (`once`) so a browser hang-up
+      // mid-stream still aborts the relay response body.
       clearTimeout(timer)
     }
   }
