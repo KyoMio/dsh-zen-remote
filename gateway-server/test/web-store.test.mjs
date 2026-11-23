@@ -1154,13 +1154,13 @@ describe('format：设备间连接行 derivePeerConnRow', () => {
     assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(forward)), {
       dot: 'warn',
       kindWord: '经网关中转',
-      reason: '本机或对方网络环境不支持直连，已自动中转 · 0 KB/s',
+      reason: '当前按网关中转显示 · 0 KB/s',
       latency: '—',
     });
     assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(backward)), {
       dot: 'warn',
       kindWord: '经网关中转',
-      reason: '本机或对方网络环境不支持直连，已自动中转 · 0 KB/s',
+      reason: '当前按网关中转显示 · 0 KB/s',
       latency: '—',
     });
   });
@@ -1209,7 +1209,7 @@ describe('format：设备间连接行 derivePeerConnRow', () => {
     assert.deepEqual(derivePeerConnRow(tZh, self, other, linksOf(link)), {
       dot: 'warn',
       kindWord: '经网关中转',
-      reason: '本机或对方网络环境不支持直连，已自动中转 · 8 KB/s',
+      reason: '当前按网关中转显示 · 8 KB/s',
       latency: '—',
     });
     // 双方都对称时优先说本机的原因
@@ -1286,7 +1286,7 @@ describe('PC-17：速率单位全链（meter → API 字段 → formatter 文案
     const link = { srcNodeId: 'self', peerNodeId: 'other', path: 'relay', rttMs: null, liveRelayKbps: apiValue };
     const row = derivePeerConnRow(tZh, makeMember('self', 'authorized'), makeMember('other', 'authorized'), linksOf(link));
     assert.equal(row.dot, 'warn');
-    assert.equal(row.reason, '本机或对方网络环境不支持直连，已自动中转 · 1 KB/s');
+    assert.equal(row.reason, '当前按网关中转显示 · 1 KB/s');
   });
 
   test('该读数经 formatRate 的量级换算不变：值就是 KB/s，不被再乘或除 8', () => {
