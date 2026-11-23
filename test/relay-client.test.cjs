@@ -3539,3 +3539,87 @@ test('Slice 2: relay-client negotiates x-zr-binary-envelope=1 for binary methods
   )
   assert.equal(client.state, 'online')
 })
+
+test('Slice 3: relay-client PreviewCache sends x-zr-if-version, reuses cached bytes on notModified, updates on version change, and clears on stop/credentialsChanged', async (t) => {
+  const bytesV1 = new Uint8Array([1, 2, 3, 4])
+  const bytesV2 = new Uint8Array([9, 8, 7, 6, 5])
+  let serverVersion = 'ver-1'
+  let token = 'tok-a'
+  let fullTransfers = 0
+  const seenIfVersions = []
+
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => token,
+    requestTimeoutMs: 500,
+    infoRefreshMs: 0,
+    fetchImpl: async (url, init) => {
+      const pathname = new URL(String(url)).pathname
+      if (pathname.endsWith('/v1/handshake')) {
+        return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      const headers = init?.headers ?? {}
+      const ifVersion = headers['x-zr-if-version']
+      seenIfVersions.push(ifVersion)
+      if (ifVersion === serverVersion) {
+        return new Response(JSON.stringify({ ok: true, notModified: true, version: serverVersion }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        })
+      }
+      fullTransfers += 1
+      const bytes = serverVersion === 'ver-1' ? bytesV1 : bytesV2
+      const buf = encodeBinaryEnvelope({ data: bytes, version: serverVersion, mimeType: 'image/png' })
+      return new Response(buf, {
+        status: 200,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'x-zr-content-encoding': BINARY_ENVELOPE_ENCODING,
+        },
+      })
+    },
+  })
+  t.after(() => client.stop())
+  await client.connect()
+
+  // 1. First read: cache miss -> full transfer, caches under version='ver-1'
+  const r1 = await client.invoke('workspaceFiles', 'readBytes', { workspaceFileScopeId: 's1', path: 'pic.png' })
+  assert.equal(seenIfVersions[0], undefined)
+  assert.equal(fullTransfers, 1)
+  assert.deepEqual(Array.from(r1.data), Array.from(bytesV1))
+
+  // 2. Second read with different key order: sends x-zr-if-version='ver-1', gets notModified, returns cached copy
+  const r2 = await client.invoke('workspaceFiles', 'readBytes', { path: 'pic.png', workspaceFileScopeId: 's1' })
+  assert.equal(seenIfVersions[1], 'ver-1')
+  assert.equal(fullTransfers, 1, 'notModified avoided redundant payload transfer')
+  assert.deepEqual(Array.from(r2.data), Array.from(bytesV1))
+  // Mutating r2 must not poison cache
+  r2.data[0] = 77
+
+  // 3. Host file changes to ver-2 -> full transfer, cache updates
+  serverVersion = 'ver-2'
+  const r3 = await client.invoke('workspaceFiles', 'readBytes', { workspaceFileScopeId: 's1', path: 'pic.png' })
+  assert.equal(seenIfVersions[2], 'ver-1')
+  assert.equal(fullTransfers, 2)
+  assert.deepEqual(Array.from(r3.data), Array.from(bytesV2))
+
+  // 4. Fourth read sends ver-2 and hits cache again
+  const r4 = await client.invoke('workspaceFiles', 'readBytes', { workspaceFileScopeId: 's1', path: 'pic.png' })
+  assert.equal(seenIfVersions[3], 'ver-2')
+  assert.equal(fullTransfers, 2)
+  assert.deepEqual(Array.from(r4.data), Array.from(bytesV2))
+
+  // 5. Credential change clears PreviewCache -> next call omits x-zr-if-version
+  token = 'tok-b'
+  client.credentialsChanged()
+  await client.connect()
+  await client.invoke('workspaceFiles', 'readBytes', { workspaceFileScopeId: 's1', path: 'pic.png' })
+  assert.equal(seenIfVersions[4], undefined, 'credentialsChanged cleared PreviewCache')
+  assert.equal(fullTransfers, 3)
+
+  // 6. stop() clears PreviewCache
+  client.stop()
+  await client.invoke('workspaceFiles', 'readBytes', { workspaceFileScopeId: 's1', path: 'pic.png' })
+  assert.equal(seenIfVersions[5], undefined, 'stop() cleared PreviewCache')
+  assert.equal(fullTransfers, 4)
+})

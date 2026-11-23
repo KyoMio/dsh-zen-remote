@@ -21,6 +21,7 @@
     "src/state-store.ts",
     "src/relay-pool.ts",
     "src/session-history-cache.ts",
+    "src/preview-cache.ts",
     "src/peer/crypto.ts",
     "src/peer/wire.ts",
     "src/peer/version-sync.ts",

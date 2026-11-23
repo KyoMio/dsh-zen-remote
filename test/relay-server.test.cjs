@@ -2497,3 +2497,63 @@ test('Slice 2: POST /v1/invoke serves binary-envelope when x-zr-binary-envelope=
   assert.equal(legacyJson.ok, true)
   assert.equal(legacyJson.value.data['$zr-u8'], Buffer.from(rawBytes).toString('base64'))
 })
+
+test('Slice 3: POST /v1/invoke honors x-zr-if-version for binary methods and skips transfer when version matches', async (t) => {
+  const rawBytes = new Uint8Array([1, 2, 3, 4, 5])
+  let currentVersion = 'mtime:100'
+  const home = path.join(ROOT, 'slice3-if-version-custom')
+  fs.mkdirSync(home, { recursive: true })
+  const store2 = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 })
+  store2.share('session-a')
+  const handler2 = createRelayHandler({
+    secret: SECRET,
+    store: store2,
+    gateway: {
+      invoke: async () => ({ data: rawBytes, mimeType: 'image/png', version: currentVersion }),
+      stream: async function* () {},
+    },
+    serverInfo: { serverId: loadServerId(home), serverName: () => 'test', dshVersion: '0.0.0-test' },
+  })
+  const server = await startServer(handler2)
+  t.after(() => server.stop())
+
+  // 1. Matching x-zr-if-version -> 200 { ok: true, notModified: true, version } JSON (no binary payload)
+  const hitRes = await server.fetch(
+    '/_dsh/zen-remote/relay/v1/invoke',
+    post(
+      '/i',
+      { namespace: 'workspaceFiles', method: 'readBytes', args: { workspaceFileScopeId: 'session-a', path: 'a.png' } },
+      { ...AUTH, 'x-zr-binary-envelope': '1', 'x-zr-if-version': 'mtime:100' },
+    ),
+  )
+  assert.equal(hitRes.status, 200)
+  assert.equal(hitRes.headers.get('x-zr-content-encoding'), null)
+  assert.deepEqual(await hitRes.json(), { ok: true, notModified: true, version: 'mtime:100' })
+
+  // 2. Stale x-zr-if-version -> full binary-envelope response
+  currentVersion = 'mtime:200'
+  const missRes = await server.fetch(
+    '/_dsh/zen-remote/relay/v1/invoke',
+    post(
+      '/i',
+      { namespace: 'workspaceFiles', method: 'readBytes', args: { workspaceFileScopeId: 'session-a', path: 'a.png' } },
+      { ...AUTH, 'x-zr-binary-envelope': '1', 'x-zr-if-version': 'mtime:100' },
+    ),
+  )
+  assert.equal(missRes.status, 200)
+  assert.equal(missRes.headers.get('x-zr-content-encoding'), BINARY_ENVELOPE_ENCODING)
+  const decoded = decodeBinaryEnvelope(Buffer.from(await missRes.arrayBuffer()))
+  assert.equal(decoded.value.version, 'mtime:200')
+  assert.deepEqual(Array.from(decoded.value.data), Array.from(rawBytes))
+
+  // 3. Unshared session with matching x-zr-if-version STILL gets 403 not-shared
+  const unsharedRes = await server.fetch(
+    '/_dsh/zen-remote/relay/v1/invoke',
+    post(
+      '/i',
+      { namespace: 'workspaceFiles', method: 'readBytes', args: { workspaceFileScopeId: 'session-secret', path: 'a.png' } },
+      { ...AUTH, 'x-zr-binary-envelope': '1', 'x-zr-if-version': 'mtime:200' },
+    ),
+  )
+  assert.equal(unsharedRes.status, 403)
+})

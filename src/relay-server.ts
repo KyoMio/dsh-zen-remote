@@ -63,6 +63,7 @@ import {
   encodeBinaryEnvelope,
   markInvokeBinary,
 } from './invoke-binary.js'
+import { IF_VERSION_HEADER } from './preview-cache.js'
 import { MAX_INVOKE_BODY_BYTES, MAX_UPLOAD_BYTES } from './upload-limits.js'
 import type { NormalizedAdapter, AdapterVerdict } from './plugin-adapter-core.js'
 import { matchAdapterRoute, adapterTailShapeViolation, locateAdapterIds, adapterOwnsRegistryEntry, AdapterMultiValueQueryError } from './plugin-adapter-core.js'
@@ -2013,6 +2014,20 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
                     ? filterSessionSearchResult(value, isAccessible)
                     : value
         const isBinaryMethod = INVOKE_BINARY_RESULT_METHODS.has(`${namespace}/${method}`)
+        if (isBinaryMethod) {
+          const ifVersion = headerValue(req, IF_VERSION_HEADER)?.trim()
+          if (
+            ifVersion !== undefined &&
+            ifVersion !== '' &&
+            isPlainObject(travels) &&
+            typeof travels.version === 'string' &&
+            travels.version !== '' &&
+            travels.version === ifVersion
+          ) {
+            responseJson(res, 200, { ok: true, notModified: true, version: travels.version })
+            return
+          }
+        }
         if (isBinaryMethod && headerValue(req, BINARY_ENVELOPE_REQUEST_HEADER) === '1') {
           let envelope: Buffer | null = null
           try {

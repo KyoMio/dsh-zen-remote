@@ -59,6 +59,7 @@ import {
   decodeBinaryEnvelope,
 } from './invoke-binary.js'
 import type { ServerPluginEntry } from './plugin-bridge.js'
+import { IF_VERSION_HEADER, PreviewCache, canonicalJson } from './preview-cache.js'
 
 /** The one protocol version this client speaks; the handshake verifies it. */
 const RELAY_PROTOCOL = 1
@@ -852,6 +853,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
   let lastHandshakeDigest: string | undefined
   let connectInFlight: Promise<RelayHandshake> | undefined
   let snapshotUnsupported = false
+  const previewCache = new PreviewCache()
   // T43 reconnect machinery: the armed timer handle, how many consecutive
   // attempts have failed (the ladder index), when the armed timer fires, the
   // code of the most recent failure, and whether the row teardown stopped
@@ -905,7 +907,10 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     // A compat verdict describes the server the CURRENT credentials pointed
     // at. Unpairing (or a revocation — the same "this server is gone" wall)
     // invalidates that answer, so the verdict goes with the link (T42-fix).
-    if (next === 'unpaired' || next === 'revoked') compat = undefined
+    if (next === 'unpaired' || next === 'revoked') {
+      compat = undefined
+      previewCache.clear()
+    }
     notify()
   }
 
@@ -935,7 +940,11 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
       setState('unpaired')
       throw new RelayError('unpaired', 'no server address or pairing token is configured')
     }
-    credentialsDigest = relayCredentialsDigest(creds.url, creds.token)
+    const nextDigest = relayCredentialsDigest(creds.url, creds.token)
+    if (credentialsDigest !== undefined && credentialsDigest !== nextDigest) {
+      previewCache.clear()
+    }
+    credentialsDigest = nextDigest
     return creds
   }
 
@@ -1765,6 +1774,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     if (digest === credentialsDigest) return
     credentialsDigest = digest
     snapshotUnsupported = false
+    previewCache.clear()
     // Same invalidation rule as setState's unpaired/revoked branch: a
     // verdict the current credentials never earned must not stay visible —
     // even when the very next handshake lands online, there is a window
@@ -1794,6 +1804,7 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
 
   function stop(): void {
     stopped = true
+    previewCache.clear()
     cancelRetry()
     if (infoTimer !== undefined) {
       clock.clearTimeout(infoTimer)
@@ -1807,15 +1818,49 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     // round-trip budget scales with. The timeout deliberately does NOT move
     // the connection state — a slow prompt is a slow call, not a dead link.
     const bodyJson = JSON.stringify({ namespace, method, args })
-    const extraHeaders = INVOKE_BINARY_RESULT_METHODS.has(`${namespace}/${method}`)
-      ? { [BINARY_ENVELOPE_REQUEST_HEADER]: '1' }
-      : undefined
-    const payload = await exchange(INVOKE_PATH, bodyJson, signal, true, creds, {
+    const isBinaryMethod = INVOKE_BINARY_RESULT_METHODS.has(`${namespace}/${method}`)
+    if (!isBinaryMethod) {
+      const payload = await exchange(INVOKE_PATH, bodyJson, signal, true, creds, {
+        timeoutMs: invokeTimeoutMs(requestTimeoutMs, bodyJson, peerRecoveryMarginMs),
+        timeoutSetsOffline: false,
+        acceptGzip: true,
+      })
+      return payload.value
+    }
+
+    const requestDigest = relayCredentialsDigest(creds.url, creds.token)
+    const cacheKey = `${namespace}/${method}:${canonicalJson(args)}`
+    const cached = previewCache.get(cacheKey)
+    const extraHeaders: Record<string, string> = {
+      [BINARY_ENVELOPE_REQUEST_HEADER]: '1',
+      ...(cached !== undefined ? { [IF_VERSION_HEADER]: cached.version } : {}),
+    }
+    let payload = await exchange(INVOKE_PATH, bodyJson, signal, true, creds, {
       timeoutMs: invokeTimeoutMs(requestTimeoutMs, bodyJson, peerRecoveryMarginMs),
       timeoutSetsOffline: false,
       acceptGzip: true,
       extraHeaders,
     })
+    if (payload.notModified === true) {
+      if (cached !== undefined) {
+        return cached.value
+      }
+      payload = await exchange(INVOKE_PATH, bodyJson, signal, true, creds, {
+        timeoutMs: invokeTimeoutMs(requestTimeoutMs, bodyJson, peerRecoveryMarginMs),
+        timeoutSetsOffline: false,
+        acceptGzip: true,
+        extraHeaders: { [BINARY_ENVELOPE_REQUEST_HEADER]: '1' },
+      })
+    }
+    if (
+      !stopped &&
+      credentialsDigest === requestDigest &&
+      isRecord(payload.value) &&
+      typeof payload.value.version === 'string' &&
+      payload.value.version !== ''
+    ) {
+      previewCache.set(cacheKey, payload.value.version, payload.value)
+    }
     return payload.value
   }
 

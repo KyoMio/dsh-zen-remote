@@ -22,6 +22,9 @@ let BINARY_ENVELOPE_ENCODING
 let MAX_BINARY_ENVELOPE_BYTES
 let MAX_BINARY_ENVELOPE_ATTACHMENTS
 let INVOKE_BINARY_RESULT_METHODS
+let PreviewCache
+let estimateValueBytes
+let canonicalJson
 
 before(async () => {
   ;({
@@ -38,6 +41,9 @@ before(async () => {
     INVOKE_BINARY_RESULT_METHODS,
   } = await import(
     pathToFileURL(path.join(__dirname, '..', 'lib', 'invoke-binary.js')).href
+  ))
+  ;({ PreviewCache, estimateValueBytes, canonicalJson } = await import(
+    pathToFileURL(path.join(__dirname, '..', 'lib', 'preview-cache.js')).href
   ))
 })
 
@@ -206,4 +212,57 @@ test('Slice 2: encodeBinaryEnvelope / decodeBinaryEnvelope round-trips attachmen
   // 7. Max attachments (64) limit enforced
   const tooMany = { items: Array.from({ length: 65 }, (_, i) => new Uint8Array([i])) }
   assert.throws(() => encodeBinaryEnvelope(tooMany), /attachment/i)
+})
+
+test('Slice 3: PreviewCache enforces LRU maxEntries/maxBytes, skips oversized entries without evicting warm entries, and isolates mutations', () => {
+  // 1. Entry-count & byte-budget LRU eviction + get() recency refresh
+  const cache = new PreviewCache({ maxBytes: 1500, maxEntryBytes: 800, maxEntries: 3 })
+  assert.equal(cache.stats().entries, 0)
+
+  const bytesA = new Uint8Array(200).fill(1)
+  const bytesB = new Uint8Array(200).fill(2)
+  const bytesC = new Uint8Array(200).fill(3)
+  assert.equal(cache.set('k1', 'v1', { data: bytesA, version: 'v1' }), true)
+  assert.equal(cache.set('k2', 'v2', { data: bytesB, version: 'v2' }), true)
+  assert.equal(cache.set('k3', 'v3', { data: bytesC, version: 'v3' }), true)
+  assert.equal(cache.stats().entries, 3)
+
+  // Touch k1 so k2 becomes LRU; adding k4 evicts k2 (not k1)
+  const got1 = cache.get('k1')
+  assert.equal(got1.version, 'v1')
+  // Mutating returned object & buffer must NOT mutate cached entry
+  got1.value.data[0] = 99
+  got1.value.version = 'tampered'
+  bytesA[1] = 88
+  const got1Again = cache.get('k1')
+  assert.equal(got1Again.value.data[0], 1)
+  assert.equal(got1Again.value.data[1], 1)
+  assert.equal(got1Again.value.version, 'v1')
+
+  assert.equal(cache.set('k4', 'v4', { data: new Uint8Array(200).fill(4), version: 'v4' }), true)
+  assert.equal(cache.get('k2'), undefined, 'LRU k2 evicted at maxEntries=3')
+  assert.ok(cache.get('k1') !== undefined, 'recently accessed k1 retained')
+
+  // 2. Oversized entry (> maxEntryBytes) is skipped WITHOUT evicting warm entries
+  const huge = new Uint8Array(900).fill(7)
+  assert.ok(estimateValueBytes({ data: huge }) > 800)
+  assert.equal(cache.set('huge', 'vh', { data: huge, version: 'vh' }), false)
+  assert.equal(cache.get('huge'), undefined)
+  assert.equal(cache.stats().entries, 3, 'oversized entry did not evict warm entries')
+
+  // 3. Byte-budget eviction: adding 700B entry evicts LRU entries until totalBytes <= 1500
+  const big = new Uint8Array(500).fill(5)
+  assert.equal(cache.set('k5', 'v5', { data: big, version: 'v5' }), true)
+  assert.ok(cache.stats().bytes <= 1500)
+  assert.equal(cache.stats().entries, 2, 'byte budget evicted oldest entries down to 2')
+
+  // 4. canonicalJson produces identical key regardless of object key order
+  assert.equal(canonicalJson({ b: 2, a: { y: 1, x: 0 } }), canonicalJson({ a: { x: 0, y: 1 }, b: 2 }))
+
+  // 5. delete() and clear()
+  assert.equal(cache.delete('k5'), true)
+  assert.equal(cache.delete('missing'), false)
+  cache.clear()
+  assert.equal(cache.stats().entries, 0)
+  assert.equal(cache.stats().bytes, 0)
 })
