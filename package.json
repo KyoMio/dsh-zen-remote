@@ -89,6 +89,7 @@
     "type": "git",
     "url": "git+https://github.com/KyoMio/dsh-zen-remote.git"
   },
+  "homepage": "https://zen-remote.com",
   "engines": {
     "node": ">=18",
     "dsh": ">=0.2.1-alpha.2 <0.3.0-0"
