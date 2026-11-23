@@ -1091,6 +1091,7 @@ describe('SqliteStore GC-2 扩展', () => {
         tlsCertFile: 'fullchain.pem',
         tlsKeyFile: 'privkey.pem',
         autoUpdateEnabled: true,
+        forceRelay: false,
       });
       // 扩展键部分更新（含可空字符串、时间戳与 TLS 三态字段往返）；未在 patch 里的键不受影响
       const updated = await store.updateExtendedSettings({
@@ -1837,6 +1838,33 @@ describe('T3 autoUpdateEnabled config & store persistence', () => {
       assert.equal(ext2.autoUpdateEnabled, true);
       await s2.updateExtendedSettings({ autoUpdateEnabled: false });
       assert.equal((await s2.getExtendedSettings()).autoUpdateEnabled, false);
+    } finally {
+      await s2.close();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('Slice 2 forceRelay store persistence', () => {
+  test('SqliteStore forceRelay defaults false and persists across reopens (no DDL migration)', async () => {
+    const dir = tmpDir('force-relay-store');
+    const dbPath = path.join(dir, 'gw.sqlite');
+    const s1 = new SqliteStore({ path: dbPath });
+    try {
+      const ext1 = await s1.getExtendedSettings();
+      assert.equal(ext1.forceRelay, false);
+      const updated = await s1.updateExtendedSettings({ forceRelay: true });
+      assert.equal(updated.forceRelay, true);
+    } finally {
+      await s1.close();
+    }
+
+    const s2 = new SqliteStore({ path: dbPath });
+    try {
+      const ext2 = await s2.getExtendedSettings();
+      assert.equal(ext2.forceRelay, true);
+      await s2.updateExtendedSettings({ forceRelay: false });
+      assert.equal((await s2.getExtendedSettings()).forceRelay, false);
     } finally {
       await s2.close();
       fs.rmSync(dir, { recursive: true, force: true });

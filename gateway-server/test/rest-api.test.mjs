@@ -43,7 +43,7 @@ function seedSettings(overrides = {}) {
 
 async function startServer(opts = {}) {
   const store = opts.store ?? new SqliteStore({ seed: opts.seed ?? seedSettings() });
-  const hooks = { memberChanged: [], networkDeleted: [], settingsChanged: [], userDisabled: [], quotaChanged: [], userDeleted: [] };
+  const hooks = { memberChanged: [], networkDeleted: [], settingsChanged: [], forceRelayChanged: [], userDisabled: [], quotaChanged: [], userDeleted: [] };
   const server = createGatewayApiServer({
     store,
     masterKey: MASTER_KEY,
@@ -55,6 +55,7 @@ async function startServer(opts = {}) {
       onMemberChanged: (event) => hooks.memberChanged.push(event),
       onNetworkDeleted: (networkId) => hooks.networkDeleted.push(networkId),
       onSettingsChanged: (settings) => hooks.settingsChanged.push(settings),
+      onForceRelayChanged: (next) => hooks.forceRelayChanged.push(next),
       onUserDisabled: (userId) => hooks.userDisabled.push(userId),
       onQuotaChanged: (userId) => hooks.quotaChanged.push(userId ?? null),
       onUserDeleted: (userId) => hooks.userDeleted.push(userId),
@@ -790,6 +791,7 @@ describe('REST API /api/v1（主服务器）', () => {
         publicUrl: null,
         sessionTtlDays: 7,
         autoUpdateEnabled: true,
+        forceRelay: false,
         defaultGroupId: 'grp_default',
         smtp: {
           configured: false,
@@ -3055,6 +3057,46 @@ describe('T5 /api/v1/admin/update* 与 /admin/runtime update 摘要', () => {
       assert.equal(dismissRes.status, 200);
       assert.equal(dismissRes.json.data.lastRollback, null);
       assert.equal(dismissRes.json.data.rollbackReason, null);
+    } finally {
+      await stopServer(h);
+    }
+  });
+});
+
+describe('Slice 2 GET/PATCH /api/v1/admin/settings forceRelay', () => {
+  test('persists forceRelay boolean, rejects non-boolean with 400, and fires onForceRelayChanged hook', async () => {
+    const h = await startServer();
+    try {
+      await seedUsers(h.store);
+      const adminCookie = await login(h.base, ADMIN_EMAIL, ADMIN_PASSWORD);
+
+      const initial = await api(h.base, 'GET', '/api/v1/admin/settings', { cookie: adminCookie });
+      assert.equal(initial.status, 200);
+      assert.equal(initial.json.data.forceRelay, false);
+
+      const bad = await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { forceRelay: 'yes' },
+      });
+      assert.equal(bad.status, 400);
+      assert.equal(h.hooks.forceRelayChanged.length, 0);
+
+      const onRes = await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { forceRelay: true },
+      });
+      assert.equal(onRes.status, 200);
+      assert.equal(onRes.json.data.forceRelay, true);
+      assert.equal((await h.store.getExtendedSettings()).forceRelay, true);
+      assert.deepEqual(h.hooks.forceRelayChanged, [true]);
+
+      const offRes = await api(h.base, 'PATCH', '/api/v1/admin/settings', {
+        cookie: adminCookie,
+        body: { forceRelay: false },
+      });
+      assert.equal(offRes.status, 200);
+      assert.equal(offRes.json.data.forceRelay, false);
+      assert.deepEqual(h.hooks.forceRelayChanged, [true, false]);
     } finally {
       await stopServer(h);
     }

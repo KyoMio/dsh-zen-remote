@@ -135,6 +135,7 @@ async function buildSettingsView(ctx: RouteContext): Promise<Record<string, unkn
     publicUrl: ext.publicUrl,
     sessionTtlDays: ext.sessionTtlDays,
     autoUpdateEnabled: ext.autoUpdateEnabled,
+    forceRelay: ext.forceRelay,
     // 当前 is_default 组的 id；无默认组行时兜底内置 id（正常初始化流程不会发生）
     defaultGroupId: groups.find((g) => g.isDefault)?.id ?? DEFAULT_GROUP_ID,
     smtp: {
@@ -311,6 +312,12 @@ async function handlePatchSettings(ctx: RouteContext): Promise<void> {
     }
     extPatch.autoUpdateEnabled = body['autoUpdateEnabled'];
   }
+  if (body['forceRelay'] !== undefined) {
+    if (typeof body['forceRelay'] !== 'boolean') {
+      throw new ApiError(400, 'INVALID_REQUEST', 'forceRelay must be a boolean');
+    }
+    extPatch.forceRelay = body['forceRelay'];
+  }
   const ext = await ctx.store.getExtendedSettings();
   const savedSmtp = decodeSmtpConfig(ext.smtpConfigEnc, ctx.masterKey);
   let smtpProvided = false;
@@ -361,6 +368,9 @@ async function handlePatchSettings(ctx: RouteContext): Promise<void> {
   // 钩子仍按基础 4 键契约通知实时层（PG-5 限速器 / 会话 TTL），配额全量失效刷新
   await runHook(ctx.hooks.onSettingsChanged, await ctx.store.getSettings());
   await runHook(ctx.hooks.onQuotaChanged);
+  if (extPatch.forceRelay !== undefined) {
+    await runHook(ctx.hooks.onForceRelayChanged, extPatch.forceRelay);
+  }
   sendOk(ctx.res, await buildSettingsView(ctx));
 }
 

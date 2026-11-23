@@ -81,6 +81,8 @@ export interface ExtendedSystemSettings extends SystemSettings {
   tlsKeyFile: string;
   /** 容器内自动热更新总开关（默认 true；首配支持 ZR_GATEWAY_AUTO_UPDATE=false|0） */
   autoUpdateEnabled: boolean;
+  /** 网关全局强制中转开关（默认 false；开启后跳过打洞/STUN 并通知在线节点切中转） */
+  forceRelay: boolean;
 }
 
 export type ExtendedSettingsPatch = Partial<ExtendedSystemSettings>;
@@ -99,6 +101,7 @@ export const DEFAULT_EXTENDED_SETTINGS: ExtendedSystemSettings = {
   tlsCertFile: 'fullchain.pem',
   tlsKeyFile: 'privkey.pem',
   autoUpdateEnabled: true,
+  forceRelay: false,
 };
 
 /** 三项配额键：settings ↔ 默认组双向同步只同步这三个键 */
@@ -130,6 +133,7 @@ export const SETTINGS_KEYS: Readonly<Record<keyof ExtendedSystemSettings, string
   tlsCertFile: 'tls_cert_file',
   tlsKeyFile: 'tls_key_file',
   autoUpdateEnabled: 'auto_update_enabled',
+  forceRelay: 'force_relay',
 };
 
 /** settings 值统一以字符串存 key-value 表（null 存空串，读取时空串解析回 null） */
@@ -192,6 +196,7 @@ export function parseExtendedSettingsRows(rows: ReadonlyArray<Record<string, unk
     tlsCertFile: text('tlsCertFile') ?? DEFAULT_EXTENDED_SETTINGS.tlsCertFile,
     tlsKeyFile: text('tlsKeyFile') ?? DEFAULT_EXTENDED_SETTINGS.tlsKeyFile,
     autoUpdateEnabled: map.get(SETTINGS_KEYS.autoUpdateEnabled) !== 'false',
+    forceRelay: map.get(SETTINGS_KEYS.forceRelay) === 'true',
   };
 }
 

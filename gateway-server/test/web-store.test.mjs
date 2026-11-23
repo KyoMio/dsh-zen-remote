@@ -367,6 +367,7 @@ function makeAdminSettings(overrides = {}) {
     publicUrl: null,
     sessionTtlDays: 7,
     autoUpdateEnabled: true,
+    forceRelay: false,
     defaultGroupId: 'grp_default',
     smtp: {
       configured: false,
@@ -3011,5 +3012,18 @@ describe('T5 ConsoleClient 更新接口与插件版本提示判定', () => {
     assert.equal(isMemberPluginOutdated(m2.pluginVersion, '2.6.0'), false);
     assert.equal(isMemberPluginOutdated(mLegacy.pluginVersion, '2.6.0'), false);
     assert.equal(isMemberPluginOutdated('2.7.0-beta.1', '2.7.0'), true);
+  });
+
+  test('Slice 2 ConsoleClient updateAdminSettings supports forceRelay and locales expose admin.forceRelay', async () => {
+    assert.ok('admin.forceRelay' in LOCALES.zh, 'zh locale must include admin.forceRelay');
+    assert.ok('admin.forceRelay' in LOCALES.en, 'en locale must include admin.forceRelay');
+    assert.ok('admin.forceRelayHint' in LOCALES.zh, 'zh locale must include admin.forceRelayHint');
+    assert.ok('admin.forceRelayHint' in LOCALES.en, 'en locale must include admin.forceRelayHint');
+    const patchedView = makeAdminSettings({ forceRelay: true });
+    const { calls, impl } = fakeFetch(() => jsonEnvelope(200, { ok: true, data: patchedView }));
+    const client = new ConsoleClient({ fetchImpl: impl });
+    const res = await client.updateAdminSettings({ forceRelay: true });
+    assert.equal(res.forceRelay, true);
+    assert.equal(JSON.parse(calls[0].init.body).forceRelay, true);
   });
 });

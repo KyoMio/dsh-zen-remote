@@ -380,6 +380,7 @@ export interface AdminSettingsData {
   sessionTtlDays: number;
   defaultGroupId: string;
   autoUpdateEnabled: boolean;
+  forceRelay: boolean;
   smtp: AdminSmtpView;
   adminApiKey: AdminApiKeyView;
 }
@@ -408,6 +409,7 @@ export interface AdminSettingsPatch {
   sessionTtlDays?: number;
   defaultGroupId?: string;
   autoUpdateEnabled?: boolean;
+  forceRelay?: boolean;
   smtp?: AdminSmtpDraft | null;
 }
 

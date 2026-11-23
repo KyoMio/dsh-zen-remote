@@ -494,6 +494,7 @@ async function startGateway(opts = {}) {
     ...(opts.gatewayVersion !== undefined ? { gatewayVersion: opts.gatewayVersion } : {}),
     ...(opts.getLatestKnownPluginVersion !== undefined ? { getLatestKnownPluginVersion: opts.getLatestKnownPluginVersion } : {}),
     ...(opts.wireCompatRange !== undefined ? { wireCompatRange: opts.wireCompatRange } : {}),
+    ...(opts.stunPorts !== undefined ? { stunPorts: opts.stunPorts } : {}),
   });
   const server = createGatewayApiServer({ store, masterKey, runtime: hub, hooks: hub.hooks, topology: hub });
   await new Promise((resolve, reject) => {
@@ -4229,6 +4230,117 @@ describe('T2 /peer/v1/ws 双向版本握手与拓扑 pluginVersion', () => {
       assert.equal(deniedB.type, 'denied');
       assert.equal(deniedB.reason, 'version-incompatible:gateway-too-old');
       await wsClosed(wsB);
+    } finally {
+      await gw.close();
+    }
+  });
+
+  test('Slice 2: forceRelay=true suppresses STUN/endpoints/punch-coordinate and live toggle broadcasts network-updated & re-emits punch-coordinate on false', async () => {
+    const gw = await startGateway({
+      stunPorts: () => ({ primaryPort: 19394, altPort: 19395 }),
+    });
+    try {
+      const net = await createNetwork(gw, { mode: 'key' });
+      const a = identity();
+      const b = identity();
+
+      // Enable forceRelay before peers authenticate
+      const enableRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+        body: JSON.stringify({ forceRelay: true }),
+      });
+      assert.equal(enableRes.status, 200);
+
+      const wsA = await wsOpen(gw.base);
+      await authNode(wsA, a, {
+        networkId: net.id,
+        joinKey: net.joinKey,
+        name: 'alpha',
+        lanEndpoints: ['192.168.1.10:40001'],
+      });
+      const welcomeA = await wsJson(wsA);
+      assert.equal(welcomeA.status, 'authorized');
+      assert.equal(welcomeA.forceRelay, true);
+      assert.equal('stun' in welcomeA, false, 'welcome must omit stun while forceRelay=true');
+      assert.equal(gw.hub.admitStunProbe(net.id, a.nodeId, a.publicKeyHex), null, 'admitStunProbe returns null while forceRelay=true');
+
+      const wsB = await wsOpen(gw.base);
+      await authNode(wsB, b, {
+        networkId: net.id,
+        joinKey: net.joinKey,
+        name: 'beta',
+        lanEndpoints: ['192.168.1.20:40002'],
+      });
+      const welcomeB = await wsJson(wsB);
+      assert.equal(welcomeB.status, 'authorized');
+      assert.equal(welcomeB.forceRelay, true);
+      assert.equal('stun' in welcomeB, false);
+      assert.deepEqual(welcomeB.peers[0].lanEndpoints, []);
+      assert.equal(welcomeB.peers[0].reflexiveEndpoint, null);
+
+      const joinedA = await wsJson(wsA);
+      assert.equal(joinedA.type, 'peer-joined');
+      assert.deepEqual(joinedA.lanEndpoints, []);
+      assert.equal(joinedA.reflexiveEndpoint, null);
+
+      // No punch-coordinate emitted while forceRelay=true
+      await wsSilence(wsA, 80);
+      await wsSilence(wsB, 80);
+
+      // applyNatObservation must early-return while forceRelay=true
+      gw.hub.applyNatObservation({
+        networkId: net.id,
+        nodeId: a.nodeId,
+        natType: 'cone',
+        reflexiveIp: '203.0.113.5',
+        reflexivePort: 50001,
+      });
+      await wsSilence(wsB, 80);
+
+      // Live toggle forceRelay -> false: broadcasts network-updated(forceRelay:false, stun) + re-emits punch-coordinate
+      const disableRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+        body: JSON.stringify({ forceRelay: false }),
+      });
+      assert.equal(disableRes.status, 200);
+
+      const updA = await wsJson(wsA);
+      const updB = await wsJson(wsB);
+      assert.equal(updA.type, 'network-updated');
+      assert.equal(updA.forceRelay, false);
+      assert.deepEqual(updA.stun, { primaryPort: 19394, altPort: 19395 });
+      assert.equal(updB.type, 'network-updated');
+      assert.equal(updB.forceRelay, false);
+
+      const punchA = await wsJson(wsA);
+      const punchB = await wsJson(wsB);
+      assert.equal(punchA.type, 'punch-coordinate');
+      assert.equal(punchA.peerNodeId, b.nodeId);
+      assert.deepEqual(punchA.lanEndpoints, ['192.168.1.20:40002']);
+      assert.equal(punchB.type, 'punch-coordinate');
+      assert.equal(punchB.peerNodeId, a.nodeId);
+      assert.deepEqual(punchB.lanEndpoints, ['192.168.1.10:40001']);
+      assert.ok(gw.hub.admitStunProbe(net.id, a.nodeId, a.publicKeyHex) !== null);
+
+      // Live toggle false -> true: broadcasts network-updated(forceRelay:true) without stun
+      const reEnableRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+        body: JSON.stringify({ forceRelay: true }),
+      });
+      assert.equal(reEnableRes.status, 200);
+      const upd2A = await wsJson(wsA);
+      const upd2B = await wsJson(wsB);
+      assert.equal(upd2A.type, 'network-updated');
+      assert.equal(upd2A.forceRelay, true);
+      assert.equal('stun' in upd2A, false);
+      assert.equal(upd2B.type, 'network-updated');
+      assert.equal(upd2B.forceRelay, true);
+
+      wsA.close();
+      wsB.close();
     } finally {
       await gw.close();
     }

@@ -67,6 +67,7 @@ export function HotConfigForm(props: {
   const [publicUrlDraft, setPublicUrlDraft] = useState(settings.publicUrl ?? '');
   const [allowSignup, setAllowSignup] = useState(settings.allowSignup);
   const [requireVerification, setRequireVerification] = useState(settings.requireEmailVerification);
+  const [forceRelay, setForceRelay] = useState(settings.forceRelay);
   const [defaultGroupId, setDefaultGroupId] = useState(settings.defaultGroupId);
   const [ttlDraft, setTtlDraft] = useState(String(settings.sessionTtlDays));
   const [busy, setBusy] = useState(false);
@@ -78,6 +79,7 @@ export function HotConfigForm(props: {
     setPublicUrlDraft(settings.publicUrl ?? '');
     setAllowSignup(settings.allowSignup);
     setRequireVerification(settings.requireEmailVerification);
+    setForceRelay(settings.forceRelay);
     setDefaultGroupId(settings.defaultGroupId);
     setTtlDraft(String(settings.sessionTtlDays));
   }, [settings]);
@@ -91,6 +93,7 @@ export function HotConfigForm(props: {
     if (trimmedUrl !== (settings.publicUrl ?? '')) patch['publicUrl'] = trimmedUrl === '' ? null : trimmedUrl;
     if (allowSignup !== settings.allowSignup) patch['allowSignup'] = allowSignup;
     if (requireVerification !== settings.requireEmailVerification) patch['requireEmailVerification'] = requireVerification;
+    if (forceRelay !== settings.forceRelay) patch['forceRelay'] = forceRelay;
     if (groups.some((g) => g.id === defaultGroupId) && defaultGroupId !== settings.defaultGroupId) {
       patch['defaultGroupId'] = defaultGroupId;
     }
@@ -186,6 +189,26 @@ export function HotConfigForm(props: {
             {t('admin.requireEmailVerificationNeedsSmtp')}
           </p>
         )}
+
+        <div className="setting-row">
+          <span id="admin-force-relay-label">{t('admin.forceRelay')}</span>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={forceRelay}
+            aria-labelledby="admin-force-relay-label"
+            className={forceRelay ? 'switch on' : 'switch'}
+            onClick={() => {
+              setForceRelay((v) => !v);
+              setSaved(false);
+            }}
+          >
+            <span className="switch-knob" aria-hidden="true" />
+          </button>
+        </div>
+        <p className="field-hint" style={{ margin: '-8px 0 14px' }}>
+          {t('admin.forceRelayHint')}
+        </p>
 
         {groups.length > 0 && (
           <div className="field">

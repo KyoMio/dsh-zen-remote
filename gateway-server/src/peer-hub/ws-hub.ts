@@ -220,14 +220,14 @@ function endpointString(reflexive: { ip: string; port: number } | null): string 
   return reflexive !== null ? `${reflexive.ip}:${reflexive.port}` : null;
 }
 
-function peerView(conn: ConnState): PeerView {
+function peerView(conn: ConnState, stripDirectEndpoints = false): PeerView {
   return {
     nodeId: conn.nodeId,
     publicKeyHex: conn.publicKeyHex,
     name: conn.name,
-    lanEndpoints: conn.lanEndpoints,
+    lanEndpoints: stripDirectEndpoints ? [] : conn.lanEndpoints,
     natType: conn.natType,
-    reflexiveEndpoint: endpointString(conn.reflexive),
+    reflexiveEndpoint: stripDirectEndpoints ? null : endpointString(conn.reflexive),
     connSeq: conn.connSeq,
     pluginVersion: conn.pluginVersion,
   };
@@ -370,6 +370,10 @@ export class PeerWsHub {
   private readonly pendingNat = new Map<string, { networkId: string; nodeId: string; natType?: NatType; lastIp?: string }>();
   /** 系统实时 relayRateKbps；构造时异步拉一次，onSettingsChanged 钩子热更新 */
   private rateKbps: number = DEFAULT_SETTINGS.relayRateKbps;
+  /** 网关全局强制中转开关；构造时异步加载、handleAuth 惰性等待、onForceRelayChanged 热更新 */
+  private forceRelay = false;
+  private forceRelayLoaded = false;
+  private forceRelayLoadPromise: Promise<void> | null = null;
   private rateTimer: NodeJS.Timeout | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
   // PS-5：单通道刷盘合流——同一时刻至多一个在途 flushTelemetry，重叠调用共享同一 Promise 并通过 flushQueued 续刷一轮。
@@ -470,6 +474,18 @@ export class PeerWsHub {
         if (!this.closed) this.rateKbps = settings.relayRateKbps;
       })
       .catch(() => {/* 库暂不可用时用默认速率，settings 变更钩子会再喂 */});
+    this.forceRelayLoadPromise = this.store
+      .getExtendedSettings()
+      .then((ext) => {
+        if (!this.closed && !this.forceRelayLoaded) {
+          this.forceRelay = ext.forceRelay;
+          this.forceRelayLoaded = true;
+        }
+      })
+      .catch(() => {/* 暂不可用时维持 false，handleAuth 再惰性重试 */})
+      .finally(() => {
+        this.forceRelayLoadPromise = null;
+      });
     const rateTickMs = options.rateTickMs === undefined ? 3000 : options.rateTickMs;
     if (rateTickMs !== null && rateTickMs > 0) {
       this.rateTimer = setInterval(() => this.tickRates(), rateTickMs);
@@ -856,35 +872,37 @@ export class PeerWsHub {
       nodeId: conn.nodeId,
       publicKeyHex: conn.publicKeyHex,
       name: conn.name,
-      lanEndpoints: conn.lanEndpoints,
+      lanEndpoints: this.forceRelay ? [] : conn.lanEndpoints,
       natType: conn.natType,
-      reflexiveEndpoint: endpointString(conn.reflexive),
+      reflexiveEndpoint: this.forceRelay ? null : endpointString(conn.reflexive),
       connSeq: conn.connSeq,
       pluginVersion: conn.pluginVersion,
     }, conn.nodeId);
     // 打洞协调：向配对节点对（新节点 ↔ 每个在线成员）同时下发；
-    // publicKeyHex 供对端做 TOFU 锚定与 E2EE 握手
-    for (const other of others) {
-      sendJson(conn.ws, {
-        type: 'punch-coordinate',
-        peerNodeId: other.nodeId,
-        publicKeyHex: other.publicKeyHex,
-        lanEndpoints: other.lanEndpoints,
-        reflexiveEndpoint: endpointString(other.reflexive),
-        natType: other.natType,
-        connSeq: other.connSeq,
-        startAfterMs: 20,
-      });
-      sendJson(other.ws, {
-        type: 'punch-coordinate',
-        peerNodeId: conn.nodeId,
-        publicKeyHex: conn.publicKeyHex,
-        lanEndpoints: conn.lanEndpoints,
-        reflexiveEndpoint: endpointString(conn.reflexive),
-        natType: conn.natType,
-        connSeq: conn.connSeq,
-        startAfterMs: 20,
-      });
+    // 强制中转模式跳过打洞坐标下发；publicKeyHex 供对端做 TOFU 锚定与 E2EE 握手
+    if (!this.forceRelay) {
+      for (const other of others) {
+        sendJson(conn.ws, {
+          type: 'punch-coordinate',
+          peerNodeId: other.nodeId,
+          publicKeyHex: other.publicKeyHex,
+          lanEndpoints: other.lanEndpoints,
+          reflexiveEndpoint: endpointString(other.reflexive),
+          natType: other.natType,
+          connSeq: other.connSeq,
+          startAfterMs: 20,
+        });
+        sendJson(other.ws, {
+          type: 'punch-coordinate',
+          peerNodeId: conn.nodeId,
+          publicKeyHex: conn.publicKeyHex,
+          lanEndpoints: conn.lanEndpoints,
+          reflexiveEndpoint: endpointString(conn.reflexive),
+          natType: conn.natType,
+          connSeq: conn.connSeq,
+          startAfterMs: 20,
+        });
+      }
     }
     // GC-3：入网注册即预热属主配额快照——首条业务帧大概率已可按组速率/月度门禁判定
     void this.loadOwnerQuota(conn.networkId).then((snapshot) => this.storeOwnerQuota(conn.networkId, snapshot));
@@ -931,19 +949,41 @@ export class PeerWsHub {
   private welcomeAuthorized(conn: ConnState): void {
     const peers = [...(this.conns.get(conn.networkId)?.values() ?? [])]
       .filter((c) => c !== conn)
-      .map(peerView);
-    // stun 为增量字段：真实 UDP 端口供节点打洞，旧节点忽略；端口未就绪时整字段缺席
-    const stunPorts = this.stunPorts?.() ?? null;
+      .map((c) => peerView(c, this.forceRelay));
+    // stun 为增量字段：真实 UDP 端口供节点打洞，旧节点忽略；端口未就绪或强制中转时整字段缺席
+    const stunPorts = this.forceRelay ? null : (this.stunPorts?.() ?? null);
     sendJson(conn.ws, {
       type: 'welcome',
       status: 'authorized',
       connSeq: conn.connSeq,
       maxPeers: conn.maxPeers,
       peerDirectMaxRttMs: conn.peerDirectMaxRttMs,
+      forceRelay: this.forceRelay,
       peers,
       ...this.welcomeVersionFields(conn.networkId, conn.pluginVersion),
       ...(stunPorts !== null ? { stun: stunPorts } : {}),
     });
+  }
+
+  private async ensureForceRelayLoaded(): Promise<void> {
+    if (this.forceRelayLoaded) return;
+    if (this.forceRelayLoadPromise !== null) {
+      await this.forceRelayLoadPromise;
+      return;
+    }
+    this.forceRelayLoadPromise = this.store
+      .getExtendedSettings()
+      .then((ext) => {
+        if (!this.closed && !this.forceRelayLoaded) {
+          this.forceRelay = ext.forceRelay;
+          this.forceRelayLoaded = true;
+        }
+      })
+      .catch(() => {/* 暂不可用维持当前状态 */})
+      .finally(() => {
+        this.forceRelayLoadPromise = null;
+      });
+    await this.forceRelayLoadPromise;
   }
 
   // ------------------------------------------------------------ 入网判定
@@ -1087,6 +1127,8 @@ export class PeerWsHub {
       return null;
     }
 
+    await this.ensureForceRelayLoaded();
+    if (isAborted()) return null;
     // Revalidate after the async join write, before any routing/hanging registration.
     if (!await this.checkOwnerAdmission(ws, network.ownerId, epoch) || isAborted() || !this.admissionCurrent(ws, network.ownerId, epoch)) return null;
     // PC-03 fix2：成员代次同步复核——这是最后一个 await 之后的闸，到这里与
@@ -1502,8 +1544,9 @@ export class PeerWsHub {
   applyNatObservation(record: NatObservation): void {
     // PC-19 shutdown fix1：close 开始后不再接纳观测——关闭后的观测不是「已接收」
     // 数据（组合根先关 UDP，正常路径不存在此类观测；库级调用方后关 UDP 时在途
-    // 回调的迟到送达在此被拒收，绝不静默积累成未确认残余）
-    if (this.closed) return;
+    // 回调的迟到送达在此被拒收，绝不静默积累成未确认残余）。
+    // 强制中转模式同样跳过 STUN 观测与打洞坐标广播。
+    if (this.closed || this.forceRelay) return;
     const key = connKey(record.networkId, record.nodeId);
     const conn = this.conns.get(record.networkId)?.get(record.nodeId) ?? this.hanging.get(key) ?? null;
     if (conn !== null) {
@@ -1544,6 +1587,7 @@ export class PeerWsHub {
 
   /** STUN observes only a live, owner-admitted identity; pending remains non-routing. */
   admitStunProbe(networkId: string, nodeId: string, publicKeyHex: string): symbol | null {
+    if (this.forceRelay) return null;
     const conn = this.conns.get(networkId)?.get(nodeId) ?? this.hanging.get(connKey(networkId, nodeId));
     return !this.closed && conn !== undefined && conn.state !== 'closed' &&
       conn.ws.readyState === conn.ws.OPEN && conn.publicKeyHex === publicKeyHex ? conn.stunAdmission : null;
@@ -1568,6 +1612,7 @@ export class PeerWsHub {
       // 默认组配额可能已变，属主快照一律作废（下一帧惰性重拉新值）
       this.ownerQuotaByNetwork.clear();
     },
+    onForceRelayChanged: (forceRelay: boolean) => this.onForceRelayChanged(forceRelay),
     onUserDisabled: (userId: string) => this.onUserDisabled(userId),
   };
 
@@ -1888,6 +1933,58 @@ export class PeerWsHub {
       }
     }
     this.broadcast(networkId, { type: 'network-updated', networkId, maxPeers, peerDirectMaxRttMs });
+  }
+
+  private onForceRelayChanged(next: boolean): void {
+    if (this.closed) return;
+    const unchanged = this.forceRelayLoaded && this.forceRelay === next;
+    this.forceRelay = next;
+    this.forceRelayLoaded = true;
+    if (unchanged) return;
+    const stunPorts = !next ? (this.stunPorts?.() ?? null) : null;
+    for (const [networkId, net] of this.conns) {
+      const first = net.values().next().value as ConnState | undefined;
+      const cached = this.networkMaxPeers.get(networkId);
+      const maxPeers = first?.maxPeers ?? cached?.maxPeers ?? 8;
+      const peerDirectMaxRttMs = first?.peerDirectMaxRttMs ?? cached?.peerDirectMaxRttMs ?? 300;
+      this.broadcast(networkId, {
+        type: 'network-updated',
+        networkId,
+        maxPeers,
+        peerDirectMaxRttMs,
+        forceRelay: next,
+        ...(!next && stunPorts !== null ? { stun: stunPorts } : {}),
+      });
+      if (!next) {
+        const members = [...net.values()];
+        for (let i = 0; i < members.length; i += 1) {
+          for (let j = i + 1; j < members.length; j += 1) {
+            const a = members[i]!;
+            const b = members[j]!;
+            sendJson(a.ws, {
+              type: 'punch-coordinate',
+              peerNodeId: b.nodeId,
+              publicKeyHex: b.publicKeyHex,
+              lanEndpoints: b.lanEndpoints,
+              reflexiveEndpoint: endpointString(b.reflexive),
+              natType: b.natType,
+              connSeq: b.connSeq,
+              startAfterMs: 20,
+            });
+            sendJson(b.ws, {
+              type: 'punch-coordinate',
+              peerNodeId: a.nodeId,
+              publicKeyHex: a.publicKeyHex,
+              lanEndpoints: a.lanEndpoints,
+              reflexiveEndpoint: endpointString(a.reflexive),
+              natType: a.natType,
+              connSeq: a.connSeq,
+              startAfterMs: 20,
+            });
+          }
+        }
+      }
+    }
   }
 
   private onUserDisabled(userId: string): void {

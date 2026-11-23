@@ -705,6 +705,7 @@ function runTestChild(mode, schema, deadlineMs) {
     publicUrl: null,
     sessionTtlDays: 7,
     autoUpdateEnabled: true,
+    forceRelay: false,
     defaultGroupId: 'grp_default',
     smtp: {
       configured: false,
