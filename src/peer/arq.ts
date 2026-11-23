@@ -259,7 +259,7 @@ export class PeerArqSession {
   private lastLossAt = -Infinity
   private rtoMs: number
   private readonly rtoMaxMs: number
-  private readonly sackCoalesceFrames: number
+  private sackCoalesceFrames: number
   private readonly sackCoalesceMs: number
   private readonly onStreamData: PeerArqOptions['onStreamData']
   private readonly onStreamReset: PeerArqOptions['onStreamReset']
@@ -270,7 +270,7 @@ export class PeerArqSession {
   private readonly onStreamClosed: PeerArqOptions['onStreamClosed']
   private readonly onAdmissionClosed: PeerArqOptions['onAdmissionClosed']
   private readonly onStallSuspected: PeerArqOptions['onStallSuspected']
-  private readonly stallSuspectMs: number
+  private stallSuspectMs: number
   private admissionClosed = false
   private readonly retryTimeoutMs: number
   private readonly terminalTtlMs: number
@@ -529,8 +529,35 @@ export class PeerArqSession {
     initialWindowSize?: number
     minWindowSize?: number
     rtoMs?: number
+    sackCoalesceFrames?: number
+    stallSuspectMs?: number
   }): void {
     if (this.closed) return
+    if (profile.sackCoalesceFrames !== undefined) {
+      if (!Number.isInteger(profile.sackCoalesceFrames)) {
+        throw new RangeError('sackCoalesceFrames must be a finite integer')
+      }
+      this.sackCoalesceFrames = Math.min(16, Math.max(0, profile.sackCoalesceFrames))
+      for (const [streamId, rx] of this.rxStreams) {
+        if (rx.sackTimer !== null && (this.sackCoalesceFrames <= 1 || rx.pendingAckFrames + 1 >= this.sackCoalesceFrames)) {
+          this.clock.clearTimeout(rx.sackTimer)
+          this.flushPendingSack(streamId, rx)
+        }
+      }
+    }
+    if (profile.stallSuspectMs !== undefined) {
+      if (!Number.isInteger(profile.stallSuspectMs)) {
+        throw new RangeError('stallSuspectMs must be a finite integer')
+      }
+      this.stallSuspectMs = Math.min(60_000, Math.max(0, profile.stallSuspectMs))
+    }
+    const hasWindowOrRto =
+      profile.windowSize !== undefined ||
+      profile.initialWindowSize !== undefined ||
+      profile.minWindowSize !== undefined ||
+      profile.rtoMs !== undefined
+    if (!hasWindowOrRto) return
+
     let nextWindow = this.windowSize
     let nextRto = this.rtoMs
     if (profile.windowSize !== undefined) {
@@ -569,7 +596,7 @@ export class PeerArqSession {
       this.minWindow = minWindow
       this.cwnd = initialCwnd
       this.ssthresh = nextWindow
-    } else {
+    } else if (profile.windowSize !== undefined || profile.minWindowSize !== undefined) {
       this.minWindow = nextWindow
       this.cwnd = nextWindow
       this.ssthresh = nextWindow

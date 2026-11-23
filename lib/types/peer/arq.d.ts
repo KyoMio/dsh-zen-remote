@@ -137,7 +137,7 @@ export declare class PeerArqSession {
     private lastLossAt;
     private rtoMs;
     private readonly rtoMaxMs;
-    private readonly sackCoalesceFrames;
+    private sackCoalesceFrames;
     private readonly sackCoalesceMs;
     private readonly onStreamData;
     private readonly onStreamReset;
@@ -148,7 +148,7 @@ export declare class PeerArqSession {
     private readonly onStreamClosed;
     private readonly onAdmissionClosed;
     private readonly onStallSuspected;
-    private readonly stallSuspectMs;
+    private stallSuspectMs;
     private admissionClosed;
     private readonly retryTimeoutMs;
     private readonly terminalTtlMs;
@@ -209,6 +209,8 @@ export declare class PeerArqSession {
         initialWindowSize?: number;
         minWindowSize?: number;
         rtoMs?: number;
+        sackCoalesceFrames?: number;
+        stallSuspectMs?: number;
     }): void;
     /**
      * Immediately retransmit all unacked in-flight fragments and reset their RTO

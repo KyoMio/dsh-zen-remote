@@ -875,4 +875,62 @@ describe('peer-client-e2e (cross-package PeerEngine + RelayPool + gateway-server
       8000,
     );
   });
+
+  test('10. Slice 4: live admin PATCH advancedTuning.peer updates connected PeerEngines peerTuning', async (t) => {
+    const net = await createNetwork(gw, { mode: 'key' });
+    const A = await startNode(t, gw, { name: 'adv-a', shared: ['s-adv'], useDefaultWelcomeStun: true });
+    const B = await startNode(t, gw, { name: 'adv-b', useDefaultWelcomeStun: true });
+    await A.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey));
+    await B.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey));
+
+    await waitFor(
+      () => A.engine.status().gatewayState === 'authorized' && B.engine.status().gatewayState === 'authorized',
+      'both nodes authorized',
+      5000,
+    );
+    assert.equal(A.engine.status().peerTuning.sackCoalesceFrames, 6);
+    assert.equal(A.engine.status().peerTuning.directPromoteStreak, 2);
+
+    const patchRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+      body: JSON.stringify({
+        advancedTuning: {
+          peer: {
+            sackCoalesceFrames: 1,
+            directPromoteStreak: 4,
+            directPromoteRatio: 0.85,
+            wsReorderGraceMs: 1200,
+          },
+        },
+      }),
+    });
+    assert.equal(patchRes.status, 200);
+
+    await waitFor(
+      () =>
+        A.engine.status().peerTuning.sackCoalesceFrames === 1 &&
+        A.engine.status().peerTuning.directPromoteStreak === 4 &&
+        A.engine.status().peerTuning.directPromoteRatio === 0.85 &&
+        B.engine.status().peerTuning.wsReorderGraceMs === 1200,
+      'live peerTuning applied to both connected PeerEngines',
+      5000,
+    );
+
+    const virtualAonB = await waitPeerOnline(B, A.identity.nodeId);
+    assert.ok((await virtualAonB.client.invoke('session', 'list', { request: {} })).items.some((i) => i.sessionId === 's-adv'));
+
+    // Reset to recommended defaults via null
+    const resetRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+      body: JSON.stringify({ advancedTuning: null }),
+    });
+    assert.equal(resetRes.status, 200);
+    await waitFor(
+      () => A.engine.status().peerTuning.sackCoalesceFrames === 6 && B.engine.status().peerTuning.directPromoteStreak === 2,
+      'peerTuning reset back to defaults on null PATCH',
+      5000,
+    );
+  });
 });

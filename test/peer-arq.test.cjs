@@ -1592,3 +1592,40 @@ test('Slice 1: coalesced in-order SACK coalesces up to N frames, flushes on time
     assert.equal(clock.pendingCount(), 0, 'closeAll() clears pending coalesce SACK timer')
   }
 })
+
+test('Slice 4: setTransportProfile live updates sackCoalesceFrames (flushing pending SACK on <=1) and stallSuspectMs', () => {
+  const dataFrame = (seq, size = 10, fin = false) => {
+    const b = Buffer.alloc(5 + size, 0x77)
+    b[0] = fin ? STREAM_FLAG_FIN : 0
+    b.writeUInt32BE(seq, 1)
+    return b
+  }
+  // 1. Live disable coalescing flushes pending SACK timer immediately and sends immediate SACKs thereafter
+  let stalls = 0
+  const { session, sent, clock } = makeSession({
+    sackCoalesceFrames: 6,
+    sackCoalesceMs: 2,
+    stallSuspectMs: 3500,
+    onStallSuspected: () => { stalls += 1 },
+  })
+  session.handleFrame(PeerFrameType.DATA, 1, dataFrame(0), 0)
+  assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 0)
+  assert.equal(clock.pendingCount(), 1)
+
+  session.setTransportProfile({ sackCoalesceFrames: 1, stallSuspectMs: 1500 })
+  assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 1, 'pending coalesced SACK flushed immediately')
+  assert.equal(clock.pendingCount(), 0, 'pending coalesce timer cleared')
+
+  session.handleFrame(PeerFrameType.DATA, 1, dataFrame(1), 0)
+  assert.equal(sent.filter((f) => f.frameType === PeerFrameType.SACK).length, 2, 'subsequent frame emits immediate SACK')
+
+  // 2. Updated stallSuspectMs=1500 triggers stall suspicion on first RTO >= 1500ms (t=1800ms) instead of 3500ms
+  const p = session.write(2, Buffer.from('stall-check'))
+  p.catch(() => {})
+  clock.advance(1799)
+  assert.equal(stalls, 0)
+  clock.advance(1)
+  assert.equal(stalls, 1)
+
+  session.closeAll()
+})

@@ -216,11 +216,15 @@ export class PeerMux {
   private readonly nextStreamIds = new Map<string, number>()
   private closed = false
   private readonly createdAt: number
+  private wsReorderGraceMs: number = WS_REORDER_GRACE_MS
+  private sackCoalesceFrames = 6
+  private stallSuspectMs: number
 
   constructor(options: PeerMuxOptions) {
     this.options = options
     this.clock = options.clock ?? realClock
     this.createdAt = this.clock.now()
+    this.stallSuspectMs = options.stallSuspectMs ?? DEFAULT_STALL_SUSPECT_MS
   }
 
   // ------------------------------------------------------------ 会话
@@ -256,9 +260,9 @@ export class PeerMux {
         sendFrame: (frameType, streamId, payload, ack) => this.dispatchFrame(session, frameType, streamId, payload, ack),
         onStreamData: (streamId, chunk, final) => this.onStreamData(session, streamId, chunk, final),
         clock: this.clock,
-        sackCoalesceFrames: 6,
+        sackCoalesceFrames: this.sackCoalesceFrames,
         sackCoalesceMs: 2,
-        stallSuspectMs: this.options.stallSuspectMs ?? DEFAULT_STALL_SUSPECT_MS,
+        stallSuspectMs: this.stallSuspectMs,
         onStallSuspected: () => this.onArqStallSuspected(session),
         onAdmissionClosed: error => this.options.log?.(`mux: ${session.nodeId}: ${error.message}`),
         onStreamClosed: (streamId, error) => {
@@ -292,11 +296,43 @@ export class PeerMux {
   /** 动态调整对端 ARQ 发送档案（p2p/relay AIMD、lan 固定大窗口）。 */
   setPeerTransportProfile(
     nodeId: string,
-    profile: { windowSize?: number; initialWindowSize?: number; minWindowSize?: number; rtoMs?: number },
+    profile: {
+      windowSize?: number
+      initialWindowSize?: number
+      minWindowSize?: number
+      rtoMs?: number
+      sackCoalesceFrames?: number
+      stallSuspectMs?: number
+    },
   ): void {
     const session = this.sessions.get(nodeId.toLowerCase())
     if (!session || session.closed || this.closed) return
     session.arq.setTransportProfile(profile)
+  }
+
+  /** 热更新网关下发的节点端调优参数，立即应用到在途及未来会话。 */
+  setPeerTuning(tuning: {
+    wsReorderGraceMs?: number
+    sackCoalesceFrames?: number
+    stallSuspectMs?: number
+  }): void {
+    if (this.closed) return
+    if (typeof tuning.wsReorderGraceMs === 'number' && Number.isInteger(tuning.wsReorderGraceMs)) {
+      this.wsReorderGraceMs = Math.min(10_000, Math.max(500, tuning.wsReorderGraceMs))
+    }
+    if (typeof tuning.sackCoalesceFrames === 'number' && Number.isInteger(tuning.sackCoalesceFrames)) {
+      this.sackCoalesceFrames = Math.min(16, Math.max(1, tuning.sackCoalesceFrames))
+    }
+    if (typeof tuning.stallSuspectMs === 'number' && Number.isInteger(tuning.stallSuspectMs)) {
+      this.stallSuspectMs = Math.min(60_000, Math.max(0, tuning.stallSuspectMs))
+    }
+    for (const session of this.sessions.values()) {
+      if (session.closed) continue
+      session.arq.setTransportProfile({
+        sackCoalesceFrames: this.sackCoalesceFrames,
+        stallSuspectMs: this.stallSuspectMs,
+      })
+    }
   }
 
   private teardownSession(session: MuxSession, reason: string): void {
@@ -479,7 +515,7 @@ export class PeerMux {
       if (
         !isExplicitDemoteBeacon &&
         (now - session.directPromotedAt) < graceMs &&
-        (!session.peerConfirmedDirect || (session.firstDirectRxAt !== null && (now - session.firstDirectRxAt) < WS_REORDER_GRACE_MS))
+        (!session.peerConfirmedDirect || (session.firstDirectRxAt !== null && (now - session.firstDirectRxAt) < this.wsReorderGraceMs))
       ) {
         session.wsSeqAtDirectPromote = session.lastInboundWsSeq
       } else {
@@ -692,9 +728,9 @@ export class PeerMux {
   /** ARQ 零 SACK 停滞：仅在 UDP 直连满 stallSuspectMs 且过 10s 冷却时上报给 engine。 */
   private onArqStallSuspected(session: MuxSession): void {
     if (session.closed || this.closed || session.path !== 'udp') return
-    const stallSuspectMs = this.options.stallSuspectMs ?? DEFAULT_STALL_SUSPECT_MS
+    const stallSuspectMs = this.stallSuspectMs
     const now = this.clock.now()
-    if (now - session.directPromotedAt < stallSuspectMs) return
+    if (stallSuspectMs <= 0 || now - session.directPromotedAt < stallSuspectMs) return
     if (session.lastStallReportAt !== null && now - session.lastStallReportAt < DIRECT_STALL_COOLDOWN_MS) return
     session.lastStallReportAt = now
     this.options.onDirectStalled?.(session.nodeId)

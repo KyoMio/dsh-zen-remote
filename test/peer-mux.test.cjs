@@ -1542,3 +1542,77 @@ test('Slice 1: PeerMux enables sackCoalesceFrames=6 on ARQ and forwards AIMD fie
     'PeerMux ARQ flushes coalesced SACK after 2ms',
   )
 })
+
+test('Slice 4: PeerMux.setPeerTuning live updates sackCoalesceFrames and wsReorderGraceMs', async (t) => {
+  const clock = makeFakeClock()
+  const a = generatePeerIdentity()
+  const b = generatePeerIdentity()
+  const bToASent = []
+  let demoted = 0
+  const B = new PeerMux({
+    networkId: NETWORK_ID,
+    identity: b,
+    clock,
+    sendGatewayBinary: null,
+    relayHandler: () => async (req, res) => {
+      for await (const _ of req) { /* drain */ }
+      res.end('ok')
+    },
+    relaySecret: () => 'test-secret',
+    directPromoteGraceMs: 5000,
+    onPeerRelayDemoted: () => { demoted += 1 },
+  })
+  t.after(() => B.close())
+
+  B.ensureSession(a.nodeId, a.publicKeyHex, 'A')
+  B.setDirectPath(a.nodeId, (ft, sid) => {
+    bToASent.push({ ft, sid })
+  })
+  const sessionB = B.sessions.get(a.nodeId)
+  B.setPeerTuning({ sackCoalesceFrames: 1, wsReorderGraceMs: 500, stallSuspectMs: 1500 })
+
+  const reqHead = Buffer.from(JSON.stringify({ t: 'req', m: 'POST', p: '/immediate-sack', h: {} }))
+  const frame0 = Buffer.alloc(5 + 4 + reqHead.length)
+  frame0.writeUInt32BE(0, 1)
+  frame0.writeUInt32BE(reqHead.length, 5)
+  reqHead.copy(frame0, 9)
+  sessionB.arq.handleFrame(PeerFrameType.DATA, 1, frame0, 0)
+  assert.equal(
+    bToASent.filter((f) => f.ft === PeerFrameType.SACK && f.sid === 1).length,
+    1,
+    'setPeerTuning(sackCoalesceFrames=1) emits SACK immediately without waiting 2ms',
+  )
+
+  const ephA = generateEphemeralX25519()
+  const ephB = generateEphemeralX25519()
+  const { derivePeerSessionCiphers } = require('../lib/peer/crypto.js')
+  const aCiphers = derivePeerSessionCiphers({
+    networkId: NETWORK_ID,
+    myNodeId: a.nodeId,
+    peerNodeId: b.nodeId,
+    myEphPrivateKeyHex: ephA.privateKeyHex,
+    myEphPublicKeyHex: ephA.publicKeyHex,
+    peerEphPublicKeyHex: ephB.publicKeyHex,
+  })
+  const bCiphers = derivePeerSessionCiphers({
+    networkId: NETWORK_ID,
+    myNodeId: b.nodeId,
+    peerNodeId: a.nodeId,
+    myEphPrivateKeyHex: ephB.privateKeyHex,
+    myEphPublicKeyHex: ephB.publicKeyHex,
+    peerEphPublicKeyHex: ephA.publicKeyHex,
+  })
+  sessionB.ciphers = bCiphers
+  B.handleOpenedFrame({ srcNodeId: a.nodeId, frameType: PeerFrameType.ACK, streamId: 0, ack: 0 }, Buffer.alloc(0))
+  clock.advance(700)
+  const sealedWs = packEncryptedFrame({
+    frameType: PeerFrameType.ACK,
+    srcNodeId: a.nodeId,
+    dstNodeId: b.nodeId,
+    streamId: 0,
+    seq: 1n,
+    ack: 0,
+  }, Buffer.alloc(0), aCiphers)
+  B.handleGatewayFrame(sealedWs)
+  assert.equal(demoted, 1, 'WS frame after 700ms (> 500ms wsReorderGraceMs) triggers demotion')
+})

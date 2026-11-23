@@ -71,6 +71,8 @@ export interface PeerEngineStatus {
     directCapSource: 'gateway' | 'default';
     /** 网关下发的全局强制中转标记（welcome / network-updated 现场更新）。 */
     forceRelay: boolean;
+    /** 当前生效的节点端调优参数（网关 welcome / network-updated 下发，未下发回落默认）。 */
+    peerTuning: PeerTuningConfig;
     /** T2/T6：与网关及同网对端的版本协调状态。 */
     versionSync: PeerVersionSyncEvaluation;
 }
@@ -173,12 +175,29 @@ export interface PeerEngine {
     status(): PeerEngineStatus;
     stop(): void;
 }
+export interface PeerTuningConfig {
+    p2pWindowMax: number;
+    p2pWindowInitial: number;
+    p2pWindowMin: number;
+    lanWindowMax: number;
+    relayWindowMax: number;
+    relayWindowInitial: number;
+    sackCoalesceFrames: number;
+    directStallSuspectMs: number;
+    relayHoldBaseMs: number;
+    relayHoldMaxMs: number;
+    directPromoteStreak: number;
+    directPromoteRatio: number;
+    wsReorderGraceMs: number;
+}
+export declare const DEFAULT_PEER_TUNING: Readonly<PeerTuningConfig>;
+export declare const parsePeerTuning: (raw: unknown) => PeerTuningConfig;
 export interface ArqTransportProfile {
     windowSize: number;
     initialWindowSize?: number;
     minWindowSize?: number;
     rtoMs: number;
 }
-export declare const arqProfileForPath: (mode: "lan" | "p2p" | "relay", smoothedRttMs: number | null) => ArqTransportProfile;
+export declare const arqProfileForPath: (mode: "lan" | "p2p" | "relay", smoothedRttMs: number | null, tuning?: PeerTuningConfig) => ArqTransportProfile;
 export declare function createPeerEngine(options: PeerEngineOptions): PeerEngine;
 //# sourceMappingURL=engine.d.ts.map

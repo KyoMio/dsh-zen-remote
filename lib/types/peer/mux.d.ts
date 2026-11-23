@@ -80,6 +80,9 @@ export declare class PeerMux {
     private readonly nextStreamIds;
     private closed;
     private readonly createdAt;
+    private wsReorderGraceMs;
+    private sackCoalesceFrames;
+    private stallSuspectMs;
     constructor(options: PeerMuxOptions);
     /** 为一个已通过 TOFU 的对端建立（或复用）mux 会话。 */
     ensureSession(nodeId: string, peerPublicKeyHex: string, peerName: string): void;
@@ -91,6 +94,14 @@ export declare class PeerMux {
         initialWindowSize?: number;
         minWindowSize?: number;
         rtoMs?: number;
+        sackCoalesceFrames?: number;
+        stallSuspectMs?: number;
+    }): void;
+    /** 热更新网关下发的节点端调优参数，立即应用到在途及未来会话。 */
+    setPeerTuning(tuning: {
+        wsReorderGraceMs?: number;
+        sackCoalesceFrames?: number;
+        stallSuspectMs?: number;
     }): void;
     private teardownSession;
     /** 拆掉一个对端的会话（peer-left / mismatch / 本机禁用）：流中止、表清理。 */

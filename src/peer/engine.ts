@@ -116,6 +116,8 @@ export interface PeerEngineStatus {
   directCapSource: 'gateway' | 'default'
   /** 网关下发的全局强制中转标记（welcome / network-updated 现场更新）。 */
   forceRelay: boolean
+  /** 当前生效的节点端调优参数（网关 welcome / network-updated 下发，未下发回落默认）。 */
+  peerTuning: PeerTuningConfig
   /** T2/T6：与网关及同网对端的版本协调状态。 */
   versionSync: PeerVersionSyncEvaluation
 }
@@ -298,6 +300,78 @@ const hasRemovedOrReplacedEndpoint = (
 const parseConnSeq = (value: unknown): number | null =>
   typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : null
 
+export interface PeerTuningConfig {
+  p2pWindowMax: number
+  p2pWindowInitial: number
+  p2pWindowMin: number
+  lanWindowMax: number
+  relayWindowMax: number
+  relayWindowInitial: number
+  sackCoalesceFrames: number
+  directStallSuspectMs: number
+  relayHoldBaseMs: number
+  relayHoldMaxMs: number
+  directPromoteStreak: number
+  directPromoteRatio: number
+  wsReorderGraceMs: number
+}
+
+export const DEFAULT_PEER_TUNING: Readonly<PeerTuningConfig> = {
+  p2pWindowMax: 160,
+  p2pWindowInitial: 32,
+  p2pWindowMin: 16,
+  lanWindowMax: 160,
+  relayWindowMax: 384,
+  relayWindowInitial: 160,
+  sackCoalesceFrames: 6,
+  directStallSuspectMs: 3500,
+  relayHoldBaseMs: 30_000,
+  relayHoldMaxMs: 300_000,
+  directPromoteStreak: 2,
+  directPromoteRatio: 0.7,
+  wsReorderGraceMs: 2_000,
+}
+
+const PEER_TUNING_INT_BOUNDS: Readonly<
+  Record<Exclude<keyof PeerTuningConfig, 'directPromoteRatio'>, readonly [number, number]>
+> = {
+  p2pWindowMax: [16, 384],
+  p2pWindowInitial: [8, 160],
+  p2pWindowMin: [8, 64],
+  lanWindowMax: [32, 384],
+  relayWindowMax: [64, 384],
+  relayWindowInitial: [32, 384],
+  sackCoalesceFrames: [1, 16],
+  directStallSuspectMs: [1500, 15_000],
+  relayHoldBaseMs: [10_000, 120_000],
+  relayHoldMaxMs: [30_000, 1_800_000],
+  directPromoteStreak: [1, 10],
+  wsReorderGraceMs: [500, 10_000],
+}
+
+export const parsePeerTuning = (raw: unknown): PeerTuningConfig => {
+  const result: PeerTuningConfig = { ...DEFAULT_PEER_TUNING }
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return result
+  const obj = raw as Record<string, unknown>
+  for (const key of Object.keys(PEER_TUNING_INT_BOUNDS) as Array<Exclude<keyof PeerTuningConfig, 'directPromoteRatio'>>) {
+    const [min, max] = PEER_TUNING_INT_BOUNDS[key]
+    const v = obj[key]
+    if (typeof v === 'number' && Number.isInteger(v)) {
+      result[key] = Math.min(max, Math.max(min, v))
+    }
+  }
+  const ratio = obj['directPromoteRatio']
+  if (typeof ratio === 'number' && Number.isFinite(ratio)) {
+    const clamped = Math.min(0.95, Math.max(0.5, ratio))
+    result.directPromoteRatio = Math.round(clamped * 100) / 100
+  }
+  result.p2pWindowInitial = Math.min(result.p2pWindowInitial, result.p2pWindowMax)
+  result.p2pWindowMin = Math.min(result.p2pWindowMin, result.p2pWindowInitial)
+  result.relayWindowInitial = Math.min(result.relayWindowInitial, result.relayWindowMax)
+  result.relayHoldMaxMs = Math.max(result.relayHoldMaxMs, result.relayHoldBaseMs)
+  return result
+}
+
 export interface ArqTransportProfile {
   windowSize: number
   initialWindowSize?: number
@@ -308,14 +382,25 @@ export interface ArqTransportProfile {
 export const arqProfileForPath = (
   mode: 'lan' | 'p2p' | 'relay',
   smoothedRttMs: number | null,
+  tuning: PeerTuningConfig = DEFAULT_PEER_TUNING,
 ): ArqTransportProfile => {
   if (mode === 'relay') {
-    return { windowSize: 384, initialWindowSize: 160, minWindowSize: 32, rtoMs: 120 }
+    return {
+      windowSize: tuning.relayWindowMax,
+      initialWindowSize: tuning.relayWindowInitial,
+      minWindowSize: Math.min(32, tuning.relayWindowInitial),
+      rtoMs: 120,
+    }
   }
-  if (mode !== 'p2p') return { windowSize: 160, rtoMs: 120 }
+  if (mode !== 'p2p') return { windowSize: tuning.lanWindowMax, rtoMs: 120 }
   const rtt = smoothedRttMs ?? 50
   const rtoMs = Math.min(1000, Math.max(120, Math.ceil(rtt * 2 + 50)))
-  return { windowSize: 160, initialWindowSize: 32, minWindowSize: 16, rtoMs }
+  return {
+    windowSize: tuning.p2pWindowMax,
+    initialWindowSize: tuning.p2pWindowInitial,
+    minWindowSize: tuning.p2pWindowMin,
+    rtoMs,
+  }
 }
 
 /**
@@ -402,6 +487,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
   let gatewayWireCompatLevel: number | null = null
   let forceRelayFromGateway = false
   let lastWelcomeStun: unknown = null
+  let activePeerTuning: PeerTuningConfig = { ...DEFAULT_PEER_TUNING }
   /** 挂载顺序即公告顺序；每项是 pool entryId（= 对端 nodeId）。 */
   const members = new Map<string, MemberRec>()
 
@@ -897,6 +983,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         gatewayState = 'authorized'
         forceRelayFromGateway = message['forceRelay'] === true
         lastWelcomeStun = message['stun'] ?? null
+        applyGatewayPeerTuning(message['peerTuning'])
         syncSelfLanKey()
         const livePeerIds = new Set<string>()
         for (const peer of Array.isArray(message['peers']) ? (message['peers'] as Array<Record<string, unknown>>) : []) {
@@ -1137,6 +1224,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           }
         }
       }
+      if (message['peerTuning'] !== undefined) {
+        applyGatewayPeerTuning(message['peerTuning'])
+      }
       const announced = message['maxPeers']
       const capOk = typeof announced === 'number' && Number.isSafeInteger(announced) && announced >= 2 && announced <= 64
       const announcedRtt = message['peerDirectMaxRttMs']
@@ -1285,7 +1375,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
 
   const applyArqProfile = (member: MemberRec, mode: 'lan' | 'p2p' | 'relay', force = false): void => {
     if (mux === null) return
-    const profile = arqProfileForPath(mode, member.directSmoothedRtt)
+    const profile = arqProfileForPath(mode, member.directSmoothedRtt, activePeerTuning)
     const initialWindow = profile.initialWindowSize ?? null
     const minWindow = profile.minWindowSize ?? null
     if (
@@ -1374,14 +1464,34 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     return typeof raw === 'number' && Number.isSafeInteger(raw) && raw >= 0 && raw <= 10_000 ? raw : 300
   }
 
-  /** 为退回中转设置指数退避冷却（30s -> 60s -> 120s -> 240s -> 300s），
+  const applyGatewayPeerTuning = (raw: unknown): void => {
+    const next = parsePeerTuning(raw)
+    const changed = (Object.keys(DEFAULT_PEER_TUNING) as Array<keyof PeerTuningConfig>).some(
+      (k) => activePeerTuning[k] !== next[k],
+    )
+    activePeerTuning = next
+    mux?.setPeerTuning({
+      wsReorderGraceMs: next.wsReorderGraceMs,
+      sackCoalesceFrames: next.sackCoalesceFrames,
+      stallSuspectMs: next.directStallSuspectMs,
+    })
+    if (!changed) return
+    for (const member of members.values()) {
+      if (member.state !== 'eligible') continue
+      const activeMode: 'lan' | 'p2p' | 'relay' =
+        member.directActive && member.directMode !== null ? member.directMode : 'relay'
+      applyArqProfile(member, activeMode, true)
+    }
+  }
+
+  /** 为退回中转设置指数退避冷却（由 activePeerTuning.relayHoldBaseMs 起步、relayHoldMaxMs 封顶），
    *  若此前已稳定直连 >= 120s 则先复位阶数。 */
   const armRelayHold = (member: MemberRec): void => {
     const now = clock.now()
     if (member.directActive && member.directPromotedAt > 0 && now - member.directPromotedAt >= DIRECT_STABLE_RESET_MS) {
       member.relayHoldStep = 0
     }
-    const holdMs = Math.min(PEER_RELAY_HOLD_MAX_MS, PEER_RELAY_HOLD_MS * (2 ** member.relayHoldStep))
+    const holdMs = Math.min(activePeerTuning.relayHoldMaxMs, activePeerTuning.relayHoldBaseMs * (2 ** member.relayHoldStep))
     member.peerRelayHoldUntil = Math.max(member.peerRelayHoldUntil, now + holdMs)
     member.relayHoldStep = Math.min(member.relayHoldStep + 1, 4)
     member.directPromotedAt = 0
@@ -1472,9 +1582,9 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       promoteDirect(member)
       return
     }
-    if (rtt <= cap * DIRECT_PROMOTE_RATIO) {
+    if (rtt <= cap * activePeerTuning.directPromoteRatio) {
       member.directGoodStreak += 1
-      if (member.directGoodStreak >= DIRECT_PROMOTE_STREAK) {
+      if (member.directGoodStreak >= activePeerTuning.directPromoteStreak) {
         promoteDirect(member)
       } else {
         punch?.triggerFastProbe(member.nodeId, false)
@@ -1575,7 +1685,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
           if (
             !m.directActive &&
             clock.now() >= m.peerRelayHoldUntil &&
-            (cap <= 0 || m.directSmoothedRtt === null || m.directSmoothedRtt <= cap * DIRECT_PROMOTE_RATIO)
+            (cap <= 0 || m.directSmoothedRtt === null || m.directSmoothedRtt <= cap * activePeerTuning.directPromoteRatio)
           ) {
             punch?.triggerFastProbe(m.nodeId, true)
           }
@@ -1596,6 +1706,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       relaySecret: options.relaySecret,
       clock,
       relayHandlerWaitMs: options.relayHandlerWaitMs ?? 3_000,
+      stallSuspectMs: activePeerTuning.directStallSuspectMs,
       directPromoteGraceMs: () =>
         directCap() > 0
           ? Math.max(6_000, (options.punch?.keepAliveMs ?? 5_000) + 1_000)
@@ -1629,6 +1740,11 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
       log,
       debug: options.debug,
     })
+    mux.setPeerTuning({
+      wsReorderGraceMs: activePeerTuning.wsReorderGraceMs,
+      sackCoalesceFrames: activePeerTuning.sackCoalesceFrames,
+      stallSuspectMs: activePeerTuning.directStallSuspectMs,
+    })
     return mux
   }
 
@@ -1658,6 +1774,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
     selfWsReanchorEpoch = 0
     selfLanReanchorEpoch = 0
     lastSelfLanKey = null
+    activePeerTuning = { ...DEFAULT_PEER_TUNING }
     try { ws?.close() } catch { /* dying */ }
     ws = null
     mux?.close()
@@ -1942,6 +2059,7 @@ export function createPeerEngine(options: PeerEngineOptions): PeerEngine {
         directCapMs: directCap(),
         directCapSource: capFromGateway === null ? 'default' : 'gateway',
         forceRelay: forceRelayFromGateway,
+        peerTuning: { ...activePeerTuning },
         versionSync,
       }
     },

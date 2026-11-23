@@ -10,7 +10,7 @@ const crypto = require('node:crypto')
 const { createHash } = require('node:crypto')
 const { pathToFileURL } = require('node:url')
 
-const { createPeerEngine, arqProfileForPath } = require('../lib/peer/engine.js')
+const { createPeerEngine, arqProfileForPath, parsePeerTuning, DEFAULT_PEER_TUNING } = require('../lib/peer/engine.js')
 const { PeerPunchManager } = require('../lib/peer/punch.js')
 const { generatePeerIdentity } = require('../lib/peer/crypto.js')
 const { PeerFrameType, decodeFrameHeader } = require('../lib/peer/wire.js')
@@ -3223,4 +3223,178 @@ test('Slice 3: welcome forceRelay=true skips STUN & beginPunch and immediately e
   await waitFor(() => stunPackets > stunBefore, 'STUN re-probed on second forceRelay=false')
   await waitFor(() => logs.some((l) => l.includes('beginPunch(')), 'beginPunch triggered directly from cached endpoints')
   await waitFor(() => engine.status().peers[0]?.path === 'lan', 're-promoted to direct lan')
+})
+
+test('Slice 4: parsePeerTuning sanitizes bounds/cross-field invariants and welcome/network-updated.peerTuning apply live', async (t) => {
+  // 1. parsePeerTuning clamps bounds & enforces cross-field invariants
+  assert.deepEqual(parsePeerTuning(undefined), DEFAULT_PEER_TUNING)
+  const sanitized = parsePeerTuning({
+    p2pWindowMax: 64,
+    p2pWindowInitial: 100, // > p2pWindowMax -> clamped to 64
+    p2pWindowMin: 80, // > p2pWindowInitial -> clamped to 64 (and 8..64 -> 64)
+    relayWindowMax: 90,
+    relayWindowInitial: 200, // > relayWindowMax -> clamped to 90
+    relayHoldBaseMs: 80_000,
+    relayHoldMaxMs: 50_000, // < relayHoldBaseMs -> clamped to 80_000
+    directPromoteRatio: 0.755, // rounded 2 decimals -> 0.76
+    sackCoalesceFrames: 'bad', // invalid type -> default 6
+  })
+  assert.equal(sanitized.p2pWindowMax, 64)
+  assert.equal(sanitized.p2pWindowInitial, 64)
+  assert.equal(sanitized.p2pWindowMin, 64)
+  assert.equal(sanitized.relayWindowMax, 90)
+  assert.equal(sanitized.relayWindowInitial, 90)
+  assert.equal(sanitized.relayHoldBaseMs, 80_000)
+  assert.equal(sanitized.relayHoldMaxMs, 80_000)
+  assert.equal(sanitized.directPromoteRatio, 0.76)
+  assert.equal(sanitized.sackCoalesceFrames, DEFAULT_PEER_TUNING.sackCoalesceFrames)
+
+  // 2. arqProfileForPath consumes custom PeerTuningConfig
+  const customProfile = arqProfileForPath('p2p', 50, {
+    ...DEFAULT_PEER_TUNING,
+    p2pWindowMax: 200,
+    p2pWindowInitial: 48,
+    p2pWindowMin: 24,
+  })
+  assert.deepEqual(customProfile, { windowSize: 200, initialWindowSize: 48, minWindowSize: 24, rtoMs: 150 })
+
+  // 3. Live welcome.peerTuning + network-updated.peerTuning apply directPromoteStreak/Ratio & relayHoldBaseMs
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'zr-peer-tuning-'))
+  const clock = manualClock()
+  const stateFileA = path.join(home, 'a-state.json')
+  const socketA = await openUdp()
+  const identityA = ensurePeerIdentity(stateFileA)
+  const socketB = await openUdp()
+  const gateB = makeGate(socketB)
+  gateB.pongDelayMs = 60
+  gateB.dropFirstPing = false
+  const identityB = generatePeerIdentity()
+  const mgrB = new PeerPunchManager({
+    networkId: NET_ID,
+    identity: identityB,
+    socket: socketB,
+    clock,
+    onDirectReady: () => {},
+    onPunchFallback: () => {},
+    onDirectLost: () => {},
+  })
+  await mgrB.ready()
+  const wsSockets = []
+  const server = http.createServer()
+  server.on('upgrade', (req, socket) => {
+    wsSockets.push(socket)
+    socket.on('error', () => {})
+    let buf = Buffer.alloc(0)
+    socket.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      for (;;) {
+        const parsed = readClientFrame(buf)
+        if (parsed === null) break
+        buf = parsed.rest
+        if (parsed.opcode === 8) { socket.end(); return }
+        if (parsed.opcode !== 1) continue
+        let msg
+        try { msg = JSON.parse(parsed.payload.toString('utf8')) } catch { continue }
+        if (msg?.type === 'auth') {
+          socket.write(wsFrame({
+            type: 'welcome',
+            status: 'authorized',
+            connSeq: 1,
+            maxPeers: 8,
+            peerDirectMaxRttMs: 100,
+            peerTuning: {
+              ...DEFAULT_PEER_TUNING,
+              directPromoteStreak: 3,
+              directPromoteRatio: 0.5,
+              relayHoldBaseMs: 10_000,
+              relayHoldMaxMs: 30_000,
+            },
+            peers: [{
+              nodeId: identityB.nodeId,
+              publicKeyHex: identityB.publicKeyHex,
+              name: 'peer-b',
+              lanEndpoints: [endpointOf(socketB)],
+              reflexiveEndpoint: null,
+              connSeq: 1,
+            }],
+          }))
+          mgrB.beginPunch({
+            peerNodeId: identityA.nodeId,
+            peerPublicKeyHex: identityA.publicKeyHex,
+            lanEndpoints: [endpointOf(socketA)],
+          })
+        }
+      }
+    })
+    const accept = createHash('sha1').update(`${req.headers['sec-websocket-key']}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`).digest('base64')
+    socket.write(Buffer.concat([
+      Buffer.from(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${accept}\r\n\r\n`),
+      wsFrame({ type: 'challenge', challengeHex: randomHex(32) }),
+    ]))
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  const pool = createRelayPool({ maxServers: 4, log: () => {} })
+  const engine = createPeerEngine({
+    stateFile: stateFileA,
+    identity: identityA,
+    relayPool: pool,
+    relayHandler: () => undefined,
+    relaySecret: () => 'sec',
+    serverName: () => 'A',
+    udpSocket: socketA,
+    udpProbe: null,
+    clock,
+    punch: { keepAliveMs: KEEPALIVE_MS, fastConfirmDelayMs: 0, pingRetryDelayMs: 0 },
+  })
+  t.after(async () => {
+    engine.stop()
+    mgrB.close()
+    for (const s of wsSockets) s.destroy()
+    server.closeAllConnections?.()
+    await new Promise((r) => server.close(r))
+    try { socketA.close() } catch {}
+    try { socketB.close() } catch {}
+    fs.rmSync(home, { recursive: true, force: true })
+  })
+
+  writePeerNetwork(stateFileA, {
+    networkId: NET_ID,
+    gatewayWsUrl: `ws://127.0.0.1:${port}`,
+    gatewayHttpOrigin: `http://127.0.0.1:${port}`,
+    joinKey: 'jk',
+    joinedAt: 1,
+  })
+  engine.resumeFromState()
+  await waitFor(() => engine.status().gatewayState === 'authorized', 'authorized with welcome.peerTuning')
+  assert.equal(engine.status().peerTuning.directPromoteStreak, 3)
+  assert.equal(engine.status().peerTuning.directPromoteRatio, 0.5)
+  assert.equal(engine.status().peerTuning.relayHoldBaseMs, 10_000)
+
+  // With cap=100 & directPromoteRatio=0.5, threshold is 50ms: 60ms RTT samples must stay relay
+  await waitFor(() => engine.status().peers[0]?.directRttMs !== null, 'first RTT sample recorded')
+  clock.advance(KEEPALIVE_MS)
+  await sleep(10)
+  assert.equal(engine.status().peers[0]?.path, 'relay', '60ms RTT stays relay under directPromoteRatio=0.5')
+
+  // Live network-updated.peerTuning updates ratio=0.85 & streak=1 -> next sample promotes to lan!
+  for (const s of wsSockets) {
+    s.write(wsFrame({
+      type: 'network-updated',
+      networkId: NET_ID,
+      peerTuning: {
+        ...DEFAULT_PEER_TUNING,
+        directPromoteStreak: 1,
+        directPromoteRatio: 0.85,
+        sackCoalesceFrames: 2,
+      },
+    }))
+  }
+  await waitFor(
+    () => engine.status().peerTuning.directPromoteStreak === 1 && engine.status().peerTuning.sackCoalesceFrames === 2,
+    'live network-updated.peerTuning applied',
+  )
+  assert.equal(engine.status().peerTuning.directPromoteRatio, 0.85)
+  clock.advance(KEEPALIVE_MS)
+  await waitFor(() => engine.status().peers[0]?.path === 'lan', 'promotes to lan once directPromoteRatio=0.85 & streak=1')
 })
