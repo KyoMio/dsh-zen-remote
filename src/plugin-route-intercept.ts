@@ -60,12 +60,12 @@
  * fetch-route-intercept.ts).
  */
 
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import { IncomingMessage, ServerResponse, type OutgoingHttpHeader, type OutgoingHttpHeaders } from 'node:http'
 import type { BridgeLocator, BridgeRegistry, BridgeStatus, NormalizedBridgeRoute } from './plugin-bridge.js'
 import { routeDeniesRemoteOf, routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeRewriteFieldsOf, routeRewritesIdsOf, routeUpgradesOf } from './plugin-bridge.js'
 import { PassThrough, Readable, Transform, Duplex } from 'node:stream'
 import { createHash, timingSafeEqual } from 'node:crypto'
-import type { Socket } from 'node:net'
+import { Socket } from 'node:net'
 import type { RelayClient } from './relay-client.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
 import { encodeRfc6455Frame, parseRfc6455Frames, type Rfc6455Frame } from './plugin-tunnel.js'
@@ -571,14 +571,16 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   const loopbackSecretBytes = typeof options.loopbackSecret === 'string' && options.loopbackSecret !== ''
     ? Buffer.from(options.loopbackSecret, 'utf8')
     : undefined
-  const isLoopbackBypass = (req: IncomingMessage): boolean => {
+  const isLoopbackSecretValid = (rawHeader: string | string[] | undefined): boolean => {
     if (loopbackSecretBytes === undefined) return false
-    const raw = req.headers['x-zen-remote-loopback']
-    const candidate = Array.isArray(raw) ? raw[0] : raw
+    const candidate = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader
     if (typeof candidate !== 'string' || candidate === '') return false
     const candidateBytes = Buffer.from(candidate, 'utf8')
     if (candidateBytes.length !== loopbackSecretBytes.length) return false
-    if (!timingSafeEqual(candidateBytes, loopbackSecretBytes)) return false
+    return timingSafeEqual(candidateBytes, loopbackSecretBytes)
+  }
+  const isLoopbackBypass = (req: { headers: Record<string, string | string[] | undefined> }): boolean => {
+    if (!isLoopbackSecretValid(req.headers['x-zen-remote-loopback'])) return false
     delete req.headers['x-zen-remote-loopback']
     return true
   }
@@ -668,11 +670,252 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-unbridged', reason, plugin } }))
   }
 
+  type OriginalHttpHandler = (
+    req: IncomingMessage,
+    res: ServerResponse,
+    peer?: unknown,
+  ) => Promise<void> | void
+  type OriginalResource = (request: Request, peer?: unknown) => Promise<Response> | Response
+
   /** The original route handler when it is worth calling at all. */
-  const handlerOf = (route: unknown): ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined =>
+  const handlerOf = (route: unknown): OriginalHttpHandler | undefined =>
     route !== undefined && isRecord(route) && typeof (route as { handler?: unknown }).handler === 'function'
-      ? (route as { handler: (req: IncomingMessage, res: ServerResponse) => Promise<void> }).handler
+      ? (route as { handler: OriginalHttpHandler }).handler
       : undefined
+
+  /** The original WebResource when the matched route is a resource route. */
+  const resourceOf = (route: unknown): OriginalResource | undefined =>
+    route !== undefined && isRecord(route) && typeof (route as { resource?: unknown }).resource === 'function'
+      ? (route as { resource: OriginalResource }).resource
+      : undefined
+
+  const callOriginalHttp = async (
+    originalHandler: OriginalHttpHandler,
+    req: IncomingMessage,
+    res: ServerResponse,
+    peer?: unknown,
+  ): Promise<void> => {
+    await (peer !== undefined ? originalHandler(req, res, peer) : originalHandler(req, res))
+  }
+
+  class ResourceBridgeResponse extends ServerResponse {
+    private bridgeHeadersSent = false
+    private bridgeEnded = false
+    private bridgeDestroyed = false
+    private readonly bridgeHeaders = new Headers()
+    private readonly bridgeBody = new PassThrough()
+    private bridgeSettled = false
+    private readonly onHeadReady: (status: number, headers: Headers, body: PassThrough) => void
+
+    constructor(
+      req: IncomingMessage,
+      onHeadReady: (status: number, headers: Headers, body: PassThrough) => void,
+    ) {
+      super(req)
+      this.onHeadReady = onHeadReady
+      Object.defineProperties(this, {
+        headersSent: { get: () => this.bridgeHeadersSent, configurable: true },
+        writableEnded: { get: () => this.bridgeEnded, configurable: true },
+        destroyed: { get: () => this.bridgeDestroyed, configurable: true },
+      })
+    }
+
+    override setHeader(name: string, value: string | number | readonly string[]): this {
+      if (Array.isArray(value)) {
+        this.bridgeHeaders.delete(name)
+        for (const item of value) this.bridgeHeaders.append(name, String(item))
+      } else {
+        this.bridgeHeaders.set(name, String(value))
+      }
+      return this
+    }
+
+    override writeHead(
+      statusCode: number,
+      statusMessage?: string | OutgoingHttpHeaders | OutgoingHttpHeader[],
+      headers?: OutgoingHttpHeaders | OutgoingHttpHeader[],
+    ): this {
+      this.statusCode = statusCode
+      const headerBag = typeof statusMessage === 'object' && statusMessage !== null ? statusMessage : headers
+      if (Array.isArray(headerBag)) {
+        for (let i = 0; i + 1 < headerBag.length; i += 2) {
+          const name = headerBag[i]
+          const value = headerBag[i + 1]
+          if (typeof name === 'string' && value !== undefined) {
+            this.setHeader(name, Array.isArray(value) ? value.map(String) : String(value))
+          }
+        }
+      } else if (headerBag !== undefined) {
+        for (const [name, value] of Object.entries(headerBag)) {
+          if (value !== undefined) this.setHeader(name, value)
+        }
+      }
+      this.emitBridgeHead()
+      return this
+    }
+
+    override write(chunk: unknown, encoding?: unknown, cb?: unknown): boolean {
+      this.emitBridgeHead()
+      let ok = true
+      if (chunk !== undefined && chunk !== null) {
+        ok = typeof encoding === 'string'
+          ? this.bridgeBody.write(chunk, encoding as BufferEncoding)
+          : this.bridgeBody.write(chunk)
+      }
+      if (typeof encoding === 'function') encoding()
+      else if (typeof cb === 'function') cb()
+      return ok
+    }
+
+    override end(chunk?: unknown, encoding?: unknown, cb?: unknown): this {
+      this.emitBridgeHead()
+      this.bridgeEnded = true
+      if (typeof chunk === 'function') {
+        this.bridgeBody.end()
+        chunk()
+      } else if (typeof encoding === 'function') {
+        if (chunk !== undefined && chunk !== null) this.bridgeBody.end(chunk)
+        else this.bridgeBody.end()
+        encoding()
+      } else {
+        if (chunk !== undefined && chunk !== null) this.bridgeBody.end(chunk)
+        else this.bridgeBody.end()
+        if (typeof cb === 'function') cb()
+      }
+      return this
+    }
+
+    override destroy(error?: Error): this {
+      if (this.bridgeDestroyed) return this
+      this.bridgeDestroyed = true
+      this.bridgeBody.destroy(error)
+      this.emit('close')
+      return this
+    }
+
+    abortBridge(): void {
+      this.destroy()
+    }
+
+    destroyBridgeBody(error?: Error): void {
+      this.bridgeBody.destroy(error)
+    }
+
+    endBridgeBody(): void {
+      this.bridgeBody.end()
+    }
+
+    private emitBridgeHead(): void {
+      if (this.bridgeHeadersSent) return
+      this.bridgeHeadersSent = true
+      if (!this.bridgeSettled) {
+        this.bridgeSettled = true
+        this.onHeadReady(this.statusCode, this.bridgeHeaders, this.bridgeBody)
+      }
+    }
+  }
+
+  const wrapResourceSurrogate = (
+    buildSurrogate: (
+      originalHandler: OriginalHttpHandler,
+    ) => (req: IncomingMessage, res: ServerResponse, peer?: unknown) => Promise<void>,
+    originalResource: OriginalResource,
+  ): OriginalResource =>
+    async (request: Request, peer?: unknown): Promise<Response> => {
+      const invokeOriginal = (req: Request): Promise<Response> | Response =>
+        peer !== undefined ? originalResource(req, peer) : originalResource(req)
+      if (!installed) return invokeOriginal(request)
+      const loopbackHeader = request.headers.get('x-zen-remote-loopback')
+      if (loopbackHeader !== null && isLoopbackSecretValid(loopbackHeader)) {
+        const headers = new Headers(request.headers)
+        headers.delete('x-zen-remote-loopback')
+        return invokeOriginal(new Request(request, { headers }))
+      }
+
+      const parsedUrl = new URL(request.url, 'http://local')
+      const syntheticHeaders: Record<string, string | string[] | undefined> = {}
+      request.headers.forEach((value, name) => {
+        const existing = syntheticHeaders[name]
+        if (existing === undefined) syntheticHeaders[name] = value
+        else if (Array.isArray(existing)) existing.push(value)
+        else syntheticHeaders[name] = [existing, value]
+      })
+      const syntheticReq = new IncomingMessage(new Socket())
+      syntheticReq.method = request.method
+      syntheticReq.url = `${parsedUrl.pathname}${parsedUrl.search}`
+      syntheticReq.headers = syntheticHeaders
+      syntheticReq.push(null)
+
+      let passthroughResponse: Response | undefined
+      let resolveResponse!: (res: Response) => void
+      let rejectResponse!: (err: unknown) => void
+      const responsePromise = new Promise<Response>((resolve, reject) => {
+        resolveResponse = resolve
+        rejectResponse = reject
+      })
+      let settled = false
+      const cleanupAbort = (): void => {
+        request.signal.removeEventListener('abort', onAbort)
+      }
+      const syntheticRes = new ResourceBridgeResponse(syntheticReq, (statusCode, responseHeaders, bodyStream) => {
+        if (settled) return
+        settled = true
+        const body = request.method === 'HEAD' || statusCode === 204 || statusCode === 205 || statusCode === 304
+          ? null
+          : new ReadableStream<Uint8Array>({
+              start(controller) {
+                bodyStream.on('data', (chunk: Buffer) => {
+                  controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength))
+                })
+                bodyStream.once('end', () => { controller.close() })
+                bodyStream.once('error', (err) => { controller.error(err) })
+              },
+              cancel() {
+                bodyStream.destroy()
+              },
+            })
+        resolveResponse(new Response(body, { status: statusCode, headers: responseHeaders }))
+      })
+      const onAbort = (): void => {
+        syntheticRes.abortBridge()
+      }
+      if (request.signal.aborted) {
+        onAbort()
+      } else {
+        request.signal.addEventListener('abort', onAbort, { once: true })
+      }
+
+      const surrogate = buildSurrogate(async (_req, _res, forwardedPeer) => {
+        passthroughResponse = await (forwardedPeer !== undefined
+          ? originalResource(request, forwardedPeer)
+          : originalResource(request))
+      })
+      void surrogate(syntheticReq, syntheticRes, peer).then(
+        () => {
+          cleanupAbort()
+          if (passthroughResponse !== undefined && !settled) {
+            settled = true
+            syntheticRes.destroyBridgeBody()
+            resolveResponse(passthroughResponse)
+          } else if (!settled) {
+            settled = true
+            syntheticRes.endBridgeBody()
+            resolveResponse(new Response(null, { status: syntheticRes.statusCode }))
+          }
+        },
+        (err: unknown) => {
+          cleanupAbort()
+          if (!settled) {
+            settled = true
+            syntheticRes.destroyBridgeBody()
+            rejectResponse(err)
+          } else {
+            syntheticRes.destroyBridgeBody(err instanceof Error ? err : new Error(String(err)))
+          }
+        },
+      )
+      return responsePromise
+    }
 
   /** The declared route this pathname hits — exact equality, or, for a
    * route declared `prefix: true` (PB-21), equality or one path segment
@@ -710,11 +953,11 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
    * explicit query declaration): ONE query parse, the virtual-id gate, the
    * unbridged walls in contract order, then the relay round-trip. A
    * declaration-v2 locator dispatches to the PB-21 half below. */
-  const surrogateHandler = (declared: DeclaredHit, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
-    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const surrogateHandler = (declared: DeclaredHit, originalHandler: OriginalHttpHandler | undefined) =>
+    async (req: IncomingMessage, res: ServerResponse, peer?: unknown): Promise<void> => {
       const passthrough = async (): Promise<void> => {
         if (originalHandler !== undefined) {
-          await originalHandler(req, res)
+          await callOriginalHttp(originalHandler, req, res, peer)
           return
         }
         res.writeHead(404)
@@ -731,7 +974,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       // verbatim. The dispatch sits after the installed check, so the v2
       // half never runs chained-over either.
       if (declared.locator.in !== 'query') {
-        await surrogateV2Handler(declared, originalHandler)(req, res)
+        await surrogateV2Handler(declared, originalHandler)(req, res, peer)
         return
       }
       // ONE parse of the query (the session parameter's home — `match` only
@@ -975,8 +1218,8 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
    * adapter-core view. The response discipline stays the query half's —
    * three headers, no hooks: `deny` and `rewriteIds` are PB-22's business.
    * Dispatch above guarantees `installed` and a non-query locator. */
-  const surrogateV2Handler = (declared: DeclaredHit, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
-    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const surrogateV2Handler = (declared: DeclaredHit, originalHandler: OriginalHttpHandler | undefined) =>
+    async (req: IncomingMessage, res: ServerResponse, peer?: unknown): Promise<void> => {
       const plugin = declared.plugin
       // The local passthrough. A json-body route has ALREADY consumed the
       // request body by the time this runs (the classify needs the parsed
@@ -993,10 +1236,10 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           const replay = new PassThrough()
           replay.end(replayBody)
           Object.assign(replay, { method: req.method, url: req.url, headers: req.headers })
-          await originalHandler(replay as unknown as IncomingMessage, res)
+          await callOriginalHttp(originalHandler, replay as unknown as IncomingMessage, res, peer)
           return
         }
-        await originalHandler(req, res)
+        await callOriginalHttp(originalHandler, req, res, peer)
       }
       let controller: AbortController | undefined
       const onClientGone = (): void => {
@@ -1291,8 +1534,11 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
 
   /** The adapter surrogate: locate → classify → walls → rewrite → hooks →
    * the relay round-trip, then the buffered JSON rewrite on the way back. */
-  const adapterSurrogateHandler = (hit: { adapter: NormalizedAdapter; route: NormalizedAdapterRoute }, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
-    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const adapterSurrogateHandler = (
+    hit: { adapter: NormalizedAdapter; route: NormalizedAdapterRoute },
+    originalHandler: OriginalHttpHandler | undefined,
+  ) =>
+    async (req: IncomingMessage, res: ServerResponse, peer?: unknown): Promise<void> => {
       const { adapter, route } = hit
       const plugin = adapter.plugin
       // The local passthrough. A body-locating route has ALREADY consumed
@@ -1309,10 +1555,10 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           const replay = new PassThrough()
           replay.end(replayBody)
           Object.assign(replay, { method: req.method, url: req.url, headers: req.headers })
-          await originalHandler(replay as unknown as IncomingMessage, res)
+          await callOriginalHttp(originalHandler, replay as unknown as IncomingMessage, res, peer)
           return
         }
-        await originalHandler(req, res)
+        await callOriginalHttp(originalHandler, req, res, peer)
       }
       // Chained-over: inert passthrough, exactly the posture of the other
       // intercepts.
@@ -1657,13 +1903,21 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     const authProp = isRecord(route) && 'auth' in route && route.auth !== undefined
       ? { auth: route.auth }
       : {}
+    const originalResource = resourceOf(route)
     const adapterHit = adapterRouteOf(pathname)
     if (adapterHit !== undefined) {
       return {
         kind: 'exact',
         path: pathname,
         ...authProp,
-        handler: adapterSurrogateHandler(adapterHit, handlerOf(route)),
+        ...(originalResource !== undefined
+          ? {
+              resource: wrapResourceSurrogate(
+                (passthrough) => adapterSurrogateHandler(adapterHit, passthrough),
+                originalResource,
+              ),
+            }
+          : { handler: adapterSurrogateHandler(adapterHit, handlerOf(route)) }),
       }
     }
     const declared = declaredRouteOf(pathname)
@@ -1672,7 +1926,14 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         kind: 'exact',
         path: pathname,
         ...authProp,
-        handler: surrogateHandler(declared, handlerOf(route)),
+        ...(originalResource !== undefined
+          ? {
+              resource: wrapResourceSurrogate(
+                (passthrough) => surrogateHandler(declared, passthrough),
+                originalResource,
+              ),
+            }
+          : { handler: surrogateHandler(declared, handlerOf(route)) }),
       }
     }
     return route
@@ -1750,7 +2011,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
    * virtual (the adapter's response hook, or the cooperative rewriteIds
    * scan) before the browser sees them. A mixed or foreign-server frame
    * kills the exchange — docs/adr/0001 holds frame by frame. */
-  const jsonBodyUpgrade = (declared: DeclaredUpgrade, originalHandler: unknown, req: IncomingMessage, socket: Socket, head: Buffer): Promise<void> =>
+  const jsonBodyUpgrade = (declared: DeclaredUpgrade, originalHandler: unknown, req: IncomingMessage, socket: Socket, head: Buffer, peer?: unknown): Promise<void> =>
     (async () => {
       const plugin = declared.plugin
       const socketGone = (): boolean => socket.destroyed || !socket.writable
@@ -1855,8 +2116,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         localSocket = pipe
         // The handler owns the exchange from here — its async body runs on
         // its own, exactly as the host would run it.
-        const handler = originalHandler as (request: IncomingMessage, sock: Socket, earlyHead: Buffer) => unknown
-        void Promise.resolve(handler(req, pipe as unknown as Socket, Buffer.alloc(0))).catch(() => destroySocket())
+        const handler = originalHandler as (request: IncomingMessage, sock: Socket, earlyHead: Buffer, admittedPeer?: unknown) => unknown
+        void Promise.resolve(
+          peer !== undefined
+            ? handler(req, pipe as unknown as Socket, Buffer.alloc(0), peer)
+            : handler(req, pipe as unknown as Socket, Buffer.alloc(0)),
+        ).catch(() => destroySocket())
       }
 
       // ---- the remote pipe: the PB-10 tunnel, frame by frame -------------
@@ -2153,15 +2418,26 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   /** The tunnel's surrogate upgrade handler. Every outcome — refusal,
    * teardown, the byte pumping — owns the socket's whole remaining life. */
   const surrogateUpgrade = (declared: DeclaredUpgrade, originalHandler: unknown) =>
-    (req: IncomingMessage, socket: Socket, head: Buffer): void => {
+    (req: IncomingMessage, socket: Socket, head: Buffer, peer?: unknown): void => {
+      const callOriginalUpgrade = (): void => {
+        if (typeof originalHandler === 'function') {
+          const fn = originalHandler as (
+            request: IncomingMessage,
+            sock: Socket,
+            earlyHead: Buffer,
+            admittedPeer?: unknown,
+          ) => unknown
+          if (peer !== undefined) fn(req, socket, head, peer)
+          else fn(req, socket, head)
+          return
+        }
+        try { socket.destroy() } catch { /* Already gone. */ }
+      }
       // The host never awaits an upgrade handler — the async body runs on
       // its own and every failure path owns the socket's teardown.
       void (async () => {
         if (!installed || isLoopbackBypass(req)) {
-          if (typeof originalHandler === 'function') originalHandler(req, socket, head)
-          else {
-            try { socket.destroy() } catch { /* Already gone. */ }
-          }
+          callOriginalUpgrade()
           return
         }
         log?.('upgrade entered for %s', declared.path)
@@ -2169,20 +2445,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // there is no session query parameter for the byte-tunnel half below
         // to read, so the frame-level half owns the whole exchange.
         if (declared.locator.in !== 'query') {
-          await jsonBodyUpgrade(declared, originalHandler, req, socket, head)
+          await jsonBodyUpgrade(declared, originalHandler, req, socket, head, peer)
           return
         }
       const socketGone = (): boolean => socket.destroyed || !socket.writable
       const passthrough = (): void => {
-        if (typeof originalHandler === 'function') {
-          originalHandler(req, socket, head)
-          return
-        }
-        try {
-          socket.destroy()
-        } catch {
-          // Already gone.
-        }
+        callOriginalUpgrade()
       }
       try {
         // ONE parse of the query — the session parameter's home.

@@ -15,6 +15,13 @@ export declare const UPLOAD_ROUTE = "/_dsh/mobile-nav/upload";
 /** Workspace-relative directory uploads land in; also the `@` mention prefix. */
 export declare const UPLOAD_DIR = ".dsh-uploads";
 /**
+ * Parse the upload endpoint's response, handling both JSON envelopes and
+ * plain-text error pages (such as DSH 0.2.2+ WebServer 401/403/503 responses).
+ * @param response - Fetch response (or minimal test double).
+ * @returns the workspace-relative path on success.
+ */
+export declare function parseUploadResponse(response: Pick<Response, 'ok' | 'status' | 'text'>): Promise<string>;
+/**
  * The upload URL for one file. Root-relative on purpose: through the
  * gateway half the pairing cookie only rides along same-origin.
  * @param sessionId - target session (its workspace receives the file).

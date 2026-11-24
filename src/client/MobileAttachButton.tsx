@@ -4,15 +4,12 @@ import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots
 import { IconPaperclipOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SessionId } from './compat/types.ts'
 import { NS } from './locales.ts'
-import { appendDraftOf, rememberThumbnail, uploadUrl, writeMention } from './attach-upload.ts'
+import { appendDraftOf, parseUploadResponse, rememberThumbnail, uploadUrl, writeMention } from './attach-upload.ts'
 
 /** Full props for the composer attachment seat. */
 export type MobileAttachButtonProps =
   & PropsRuntime<'conversation.input.left'>
   & PropsLocale<typeof NS>
-
-/** Shape of the node half's response body (src/index.ts handleUpload). */
-type UploadResult = { ok: true; relPath: string } | { ok: false; error: { code: string; message: string } }
 
 /** Post one file to the host route and return the workspace-relative path it landed on. */
 async function uploadFile(sessionId: SessionId, file: File): Promise<string> {
@@ -24,11 +21,7 @@ async function uploadFile(sessionId: SessionId, file: File): Promise<string> {
     headers: { 'Content-Type': file.type === '' ? 'application/octet-stream' : file.type },
     body: file,
   })
-  const body = (await response.json()) as UploadResult
-  if (!response.ok || !body.ok) {
-    throw new Error(body.ok === false ? body.error.message : `HTTP ${response.status}`)
-  }
-  return body.relPath
+  return parseUploadResponse(response)
 }
 
 /**

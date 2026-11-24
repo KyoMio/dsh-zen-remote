@@ -26,6 +26,46 @@ export const UPLOAD_DIR = '.dsh-uploads'
  */
 const MENTION = new RegExp(`@(${UPLOAD_DIR.replace('.', '\\.')}/\\S+)`, 'g')
 
+/** Shape of the node half's upload JSON response body. */
+type UploadResponseBody =
+  | { ok: true; relPath: string }
+  | { ok: false; error?: { code?: string; message?: string } }
+
+/**
+ * Parse the upload endpoint's response, handling both JSON envelopes and
+ * plain-text error pages (such as DSH 0.2.2+ WebServer 401/403/503 responses).
+ * @param response - Fetch response (or minimal test double).
+ * @returns the workspace-relative path on success.
+ */
+export async function parseUploadResponse(
+  response: Pick<Response, 'ok' | 'status' | 'text'>,
+): Promise<string> {
+  const raw = await response.text()
+  let body: UploadResponseBody | undefined
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) && 'ok' in parsed) {
+      body = parsed as UploadResponseBody
+    }
+  } catch {
+    // Plain-text 401/403/503 or non-JSON proxy error page.
+    body = undefined
+  }
+  if (response.ok && body?.ok === true && typeof body.relPath === 'string') {
+    return body.relPath
+  }
+  if (body?.ok === false) {
+    const message = typeof body.error?.message === 'string' && body.error.message !== ''
+      ? body.error.message
+      : typeof body.error?.code === 'string' && body.error.code !== ''
+        ? body.error.code
+        : `HTTP ${response.status}`
+    throw new Error(message)
+  }
+  const snippet = raw.trim()
+  throw new Error(snippet !== '' ? `HTTP ${response.status}: ${snippet.slice(0, 120)}` : `HTTP ${response.status}`)
+}
+
 /**
  * The upload URL for one file. Root-relative on purpose: through the
  * gateway half the pairing cookie only rides along same-origin.

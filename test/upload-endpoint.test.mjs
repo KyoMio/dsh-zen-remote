@@ -14,6 +14,7 @@ import {
   leafOf,
   mentionsIn,
   middleEllipsis,
+  parseUploadResponse,
   uploadUrl,
   writeMention,
 } from '../src/client/attach-upload.ts'
@@ -255,4 +256,45 @@ test('upload endpoint integration: disk writes, caps, symlinks, and admission wa
   assert.equal(allowed.body.relPath, `${UPLOAD_DIR}/admitted.txt`)
   assert.equal(admitted, 1)
   assert.equal(await readFile(join(workspace, UPLOAD_DIR, 'admitted.txt'), 'utf8'), 'through the wall')
+})
+
+test('D23-1/fix: parseUploadResponse reports plain-text host rejections instead of throwing JSON parse errors', async () => {
+  const fakeResponse = (status, bodyText) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => bodyText,
+  })
+
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(401, 'unauthorized')),
+    /HTTP 401: unauthorized/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(403, 'forbidden')),
+    /HTTP 403: forbidden/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(503, 'authentication unavailable')),
+    /HTTP 503: authentication unavailable/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(502, '')),
+    /^Error: HTTP 502$/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(403, JSON.stringify({ ok: false, error: { code: 'forbidden', message: 'owner only' } }))),
+    /owner only/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(401, JSON.stringify({ ok: false, error: { code: 'unauthorized' } }))),
+    /unauthorized/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(200, 'not-json')),
+    /HTTP 200: not-json/,
+  )
+  assert.equal(
+    await parseUploadResponse(fakeResponse(200, JSON.stringify({ ok: true, relPath: '.dsh-attachments/a.png' }))),
+    '.dsh-attachments/a.png',
+  )
 })

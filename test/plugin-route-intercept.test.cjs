@@ -784,3 +784,162 @@ test('D23-2: wrappedMatch and wrappedUpgradesGet preserve original auth without 
     handle.uninstall()
   }
 })
+
+test('PR77-1/PR77-2: wrappedMatch preserves WebResourceRoute resource and forwards peer on local resource, query handler, and upgrade', async (t) => {
+  const { PassThrough } = require('node:stream')
+  const { EventEmitter } = require('node:events')
+  const relay = await startFakeRelay()
+  t.after(() => relay.stop())
+  const relayClient = fakeRelayClient(relay.__port)
+
+  const exact = new Map()
+  const prefixes = new Map()
+  const upgrades = new Map()
+  const webServer = {
+    exact,
+    prefixes,
+    upgrades,
+    match(pathname) {
+      const exactHit = exact.get(pathname)
+      if (exactHit !== undefined) return exactHit
+      for (const [prefix, route] of prefixes) {
+        if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return route
+      }
+      return undefined
+    },
+  }
+
+  const seen = { resourcePeers: [], handlerPeers: [], upgradePeers: [] }
+  exact.set('/panel/res', {
+    kind: 'exact',
+    path: '/panel/res',
+    auth: 'anonymous',
+    resource: async (request, peer) => {
+      seen.resourcePeers.push({ method: request.method, peer })
+      return new Response(request.method === 'HEAD' ? null : JSON.stringify({ localRes: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'x-local-res': 'yes' },
+      })
+    },
+  })
+  prefixes.set('/panel/res-prefix', {
+    kind: 'prefix',
+    path: '/panel/res-prefix',
+    resource: async (request, peer) => {
+      seen.resourcePeers.push({ method: request.method, peer, url: request.url })
+      return new Response('prefix-local', { status: 200, headers: { 'x-prefix-res': '1' } })
+    },
+  })
+  exact.set('/panel/data', {
+    kind: 'exact',
+    path: '/panel/data',
+    handler: async (_req, res, peer) => {
+      seen.handlerPeers.push(peer)
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true }))
+    },
+  })
+  upgrades.set('/panel/ws', {
+    path: '/panel/ws',
+    handler: (_req, socket, _head, peer) => {
+      seen.upgradePeers.push(peer)
+      socket.end()
+    },
+  })
+
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'res-panel',
+    version: '1.0.0',
+    routes: [
+      { path: '/panel/res', scope: 'session' },
+      { path: '/panel/res-prefix', scope: 'session', prefix: true },
+      { path: '/panel/data', scope: 'session' },
+      { path: '/panel/ws', scope: 'session', upgrade: true },
+    ],
+  })
+
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay: relayClient,
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'res-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  const ownerPeer = { principal: { kind: 'owner', id: 'local-owner' } }
+
+  // 1. WebResourceRoute keeps `.resource` (not `.handler`) and preserves auth
+  const resRoute = webServer.match('/panel/res')
+  assert.equal(typeof resRoute.resource, 'function')
+  assert.equal(resRoute.handler, undefined)
+  assert.equal(resRoute.auth, 'anonymous')
+
+  const localHead = await resRoute.resource(
+    new Request('http://127.0.0.1/panel/res?sessionId=local-1', { method: 'HEAD' }),
+    ownerPeer,
+  )
+  assert.equal(localHead.status, 200)
+  assert.equal(localHead.headers.get('x-local-res'), 'yes')
+  assert.equal(seen.resourcePeers.length, 1)
+  assert.equal(seen.resourcePeers[0].method, 'HEAD')
+  assert.equal(seen.resourcePeers[0].peer, ownerPeer)
+
+  const prefixRoute = webServer.match('/panel/res-prefix/sub.txt')
+  assert.equal(typeof prefixRoute.resource, 'function')
+  assert.equal(prefixRoute.handler, undefined)
+  const localPrefix = await prefixRoute.resource(
+    new Request('http://127.0.0.1/panel/res-prefix/sub.txt?sessionId=local-1'),
+    ownerPeer,
+  )
+  assert.equal(await localPrefix.text(), 'prefix-local')
+  assert.equal(seen.resourcePeers.length, 2)
+  assert.equal(seen.resourcePeers[1].peer, ownerPeer)
+
+  // Remote session still bridges through relay and returns a Fetch Response
+  relay.state.reply = (_relayReq, relayRes) => {
+    relayRes.writeHead(200, { 'content-type': 'application/json' })
+    relayRes.end(JSON.stringify({ remoteRes: true }))
+  }
+  const remoteRes = await resRoute.resource(
+    new Request(`http://127.0.0.1/panel/res?sessionId=${encodeURIComponent(VIRTUAL)}`),
+    ownerPeer,
+  )
+  assert.equal(remoteRes.status, 200)
+  assert.deepEqual(await remoteRes.json(), { remoteRes: true })
+  assert.equal(seen.resourcePeers.length, 2, 'remote request must not invoke local resource')
+  assert.equal(relay.state.hits.length, 1)
+  assert.equal(relay.state.hits[0].zrQuery, 'sessionId=session-a')
+
+  // 2. Local query handler receives forwarded peer
+  const req = Object.assign(new EventEmitter(), {
+    url: '/panel/data?sessionId=local-1',
+    method: 'GET',
+    headers: {},
+    destroy() {},
+  })
+  const chunks = []
+  const res = Object.assign(new PassThrough(), {
+    statusCode: 200,
+    setHeader() {},
+    writeHead(code) { this.statusCode = code },
+  })
+  res.on('data', (c) => chunks.push(c))
+  await webServer.match('/panel/data').handler(req, res, ownerPeer)
+  assert.equal(seen.handlerPeers.length, 1)
+  assert.equal(seen.handlerPeers[0], ownerPeer)
+  assert.deepEqual(JSON.parse(Buffer.concat(chunks).toString('utf8')), { ok: true })
+
+  // 3. Local WebSocket upgrade receives forwarded peer
+  const upReq = Object.assign(new EventEmitter(), {
+    url: '/panel/ws?sessionId=local-1',
+    method: 'GET',
+    headers: {},
+  })
+  const socket = new PassThrough()
+  webServer.upgrades.get('/panel/ws').handler(upReq, socket, Buffer.alloc(0), ownerPeer)
+  assert.equal(seen.upgradePeers.length, 1)
+  assert.equal(seen.upgradePeers[0], ownerPeer)
+})
