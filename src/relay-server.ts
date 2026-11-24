@@ -317,6 +317,9 @@ export interface RelayHandlerOptions {
    * swallows before destroying the socket (the {@link DRAIN_SLACK_BYTES}
    * bound); defaults to 8 MiB. Tests inject a small value. */
   drainSlackBytes?: number
+  /** Stream frame compressor; defaults to zlib gzip level 1. Tests inject a
+   * controllable implementation. */
+  compressFrame?: (input: Buffer) => Promise<Buffer>
   /** The plugin bridge's server half (PB-3). Absent — a wiring that never
    * mounted it, old tests — and `POST relay/v1/plugin` answers 501
    * `unsupported`, exactly like the `/api` passthrough without a dispatcher. */
@@ -1348,6 +1351,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
   const drainDeadlineMs = options.drainDeadlineMs ?? DRAIN_DEADLINE_MS
   const drainSlackBytes = options.drainSlackBytes ?? DRAIN_SLACK_BYTES
   const parentOf = options.parentOf ?? (() => undefined)
+  const compressFrame = options.compressFrame ?? ((input: Buffer) => gzipAsync(input, { level: 1 }))
   const isAccessible = (sessionId: string): boolean => store.isAccessible(sessionId, parentOf)
 
   /**
@@ -3188,6 +3192,8 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             let outBytes = Buffer.from(`${lineText}\n`, 'utf8')
             // Compression MUST run serially inside writeChain so a slow gzip
             // of a large snapshot never gets overtaken by a small event or end tail.
+            let gzBuf: Buffer | undefined
+            let didAsyncWork = false
             if (
               clientAcceptsGzip &&
               !tail &&
@@ -3195,26 +3201,27 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               isPlainObject(current) &&
               current.type === 'frame'
             ) {
+              didAsyncWork = true
               try {
-                const gzBuf = await gzipAsync(outBytes.subarray(0, outBytes.byteLength - 1), { level: 1 })
-                if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
-                if (prepare !== undefined) {
-                  const rechecked = prepare(current)
-                  if (rechecked === null) return
-                  if (rechecked !== current) {
-                    outBytes = Buffer.from(`${JSON.stringify(rechecked)}\n`, 'utf8')
-                  } else {
-                    const wrapped = `${JSON.stringify({ type: 'gz', b64: gzBuf.toString('base64') })}\n`
-                    if (wrapped.length < outBytes.byteLength) outBytes = Buffer.from(wrapped, 'utf8')
-                  }
-                } else {
-                  const wrapped = `${JSON.stringify({ type: 'gz', b64: gzBuf.toString('base64') })}\n`
-                  if (wrapped.length < outBytes.byteLength) {
-                    outBytes = Buffer.from(wrapped, 'utf8')
-                  }
-                }
+                gzBuf = await compressFrame(outBytes.subarray(0, outBytes.byteLength - 1))
               } catch {
                 // Fall back to uncompressed line on unexpected zlib failure.
+                gzBuf = undefined
+              }
+            }
+            if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
+            if (didAsyncWork && prepare !== undefined) {
+              const rechecked = prepare(current)
+              if (rechecked === null) return
+              if (rechecked !== current) {
+                gzBuf = undefined
+                outBytes = Buffer.from(`${JSON.stringify(rechecked)}\n`, 'utf8')
+              }
+            }
+            if (gzBuf !== undefined) {
+              const wrapped = `${JSON.stringify({ type: 'gz', b64: gzBuf.toString('base64') })}\n`
+              if (wrapped.length < outBytes.byteLength) {
+                outBytes = Buffer.from(wrapped, 'utf8')
               }
             }
             if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return

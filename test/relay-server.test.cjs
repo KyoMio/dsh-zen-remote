@@ -73,6 +73,7 @@ function makeParts(name, overrides = {}) {
     ...(overrides.uploadCapBytes !== undefined ? { uploadCapBytes: overrides.uploadCapBytes } : {}),
     ...(overrides.drainDeadlineMs !== undefined ? { drainDeadlineMs: overrides.drainDeadlineMs } : {}),
     ...(overrides.drainSlackBytes !== undefined ? { drainSlackBytes: overrides.drainSlackBytes } : {}),
+    ...(overrides.compressFrame !== undefined ? { compressFrame: overrides.compressFrame } : {}),
   })
   return { handler, calls, streamCalls, gateway, store, home }
 }
@@ -2701,4 +2702,138 @@ test('PR78-2: queued sessionStatus/follow frames are re-checked against share ac
     }
   }
   assert.equal(frames.some((f) => f.type === 'changed' && f.state.sessionId === 'session-b'), true)
+})
+
+test('PR78-R2-M1: gzip-negotiated sessionStatus/follow rechecks accessibility on both compression failure and success', async (t) => {
+  const idA = 'session-a'
+  const idB = 'session-b-keep'
+  let compressCount = 0
+  let pushFrame
+  let finishStream
+  let parts
+
+  parts = makeParts('pr78-r2-gzip-recheck', {
+    compressFrame: async (input) => {
+      compressCount += 1
+      // Revoke session-a while async compression is in flight:
+      // #1 baseline -> reject compression; #2 changed -> reject compression; #3 changed -> resolve valid gzip
+      parts.store.unshare(idA)
+      if (compressCount <= 2) {
+        throw new Error('simulated zlib failure')
+      }
+      return zlib.gzipSync(input, { level: 1 })
+    },
+    stream: async () => ({
+      [Symbol.asyncIterator]() {
+        const queue = []
+        let waiter = null
+        let done = false
+        pushFrame = (item) => {
+          if (waiter) {
+            const w = waiter
+            waiter = null
+            w({ value: item, done: false })
+          } else {
+            queue.push(item)
+          }
+        }
+        finishStream = () => {
+          done = true
+          if (waiter) {
+            const w = waiter
+            waiter = null
+            w({ value: undefined, done: true })
+          }
+        }
+        return {
+          next() {
+            if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false })
+            if (done) return Promise.resolve({ value: undefined, done: true })
+            return new Promise((resolve) => { waiter = resolve })
+          },
+          return() {
+            done = true
+            return Promise.resolve({ value: undefined, done: true })
+          },
+        }
+      },
+    }),
+  })
+  assert.equal(parts.store.share(idA), true)
+  assert.equal(parts.store.share(idB), true)
+
+  const server = await startServer(parts.handler)
+  t.after(() => server.stop())
+
+  const resPromise = server.fetch(
+    '/_dsh/zen-remote/relay/v1/stream',
+    post(
+      '/s',
+      { namespace: 'sessionStatus', method: 'follow', args: {} },
+      { ...AUTH, 'content-type': 'application/json', 'x-zr-accept-encoding': 'gzip' },
+    ),
+  )
+
+  while (!pushFrame) await new Promise((r) => setTimeout(r, 5))
+
+  const mkState = (sessionId, turn, extra = {}) => ({
+    sessionId,
+    completedTurn: turn,
+    failed: false,
+    readTurn: turn - 1,
+    manualUnread: false,
+    ...extra,
+  })
+
+  // 1. Baseline (>1024 B via pad on cached idA): compressCount=1 unshares idA and fails -> filtered baseline excludes idA
+  pushFrame({ type: 'baseline', items: [mkState(idA, 1, { pad: 'p'.repeat(1100) }), mkState(idB, 1)] })
+  const res = await resPromise
+  assert.equal(res.status, 200)
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  const lines = []
+  const readUntil = async (predicate) => {
+    while (!predicate()) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const split = buf.split('\n')
+      buf = split.pop() ?? ''
+      for (const raw of split) {
+        if (!raw) continue
+        const obj = JSON.parse(raw)
+        lines.push(obj.type === 'gz' ? JSON.parse(zlib.gunzipSync(Buffer.from(obj.b64, 'base64')).toString('utf8')) : obj)
+      }
+    }
+  }
+
+  await readUntil(() => lines.some((l) => l.type === 'frame'))
+
+  // 2. Changed (>1024 B): compressCount=2 unshares idA and fails -> frame must be dropped completely
+  parts.store.share(idA)
+  await new Promise((r) => setTimeout(r, 15))
+  pushFrame({ type: 'changed', state: mkState(idB, 2) })
+  await readUntil(() => lines.some((l) => l.type === 'frame' && l.frame?.type === 'changed' && l.frame?.state?.completedTurn === 2))
+
+  // 3. Changed (>1024 B): compressCount=3 unshares idA and succeeds -> frame must ALSO be dropped
+  parts.store.share(idA)
+  await new Promise((r) => setTimeout(r, 15))
+  pushFrame({ type: 'changed', state: mkState(idB, 3) })
+  await new Promise((r) => setTimeout(r, 20))
+  finishStream()
+  await readUntil(() => lines.some((l) => l.type === 'end'))
+
+  assert.equal(compressCount, 3)
+  const frames = lines.filter((l) => l.type === 'frame').map((l) => l.frame)
+  for (const frame of frames) {
+    if (frame.type === 'changed') {
+      assert.notEqual(frame.state.sessionId, idA)
+    } else if (frame.type === 'baseline') {
+      assert.equal(frame.items.some((item) => item.sessionId === idA), false)
+      assert.equal(frame.items.some((item) => item.sessionId === idB), true)
+    }
+  }
+  assert.equal(frames.some((f) => f.type === 'changed' && f.state.sessionId === idB && f.state.completedTurn === 2), true)
+  assert.equal(frames.some((f) => f.type === 'changed' && f.state.sessionId === idB && f.state.completedTurn === 3), true)
 })

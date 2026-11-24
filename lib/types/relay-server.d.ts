@@ -176,6 +176,9 @@ export interface RelayHandlerOptions {
      * swallows before destroying the socket (the {@link DRAIN_SLACK_BYTES}
      * bound); defaults to 8 MiB. Tests inject a small value. */
     drainSlackBytes?: number;
+    /** Stream frame compressor; defaults to zlib gzip level 1. Tests inject a
+     * controllable implementation. */
+    compressFrame?: (input: Buffer) => Promise<Buffer>;
     /** The plugin bridge's server half (PB-3). Absent — a wiring that never
      * mounted it, old tests — and `POST relay/v1/plugin` answers 501
      * `unsupported`, exactly like the `/api` passthrough without a dispatcher. */
