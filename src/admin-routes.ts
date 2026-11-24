@@ -126,7 +126,16 @@ class AdminError extends Error {
 }
 
 /** What `connection.admit` answers: the operator peer, or the refusal status. */
-export type AdminAdmission = { readonly peer: unknown } | { readonly rejection: 401 | 403 }
+export type AdminAdmission = { readonly peer: unknown } | { readonly rejection: 401 | 403 | 503 }
+
+/** Map an admission refusal status to the wire error code across host routes. */
+export function admitRejectionCode(rejection: 401 | 403 | 503): 'unauthorized' | 'forbidden' | 'service-unavailable' {
+  switch (rejection) {
+    case 401: return 'unauthorized'
+    case 403: return 'forbidden'
+    case 503: return 'service-unavailable'
+  }
+}
 
 /** The effective-config snapshot resolveConfig() produces, recomputed per request. */
 export interface AdminConfigSnapshot {
@@ -689,7 +698,7 @@ export function createAdminHandler(options: AdminHandlerOptions): AdminHandler {
     if ('rejection' in admission) {
       responseJson(res, admission.rejection, {
         ok: false,
-        error: { code: admission.rejection === 401 ? 'unauthorized' : 'forbidden' },
+        error: { code: admitRejectionCode(admission.rejection) },
       })
       return
     }

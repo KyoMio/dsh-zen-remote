@@ -60,12 +60,12 @@
  * fetch-route-intercept.ts).
  */
 
-import type { IncomingMessage, ServerResponse } from 'node:http'
+import { IncomingMessage, ServerResponse, type OutgoingHttpHeader, type OutgoingHttpHeaders } from 'node:http'
 import type { BridgeLocator, BridgeRegistry, BridgeStatus, NormalizedBridgeRoute } from './plugin-bridge.js'
 import { routeDeniesRemoteOf, routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeRewriteFieldsOf, routeRewritesIdsOf, routeUpgradesOf } from './plugin-bridge.js'
 import { PassThrough, Readable, Transform, Duplex } from 'node:stream'
 import { createHash, timingSafeEqual } from 'node:crypto'
-import type { Socket } from 'node:net'
+import { Socket } from 'node:net'
 import type { RelayClient } from './relay-client.js'
 import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
 import { encodeRfc6455Frame, parseRfc6455Frames, type Rfc6455Frame } from './plugin-tunnel.js'
@@ -168,14 +168,14 @@ function rewriteIdsAtFields(root: unknown, fields: readonly string[], serverId: 
  * backpressure — the one discipline every verbatim passthrough runs. The
  * `close` listener settles the wait when the browser vanishes mid-body (a
  * lost drain event would otherwise hang the write loop). */
-async function pumpResponse(
+async function writeChunksWithBackpressure(
   res: ServerResponse,
-  reader: { read(): Promise<{ done: boolean; value?: Uint8Array }> },
-): Promise<void> {
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    if (!res.write(value)) {
+  chunks: readonly Buffer[],
+): Promise<boolean> {
+  for (const chunk of chunks) {
+    if (res.destroyed) return false
+    if (!res.write(chunk)) {
+      if (res.destroyed) return false
       await new Promise<void>((resolve) => {
         const settled = (): void => {
           res.off('drain', settled)
@@ -185,7 +185,45 @@ async function pumpResponse(
         res.once('drain', settled)
         res.once('close', settled)
       })
+      if (res.destroyed) return false
     }
+  }
+  return !res.destroyed
+}
+
+async function pumpResponse(
+  res: ServerResponse,
+  reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel?: (reason?: unknown) => Promise<void> },
+): Promise<void> {
+  while (!res.destroyed) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (res.destroyed) {
+      await reader.cancel?.().catch(() => {})
+      break
+    }
+    if (!res.write(value)) {
+      if (res.destroyed) {
+        await reader.cancel?.().catch(() => {})
+        break
+      }
+      await new Promise<void>((resolve) => {
+        const settled = (): void => {
+          res.off('drain', settled)
+          res.off('close', settled)
+          resolve()
+        }
+        res.once('drain', settled)
+        res.once('close', settled)
+      })
+      if (res.destroyed) {
+        await reader.cancel?.().catch(() => {})
+        break
+      }
+    }
+  }
+  if (res.destroyed) {
+    await reader.cancel?.().catch(() => {})
   }
 }
 
@@ -228,6 +266,10 @@ async function answerRewriteIds(
   let size = 0
   let overflow = false
   while (true) {
+    if (res.destroyed) {
+      await reader.cancel().catch(() => {})
+      return
+    }
     const { done, value } = await reader.read()
     if (done) break
     size += value.length
@@ -239,23 +281,18 @@ async function answerRewriteIds(
       break
     }
   }
+  if (res.destroyed) {
+    await reader.cancel().catch(() => {})
+    return
+  }
   if (overflow) {
     res.writeHead(response.status, verbatimHeaders)
-    for (const chunk of chunks) {
-      if (!res.write(chunk)) {
-        await new Promise<void>((resolve) => {
-          const settled = (): void => {
-            res.off('drain', settled)
-            res.off('close', settled)
-            resolve()
-          }
-          res.once('drain', settled)
-          res.once('close', settled)
-        })
-      }
+    if (await writeChunksWithBackpressure(res, chunks)) {
+      await pumpResponse(res, reader)
+      if (!res.destroyed) res.end()
+    } else {
+      await reader.cancel().catch(() => {})
     }
-    await pumpResponse(res, reader)
-    res.end()
     return
   }
   const text = Buffer.concat(chunks).toString('utf8')
@@ -571,14 +608,16 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   const loopbackSecretBytes = typeof options.loopbackSecret === 'string' && options.loopbackSecret !== ''
     ? Buffer.from(options.loopbackSecret, 'utf8')
     : undefined
-  const isLoopbackBypass = (req: IncomingMessage): boolean => {
+  const isLoopbackSecretValid = (rawHeader: string | string[] | undefined): boolean => {
     if (loopbackSecretBytes === undefined) return false
-    const raw = req.headers['x-zen-remote-loopback']
-    const candidate = Array.isArray(raw) ? raw[0] : raw
+    const candidate = Array.isArray(rawHeader) ? rawHeader[0] : rawHeader
     if (typeof candidate !== 'string' || candidate === '') return false
     const candidateBytes = Buffer.from(candidate, 'utf8')
     if (candidateBytes.length !== loopbackSecretBytes.length) return false
-    if (!timingSafeEqual(candidateBytes, loopbackSecretBytes)) return false
+    return timingSafeEqual(candidateBytes, loopbackSecretBytes)
+  }
+  const isLoopbackBypass = (req: { headers: Record<string, string | string[] | undefined> }): boolean => {
+    if (!isLoopbackSecretValid(req.headers['x-zen-remote-loopback'])) return false
     delete req.headers['x-zen-remote-loopback']
     return true
   }
@@ -668,11 +707,337 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-unbridged', reason, plugin } }))
   }
 
+  type OriginalHttpHandler = (
+    req: IncomingMessage,
+    res: ServerResponse,
+    peer?: unknown,
+  ) => Promise<void> | void
+  type OriginalResource = (request: Request, peer?: unknown) => Promise<Response> | Response
+
   /** The original route handler when it is worth calling at all. */
-  const handlerOf = (route: unknown): ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined =>
+  const handlerOf = (route: unknown): OriginalHttpHandler | undefined =>
     route !== undefined && isRecord(route) && typeof (route as { handler?: unknown }).handler === 'function'
-      ? (route as { handler: (req: IncomingMessage, res: ServerResponse) => Promise<void> }).handler
+      ? (route as { handler: OriginalHttpHandler }).handler
       : undefined
+
+  /** The original WebResource when the matched route is a resource route. */
+  const resourceOf = (route: unknown): OriginalResource | undefined =>
+    route !== undefined && isRecord(route) && typeof (route as { resource?: unknown }).resource === 'function'
+      ? (route as { resource: OriginalResource }).resource
+      : undefined
+
+  const callOriginalHttp = async (
+    originalHandler: OriginalHttpHandler,
+    req: IncomingMessage,
+    res: ServerResponse,
+    peer?: unknown,
+  ): Promise<void> => {
+    await (peer !== undefined ? originalHandler(req, res, peer) : originalHandler(req, res))
+  }
+
+  const toUint8Array = (chunk: unknown, encoding?: unknown): Uint8Array | undefined => {
+    if (chunk instanceof Uint8Array) {
+      return chunk.byteLength === 0 ? undefined : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+    }
+    if (typeof chunk === 'string') {
+      const buf = typeof encoding === 'string' ? Buffer.from(chunk, encoding as BufferEncoding) : Buffer.from(chunk)
+      return buf.byteLength === 0 ? undefined : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+    }
+    return undefined
+  }
+
+  class ResourceBridgeResponse extends ServerResponse {
+    private bridgeHeadersSent = false
+    private bridgeEnded = false
+    private bridgeDestroyed = false
+    private bridgeClosed = false
+    private bridgeWaitingDrain = false
+    private readonly bridgeHeaders = new Headers()
+    private bridgeController: ReadableStreamDefaultController<Uint8Array> | undefined
+    private bridgeSettled = false
+    private readonly onHeadReady: (status: number, headers: Headers, bridgeRes: ResourceBridgeResponse) => void
+
+    constructor(
+      req: IncomingMessage,
+      onHeadReady: (status: number, headers: Headers, bridgeRes: ResourceBridgeResponse) => void,
+    ) {
+      super(req)
+      this.onHeadReady = onHeadReady
+      Object.defineProperties(this, {
+        headersSent: { get: () => this.bridgeHeadersSent, configurable: true },
+        writableEnded: { get: () => this.bridgeEnded, configurable: true },
+        destroyed: { get: () => this.bridgeDestroyed, configurable: true },
+      })
+    }
+
+    attachStreamController(controller: ReadableStreamDefaultController<Uint8Array>): void {
+      this.bridgeController = controller
+    }
+
+    onStreamPull(): void {
+      if (
+        this.bridgeWaitingDrain &&
+        !this.bridgeClosed &&
+        !this.bridgeDestroyed &&
+        (this.bridgeController?.desiredSize ?? 0) > 0
+      ) {
+        this.bridgeWaitingDrain = false
+        this.emit('drain')
+      }
+    }
+
+    onStreamCancel(): void {
+      this.bridgeClosed = true
+      this.bridgeWaitingDrain = false
+      this.destroy()
+    }
+
+    finishIfOpen(): void {
+      if (this.bridgeClosed || this.bridgeDestroyed) return
+      this.bridgeClosed = true
+      this.bridgeWaitingDrain = false
+      try {
+        this.bridgeController?.close()
+      } catch {
+        // Controller already closed or errored.
+      }
+    }
+
+    private enqueueChunk(chunk: unknown, encoding?: unknown): boolean {
+      if (this.bridgeClosed || this.bridgeDestroyed || this.bridgeController === undefined) return true
+      const bytes = toUint8Array(chunk, encoding)
+      if (bytes === undefined) return true
+      try {
+        this.bridgeController.enqueue(bytes)
+      } catch {
+        this.bridgeClosed = true
+        this.bridgeWaitingDrain = false
+        return true
+      }
+      if ((this.bridgeController.desiredSize ?? 0) <= 0) {
+        this.bridgeWaitingDrain = true
+        return false
+      }
+      return true
+    }
+
+    closeNullBody(): void {
+      if (this.bridgeDestroyed) return
+      this.bridgeClosed = true
+      this.bridgeWaitingDrain = false
+      this.bridgeDestroyed = true
+      this.emit('close')
+    }
+
+    override setHeader(name: string, value: string | number | readonly string[]): this {
+      if (Array.isArray(value)) {
+        this.bridgeHeaders.delete(name)
+        for (const item of value) this.bridgeHeaders.append(name, String(item))
+      } else {
+        this.bridgeHeaders.set(name, String(value))
+      }
+      return this
+    }
+
+    override writeHead(
+      statusCode: number,
+      statusMessage?: string | OutgoingHttpHeaders | OutgoingHttpHeader[],
+      headers?: OutgoingHttpHeaders | OutgoingHttpHeader[],
+    ): this {
+      this.statusCode = statusCode
+      const headerBag = typeof statusMessage === 'object' && statusMessage !== null ? statusMessage : headers
+      if (Array.isArray(headerBag)) {
+        for (let i = 0; i + 1 < headerBag.length; i += 2) {
+          const name = headerBag[i]
+          const value = headerBag[i + 1]
+          if (typeof name === 'string' && value !== undefined) {
+            this.setHeader(name, Array.isArray(value) ? value.map(String) : String(value))
+          }
+        }
+      } else if (headerBag !== undefined) {
+        for (const [name, value] of Object.entries(headerBag)) {
+          if (value !== undefined) this.setHeader(name, value)
+        }
+      }
+      this.emitBridgeHead()
+      return this
+    }
+
+    override write(chunk: unknown, encoding?: unknown, cb?: unknown): boolean {
+      this.emitBridgeHead()
+      let ok = true
+      if (chunk !== undefined && chunk !== null) {
+        ok = this.enqueueChunk(chunk, typeof encoding === 'function' ? undefined : encoding)
+      }
+      if (typeof encoding === 'function') encoding()
+      else if (typeof cb === 'function') cb()
+      return ok
+    }
+
+    override end(chunk?: unknown, encoding?: unknown, cb?: unknown): this {
+      this.emitBridgeHead()
+      if (typeof chunk === 'function') {
+        this.bridgeEnded = true
+        this.finishIfOpen()
+        chunk()
+        return this
+      }
+      if (chunk !== undefined && chunk !== null) {
+        this.enqueueChunk(chunk, typeof encoding === 'function' ? undefined : encoding)
+      }
+      this.bridgeEnded = true
+      this.finishIfOpen()
+      if (typeof encoding === 'function') encoding()
+      else if (typeof cb === 'function') cb()
+      return this
+    }
+
+    override destroy(error?: Error): this {
+      if (this.bridgeDestroyed) return this
+      this.bridgeDestroyed = true
+      this.bridgeWaitingDrain = false
+      if (!this.bridgeClosed && !this.bridgeEnded) {
+        this.bridgeClosed = true
+        try {
+          this.bridgeController?.error(error ?? new Error('Response stream aborted'))
+        } catch {
+          // Controller already closed or errored.
+        }
+      }
+      this.emit('close')
+      return this
+    }
+
+    abortBridge(): void {
+      this.destroy()
+    }
+
+    private emitBridgeHead(): void {
+      if (this.bridgeHeadersSent || this.bridgeDestroyed) return
+      this.bridgeHeadersSent = true
+      if (!this.bridgeSettled) {
+        this.bridgeSettled = true
+        this.onHeadReady(this.statusCode, this.bridgeHeaders, this)
+      }
+    }
+  }
+
+  const wrapResourceSurrogate = (
+    buildSurrogate: (
+      originalHandler: OriginalHttpHandler,
+    ) => (req: IncomingMessage, res: ServerResponse, peer?: unknown) => Promise<void>,
+    originalResource: OriginalResource,
+  ): OriginalResource =>
+    async (request: Request, peer?: unknown): Promise<Response> => {
+      const invokeOriginal = (req: Request): Promise<Response> | Response =>
+        peer !== undefined ? originalResource(req, peer) : originalResource(req)
+      if (!installed) return invokeOriginal(request)
+      const loopbackHeader = request.headers.get('x-zen-remote-loopback')
+      if (loopbackHeader !== null && isLoopbackSecretValid(loopbackHeader)) {
+        const headers = new Headers(request.headers)
+        headers.delete('x-zen-remote-loopback')
+        return invokeOriginal(new Request(request, { headers }))
+      }
+      if (request.signal.aborted) {
+        const reason: unknown = request.signal.reason
+        throw reason instanceof Error
+          ? reason
+          : new Error(typeof reason === 'string' && reason !== '' ? reason : 'Request aborted')
+      }
+
+      const parsedUrl = new URL(request.url, 'http://local')
+      const syntheticHeaders: Record<string, string | string[] | undefined> = {}
+      request.headers.forEach((value, name) => {
+        const existing = syntheticHeaders[name]
+        if (existing === undefined) syntheticHeaders[name] = value
+        else if (Array.isArray(existing)) existing.push(value)
+        else syntheticHeaders[name] = [existing, value]
+      })
+      const syntheticReq = new IncomingMessage(new Socket())
+      syntheticReq.method = request.method
+      syntheticReq.url = `${parsedUrl.pathname}${parsedUrl.search}`
+      syntheticReq.headers = syntheticHeaders
+      syntheticReq.push(null)
+
+      let passthroughResponse: Response | undefined
+      let resolveResponse!: (res: Response) => void
+      let rejectResponse!: (err: unknown) => void
+      const responsePromise = new Promise<Response>((resolve, reject) => {
+        resolveResponse = resolve
+        rejectResponse = reject
+      })
+      let settled = false
+      const cleanupAbort = (): void => {
+        request.signal.removeEventListener('abort', onAbort)
+      }
+      const syntheticRes = new ResourceBridgeResponse(syntheticReq, (statusCode, responseHeaders, bridgeRes) => {
+        if (settled) return
+        settled = true
+        const body = request.method === 'HEAD' || statusCode === 204 || statusCode === 205 || statusCode === 304
+          ? null
+          : new ReadableStream<Uint8Array>(
+              {
+                start(controller) {
+                  bridgeRes.attachStreamController(controller)
+                },
+                pull() {
+                  bridgeRes.onStreamPull()
+                },
+                cancel() {
+                  bridgeRes.onStreamCancel()
+                },
+              },
+              new ByteLengthQueuingStrategy({ highWaterMark: 16 * 1024 }),
+            )
+        resolveResponse(new Response(body, { status: statusCode, headers: responseHeaders }))
+        if (body === null) {
+          bridgeRes.closeNullBody()
+        }
+      })
+      const onAbort = (): void => {
+        syntheticRes.abortBridge()
+      }
+      if (request.signal.aborted) {
+        onAbort()
+      } else {
+        request.signal.addEventListener('abort', onAbort, { once: true })
+      }
+
+      const surrogate = buildSurrogate(async (_req, _res, forwardedPeer) => {
+        passthroughResponse = await (forwardedPeer !== undefined
+          ? originalResource(request, forwardedPeer)
+          : originalResource(request))
+      })
+      void surrogate(syntheticReq, syntheticRes, peer).then(
+        () => {
+          cleanupAbort()
+          if (passthroughResponse !== undefined && !settled) {
+            settled = true
+            resolveResponse(passthroughResponse)
+          } else if (!settled) {
+            settled = true
+            if (syntheticRes.destroyed) {
+              rejectResponse(new Error('Response stream aborted'))
+            } else {
+              syntheticRes.finishIfOpen()
+              resolveResponse(new Response(null, { status: syntheticRes.statusCode }))
+            }
+          } else {
+            syntheticRes.finishIfOpen()
+          }
+        },
+        (err: unknown) => {
+          cleanupAbort()
+          const error = err instanceof Error ? err : new Error(String(err))
+          syntheticRes.destroy(error)
+          if (!settled) {
+            settled = true
+            rejectResponse(err)
+          }
+        },
+      )
+      return responsePromise
+    }
 
   /** The declared route this pathname hits — exact equality, or, for a
    * route declared `prefix: true` (PB-21), equality or one path segment
@@ -710,11 +1075,11 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
    * explicit query declaration): ONE query parse, the virtual-id gate, the
    * unbridged walls in contract order, then the relay round-trip. A
    * declaration-v2 locator dispatches to the PB-21 half below. */
-  const surrogateHandler = (declared: DeclaredHit, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
-    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const surrogateHandler = (declared: DeclaredHit, originalHandler: OriginalHttpHandler | undefined) =>
+    async (req: IncomingMessage, res: ServerResponse, peer?: unknown): Promise<void> => {
       const passthrough = async (): Promise<void> => {
         if (originalHandler !== undefined) {
-          await originalHandler(req, res)
+          await callOriginalHttp(originalHandler, req, res, peer)
           return
         }
         res.writeHead(404)
@@ -731,7 +1096,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       // verbatim. The dispatch sits after the installed check, so the v2
       // half never runs chained-over either.
       if (declared.locator.in !== 'query') {
-        await surrogateV2Handler(declared, originalHandler)(req, res)
+        await surrogateV2Handler(declared, originalHandler)(req, res, peer)
         return
       }
       // ONE parse of the query (the session parameter's home — `match` only
@@ -975,8 +1340,8 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
    * adapter-core view. The response discipline stays the query half's —
    * three headers, no hooks: `deny` and `rewriteIds` are PB-22's business.
    * Dispatch above guarantees `installed` and a non-query locator. */
-  const surrogateV2Handler = (declared: DeclaredHit, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
-    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const surrogateV2Handler = (declared: DeclaredHit, originalHandler: OriginalHttpHandler | undefined) =>
+    async (req: IncomingMessage, res: ServerResponse, peer?: unknown): Promise<void> => {
       const plugin = declared.plugin
       // The local passthrough. A json-body route has ALREADY consumed the
       // request body by the time this runs (the classify needs the parsed
@@ -993,10 +1358,10 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           const replay = new PassThrough()
           replay.end(replayBody)
           Object.assign(replay, { method: req.method, url: req.url, headers: req.headers })
-          await originalHandler(replay as unknown as IncomingMessage, res)
+          await callOriginalHttp(originalHandler, replay as unknown as IncomingMessage, res, peer)
           return
         }
-        await originalHandler(req, res)
+        await callOriginalHttp(originalHandler, req, res, peer)
       }
       let controller: AbortController | undefined
       const onClientGone = (): void => {
@@ -1291,8 +1656,11 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
 
   /** The adapter surrogate: locate → classify → walls → rewrite → hooks →
    * the relay round-trip, then the buffered JSON rewrite on the way back. */
-  const adapterSurrogateHandler = (hit: { adapter: NormalizedAdapter; route: NormalizedAdapterRoute }, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
-    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+  const adapterSurrogateHandler = (
+    hit: { adapter: NormalizedAdapter; route: NormalizedAdapterRoute },
+    originalHandler: OriginalHttpHandler | undefined,
+  ) =>
+    async (req: IncomingMessage, res: ServerResponse, peer?: unknown): Promise<void> => {
       const { adapter, route } = hit
       const plugin = adapter.plugin
       // The local passthrough. A body-locating route has ALREADY consumed
@@ -1309,10 +1677,10 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           const replay = new PassThrough()
           replay.end(replayBody)
           Object.assign(replay, { method: req.method, url: req.url, headers: req.headers })
-          await originalHandler(replay as unknown as IncomingMessage, res)
+          await callOriginalHttp(originalHandler, replay as unknown as IncomingMessage, res, peer)
           return
         }
-        await originalHandler(req, res)
+        await callOriginalHttp(originalHandler, req, res, peer)
       }
       // Chained-over: inert passthrough, exactly the posture of the other
       // intercepts.
@@ -1544,6 +1912,10 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         let size = 0
         let overflow = false
         while (true) {
+          if (res.destroyed) {
+            await reader.cancel().catch(() => {})
+            return
+          }
           const { done, value } = await reader.read()
           if (done) break
           size += value.length
@@ -1555,6 +1927,10 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             break
           }
         }
+        if (res.destroyed) {
+          await reader.cancel().catch(() => {})
+          return
+        }
         if (overflow) {
           adapterResponsePassthroughs += 1
           res.writeHead(response.status, {
@@ -1563,21 +1939,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
             ...Object.assign({}, ...allowlistedHeaders),
           })
-          for (const chunk of chunks) {
-            if (!res.write(chunk)) {
-              await new Promise<void>((resolve) => {
-                const settled = (): void => {
-                  res.off('drain', settled)
-                  res.off('close', settled)
-                  resolve()
-                }
-                res.once('drain', settled)
-                res.once('close', settled)
-              })
-            }
+          if (await writeChunksWithBackpressure(res, chunks)) {
+            await pumpResponse(res, reader)
+            if (!res.destroyed) res.end()
+          } else {
+            await reader.cancel().catch(() => {})
           }
-          await pumpResponse(res, reader)
-          res.end()
           return
         }
         const text = Buffer.concat(chunks).toString('utf8')
@@ -1654,12 +2021,24 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     const route = savedMatch.call(this, pathname)
     if (!installed) return route
     if (typeof pathname !== 'string' || !pathname.startsWith('/')) return route
+    const authProp = isRecord(route) && 'auth' in route && route.auth !== undefined
+      ? { auth: route.auth }
+      : {}
+    const originalResource = resourceOf(route)
     const adapterHit = adapterRouteOf(pathname)
     if (adapterHit !== undefined) {
       return {
         kind: 'exact',
         path: pathname,
-        handler: adapterSurrogateHandler(adapterHit, handlerOf(route)),
+        ...authProp,
+        ...(originalResource !== undefined
+          ? {
+              resource: wrapResourceSurrogate(
+                (passthrough) => adapterSurrogateHandler(adapterHit, passthrough),
+                originalResource,
+              ),
+            }
+          : { handler: adapterSurrogateHandler(adapterHit, handlerOf(route)) }),
       }
     }
     const declared = declaredRouteOf(pathname)
@@ -1667,7 +2046,15 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       return {
         kind: 'exact',
         path: pathname,
-        handler: surrogateHandler(declared, handlerOf(route)),
+        ...authProp,
+        ...(originalResource !== undefined
+          ? {
+              resource: wrapResourceSurrogate(
+                (passthrough) => surrogateHandler(declared, passthrough),
+                originalResource,
+              ),
+            }
+          : { handler: surrogateHandler(declared, handlerOf(route)) }),
       }
     }
     return route
@@ -1745,7 +2132,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
    * virtual (the adapter's response hook, or the cooperative rewriteIds
    * scan) before the browser sees them. A mixed or foreign-server frame
    * kills the exchange — docs/adr/0001 holds frame by frame. */
-  const jsonBodyUpgrade = (declared: DeclaredUpgrade, originalHandler: unknown, req: IncomingMessage, socket: Socket, head: Buffer): Promise<void> =>
+  const jsonBodyUpgrade = (declared: DeclaredUpgrade, originalHandler: unknown, req: IncomingMessage, socket: Socket, head: Buffer, peer?: unknown): Promise<void> =>
     (async () => {
       const plugin = declared.plugin
       const socketGone = (): boolean => socket.destroyed || !socket.writable
@@ -1850,8 +2237,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         localSocket = pipe
         // The handler owns the exchange from here — its async body runs on
         // its own, exactly as the host would run it.
-        const handler = originalHandler as (request: IncomingMessage, sock: Socket, earlyHead: Buffer) => unknown
-        void Promise.resolve(handler(req, pipe as unknown as Socket, Buffer.alloc(0))).catch(() => destroySocket())
+        const handler = originalHandler as (request: IncomingMessage, sock: Socket, earlyHead: Buffer, admittedPeer?: unknown) => unknown
+        void Promise.resolve(
+          peer !== undefined
+            ? handler(req, pipe as unknown as Socket, Buffer.alloc(0), peer)
+            : handler(req, pipe as unknown as Socket, Buffer.alloc(0)),
+        ).catch(() => destroySocket())
       }
 
       // ---- the remote pipe: the PB-10 tunnel, frame by frame -------------
@@ -2148,15 +2539,26 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
   /** The tunnel's surrogate upgrade handler. Every outcome — refusal,
    * teardown, the byte pumping — owns the socket's whole remaining life. */
   const surrogateUpgrade = (declared: DeclaredUpgrade, originalHandler: unknown) =>
-    (req: IncomingMessage, socket: Socket, head: Buffer): void => {
+    (req: IncomingMessage, socket: Socket, head: Buffer, peer?: unknown): void => {
+      const callOriginalUpgrade = (): void => {
+        if (typeof originalHandler === 'function') {
+          const fn = originalHandler as (
+            request: IncomingMessage,
+            sock: Socket,
+            earlyHead: Buffer,
+            admittedPeer?: unknown,
+          ) => unknown
+          if (peer !== undefined) fn(req, socket, head, peer)
+          else fn(req, socket, head)
+          return
+        }
+        try { socket.destroy() } catch { /* Already gone. */ }
+      }
       // The host never awaits an upgrade handler — the async body runs on
       // its own and every failure path owns the socket's teardown.
       void (async () => {
         if (!installed || isLoopbackBypass(req)) {
-          if (typeof originalHandler === 'function') originalHandler(req, socket, head)
-          else {
-            try { socket.destroy() } catch { /* Already gone. */ }
-          }
+          callOriginalUpgrade()
           return
         }
         log?.('upgrade entered for %s', declared.path)
@@ -2164,20 +2566,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         // there is no session query parameter for the byte-tunnel half below
         // to read, so the frame-level half owns the whole exchange.
         if (declared.locator.in !== 'query') {
-          await jsonBodyUpgrade(declared, originalHandler, req, socket, head)
+          await jsonBodyUpgrade(declared, originalHandler, req, socket, head, peer)
           return
         }
       const socketGone = (): boolean => socket.destroyed || !socket.writable
       const passthrough = (): void => {
-        if (typeof originalHandler === 'function') {
-          originalHandler(req, socket, head)
-          return
-        }
-        try {
-          socket.destroy()
-        } catch {
-          // Already gone.
-        }
+        callOriginalUpgrade()
       }
       try {
         // ONE parse of the query — the session parameter's home.
@@ -2367,8 +2761,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     const originalHandler = entry !== undefined && isRecord(entry) && typeof (entry as { handler?: unknown }).handler === 'function'
       ? (entry as { handler: unknown }).handler
       : undefined
+    const authProp = entry !== undefined && isRecord(entry) && 'auth' in entry && entry.auth !== undefined
+      ? { auth: entry.auth }
+      : {}
     return {
       path: pathname,
+      ...authProp,
       handler: surrogateUpgrade(declared, originalHandler),
     }
   } as unknown as typeof targetWithUpgrades.upgrades.get

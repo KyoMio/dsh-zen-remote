@@ -6,6 +6,7 @@
 //
 // Not mounted as its own row: the main entry (src/index.ts) loads it for the host role.
 import { readFileConfig, resolveConfig } from './lib/config.js'
+import { resolveUpstreamTokenUrl } from './lib/upstream-token.js'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
@@ -101,9 +102,22 @@ export function apply(ctx, config) {
       const hostForUrl = (!rawHost || rawHost === '0.0.0.0' || rawHost === '::' || rawHost === '[::]')
         ? '127.0.0.1'
         : (rawHost.includes(':') && !rawHost.startsWith('[') ? `[${rawHost}]` : rawHost)
-      const tokenUrl = ctx.connection && typeof ctx.connection.authenticatedUrl === 'function'
-        ? ctx.connection.authenticatedUrl(proto + '//' + hostForUrl + ':' + targetPort)
-        : undefined
+      const baseUrl = proto + '//' + hostForUrl + ':' + targetPort
+      let tokenUrl = resolveUpstreamTokenUrl(ctx, ctx.webServer, baseUrl)
+      if (tokenUrl === undefined && typeof ctx.connection?.authenticatedUrl !== 'function') {
+        const loader = (typeof ctx.get === 'function' ? ctx.get('loader') : undefined) ?? ctx.reflect?.get?.('loader')
+        if (typeof loader?.await === 'function') {
+          await loader.await().catch(() => {})
+          if (disposed) return
+          tokenUrl = resolveUpstreamTokenUrl(ctx, ctx.webServer, baseUrl)
+        }
+        if (tokenUrl === undefined && typeof ctx.emit === 'function') {
+          const warn = typeof ctx.logger?.warn === 'function'
+            ? (...args) => ctx.logger.warn(...args)
+            : console.warn
+          warn('[dsh-zen-remote-gateway] webserver/entry-url returned no token for %s; check host-authentication-token', baseUrl)
+        }
+      }
       const resolvedNode = await ctx.subprocess.resolveExecutable('node').catch(() => process.execPath)
       if (disposed) return // 行在 await 期间被销毁：不再 spawn
       // Windows 桌面端下 PATH 最前面是 runtime/bin/node.cmd 批处理脚本；而

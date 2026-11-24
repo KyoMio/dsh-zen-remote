@@ -141,19 +141,19 @@ test('the via-gateway marker refuses EVERY wizard route, GET included', async ()
 })
 
 test('admit rejections relay verbatim BEFORE the via wall; via loses to admit (GW-fix-1/L2)', async () => {
-  for (const status of [401, 403]) {
+  for (const [status, code] of [[401, 'unauthorized'], [403, 'forbidden'], [503, 'service-unavailable']]) {
     const { server, port } = await serve(wizard.createWizardHandler(wizardOptions({ admit: () => ({ rejection: status }) })))
     try {
       // The via header is deliberately PRESENT: admit is wall 1, so its
-      // rejection must win with the plain unauthorized/forbidden envelope —
-      // answering `via-gateway` here would mean the walls swapped places.
+      // rejection must win with the plain unauthorized/forbidden/service-unavailable
+      // envelope — answering `via-gateway` here would mean the walls swapped places.
       const headers = { 'x-zen-remote-via': 'gateway' }
       const get = await request(port, { method: 'GET', path: wizard.WIZARD_STATUS_ROUTE, headers })
       assert.equal(get.status, status)
-      assert.equal(JSON.parse(get.body).error.code, status === 401 ? 'unauthorized' : 'forbidden')
+      assert.equal(JSON.parse(get.body).error.code, code)
       const post = await request(port, { method: 'POST', path: `${wizard.WIZARD_ROUTE_PREFIX}/x`, headers: { ...headers, ...sameOrigin(port) }, body: {} })
       assert.equal(post.status, status)
-      assert.equal(JSON.parse(post.body).error.code, status === 401 ? 'unauthorized' : 'forbidden')
+      assert.equal(JSON.parse(post.body).error.code, code)
     } finally {
       await new Promise((resolve) => server.close(resolve))
     }
@@ -348,13 +348,19 @@ function ctxRecording(services) {
     on() { return () => {} },
     effect(fn) { fn() },
     logger: { warn() {} },
-    inject(deps, cb) {
+    inject(deps, cb, inheritedDeps = []) {
       if (!deps.every((d) => services[d] !== undefined)) return
-      const target = { get: (name) => services[name], reflect: { get: (name) => services[name] }, effect: (fn2) => fn2() }
+      const mergedDeps = [...inheritedDeps, ...deps]
+      const target = {
+        get: (name) => services[name],
+        reflect: { get: (name) => services[name] },
+        inject: (subDeps, subCb) => ctx.inject(subDeps, subCb, mergedDeps),
+        effect: (fn2) => fn2(),
+      }
       cb(new Proxy(target, {
         get(t, prop) {
           if (typeof prop === 'symbol' || prop in t) return Reflect.get(t, prop)
-          if (deps.includes(prop)) return services[prop]
+          if (mergedDeps.includes(prop)) return services[prop]
           throw new Error(`cannot get property "${String(prop)}" without inject`)
         },
       }))
@@ -731,18 +737,20 @@ test('the wizard effect disposal stops the managed Caddy before unregistering', 
       // cordis 的 Context 类型上 reflect 是必需属性，BU-1 fallback 早已
       // 这样读 connection），fake 跟上这个真相。
       reflect: { get: (name) => services[name] },
-      inject(deps, cb) {
+      inject(deps, cb, inheritedDeps = []) {
         if (!deps.every((d) => services[d] !== undefined)) return
+        const mergedDeps = [...inheritedDeps, ...deps]
         const target = {
           get: (name) => services[name],
           reflect: { get: (name) => services[name] },
+          inject: (subDeps, subCb) => ctx.inject(subDeps, subCb, mergedDeps),
           effect: (fn2, name2) => disposers.push({ name: name2, disposer: fn2() }),
         }
         void services
         cb(new Proxy(target, {
           get(t, prop) {
             if (typeof prop === 'symbol' || prop in t) return Reflect.get(t, prop)
-            if (deps.includes(prop)) return services[prop]
+            if (mergedDeps.includes(prop)) return services[prop]
             throw new Error(`cannot get property "${String(prop)}" without inject`)
           },
         }))

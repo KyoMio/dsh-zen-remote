@@ -121,7 +121,7 @@ test.before(async () => {
 test.after(() => new Promise((resolve) => gateway.close(() => adminServer.close(resolve))))
 
 test('admit rejections relay verbatim and never reach the gateway', async () => {
-  for (const [status, code] of [[401, 'unauthorized'], [403, 'forbidden']]) {
+  for (const [status, code] of [[401, 'unauthorized'], [403, 'forbidden'], [503, 'service-unavailable']]) {
     const { server, port } = await startAdminServer(makeOptions(gwPort, { admit: () => ({ rejection: status }) }))
     try {
       const before = seen.length

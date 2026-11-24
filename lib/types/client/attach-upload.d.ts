@@ -14,6 +14,29 @@
 export declare const UPLOAD_ROUTE = "/_dsh/mobile-nav/upload";
 /** Workspace-relative directory uploads land in; also the `@` mention prefix. */
 export declare const UPLOAD_DIR = ".dsh-uploads";
+/** HTTP/error-code-preserving error thrown when the upload endpoint rejects a request. */
+export declare class UploadHttpError extends Error {
+    readonly status: number;
+    readonly code?: string;
+    constructor(message: string, status: number, code?: string);
+}
+/** UI translation keys used by {@link uploadErrorSummary}. */
+export type UploadErrorKey = 'attachFailed' | 'attachFailedUnauthorized' | 'attachFailedForbidden' | 'attachFailedUnavailable';
+/**
+ * Format a concise localized label for mobile upload failures (including plain-text
+ * 401/403/503 host rejections).
+ * @param cause - thrown error from upload fetch/parsing.
+ * @param t - component translation lookup.
+ * @returns short user-visible status label.
+ */
+export declare function uploadErrorSummary(cause: unknown, t: (key: UploadErrorKey) => string): string;
+/**
+ * Parse the upload endpoint's response, handling both JSON envelopes and
+ * plain-text error pages (such as DSH 0.2.2+ WebServer 401/403/503 responses).
+ * @param response - Fetch response (or minimal test double).
+ * @returns the workspace-relative path on success.
+ */
+export declare function parseUploadResponse(response: Pick<Response, 'ok' | 'status' | 'text'>): Promise<string>;
 /**
  * The upload URL for one file. Root-relative on purpose: through the
  * gateway half the pairing cookie only rides along same-origin.

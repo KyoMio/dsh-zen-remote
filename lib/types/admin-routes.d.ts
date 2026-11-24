@@ -63,8 +63,10 @@ export declare const ADMIN_PLUGIN_BRIDGE_ROUTE = "/_dsh/zen-remote/admin/plugin-
 export type AdminAdmission = {
     readonly peer: unknown;
 } | {
-    readonly rejection: 401 | 403;
+    readonly rejection: 401 | 403 | 503;
 };
+/** Map an admission refusal status to the wire error code across host routes. */
+export declare function admitRejectionCode(rejection: 401 | 403 | 503): 'unauthorized' | 'forbidden' | 'service-unavailable';
 /** The effective-config snapshot resolveConfig() produces, recomputed per request. */
 export interface AdminConfigSnapshot {
     values: ZenRemoteConfig;

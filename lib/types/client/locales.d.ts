@@ -26,6 +26,9 @@ export declare const zh: {
     readonly attach: "添加附件";
     readonly attachBusy: "上传中…";
     readonly attachFailed: "上传失败，点按重试";
+    readonly attachFailedUnauthorized: "上传失败（未认证 401）";
+    readonly attachFailedForbidden: "上传失败（无权限 403）";
+    readonly attachFailedUnavailable: "上传失败（认证服务不可用 503）";
     readonly attachRemove: "移除附件 {name}";
     readonly infoClose: "关闭";
     readonly infoMode: "模式";

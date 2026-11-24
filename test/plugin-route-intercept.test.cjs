@@ -727,3 +727,466 @@ test('T4 refusal log throttling: refusalLogWindowMs=0 disables throttling', asyn
   assert.equal(debugs.filter((entry) => entry.format.includes('refused for')).length, 0)
   assert.equal(handle.diagnostics().refused, 3)
 })
+
+test('D23-2: wrappedMatch and wrappedUpgradesGet preserve original auth without synthesizing absent auth', () => {
+  const exact = new Map()
+  const prefixes = new Map()
+  const upgrades = new Map()
+  const webServer = {
+    exact,
+    prefixes,
+    upgrades,
+    match(pathname) {
+      return exact.get(pathname) ?? prefixes.get(pathname)
+    },
+  }
+  const noop = () => {}
+  exact.set('/panel/anon', { kind: 'exact', path: '/panel/anon', auth: 'anonymous', handler: noop })
+  exact.set('/panel/deny', { kind: 'exact', path: '/panel/deny', auth: 'deny', handler: noop })
+  exact.set('/panel/plain', { kind: 'exact', path: '/panel/plain', handler: noop })
+  upgrades.set('/panel/ws-anon', { path: '/panel/ws-anon', auth: 'anonymous', handler: noop })
+  upgrades.set('/panel/ws-deny', { path: '/panel/ws-deny', auth: 'deny', handler: noop })
+  upgrades.set('/panel/ws-plain', { path: '/panel/ws-plain', handler: noop })
+
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'auth-panel',
+    version: '1.0.0',
+    routes: [
+      { path: '/panel/anon', scope: 'session' },
+      { path: '/panel/deny', scope: 'session' },
+      { path: '/panel/plain', scope: 'session' },
+      { path: '/panel/ws-anon', scope: 'session', upgrade: true },
+      { path: '/panel/ws-deny', scope: 'session', upgrade: true },
+      { path: '/panel/ws-plain', scope: 'session', upgrade: true },
+    ],
+  })
+
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay: {},
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'auth-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  try {
+    assert.equal(webServer.match('/panel/anon').auth, 'anonymous')
+    assert.equal(webServer.match('/panel/deny').auth, 'deny')
+    const plainMatch = webServer.match('/panel/plain')
+    assert.equal('auth' in plainMatch, false, 'must not fabricate auth when original route omits it')
+
+    assert.equal(webServer.upgrades.get('/panel/ws-anon').auth, 'anonymous')
+    assert.equal(webServer.upgrades.get('/panel/ws-deny').auth, 'deny')
+    const plainUpgrade = webServer.upgrades.get('/panel/ws-plain')
+    assert.equal('auth' in plainUpgrade, false, 'must not fabricate auth when original upgrade omits it')
+  } finally {
+    handle.uninstall()
+  }
+})
+
+test('PR77-1/PR77-2: wrappedMatch preserves WebResourceRoute resource and forwards peer on local resource, query handler, and upgrade', async (t) => {
+  const { PassThrough } = require('node:stream')
+  const { EventEmitter } = require('node:events')
+  const relay = await startFakeRelay()
+  t.after(() => relay.stop())
+  const relayClient = fakeRelayClient(relay.__port)
+
+  const exact = new Map()
+  const prefixes = new Map()
+  const upgrades = new Map()
+  const webServer = {
+    exact,
+    prefixes,
+    upgrades,
+    match(pathname) {
+      const exactHit = exact.get(pathname)
+      if (exactHit !== undefined) return exactHit
+      for (const [prefix, route] of prefixes) {
+        if (pathname === prefix || pathname.startsWith(`${prefix}/`)) return route
+      }
+      return undefined
+    },
+  }
+
+  const seen = { resourcePeers: [], handlerPeers: [], upgradePeers: [] }
+  exact.set('/panel/res', {
+    kind: 'exact',
+    path: '/panel/res',
+    auth: 'anonymous',
+    resource: async (request, peer) => {
+      seen.resourcePeers.push({ method: request.method, peer })
+      return new Response(request.method === 'HEAD' ? null : JSON.stringify({ localRes: true }), {
+        status: 200,
+        headers: { 'content-type': 'application/json', 'x-local-res': 'yes' },
+      })
+    },
+  })
+  prefixes.set('/panel/res-prefix', {
+    kind: 'prefix',
+    path: '/panel/res-prefix',
+    resource: async (request, peer) => {
+      seen.resourcePeers.push({ method: request.method, peer, url: request.url })
+      return new Response('prefix-local', { status: 200, headers: { 'x-prefix-res': '1' } })
+    },
+  })
+  exact.set('/panel/data', {
+    kind: 'exact',
+    path: '/panel/data',
+    handler: async (_req, res, peer) => {
+      seen.handlerPeers.push(peer)
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true }))
+    },
+  })
+  upgrades.set('/panel/ws', {
+    path: '/panel/ws',
+    handler: (_req, socket, _head, peer) => {
+      seen.upgradePeers.push(peer)
+      socket.end()
+    },
+  })
+
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'res-panel',
+    version: '1.0.0',
+    routes: [
+      { path: '/panel/res', scope: 'session' },
+      { path: '/panel/res-prefix', scope: 'session', prefix: true },
+      { path: '/panel/data', scope: 'session' },
+      { path: '/panel/ws', scope: 'session', upgrade: true },
+    ],
+  })
+
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay: relayClient,
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'res-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  const ownerPeer = { principal: { kind: 'owner', id: 'local-owner' } }
+
+  // 1. WebResourceRoute keeps `.resource` (not `.handler`) and preserves auth
+  const resRoute = webServer.match('/panel/res')
+  assert.equal(typeof resRoute.resource, 'function')
+  assert.equal(resRoute.handler, undefined)
+  assert.equal(resRoute.auth, 'anonymous')
+
+  const localHead = await resRoute.resource(
+    new Request('http://127.0.0.1/panel/res?sessionId=local-1', { method: 'HEAD' }),
+    ownerPeer,
+  )
+  assert.equal(localHead.status, 200)
+  assert.equal(localHead.headers.get('x-local-res'), 'yes')
+  assert.equal(seen.resourcePeers.length, 1)
+  assert.equal(seen.resourcePeers[0].method, 'HEAD')
+  assert.equal(seen.resourcePeers[0].peer, ownerPeer)
+
+  const prefixRoute = webServer.match('/panel/res-prefix/sub.txt')
+  assert.equal(typeof prefixRoute.resource, 'function')
+  assert.equal(prefixRoute.handler, undefined)
+  const localPrefix = await prefixRoute.resource(
+    new Request('http://127.0.0.1/panel/res-prefix/sub.txt?sessionId=local-1'),
+    ownerPeer,
+  )
+  assert.equal(await localPrefix.text(), 'prefix-local')
+  assert.equal(seen.resourcePeers.length, 2)
+  assert.equal(seen.resourcePeers[1].peer, ownerPeer)
+
+  // Remote session still bridges through relay and returns a Fetch Response
+  relay.state.reply = (_relayReq, relayRes) => {
+    relayRes.writeHead(200, { 'content-type': 'application/json' })
+    relayRes.end(JSON.stringify({ remoteRes: true }))
+  }
+  const remoteRes = await resRoute.resource(
+    new Request(`http://127.0.0.1/panel/res?sessionId=${encodeURIComponent(VIRTUAL)}`),
+    ownerPeer,
+  )
+  assert.equal(remoteRes.status, 200)
+  assert.deepEqual(await remoteRes.json(), { remoteRes: true })
+  assert.equal(seen.resourcePeers.length, 2, 'remote request must not invoke local resource')
+  assert.equal(relay.state.hits.length, 1)
+  assert.equal(relay.state.hits[0].zrQuery, 'sessionId=session-a')
+
+  // 2. Local query handler receives forwarded peer
+  const req = Object.assign(new EventEmitter(), {
+    url: '/panel/data?sessionId=local-1',
+    method: 'GET',
+    headers: {},
+    destroy() {},
+  })
+  const chunks = []
+  const res = Object.assign(new PassThrough(), {
+    statusCode: 200,
+    setHeader() {},
+    writeHead(code) { this.statusCode = code },
+  })
+  res.on('data', (c) => chunks.push(c))
+  await webServer.match('/panel/data').handler(req, res, ownerPeer)
+  assert.equal(seen.handlerPeers.length, 1)
+  assert.equal(seen.handlerPeers[0], ownerPeer)
+  assert.deepEqual(JSON.parse(Buffer.concat(chunks).toString('utf8')), { ok: true })
+
+  // 3. Local WebSocket upgrade receives forwarded peer
+  const upReq = Object.assign(new EventEmitter(), {
+    url: '/panel/ws?sessionId=local-1',
+    method: 'GET',
+    headers: {},
+  })
+  const socket = new PassThrough()
+  webServer.upgrades.get('/panel/ws').handler(upReq, socket, Buffer.alloc(0), ownerPeer)
+  assert.equal(seen.upgradePeers.length, 1)
+  assert.equal(seen.upgradePeers[0], ownerPeer)
+})
+
+test('PR77-R2-M1: WebResourceRoute streams >16 KiB remote response across backpressure and pull drain', async (t) => {
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  exact.set('/panel/data', {
+    kind: 'exact',
+    path: '/panel/data',
+    resource: async () => new Response('local-only', { status: 200 }),
+  })
+
+  const chunkCount = 6
+  const chunkSize = 32 * 1024
+  const expectedTotal = chunkCount * chunkSize
+  const relay = {
+    pluginRequest: async () => {
+      let sent = 0
+      const stream = new ReadableStream({
+        async pull(controller) {
+          if (sent >= chunkCount) {
+            controller.close()
+            return
+          }
+          await new Promise((r) => setTimeout(r, 2))
+          controller.enqueue(new Uint8Array(chunkSize).fill(0x41 + sent))
+          sent += 1
+        },
+      })
+      return new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      })
+    },
+  }
+
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED)
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay,
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  const res = await webServer.match('/panel/data').resource(
+    new Request(`http://127.0.0.1/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`),
+  )
+  assert.equal(res.status, 200)
+  const reader = res.body.getReader()
+  const received = []
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    received.push(value)
+    await new Promise((r) => setTimeout(r, 5))
+  }
+  const combined = Buffer.concat(received.map((u8) => Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength)))
+  assert.equal(combined.byteLength, expectedTotal)
+  assert.equal(combined[0], 0x41)
+  assert.equal(combined[expectedTotal - 1], 0x41 + chunkCount - 1)
+})
+
+test('PR77-R2-M2: WebResourceRoute rejects mid-stream upstream failures and aborts relay on downstream cancel', async (t) => {
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  exact.set('/panel/data', {
+    kind: 'exact',
+    path: '/panel/data',
+    resource: async () => new Response('local-only', { status: 200 }),
+  })
+
+  let capturedSignal
+  let mode = 'upstream-fail'
+  const relay = {
+    pluginRequest: async (_req, signal) => {
+      capturedSignal = signal
+      let step = 0
+      const stream = new ReadableStream({
+        pull(controller) {
+          if (step === 0) {
+            step += 1
+            controller.enqueue(new TextEncoder().encode(mode === 'upstream-fail' ? 'part-1' : 'chunk-1'))
+            return
+          }
+          if (mode === 'upstream-fail') {
+            controller.error(new Error('upstream stream reset'))
+          }
+        },
+      })
+      return new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'text/plain' },
+      })
+    },
+  }
+
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED)
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay,
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  // 1. Mid-stream upstream error after 200 headers must fail next read instead of hanging
+  const res1 = await webServer.match('/panel/data').resource(
+    new Request(`http://127.0.0.1/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`),
+  )
+  assert.equal(res1.status, 200)
+  const reader1 = res1.body.getReader()
+  const first1 = await reader1.read()
+  assert.equal(first1.done, false)
+  assert.equal(new TextDecoder().decode(first1.value), 'part-1')
+  await assert.rejects(() => reader1.read(), /aborted|reset/i)
+
+  // 2. Downstream cancel() must close synthetic response and abort upstream relay signal
+  mode = 'cancel-test'
+  const res2 = await webServer.match('/panel/data').resource(
+    new Request(`http://127.0.0.1/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`),
+  )
+  assert.equal(res2.status, 200)
+  const reader2 = res2.body.getReader()
+  const first2 = await reader2.read()
+  assert.equal(new TextDecoder().decode(first2.value), 'chunk-1')
+  assert.equal(capturedSignal.aborted, false)
+  await reader2.cancel('consumer gone')
+  await waitFor(() => capturedSignal.aborted)
+  assert.equal(capturedSignal.aborted, true)
+})
+
+test('PR77-R3-M1: WebResourceRoute rejects pre-aborted Request before touching relay', async (t) => {
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  exact.set('/panel/data', {
+    kind: 'exact',
+    path: '/panel/data',
+    resource: async () => new Response('local-only', { status: 200 }),
+  })
+
+  let relayCalls = 0
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED)
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay: {
+      pluginRequest: async () => {
+        relayCalls += 1
+        return new Response('should not run', { status: 200 })
+      },
+    },
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  const ac = new AbortController()
+  ac.abort('cancelled-before-dispatch')
+  const req = new Request(`http://127.0.0.1/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`, {
+    signal: ac.signal,
+  })
+  await assert.rejects(
+    () => webServer.match('/panel/data').resource(req),
+    /cancelled-before-dispatch|abort/i,
+  )
+  assert.equal(relayCalls, 0)
+})
+
+test('PR77-R3-L3: WebResourceRoute HEAD settles immediately and aborts unwanted upstream body (e.g. proxy 502)', async (t) => {
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  exact.set('/panel/data', {
+    kind: 'exact',
+    path: '/panel/data',
+    resource: async () => new Response('local-only', { status: 200 }),
+  })
+
+  let capturedSignal
+  let upstreamCancelled = false
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'test-panel',
+    version: '1.0.0',
+    routes: [{ path: '/panel/data', scope: 'session', methods: ['GET', 'HEAD'] }],
+  })
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay: {
+      pluginRequest: async (_req, signal) => {
+        capturedSignal = signal
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('<html>502 Bad Gateway</html>'))
+          },
+          cancel() {
+            upstreamCancelled = true
+          },
+        })
+        return new Response(stream, {
+          status: 502,
+          headers: { 'content-type': 'text/html' },
+        })
+      },
+    },
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  const res = await webServer.match('/panel/data').resource(
+    new Request(`http://127.0.0.1/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`, { method: 'HEAD' }),
+  )
+  assert.equal(res.status, 502)
+  assert.equal(res.body, null)
+  await waitFor(() => capturedSignal?.aborted === true && upstreamCancelled)
+  assert.equal(capturedSignal.aborted, true)
+  assert.equal(upstreamCancelled, true)
+})

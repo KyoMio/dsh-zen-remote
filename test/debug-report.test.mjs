@@ -287,3 +287,120 @@ test('assembleDebugReport: plate structure, constructive exclusion, and PG-2 pee
   assert.ok(String(pg2Report.logs[0].msg).includes('<token>'))
   assert.ok(String(pg2Report.logs[1].msg).includes('zr-nets://domain'))
 })
+
+test('D23-4: debug.ts detects both <style data-plugin> (0.2.2-rc.2+) and legacy <style data-plugin-css>', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval', 'Date'], now: 10_000 })
+  const { installDebugBadge } = await import('../src/client/debug.ts')
+
+  const globalKeys = [
+    'window', 'document', 'location', 'localStorage', 'matchMedia', 'getComputedStyle',
+    'innerWidth', 'innerHeight', 'devicePixelRatio', 'outerHeight', 'screenX', 'screenY',
+    'screen', 'Element', 'MutationObserver',
+  ]
+  const savedDescriptors = new Map(
+    globalKeys.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]),
+  )
+  t.after(() => {
+    for (const [key, desc] of savedDescriptors) {
+      if (desc === undefined) delete globalThis[key]
+      else Object.defineProperty(globalThis, key, desc)
+    }
+  })
+
+  const setGlobal = (key, value) => {
+    Object.defineProperty(globalThis, key, { value, configurable: true, writable: true })
+  }
+
+  const runProbe = (styleAttrs, styleText) => {
+    const disposers = []
+    const badgeListeners = new Map()
+    const makeEl = () => ({
+      style: { cssText: '', setProperty() {}, removeProperty() {}, getPropertyValue: () => '' },
+      dataset: {},
+      textContent: '',
+      children: [],
+      contains: () => false,
+      appendChild(child) { this.children.push(child) },
+      remove() {},
+      addEventListener(type, fn) { badgeListeners.set(type, fn) },
+      removeEventListener() {},
+      hasAttribute: () => false,
+      getAttribute: () => null,
+      getBoundingClientRect: () => ({ top: 0, bottom: 0, height: 0 }),
+    })
+    const created = []
+    const body = makeEl()
+    const styleEl = styleAttrs ? { textContent: styleText, attrs: styleAttrs } : null
+    const matchesSelector = (sel, attrs) => {
+      if (!attrs) return false
+      return sel.split(',').map((s) => s.trim()).some((part) => {
+        const m = part.match(/^style\[(data-[a-z-]+)\*="([^"]+)"\]$/)
+        return m !== null && typeof attrs[m[1]] === 'string' && attrs[m[1]].includes(m[2])
+      })
+    }
+
+    setGlobal('Element', function Element() {})
+    setGlobal('MutationObserver', class {
+      observe() {}
+      disconnect() {}
+    })
+    setGlobal('window', {
+      addEventListener() {},
+      removeEventListener() {},
+      visualViewport: { height: 800, offsetTop: 0, pageTop: 0, scale: 1 },
+    })
+    setGlobal('location', { pathname: '/', search: '?mobile-nav-debug=1', href: 'http://127.0.0.1/?mobile-nav-debug=1', replace() {} })
+    setGlobal('localStorage', { getItem: () => null, setItem() {}, removeItem() {} })
+    setGlobal('matchMedia', () => ({ matches: false }))
+    setGlobal('getComputedStyle', () => ({ visibility: 'visible', paddingTop: '0px', paddingBottom: '0px', getPropertyValue: () => '' }))
+    setGlobal('innerWidth', 390)
+    setGlobal('innerHeight', 844)
+    setGlobal('outerHeight', 844)
+    setGlobal('devicePixelRatio', 3)
+    setGlobal('screenX', 0)
+    setGlobal('screenY', 0)
+    setGlobal('screen', { width: 390, height: 844, availWidth: 390, availHeight: 844 })
+    setGlobal('document', {
+      documentElement: makeEl(),
+      body,
+      addEventListener() {},
+      removeEventListener() {},
+      createElement() { const el = makeEl(); created.push(el); return el },
+      querySelector(sel) { return matchesSelector(sel, styleEl?.attrs) ? styleEl : null },
+      querySelectorAll: () => [],
+    })
+
+    installDebugBadge({
+      effect(fn) {
+        const stop = fn()
+        if (typeof stop === 'function') disposers.push(stop)
+        return stop
+      },
+    })
+    try {
+      const badge = created[1]
+      // Single-tap badge and advance 620ms timer to expand debug readout.
+      badgeListeners.get('click')({ preventDefault() {}, stopPropagation() {} })
+      t.mock.timers.tick(650)
+      return badge.textContent
+    } finally {
+      for (const stop of disposers) stop()
+    }
+  }
+
+  const modern = runProbe({ 'data-plugin': 'dsh-zen-remote', 'data-path': '/client.js' }, 'body{color:red}')
+  assert.match(modern, /\bcss true\b/)
+  assert.match(modern, /\bcssLen 15\b/)
+
+  const mobilePlugin = runProbe({ 'data-plugin': 'dsh-mobile-nav' }, 'body{}')
+  assert.match(mobilePlugin, /\bcss true\b/)
+  assert.match(mobilePlugin, /\bcssLen 6\b/)
+
+  const legacy = runProbe({ 'data-plugin-css': 'mobile' }, '/* legacy */')
+  assert.match(legacy, /\bcss true\b/)
+  assert.match(legacy, /\bcssLen 12\b/)
+
+  const absent = runProbe(null, '')
+  assert.match(absent, /\bcss false\b/)
+  assert.match(absent, /\bcssLen 0\b/)
+})

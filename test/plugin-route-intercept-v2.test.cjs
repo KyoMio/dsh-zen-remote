@@ -1131,3 +1131,303 @@ test('MS-4: a WebSocket upgrade opens its tunnel on its own server\'s relay; an 
     await h.stop()
   }
 })
+
+test('D23-2: wrappedMatch adapter branch preserves original auth and omits absent auth', () => {
+  const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
+  const { createBridgeRegistry } = require('../lib/plugin-bridge.js')
+  const { normalizeAdapter } = require('../lib/plugin-adapter-core.js')
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  const noop = () => {}
+  exact.set('/adapted/anon', { kind: 'exact', path: '/adapted/anon', auth: 'anonymous', handler: noop })
+  exact.set('/adapted/deny', { kind: 'exact', path: '/adapted/deny', auth: 'deny', handler: noop })
+  exact.set('/adapted/plain', { kind: 'exact', path: '/adapted/plain', handler: noop })
+
+  const adapter = normalizeAdapter({
+    plugin: 'adapted-auth',
+    versions: ['1.0.0'],
+    routes: [
+      { path: '/adapted/anon', match: 'exact', locator: { in: 'query', name: 'sessionId' } },
+      { path: '/adapted/deny', match: 'exact', locator: { in: 'query', name: 'sessionId' } },
+      { path: '/adapted/plain', match: 'exact', locator: { in: 'query', name: 'sessionId' } },
+    ],
+  }, '1.0.0')
+
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry: createBridgeRegistry(),
+    adapters: [adapter],
+    relay: {},
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'adapted-auth', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  try {
+    assert.equal(webServer.match('/adapted/anon').auth, 'anonymous')
+    assert.equal(webServer.match('/adapted/deny').auth, 'deny')
+    assert.equal('auth' in webServer.match('/adapted/plain'), false)
+  } finally {
+    handle.uninstall()
+  }
+})
+
+test('PR77-2: v2 json-body replay, adapter handler, and jsonBodyUpgrade preserve peer on local passthrough', async (t) => {
+  const { PassThrough, Readable } = require('node:stream')
+  const { EventEmitter } = require('node:events')
+  const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
+  const { createBridgeRegistry } = require('../lib/plugin-bridge.js')
+  const { normalizeAdapter } = require('../lib/plugin-adapter-core.js')
+  const { encodeRfc6455Frame } = require('../lib/plugin-tunnel.js')
+
+  const exact = new Map()
+  const upgrades = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades,
+    match(pathname) { return exact.get(pathname) },
+  }
+
+  const seen = { v2Peers: [], adapterPeers: [], wsPeers: [] }
+  exact.set('/v2/cmd', {
+    kind: 'exact',
+    path: '/v2/cmd',
+    handler: async (req, res, peer) => {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      seen.v2Peers.push({ peer, body: Buffer.concat(chunks).toString('utf8') })
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ v2: true }))
+    },
+  })
+  exact.set('/adapted/cmd', {
+    kind: 'exact',
+    path: '/adapted/cmd',
+    handler: async (req, res, peer) => {
+      const chunks = []
+      for await (const chunk of req) chunks.push(chunk)
+      seen.adapterPeers.push({ peer, body: Buffer.concat(chunks).toString('utf8') })
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ adapted: true }))
+    },
+  })
+  upgrades.set('/v2/ws', {
+    path: '/v2/ws',
+    handler: (_req, socket, _head, peer) => {
+      seen.wsPeers.push(peer)
+      socket.end()
+    },
+  })
+
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'v2-peer',
+    version: '1.0.0',
+    routes: [
+      { path: '/v2/cmd', scope: 'session', methods: ['POST'], maxBody: 4096, locator: { in: 'json-body', fields: ['sessionId'] } },
+      { path: '/v2/ws', scope: 'session', upgrade: true, locator: { in: 'json-body', fields: ['sessionId'] } },
+    ],
+  })
+  const adapter = normalizeAdapter({
+    plugin: 'adapted-peer',
+    versions: ['1.0.0'],
+    routes: [
+      { path: '/adapted/cmd', match: 'exact', methods: ['POST'], locator: { in: 'json-body', fields: ['sessionId'] } },
+    ],
+  }, '1.0.0')
+  registry.registerNormalized(adapter.declaration)
+
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    adapters: [adapter],
+    relay: {},
+    getServerId: () => SERVER_ID,
+    getStatus: () => [
+      { plugin: 'v2-peer', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' },
+      { plugin: 'adapted-peer', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' },
+    ],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  const ownerPeer = { principal: { kind: 'owner', id: 'p-1' } }
+
+  // 1. V2 json-body replay preserves peer
+  const v2Payload = JSON.stringify({ sessionId: 'local-1' })
+  const v2Req = Object.assign(Readable.from([Buffer.from(v2Payload)]), {
+    url: '/v2/cmd',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+  })
+  const v2Res = Object.assign(new PassThrough(), {
+    statusCode: 200,
+    setHeader() {},
+    writeHead(code) { this.statusCode = code },
+  })
+  await webServer.match('/v2/cmd').handler(v2Req, v2Res, ownerPeer)
+  assert.equal(seen.v2Peers.length, 1)
+  assert.equal(seen.v2Peers[0].peer, ownerPeer)
+  assert.equal(seen.v2Peers[0].body, v2Payload)
+
+  // 2. Adapter json-body replay preserves peer
+  const adPayload = JSON.stringify({ sessionId: 'local-2' })
+  const adReq = Object.assign(Readable.from([Buffer.from(adPayload)]), {
+    url: '/adapted/cmd',
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+  })
+  const adRes = Object.assign(new PassThrough(), {
+    statusCode: 200,
+    setHeader() {},
+    writeHead(code) { this.statusCode = code },
+  })
+  await webServer.match('/adapted/cmd').handler(adReq, adRes, ownerPeer)
+  assert.equal(seen.adapterPeers.length, 1)
+  assert.equal(seen.adapterPeers[0].peer, ownerPeer)
+  assert.equal(seen.adapterPeers[0].body, adPayload)
+
+  // 3. jsonBodyUpgrade defers startLocal() until first local frame, still passing peer
+  const { Duplex } = require('node:stream')
+  const upReq = Object.assign(new EventEmitter(), {
+    url: '/v2/ws',
+    method: 'GET',
+    headers: {
+      'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==',
+      'sec-websocket-version': '13',
+    },
+  })
+  const socket = new Duplex({
+    write(_chunk, _encoding, cb) { cb() },
+    read() {},
+  })
+  webServer.upgrades.get('/v2/ws').handler(upReq, socket, Buffer.alloc(0), ownerPeer)
+  await new Promise((r) => setTimeout(r, 20))
+  const localFrame = encodeRfc6455Frame(0x1, Buffer.from(JSON.stringify({ sessionId: 'local-ws' })), true, true)
+  socket.push(localFrame)
+  await new Promise((r) => setTimeout(r, 30))
+  assert.equal(seen.wsPeers.length, 1)
+  assert.equal(seen.wsPeers[0], ownerPeer)
+})
+
+test('PR77-R3-M2: >8 MiB overflow flush in both answerRewriteIds and adapterSurrogateHandler exits on downstream close', async (t) => {
+  const { EventEmitter } = require('node:events')
+  const { Readable } = require('node:stream')
+  const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
+  const { createBridgeRegistry } = require('../lib/plugin-bridge.js')
+  const { normalizeAdapter } = require('../lib/plugin-adapter-core.js')
+
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  exact.set('/v2/big', { kind: 'exact', path: '/v2/big', handler: async (_r, res) => res.end('local') })
+  exact.set('/adapted/big', { kind: 'exact', path: '/adapted/big', handler: async (_r, res) => res.end('local') })
+
+  let readerCancelled = 0
+  const makeBigRelay = () => ({
+    pluginRequest: async () => {
+      let sent = 0
+      const stream = new ReadableStream({
+        pull(controller) {
+          if (sent < 10) {
+            sent += 1
+            controller.enqueue(new Uint8Array(1024 * 1024).fill(0x20))
+            return
+          }
+          controller.close()
+        },
+        cancel() {
+          readerCancelled += 1
+        },
+      })
+      return new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'v2-big',
+    version: '1.0.0',
+    routes: [
+      { path: '/v2/big', scope: 'session', rewriteIds: true },
+    ],
+  })
+  const adapter = normalizeAdapter({
+    plugin: 'adapted-big',
+    versions: ['1.0.0'],
+    client: {
+      response: (ctx) => ctx.body,
+    },
+    routes: [
+      { path: '/adapted/big', match: 'exact', locator: { in: 'query', name: 'sessionId' } },
+    ],
+  }, '1.0.0')
+  registry.registerNormalized(adapter.declaration)
+
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    adapters: [adapter],
+    relay: makeBigRelay(),
+    getServerId: () => SERVER_ID,
+    getStatus: () => [
+      { plugin: 'v2-big', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' },
+      { plugin: 'adapted-big', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' },
+    ],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  for (const pathname of ['/v2/big', '/adapted/big']) {
+    const req = Object.assign(Readable.from([]), {
+      url: `${pathname}?sessionId=${encodeURIComponent(VA)}`,
+      method: 'GET',
+      headers: {},
+      destroy() {},
+    })
+    let writeCount = 0
+    const res = Object.assign(new EventEmitter(), {
+      statusCode: 200,
+      headersSent: false,
+      writableEnded: false,
+      destroyed: false,
+      setHeader() {},
+      writeHead(code) { this.statusCode = code; this.headersSent = true; return this },
+      write() {
+        writeCount += 1
+        if (writeCount === 1) {
+          // Simulate backpressure followed by abrupt client close (no drain ever fires)
+          setTimeout(() => {
+            res.destroyed = true
+            res.emit('close')
+          }, 15)
+          return false
+        }
+        throw new Error(`write called ${writeCount} times after close`)
+      },
+      end() {
+        this.writableEnded = true
+      },
+      destroy() {
+        this.destroyed = true
+        this.emit('close')
+      },
+    })
+    await webServer.match(pathname).handler(req, res)
+    assert.equal(writeCount, 1)
+    assert.equal(res.destroyed, true)
+  }
+  assert.equal(readerCancelled, 2)
+})

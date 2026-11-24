@@ -30,6 +30,7 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
+import { admitRejectionCode } from '../admin-routes.js'
 import type { AdminAdmission, AdminConfigSnapshot } from '../admin-routes.js'
 import type { ConfigSource } from '../config.js'
 import { responseJson, sameOriginPost } from '../http.js'
@@ -194,7 +195,7 @@ export function createWizardHandler(options: WizardHandlerOptions): WizardHandle
       if ('rejection' in admission) {
         responseJson(res, admission.rejection, {
           ok: false,
-          error: { code: admission.rejection === 401 ? 'unauthorized' : 'forbidden' },
+          error: { code: admitRejectionCode(admission.rejection) },
         })
         return
       }

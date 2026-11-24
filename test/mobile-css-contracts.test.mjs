@@ -131,3 +131,58 @@ test('T9: pwa/app.css gates input 16px floor and pre code scroll under max-width
   const touchJs = fs.readFileSync(path.join(import.meta.dirname, '..', 'pwa', 'touch-gestures.js'), 'utf8')
   assert.match(touchJs, /DOMContentLoaded/)
 })
+
+/** Evaluate a `:is([class*="_x_"], [class$="_x"], [class*="_x "])` clause against a class attribute string. */
+function matchesDualGenClassClause(clause, classAttr) {
+  const inner = clause.match(/^:is\((.+)\)$/)?.[1]
+  assert.ok(inner, `expected :is(...) clause, got: ${clause}`)
+  const branches = inner.split(',').map((s) => s.trim())
+  return branches.some((b) => {
+    const contains = b.match(/^\[class\*="([^"]+)"\]$/)
+    if (contains) return classAttr.includes(contains[1])
+    const ends = b.match(/^\[class\$="([^"]+)"\]$/)
+    if (ends) return classAttr.endsWith(ends[1])
+    assert.fail(`unexpected selector branch: ${b}`)
+  })
+}
+
+test('D23-4: ui-primitives dual-generation CSS Module selectors match _local_hash and hash_local without prefix collisions', () => {
+  const cases = [
+    { name: 'CONTENT_CSS markdown', css: CONTENT_CSS, local: 'markdown', occurrences: 3 },
+    { name: 'CONTENT_CSS tableScroll', css: CONTENT_CSS, local: 'tableScroll', occurrences: 3 },
+    { name: 'LAYOUT_CSS text', css: LAYOUT_CSS, local: 'text', occurrences: 1 },
+    { name: 'COMPAT_CSS itemIcon', css: COMPAT_CSS, local: 'itemIcon', occurrences: 1 },
+  ]
+
+  for (const { name, css, local, occurrences } of cases) {
+    // No bare legacy `[class*="_<local>_"]` outside `:is(...)` may remain.
+    const bareLegacy = new RegExp(`(?<!:is\\()\\[class\\*="_${local}_"\\]`, 'g')
+    assert.equal(css.match(bareLegacy), null, `${name}: bare legacy [class*="_${local}_"] must not remain`)
+
+    const clauseRe = new RegExp(`:is\\(\\[class\\*="_${local}_"\\],\\s*\\[class\\$="_${local}"\\],\\s*\\[class\\*="_${local} "\\]\\)`, 'g')
+    const matchedClauses = css.match(clauseRe) ?? []
+    assert.equal(matchedClauses.length, occurrences, `${name}: expected ${occurrences} dual-gen clause(s)`)
+
+    for (const clause of matchedClauses) {
+      assert.equal(matchesDualGenClassClause(clause, `_${local}_8a3f2`), true, `${name}: old _local_hash`)
+      assert.equal(matchesDualGenClassClause(clause, `foo _${local}_8a3f2 bar`), true, `${name}: old _local_hash multi-class`)
+      assert.equal(matchesDualGenClassClause(clause, `8a3f2_${local}`), true, `${name}: new hash_local`)
+      assert.equal(matchesDualGenClassClause(clause, `8a3f2_${local} extra`), true, `${name}: new hash_local first-of-many`)
+      assert.equal(matchesDualGenClassClause(clause, `other 8a3f2_${local}`), true, `${name}: new hash_local last-of-many`)
+      assert.equal(matchesDualGenClassClause(clause, `other 8a3f2_${local} extra`), true, `${name}: new hash_local middle`)
+      assert.equal(matchesDualGenClassClause(clause, `8a3f2_${local}Compact`), false, `${name}: no suffix prefix collision`)
+      assert.equal(matchesDualGenClassClause(clause, `_${local}Extra_8a3f2`), false, `${name}: no legacy prefix collision`)
+    }
+  }
+
+  // Specifically verify the compat.css.ts permission menu `:not(:has(:is(...)))` guard
+  // suppresses the fallback ::before rule when any generation of itemIcon is present.
+  const menuRule = COMPAT_CSS.match(/button\[role="menuitem"\]:not\(:has\((:is\([^)]+\))\)\)::before/)
+  assert.ok(menuRule, 'compat permission menu :not(:has(:is(...)))::before rule must exist')
+  const iconClause = menuRule[1]
+  for (const childClass of ['_itemIcon_8a3f2', '8a3f2_itemIcon', '8a3f2_itemIcon extra']) {
+    const triggersFallbackBefore = !matchesDualGenClassClause(iconClause, childClass)
+    assert.equal(triggersFallbackBefore, false, `item with child "${childClass}" must not trigger duplicate ::before icon`)
+  }
+  assert.equal(!matchesDualGenClassClause(iconClause, '8a3f2_itemIconExtra'), true, 'unrelated class still gets fallback icon')
+})

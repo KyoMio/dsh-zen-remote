@@ -906,7 +906,7 @@ export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility -----
        all ship icons in the menu). Self-coordinating with the plugin's own
        injection: once its svg lands it arrives inside a cloned icon span,
        the :not() stops matching, no double icon. */
-    [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] [role="menu"] button[role="menuitem"]:not(:has([class*="_itemIcon_"]))::before,
+    [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] [role="menu"] button[role="menuitem"]:not(:has(:is([class*="_itemIcon_"], [class$="_itemIcon"], [class*="_itemIcon "])))::before,
     [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] button[class$="_trigger"][aria-label$="Auto"]::before {
       content: '';
       width: 16px;

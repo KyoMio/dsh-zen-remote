@@ -589,3 +589,31 @@ test('a fold-stage throw after a successful readSession is a clean 500', async (
   assert.equal(queryState.read[queryState.read.length - 1], 'sess-boom')
   assert.equal(warned, warnedBefore + 1, 'the failure was logged')
 })
+
+test('admit rejections 401, 403, and 503 relay with mapped error codes', async (t) => {
+  const share = await import(SHARE_URL)
+  const { query, state } = makeSessionQuery({
+    'sess-live': { session: { version: 3, id: 'sess-live', createdAt: CREATED_AT, cwd: '/tmp/x', isSeeded: true }, events: fixtureEvents() },
+  })
+  const ctx = { sessionQuery: query, logger: { warn: () => {} } }
+  let currentAdmission = { rejection: 401 }
+  const srv = createServer((req, res) => { void share.handleShareExport(ctx, req, res, () => currentAdmission) })
+  await new Promise((resolve) => srv.listen(0, '127.0.0.1', resolve))
+  t.after(() => new Promise((resolve) => srv.close(resolve)))
+  const srvBase = `http://127.0.0.1:${srv.address().port}`
+
+  for (const [status, code] of [[401, 'unauthorized'], [403, 'forbidden'], [503, 'service-unavailable']]) {
+    currentAdmission = { rejection: status }
+    const res = await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-live`)
+    assert.equal(res.status, status)
+    const body = await res.json()
+    assert.equal(body.ok, false)
+    assert.equal(body.error.code, code)
+  }
+  assert.deepEqual(state.read, [], 'rejected requests never touch sessionQuery')
+
+  currentAdmission = { peer: { principal: { kind: 'owner' } } }
+  const okRes = await fetch(`${srvBase}/_dsh/mobile-nav/share-export?session=sess-live`)
+  assert.equal(okRes.status, 200)
+  assert.deepEqual(state.read, ['sess-live'])
+})

@@ -41,7 +41,7 @@ declare module '@deepseek-ai/cordis' {
 }
 import { readFileConfig, resolveConfig, unwrapVolatile, servesRole, connectsRole } from './config.js'
 import { createActivityTracker, createParentIndex, seedParentIndexFromSnapshots, startSweeper, type PersistedSessionSnapshot } from './activity.js'
-import { ADMIN_ROUTE_PREFIX, createAdminHandler } from './admin-routes.js'
+import { ADMIN_ROUTE_PREFIX, admitRejectionCode, createAdminHandler } from './admin-routes.js'
 import type { AdminHandlerOptions, SessionQueryLike } from './admin-routes.js'
 import { CLIENT_ROUTE_PREFIX, createClientHandler } from './client-routes.js'
 import { responseJson, sameOriginPost } from './http.js'
@@ -92,6 +92,7 @@ import { createVerificationManager } from './wizard/verify.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 import { createPluginLoopback } from './plugin-loopback.js'
 import { createPluginTunnel } from './plugin-tunnel.js'
+import { resolveUpstreamTokenUrl } from './upstream-token.js'
 import { createLogRing, createPluginLog } from './log-ring.js'
 import { DEFAULT_MAX_UPLOAD_BYTES } from './upload-limits.js'
 import { applyUnshadowedRowKeys, clearUnshadowedRowKeys, writeCliConfig } from './cli/config-writer.js'
@@ -541,7 +542,7 @@ export async function handleUpload(
     if ('rejection' in admission) {
       responseJson(res, admission.rejection, {
         ok: false,
-        error: { code: admission.rejection === 401 ? 'unauthorized' : 'forbidden' },
+        error: { code: admitRejectionCode(admission.rejection) },
       })
       return
     }
@@ -576,6 +577,34 @@ export async function handleUpload(
     if (warn !== undefined) warn('dsh-mobile-nav upload rejected: %s', message(error))
     else ctx.logger.warn('dsh-mobile-nav upload rejected: %s', message(error))
     responseJson(res, status, { ok: false, error: { code, message: message(error) } })
+  }
+}
+
+/** WebRoute extended with DSH 0.2.2-rc.2+ `auth` policy (ignored on older hosts). */
+type WebRouteWithAuth = Parameters<Context['webServer']['register']>[0] & {
+  auth?: 'anonymous' | 'required' | 'deny'
+}
+
+/**
+ * Wrap `connection.admit(req)` in an optional `connection.authentication` sub-fiber
+ * so Cordis 4.2 permits nested service reads on DSH >=0.2.2-rc.2 without blocking
+ * route registration on DSH 0.2.1–0.2.2-rc.1 hosts, and enforce `owner` principal
+ * when `peer.principal` is present.
+ * @param routeCtx - inject context that already declared `connection`.
+ * @returns admission wrapper relaying rejections and enforcing `owner` principal.
+ */
+export function createAdmitFn(routeCtx: Context): (req: IncomingMessage) => AdminAdmission {
+  let subFiberAdmit: ((req: IncomingMessage) => AdminAdmission) | undefined
+  routeCtx.inject(['connection.authentication'], (authCtx) => {
+    subFiberAdmit = (req) => authCtx.connection.admit(req)
+    authCtx.effect(() => () => { subFiberAdmit = undefined })
+  })
+  return (req) => {
+    const admission = subFiberAdmit ? subFiberAdmit(req) : routeCtx.connection.admit(req)
+    if ('rejection' in admission) return admission
+    const principal = (admission.peer as { principal?: { kind?: unknown } } | null | undefined)?.principal
+    if (principal !== undefined && principal.kind !== 'owner') return { rejection: 403 }
+    return admission
   }
 }
 
@@ -1326,10 +1355,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // above: an inject callback whose services are already present runs
     // synchronously during apply, and the shares options close over `store`.
     ctx.inject(['webServer', 'connection'], (webCtx) => {
+      const admit = createAdmitFn(webCtx)
       webCtx.effect(() => webCtx.webServer.register({
         kind: 'prefix',
         path: ADMIN_ROUTE_PREFIX,
-        handler: createAdminHandler(adminOptionsFor((req) => webCtx.connection.admit(req))),
+        handler: createAdminHandler(adminOptionsFor(admit)),
       }), 'dsh-zen-remote: admin routes')
     })
     // Gateway-wizard routes (GW-4, extended by GW-5): a separate LONGEST-
@@ -1350,11 +1380,12 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // so the CLI IPC delegate drives the SAME manager set; this effect only
     // registers the route and stops the children with the row.)
     ctx.inject(['webServer', 'connection'], (wizardCtx) => {
+      const admit = createAdmitFn(wizardCtx)
       wizardCtx.effect(() => {
         const unregister = wizardCtx.webServer.register({
           kind: 'prefix',
           path: WIZARD_ROUTE_PREFIX,
-          handler: createWizardHandler(wizardOptionsFor((req) => wizardCtx.connection.admit(req))),
+          handler: createWizardHandler(wizardOptionsFor(admit)),
         })
         // H1: the row's disposal must not orphan the managed children — the
         // Caddy/cloudflared processes die WITH the row that spawned them,
@@ -1417,12 +1448,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           return { protocol: webServer?.protocol === 'https:' ? ('https:' as const) : ('http:' as const), port }
         }
         const getTokenUrl = () => {
-          const connection = relayCtx.reflect.get('connection') as
-            | { authenticatedUrl?: (base: string) => string | undefined }
-            | undefined
-          if (typeof connection?.authenticatedUrl !== 'function') return undefined
+          const webServerObj = relayCtx.reflect.get('webServer')
           const { protocol, port } = getLoopbackTarget()
-          return connection.authenticatedUrl(`${protocol}//127.0.0.1:${port}`)
+          return resolveUpstreamTokenUrl(relayCtx, webServerObj, `${protocol}//127.0.0.1:${port}`)
         }
         // One loopback executor for BOTH plugin halves (the HTTP forward and
         // the PB-10 tunnel): a single cookie cache behind two consumers.
@@ -1497,11 +1525,16 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             }),
           },
         })
-        const unregister = relayCtx.webServer.register({
+        const relayRoute: WebRouteWithAuth = {
           kind: 'prefix',
           path: RELAY_PREFIX,
+          // Gateway and peer-tunnel relay requests carry `x-zen-remote-secret`
+          // rather than DSH browser cookies; `WebServer`'s `anonymous` policy
+          // still enforces Host/Origin checks while older hosts ignore `auth`.
+          auth: 'anonymous',
           handler,
-        })
+        }
+        const unregister = relayCtx.webServer.register(relayRoute)
         // Publish the handler for the admin shares route's viewer counts
         // (T33a2) BEFORE the route is reachable, so no request can hit a
         // mounted route with an unpublished handler.
@@ -1567,11 +1600,12 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     // every `/client/peer/*` request with 404 `not-found`.
     if (!connectsRole(effective.values.role)) {
       ctx.inject(['webServer', 'connection'], (clientCtx) => {
+        const admit = createAdmitFn(clientCtx)
         clientCtx.effect(() => clientCtx.webServer.register({
           kind: 'prefix',
           path: CLIENT_ROUTE_PREFIX,
           handler: createClientHandler({
-            admit: (req) => clientCtx.connection.admit(req),
+            admit,
             getRowConfig: () => config,
             remoteStatusOnly: true,
             getServiceProbe: uploadServiceProbe(clientCtx),
@@ -2231,10 +2265,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
     })
     cliClientHandler = createClientHandler(clientOptionsFor(noopAdmit, ctx))
     ctx.inject(['webServer', 'connection'], (clientCtx) => {
+      const admit = createAdmitFn(clientCtx)
       clientCtx.effect(() => clientCtx.webServer.register({
         kind: 'prefix',
         path: CLIENT_ROUTE_PREFIX,
-        handler: createClientHandler(clientOptionsFor((req) => clientCtx.connection.admit(req), clientCtx)),
+        handler: createClientHandler(clientOptionsFor(admit, clientCtx)),
       }), 'dsh-zen-remote: client routes')
     })
   }
@@ -2347,6 +2382,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   // value that is not a positive finite number falls to the shipped default,
   // the same junk-in/shipped-default rule the keyboard knobs follow.
   ctx.inject(['webServer', 'sessions', 'connection'], (webCtx) => {
+    const admit = createAdmitFn(webCtx)
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'exact',
       path: UPLOAD_ROUTE,
@@ -2364,7 +2400,7 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           maxBytes,
           req,
           res,
-          (admitReq) => webCtx.connection.admit(admitReq),
+          (admitReq) => admit(admitReq),
           logWarn,
         )
       },
@@ -2378,9 +2414,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   // per request through unwrapVolatile, so an edit lands without waiting for
   // a row reload.
   ctx.inject(['webServer'], (webCtx) => {
-    webCtx.effect(() => webCtx.webServer.register({
+    const configRoute: WebRouteWithAuth = {
       kind: 'exact',
       path: CLIENT_CONFIG_ROUTE,
+      auth: 'required',
       handler: (req, res) => {
         if (req.method !== 'GET') {
           res.setHeader('Allow', 'GET')
@@ -2397,7 +2434,8 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           ...clamped('keyboardSafetyPadPx', unwrapVolatile(config.keyboardSafetyPadPx) as number | undefined, 0, 200),
         })
       },
-    }), 'dsh-mobile-nav: client config route')
+    }
+    webCtx.effect(() => webCtx.webServer.register(configRoute), 'dsh-mobile-nav: client config route')
   })
   // Share-image transcript route (issue #7): needs the sessionQuery service
   // every standard dsh-base composition provides, plus the connection
@@ -2408,10 +2446,11 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   // simply never mounts the route — the browser half's fetch then 404s into
   // its "needs full DSH" message.
   ctx.inject(['webServer', 'sessionQuery', 'connection'], (webCtx) => {
+    const admit = createAdmitFn(webCtx)
     webCtx.effect(() => webCtx.webServer.register({
       kind: 'exact',
       path: SHARE_EXPORT_ROUTE,
-      handler: (req, res) => handleShareExport(webCtx, req, res, (admitReq) => webCtx.connection.admit(admitReq)),
+      handler: (req, res) => handleShareExport(webCtx, req, res, admit),
     }), 'dsh-mobile-nav: share export route')
   })
 }

@@ -211,3 +211,145 @@ test('a resolved config value overrides even a stale or illegal host env var', a
     else process.env.LAN_GATE_PORT = saved
   }
 })
+
+test('D23-3: resolveUpstreamTokenUrl prefers authenticatedUrl and filters webserver/entry-url entries', async () => {
+  const { resolveUpstreamTokenUrl } = await import('../lib/upstream-token.js')
+  const ws = { port: 3999 }
+
+  // 1. Legacy host (0.1.2 ~ 0.2.2-rc.1): authenticatedUrl wins without emitting.
+  let emitted = 0
+  const legacyUrl = resolveUpstreamTokenUrl({
+    connection: { authenticatedUrl: (base) => `${base}?token=legacy` },
+    emit: () => { emitted += 1 },
+  }, ws, 'http://127.0.0.1:3999')
+  assert.equal(legacyUrl, 'http://127.0.0.1:3999?token=legacy')
+  assert.equal(emitted, 0)
+
+  // 2. DSH >=0.2.2-rc.2: emits webserver/entry-url with webServer as thisArg and filters candidates.
+  let seenThis
+  let seenBase
+  const resolved = resolveUpstreamTokenUrl({
+    connection: {},
+    emit(thisArg, event, baseUrl, entries) {
+      seenThis = thisArg
+      seenBase = baseUrl
+      assert.equal(event, 'webserver/entry-url')
+      entries.push(
+        null,
+        { url: 123 },
+        { url: 'not a valid url' },
+        { url: 'http://evil.example:3999/?token=wrong-origin' },
+        { url: 'http://127.0.0.1:3999/other?token=wrong-path' },
+        { url: 'http://127.0.0.1:3999/' },
+        { url: 'http://127.0.0.1:3999/?token=' },
+        { url: 'http://127.0.0.1:3999/?token=a&token=b' },
+        { label: 'dsh web', url: 'http://127.0.0.1:3999/?token=good-tok&open=1', open: true },
+        { label: 'second', url: 'http://127.0.0.1:3999/?token=second-tok' },
+      )
+    },
+  }, ws, 'http://127.0.0.1:3999')
+  assert.equal(seenThis, ws)
+  assert.equal(seenBase, 'http://127.0.0.1:3999')
+  assert.equal(resolved, 'http://127.0.0.1:3999/?token=good-tok&open=1')
+})
+
+test('D23-3: lan-gate awaits loader.await() when webserver/entry-url is registered asynchronously and aborts if disposed during wait', async () => {
+  const entry = await loadEntry()
+  const savedToken = process.env.LAN_GATE_UPSTREAM_TOKEN_URL
+  delete process.env.LAN_GATE_UPSTREAM_TOKEN_URL
+  try {
+    // Case A: host-authentication-token registers webserver/entry-url before loader.await() resolves.
+    let resolveLoader
+    let resolveExecCalls = 0
+    let listenerRegistered = false
+    const spawned = []
+    const ws = { port: 3999, protocol: 'http:', host: '127.0.0.1' }
+    const ctx = {
+      webServer: ws,
+      connection: {},
+      get: (name) => (name === 'loader' ? { await: () => new Promise((r) => { resolveLoader = r }) } : undefined),
+      emit(thisArg, event, baseUrl, entries) {
+        if (thisArg === ws && event === 'webserver/entry-url' && listenerRegistered) {
+          entries.push({ label: 'dsh web', url: `${baseUrl}/?token=late-token`, open: true })
+        }
+      },
+      effect(fn) { return fn() },
+      subprocess: {
+        resolveExecutable: async () => { resolveExecCalls += 1; return process.execPath },
+        spawn(opts) {
+          spawned.push(opts)
+          return { done: Promise.resolve({ exitCode: 0, signal: null }), terminate() {} }
+        },
+      },
+    }
+
+    // apply() stays synchronous and does not spawn while loader.await() is pending.
+    entry.apply(ctx, {})
+    await FLUSH()
+    assert.equal(spawned.length, 0)
+    assert.equal(resolveExecCalls, 0)
+
+    listenerRegistered = true
+    resolveLoader()
+    await FLUSH()
+    await FLUSH()
+    assert.equal(spawned.length, 1)
+    assert.equal(spawned[0].env.LAN_GATE_UPSTREAM_TOKEN_URL, 'http://127.0.0.1:3999/?token=late-token')
+
+    // Case B: disposed while loader.await() is pending -> never resolves executable or spawns.
+    let resolveLoaderB
+    let execCalledB = 0
+    const spawnedB = []
+    const disposersB = []
+    const ctxB = {
+      webServer: ws,
+      connection: {},
+      get: (name) => (name === 'loader' ? { await: () => new Promise((r) => { resolveLoaderB = r }) } : undefined),
+      emit() {},
+      effect(fn) { disposersB.push(fn()) },
+      subprocess: {
+        resolveExecutable: async () => { execCalledB += 1; return process.execPath },
+        spawn(opts) {
+          spawnedB.push(opts)
+          return { done: Promise.resolve({ exitCode: 0, signal: null }), terminate() {} }
+        },
+      },
+    }
+    entry.apply(ctxB, {})
+    await FLUSH()
+    for (const d of disposersB) d()
+    resolveLoaderB()
+    await FLUSH()
+    assert.equal(execCalledB, 0, 'disposed during loader.await() must abort before resolveExecutable')
+    assert.equal(spawnedB.length, 0, 'disposed during loader.await() must never spawn')
+
+    // Case C: 0.2.2-rc.2+ host with no token entry logs one warning.
+    const warns = []
+    const spawnedC = []
+    const ctxC = {
+      webServer: ws,
+      connection: {},
+      logger: { warn: (...args) => warns.push(args) },
+      get: (name) => (name === 'loader' ? { await: () => Promise.resolve() } : undefined),
+      emit() {},
+      effect(fn) { return fn() },
+      subprocess: {
+        resolveExecutable: async () => process.execPath,
+        spawn(opts) {
+          spawnedC.push(opts)
+          return { done: Promise.resolve({ exitCode: 0, signal: null }), terminate() {} }
+        },
+      },
+    }
+    entry.apply(ctxC, {})
+    await FLUSH()
+    await FLUSH()
+    assert.equal(spawnedC.length, 1)
+    assert.equal(spawnedC[0].env.LAN_GATE_UPSTREAM_TOKEN_URL, undefined)
+    assert.equal(warns.length, 1)
+    assert.match(String(warns[0][0]), /webserver\/entry-url/)
+  } finally {
+    if (savedToken === undefined) delete process.env.LAN_GATE_UPSTREAM_TOKEN_URL
+    else process.env.LAN_GATE_UPSTREAM_TOKEN_URL = savedToken
+  }
+})

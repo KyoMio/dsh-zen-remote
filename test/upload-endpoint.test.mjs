@@ -8,12 +8,15 @@ import { UPLOAD_DIR, handleUpload, safeUploadName, sameOriginPost } from '../lib
 import {
   UPLOAD_DIR as CLIENT_UPLOAD_DIR,
   UPLOAD_ROUTE,
+  UploadHttpError,
   appendDraftOf,
   draftWithMention,
   draftWithoutMention,
   leafOf,
   mentionsIn,
   middleEllipsis,
+  parseUploadResponse,
+  uploadErrorSummary,
   uploadUrl,
   writeMention,
 } from '../src/client/attach-upload.ts'
@@ -237,12 +240,12 @@ test('upload endpoint integration: disk writes, caps, symlinks, and admission wa
     return { rejection: currentAdmission }
   }
 
-  for (const status of [401, 403]) {
+  for (const [status, code] of [[401, 'unauthorized'], [403, 'forbidden'], [503, 'service-unavailable']]) {
     currentAdmission = status
     const denied = await post('?session=session-live&name=denied.txt', 'x')
     assert.equal(denied.status, status)
     assert.equal(denied.body.ok, false)
-    assert.equal(denied.body.error.code, status === 401 ? 'unauthorized' : 'forbidden')
+    assert.equal(denied.body.error.code, code)
   }
   assert.deepEqual(await readdir(join(workspace, UPLOAD_DIR)), [
     '.gitignore', 'blob.bin', 'evil.txt', 'notes-1.txt', 'notes.txt',
@@ -255,4 +258,81 @@ test('upload endpoint integration: disk writes, caps, symlinks, and admission wa
   assert.equal(allowed.body.relPath, `${UPLOAD_DIR}/admitted.txt`)
   assert.equal(admitted, 1)
   assert.equal(await readFile(join(workspace, UPLOAD_DIR, 'admitted.txt'), 'utf8'), 'through the wall')
+})
+
+test('D23-1/fix: parseUploadResponse reports plain-text host rejections instead of throwing JSON parse errors', async () => {
+  const fakeResponse = (status, bodyText) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => bodyText,
+  })
+
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(401, 'unauthorized')),
+    /HTTP 401: unauthorized/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(403, 'forbidden')),
+    /HTTP 403: forbidden/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(503, 'authentication unavailable')),
+    /HTTP 503: authentication unavailable/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(502, '')),
+    /^Error: HTTP 502$/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(403, JSON.stringify({ ok: false, error: { code: 'forbidden', message: 'owner only' } }))),
+    /owner only/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(401, JSON.stringify({ ok: false, error: { code: 'unauthorized' } }))),
+    /unauthorized/,
+  )
+  await assert.rejects(
+    () => parseUploadResponse(fakeResponse(200, 'not-json')),
+    /HTTP 200: not-json/,
+  )
+  assert.equal(
+    await parseUploadResponse(fakeResponse(200, JSON.stringify({ ok: true, relPath: '.dsh-attachments/a.png' }))),
+    '.dsh-attachments/a.png',
+  )
+})
+
+test('PR77-R3-L4: UploadHttpError and uploadErrorSummary render localized rejection reasons visibly', async () => {
+  const fakeResponse = (status, bodyText) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => bodyText,
+  })
+  const labels = {
+    attachFailed: 'Upload failed — tap to retry',
+    attachFailedUnauthorized: 'Upload failed (401 unauthorized)',
+    attachFailedForbidden: 'Upload failed (403 forbidden)',
+    attachFailedUnavailable: 'Upload failed (503 unavailable)',
+  }
+  const t = (key) => labels[key]
+
+  const err401 = await parseUploadResponse(fakeResponse(401, 'unauthorized')).catch((e) => e)
+  assert.equal(err401 instanceof UploadHttpError, true)
+  assert.equal(err401.status, 401)
+  assert.equal(uploadErrorSummary(err401, t), labels.attachFailedUnauthorized)
+
+  const err403 = await parseUploadResponse(fakeResponse(403, 'forbidden')).catch((e) => e)
+  assert.equal(err403 instanceof UploadHttpError, true)
+  assert.equal(err403.status, 403)
+  assert.equal(uploadErrorSummary(err403, t), labels.attachFailedForbidden)
+
+  const err503 = await parseUploadResponse(fakeResponse(503, 'authentication unavailable')).catch((e) => e)
+  assert.equal(err503 instanceof UploadHttpError, true)
+  assert.equal(err503.status, 503)
+  assert.equal(uploadErrorSummary(err503, t), labels.attachFailedUnavailable)
+
+  const err502 = await parseUploadResponse(fakeResponse(502, 'bad gateway')).catch((e) => e)
+  assert.equal(err502 instanceof UploadHttpError, true)
+  assert.equal(uploadErrorSummary(err502, t), 'Upload failed — tap to retry (HTTP 502)')
+
+  assert.equal(uploadErrorSummary(new TypeError('Failed to fetch'), t), labels.attachFailed)
 })
