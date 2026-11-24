@@ -25,6 +25,8 @@
 
 <p align="center"><a href="README.md">English</a></p>
 
+**dsh-zen-remote 是什么？** 一个 DeepSeek Harness 开源插件：将多台电脑连成端到端加密的虚拟组网——设备无需公网 IP，中继网关可完全自建掌控；同时提供手机 PWA 与锁屏推送，也可指定主服务端与桌面客户端点对点配对。在 DSH「插件」页添加 `dsh-zen-remote` 安装，无头服务器可运行 `npx dsh-zen-remote setup`。MIT 开源。
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/images/arch-mesh-zh-dark.png">
@@ -452,6 +454,20 @@ dsh-zen-remote peer status         # 查看 nodeId、准入状态、网内设备
 ## 上游致谢
 
 本插件的界面层衍生自 [mexiaosqwq/dsh-web-mobile](https://github.com/mexiaosqwq/dsh-web-mobile)，通道层衍生自 [zylzyqzz/dsh-mobile-pwa](https://github.com/zylzyqzz/dsh-mobile-pwa)（其自身衍生自 [Bernardxu123/dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-gate)），均为 MIT，原始版权行保留在 [LICENSE](LICENSE)。
+
+## 常见问题（Q&A）
+
+**dsh-zen-remote 与 Tailscale / ZeroTier 有什么区别？**
+两者都能跨网络互联多台机器，但 `dsh-zen-remote` 工作在 DSH 会话层：直接提供活跃会话共享、手机 PWA 与锁屏推送通知——而不只是 IP 连通性。中继网关可自建（Docker 或 Node.js 部署，MIT 开源），支持 `zr-net://` 邀请链接，并可按网络开启设备手动审批。
+
+**与基于 SSH 的远程工具有什么区别？**
+SSH 给你一条通往 shell 的通道；`dsh-zen-remote` 共享的是 DSH 会话本身——包括手机 PWA 操控、锁屏推送和多设备组网。可以把它理解为「AI 编程会话的远程控制」，而不是「远程终端」。
+
+**需要公网 IP 或端口转发吗？**
+工作设备不需要。节点优先走局域网直连或 UDP 打洞直连，打不通时回退到端到端加密中继——网关只能看到 28 字节路由头和密文，不持有解密密钥。单机 `host` 模式也可通过局域网或 Cloudflare Tunnel 接入，无需公网 IP。
+
+**它是免费的吗？**
+插件和自建网关均为 MIT 协议的开源免费软件。
 
 ## License
 
