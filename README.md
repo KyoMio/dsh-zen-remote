@@ -10,8 +10,6 @@
   Link computers into an end-to-end encrypted virtual mesh with zero public IPs, keep phone PWA &amp; lock-screen push active, or pair specific hosts and desktop clients.
 </p>
 
-**What is dsh-zen-remote?** An open-source plugin for DeepSeek Harness that links your computers into an end-to-end encrypted mesh — no public IPs, no central server you don't control. It keeps a phone web app and lock-screen notifications alive for remote sessions, or pairs specific hosts and desktops. Install: `npm i -g dsh-zen-remote`. MIT licensed.
-
 <p align="center">
 <a href="https://www.npmjs.com/package/dsh-zen-remote"><img src="https://img.shields.io/npm/v/dsh-zen-remote?style=flat-square&color=5B4CF0&logo=npm&label=npm" alt="npm version"></a>
 <a href="https://www.npmjs.com/package/dsh-zen-remote"><img src="https://img.shields.io/npm/dm/dsh-zen-remote?style=flat-square&color=0B7285&label=downloads" alt="npm downloads"></a>
@@ -26,6 +24,8 @@
 </p>
 
 <p align="center"><a href="README.zh-CN.md">中文文档</a></p>
+
+**What is dsh-zen-remote?** An open-source plugin for DeepSeek Harness that links your computers into an end-to-end encrypted virtual mesh — no public IPs on your machines, and you control the self-hosted gateway. It also provides a phone PWA with lock-screen push notifications, or pairs specific hosts and desktops directly. Install via DSH Plugins (`dsh-zen-remote`) or `npx dsh-zen-remote setup`. MIT licensed.
 
 <p align="center">
   <picture>
@@ -458,13 +458,13 @@ This plugin's interface layer derives from [mexiaosqwq/dsh-web-mobile](https://g
 ## Q&A
 
 **How is dsh-zen-remote different from Tailscale/ZeroTier?**
-Both create private networks across machines, but zen-remote operates at the session layer for DSH: it shares live sessions, phone PWA access, and push notifications — not just IP connectivity. The gateway is self-hostable (Docker, MIT); invite-only networks add an approval step.
+Both connect machines across private networks, but `dsh-zen-remote` operates at the DSH session layer: it provides live session sharing, a phone PWA, and lock-screen push notifications — not just IP connectivity. The relay gateway is self-hostable (Docker or Node.js, MIT), with `zr-net://` invite links and optional manual device approval.
 
 **How is it different from SSH-based remote tools?**
-SSH gives you a channel to a shell. zen-remote shares the DSH session itself — including phone PWA control, lock-screen push, and multi-device mesh. Think "remote control for an AI coding session," not "remote terminal."
+SSH gives you a channel to a shell. `dsh-zen-remote` shares the DSH session itself — including phone PWA control, lock-screen push, and multi-device mesh. Think "remote control for an AI coding session," not "remote terminal."
 
 **Do I need a public IP or port forwarding?**
-No. Peers connect via UDP hole-punching with an end-to-end encrypted relay as fallback. The gateway only sees ciphertext.
+Not on your machines. Peers connect via LAN direct or UDP hole-punching first, falling back to an end-to-end encrypted relay where the gateway sees only a 28-byte routing header and ciphertext (no decryption keys). Standalone `host` mode also works without a public IP over LAN or Cloudflare Tunnel.
 
 **Is it free?**
 The plugin and self-hosted gateway are MIT-licensed open source.
