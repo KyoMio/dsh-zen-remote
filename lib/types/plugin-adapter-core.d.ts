@@ -269,8 +269,10 @@ export declare const MAX_ADAPTER_RESPONSE_BUFFER_BYTES: number;
 /** Response headers an ADAPTER answer may carry through VERBATIM, beyond
  * the three every bridged forward passes (content-type, content-length,
  * cache-control): the better-sidebar HTML preview ships a `content-
- * security-policy` sandbox and downloads carry `content-disposition` —
- * stripping those breaks the very panels the adapter exists to serve.
- * Cooperative declaration routes keep the three-header behavior. */
-export declare const ADAPTER_RESPONSE_HEADER_ALLOWLIST: readonly ["content-security-policy", "content-disposition", "etag", "last-modified", "accept-ranges", "content-range"];
+ * security-policy` sandbox, downloads carry `content-disposition`, and
+ * `/sidebar/file` & `/sidebar/html` carry range and hardening headers
+ * (`x-content-type-options`, `referrer-policy`) — stripping those weakens or
+ * breaks the panels the adapter exists to serve. Cooperative declaration
+ * routes keep the three-header behavior. */
+export declare const ADAPTER_RESPONSE_HEADER_ALLOWLIST: readonly ["content-security-policy", "content-disposition", "etag", "last-modified", "accept-ranges", "content-range", "x-content-type-options", "referrer-policy"];
 //# sourceMappingURL=plugin-adapter-core.d.ts.map
