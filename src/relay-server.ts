@@ -3171,10 +3171,20 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
          */
         const clientAcceptsGzip = acceptsZrGzip(req)
         let writeChain: Promise<void> = Promise.resolve()
-        const writeLine = (value: unknown, tail = false): Promise<void> => {
+        const writeLine = (
+          value: unknown,
+          tail = false,
+          prepare?: (current: unknown) => unknown | null,
+        ): Promise<void> => {
           const run = writeChain.then(async () => {
             if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
-            const lineText = JSON.stringify(value)
+            let current: unknown = value
+            if (prepare !== undefined) {
+              const prepared = prepare(current)
+              if (prepared === null) return
+              current = prepared
+            }
+            const lineText = JSON.stringify(current)
             let outBytes = Buffer.from(`${lineText}\n`, 'utf8')
             // Compression MUST run serially inside writeChain so a slow gzip
             // of a large snapshot never gets overtaken by a small event or end tail.
@@ -3182,14 +3192,26 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
               clientAcceptsGzip &&
               !tail &&
               outBytes.byteLength - 1 >= ZR_GZIP_MIN_BYTES &&
-              isPlainObject(value) &&
-              value.type === 'frame'
+              isPlainObject(current) &&
+              current.type === 'frame'
             ) {
               try {
                 const gzBuf = await gzipAsync(outBytes.subarray(0, outBytes.byteLength - 1), { level: 1 })
-                const wrapped = `${JSON.stringify({ type: 'gz', b64: gzBuf.toString('base64') })}\n`
-                if (wrapped.length < outBytes.byteLength) {
-                  outBytes = Buffer.from(wrapped, 'utf8')
+                if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
+                if (prepare !== undefined) {
+                  const rechecked = prepare(current)
+                  if (rechecked === null) return
+                  if (rechecked !== current) {
+                    outBytes = Buffer.from(`${JSON.stringify(rechecked)}\n`, 'utf8')
+                  } else {
+                    const wrapped = `${JSON.stringify({ type: 'gz', b64: gzBuf.toString('base64') })}\n`
+                    if (wrapped.length < outBytes.byteLength) outBytes = Buffer.from(wrapped, 'utf8')
+                  }
+                } else {
+                  const wrapped = `${JSON.stringify({ type: 'gz', b64: gzBuf.toString('base64') })}\n`
+                  if (wrapped.length < outBytes.byteLength) {
+                    outBytes = Buffer.from(wrapped, 'utf8')
+                  }
                 }
               } catch {
                 // Fall back to uncompressed line on unexpected zlib failure.
@@ -3317,6 +3339,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         let applyToState: ((frame: unknown) => void) | undefined
         let forgeState: ForgeStatesState | undefined
         let sessionStatusFilter: ((frame: unknown) => Record<string, unknown> | null) | undefined
+        let sessionStatusPrepare: ((current: unknown) => unknown | null) | undefined
         let companionAbort: AbortController | undefined
 
         if (decision.filter === 'workspace') {
@@ -3375,6 +3398,37 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         } else if (decision.filter === 'session-status') {
           const cache = new Map<string, SessionReadState>()
           const exposed = new Set<string>()
+          sessionStatusPrepare = (current) => {
+            if (!isPlainObject(current) || current.type !== 'frame' || !isPlainObject(current.frame)) return current
+            const frame = current.frame
+            if (frame.type === 'changed') {
+              if (
+                isPlainObject(frame.state) &&
+                typeof frame.state.sessionId === 'string' &&
+                !isAccessible(frame.state.sessionId)
+              ) {
+                exposed.delete(frame.state.sessionId)
+                return null
+              }
+              return current
+            }
+            if (frame.type === 'baseline' && Array.isArray(frame.items)) {
+              const allAccessible = frame.items.every(
+                (item) => isPlainObject(item) && typeof item.sessionId === 'string' && isAccessible(item.sessionId),
+              )
+              if (allAccessible) return current
+              const nextItems = frame.items.filter(
+                (item) => isPlainObject(item) && typeof item.sessionId === 'string' && isAccessible(item.sessionId),
+              )
+              for (const item of frame.items) {
+                if (isPlainObject(item) && typeof item.sessionId === 'string' && !isAccessible(item.sessionId)) {
+                  exposed.delete(item.sessionId)
+                }
+              }
+              return { ...current, frame: { type: 'baseline', items: nextItems } }
+            }
+            return current
+          }
           sessionStatusFilter = (frame) => {
             const out = filterSessionStatusFrame(frame, isAccessible, cache)
             if (out === undefined) return null
@@ -3400,14 +3454,14 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
                   exposed.add(state.sessionId)
                   items.push(state)
                 }
-                void writeLine({ type: 'frame', frame: { type: 'baseline', items } })
+                void writeLine({ type: 'frame', frame: { type: 'baseline', items } }, false, sessionStatusPrepare)
                 return
               }
             }
             for (const [id, state] of cache) {
               if (!isAccessible(id) || exposed.has(id)) continue
               exposed.add(id)
-              void writeLine({ type: 'frame', frame: { type: 'changed', state } })
+              void writeLine({ type: 'frame', frame: { type: 'changed', state } }, false, sessionStatusPrepare)
             }
           })
         } else if (eventsSub !== undefined) {
@@ -3585,7 +3639,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
                   }
                 }
               }
-              await writeLine({ type: 'frame', frame: outFrame })
+              await writeLine({ type: 'frame', frame: outFrame }, false, sessionStatusPrepare)
             }
             closeWith({ type: 'end' })
           }

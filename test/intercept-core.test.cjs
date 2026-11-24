@@ -2469,3 +2469,137 @@ test('D23-6: forgePanel/{worktreeBases,revisit,reviewStage,changesLens} classify
 
   handle.uninstall()
 })
+
+test('PR78-1: non-owner peers (e.g. LiveShare viewers) bypass Zen Remote dispatch/open on wrapped RPCs and streams', async () => {
+  const gateway = new FakeTypertGateway()
+  const localDispatches = []
+  const localStreams = []
+  const origDispatch = gateway.dispatchRpc.bind(gateway)
+  const origOpen = gateway.openWireStream.bind(gateway)
+  gateway.dispatchRpc = (endpoint, payload, signal, peer) => {
+    localDispatches.push({ endpoint, payload, peer })
+    return origDispatch(endpoint, payload, signal, peer)
+  }
+  gateway.openWireStream = (endpoint, payload, uplink, peer, signal, control) => {
+    localStreams.push({ endpoint, payload, peer })
+    return origOpen(endpoint, payload, uplink, peer, signal, control)
+  }
+  const relay = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '11111111', serverName: 'S1', dshVersion: '0.0.0', fingerprints: {} },
+  })
+  const poolEntries = [
+    { id: 'e1', serverId: '11111111', serverName: 'S1', displayName: 'S1', client: relay },
+  ]
+  const pool = {
+    entries: () => poolEntries,
+    getByServerId: (sid) => poolEntries.find((e) => e.serverId === sid),
+  }
+  const handle = installIntercept({
+    raw: gateway,
+    pool,
+    getServerId: () => undefined,
+    log: () => {},
+  })
+
+  const viewerPeer = { principal: { kind: 'live-share', id: 'viewer-1' } }
+  const ownerPeer = gateway.operatorPeer()
+  const invokesBefore = relay.invokes.length
+  const streamsBefore = relay.streams.length
+
+  // Non-owner calling sessionStatus/mark with a virtual id must fall back locally instead of invoking relay
+  await gateway.rpcBridge(
+    'sessionStatus/mark',
+    { args: { sessionId: toVirtual('11111111', 's-1'), action: { type: 'unread' } } },
+    undefined,
+    viewerPeer,
+  )
+  assert.equal(localDispatches.length, 1)
+  assert.equal(localDispatches[0].peer, viewerPeer)
+  assert.equal(relay.invokes.length, invokesBefore)
+
+  // Non-owner opening sessionStatus/follow must fall back locally instead of opening relay stream
+  const viewerController = new AbortController()
+  await gateway.wireTap(
+    'sessionStatus/follow',
+    { args: {} },
+    undefined,
+    viewerPeer,
+    viewerController.signal,
+    { signal: viewerController.signal },
+  )
+  assert.equal(localStreams.length, 1)
+  assert.equal(localStreams[0].peer, viewerPeer)
+  assert.equal(relay.streams.length, streamsBefore)
+
+  // Owner peer still forwards through Zen Remote relay
+  const ownerMark = await gateway.rpcBridge(
+    'sessionStatus/mark',
+    { args: { sessionId: toVirtual('11111111', 's-1'), action: { type: 'unread' } } },
+    undefined,
+    ownerPeer,
+  )
+  assert.equal(ownerMark.ok, true)
+  assert.equal(relay.invokes.length, invokesBefore + 1)
+  assert.equal(relay.invokes[relay.invokes.length - 1].namespace, 'sessionStatus')
+
+  handle.uninstall()
+})
+
+test('PR78-3: mergedMultiSnapshotStream reattaches when a re-paired RelayClient replaces the instance for the same serverId', async () => {
+  const gateway = new FakeTypertGateway()
+  const localGate = createGate()
+  const origOpen = gateway.openWireStream.bind(gateway)
+  gateway.openWireStream = (endpoint, ...rest) =>
+    endpoint === 'sessionStatus/follow' ? localGate.iterable : origOpen(endpoint, ...rest)
+
+  const relayOld = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '11111111', serverName: 'S1-old', dshVersion: '0.0.0', fingerprints: {} },
+  })
+  const relayNew = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '11111111', serverName: 'S1-new', dshVersion: '0.0.0', fingerprints: {} },
+  })
+  const poolEntries = [
+    { id: 'e1', serverId: '11111111', serverName: 'S1-old', displayName: 'S1-old', client: relayOld },
+  ]
+  const pool = {
+    entries: () => poolEntries,
+    getByServerId: (sid) => poolEntries.find((e) => e.serverId === sid),
+  }
+  const handle = installIntercept({
+    raw: gateway,
+    pool,
+    getServerId: () => undefined,
+    log: () => {},
+  })
+
+  const controller = new AbortController()
+  const stream = await gateway.wireTap('sessionStatus/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const iter = stream[Symbol.asyncIterator]()
+  const nextFrame = () => iter.next().then((r) => r.value)
+
+  localGate.push({ type: 'baseline', items: [] })
+  assert.deepEqual(await nextFrame(), { type: 'baseline', items: [] })
+
+  await waitUntil(() => relayOld.streams.length === 1)
+  const rOldRec = { sessionId: 's-1', completedTurn: 1, failed: false, readTurn: 0, manualUnread: false }
+  relayOld.streams[0].gate.push({ type: 'baseline', items: [rOldRec] })
+  assert.deepEqual(await nextFrame(), { type: 'changed', state: { ...rOldRec, sessionId: toVirtual('11111111', 's-1') } })
+
+  // Swap client instance for the same serverId (re-pair to new host address) and notify pool
+  poolEntries[0] = { id: 'e2', serverId: '11111111', serverName: 'S1-new', displayName: 'S1-new', client: relayNew }
+  handle.notePoolEvent()
+
+  // Old stream aborted + baseline removes old records + new client subscribes
+  await waitUntil(() => relayNew.streams.length === 1)
+  assert.equal(relayOld.streams[0].aborted, true)
+  const resetBaseline = await nextFrame()
+  assert.deepEqual(resetBaseline, { type: 'baseline', items: [] })
+
+  const rNewRec = { sessionId: 's-1', completedTurn: 3, failed: false, readTurn: 3, manualUnread: false }
+  relayNew.streams[0].gate.push({ type: 'baseline', items: [rNewRec] })
+  assert.deepEqual(await nextFrame(), { type: 'changed', state: { ...rNewRec, sessionId: toVirtual('11111111', 's-1') } })
+
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})

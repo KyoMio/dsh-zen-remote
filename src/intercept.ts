@@ -3643,6 +3643,10 @@ async function* mergedMultiSnapshotStream(deps: MultiSnapshotStreamDeps): AsyncG
         const sid = entry.serverId
         if (sid === undefined) continue
         seen.add(sid)
+        const existing = slots.get(sid)
+        if (existing !== undefined && existing.client !== entry.client) {
+          removeSlot(sid)
+        }
         if (!slots.has(sid)) attachSlot(sid, entry.client)
       }
       for (const sid of [...slots.keys()]) {
@@ -6305,6 +6309,18 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     return { args: { ...args, request: { ...request, provider: providerParts.id } } }
   }
 
+  /**
+   * Non-owner peers (e.g. LiveShare viewers) must never ride Zen Remote's
+   * owner-credential forwarding or receive merged remote server streams; they
+   * fall through straight to DSH's own Gateway and remoteAccess checks.
+   */
+  const isNonOwnerPeer = (peer: unknown): boolean => {
+    if (!isPlainObject(peer)) return false
+    const principal = peer.principal
+    if (!isPlainObject(principal)) return false
+    return principal.kind !== 'owner'
+  }
+
   const wrappedDispatch = function wrappedDispatch(
     this: unknown,
     endpoint: string,
@@ -6315,7 +6331,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // An uninstalled wrap is INERT, not absent: another plugin may have
     // wrapped over us and kept a reference to this very function, so it must
     // degrade to a plain passthrough instead of forwarding anything.
-    if (!installed || interceptBypass.getStore() === true) {
+    if (!installed || interceptBypass.getStore() === true || isNonOwnerPeer(peer)) {
       return (chainTarget.dispatchRpc as (...callArgs: unknown[]) => unknown).call(raw, endpoint, payload, signal, peer)
     }
     counters.dispatchRpc += 1
@@ -6393,7 +6409,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // (undefined on older hosts and on the 5-argument wireStream.open path).
     uplinkWindow?: unknown,
   ): unknown {
-    if (!installed || interceptBypass.getStore() === true) {
+    if (!installed || interceptBypass.getStore() === true || isNonOwnerPeer(peer)) {
       return (chainTarget.openWireStream as (...callArgs: unknown[]) => unknown).call(
         raw,
         endpoint,
