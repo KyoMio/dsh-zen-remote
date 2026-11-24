@@ -1,6 +1,12 @@
 // content — chat markdown readability on phones (2026-08-18). Shares no
 // selector with any other file; appended last in styles/index.ts.
 
+const cssMod = (local: string): string =>
+  `:is([class*="_${local}_"], [class$="_${local}"], [class*="_${local} "])`
+
+const MD = cssMod('markdown')
+const TABLE_SCROLL = cssMod('tableScroll')
+
 export const CONTENT_CSS = `/* ---------- chat markdown content (< 768px) ---------- */
 
 @media (max-width: 767px) {
@@ -28,7 +34,7 @@ export const CONTENT_CSS = `/* ---------- chat markdown content (< 768px) ------
      block side agrees. Prose is untouched until something would overflow;
      the table is already pinned wide by min-width: max-content below. */
   [data-chat-flow],
-  [class*="_markdown_"] {
+  ${MD} {
     overflow-wrap: anywhere;
   }
 
@@ -41,7 +47,7 @@ export const CONTENT_CSS = `/* ---------- chat markdown content (< 768px) ------
      am willing to go to for mixed CJK/Latin: the glyphs are full-height with
      no descender relief, so tighter starts to look stacked. Phone only —
      the desktop column keeps the official rhythm. */
-  [class*="_markdown_"] {
+  ${MD} {
     line-height: 1.65;
   }
   /* Paragraph rhythm. Each paragraph is its own markdown block and the
@@ -52,7 +58,7 @@ export const CONTENT_CSS = `/* ---------- chat markdown content (< 768px) ------
      never run together, but noticeably denser. Scoped by :has() to
      containers that actually hold prose blocks, so tool cards and other
      flex bodies with the same hashed suffix keep their own spacing. */
-  [data-phase] [class$="_body"]:has(> [class*="_markdown_"]) {
+  [data-phase] [class$="_body"]:has(> ${MD}) {
     row-gap: 12px !important;
   }
 
@@ -65,8 +71,8 @@ export const CONTENT_CSS = `/* ---------- chat markdown content (< 768px) ------
      wrapped mid-length cells) keeps typical cells on one line; only truly
      prose-heavy cells wrap, instead of dragging the table kilometers
      wide. */
-  [class*="_tableScroll_"] th,
-  [class*="_tableScroll_"] td {
+  ${TABLE_SCROLL} th,
+  ${TABLE_SCROLL} td {
     max-width: 480px !important;
   }
 
@@ -78,7 +84,7 @@ export const CONTENT_CSS = `/* ---------- chat markdown content (< 768px) ------
      2026-08-18). Redeclare the natural-width intent with both width and
      min-width so whichever keyword the engine honors wins; the wrapper
      already scrolls the overflow. */
-  [class*="_tableScroll_"] table {
+  ${TABLE_SCROLL} table {
     width: max-content !important;
     min-width: max-content !important;
     max-width: none !important;

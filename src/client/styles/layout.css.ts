@@ -205,7 +205,7 @@ export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
      (16px too) — cover it as well. */
   [data-phase] [class$="_scroll"]:has(p) p,
   [data-phase] [class$="_scroll"]:has(p) li,
-  [data-phase] [class$="_scroll"]:has(p) [class*="_text_"] {
+  [data-phase] [class$="_scroll"]:has(p) :is([class*="_text_"], [class$="_text"], [class*="_text "]) {
     font-size: 15px !important;
   }
 

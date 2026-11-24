@@ -147,6 +147,7 @@ export function installDebugBadge(ctx: ClientContext): void {
     }
     badge.addEventListener('click', onBadgeTap)
 
+    const PLUGIN_STYLE_SELECTOR = 'style[data-plugin*="zen-remote"], style[data-plugin*="mobile"], style[data-plugin-css*="mobile"]'
     const read = (): string => {
       const q = (sel: string) => !!document.querySelector(sel)
       const vis = (sel: string) => {
@@ -160,7 +161,7 @@ export function installDebugBadge(ctx: ClientContext): void {
         `URL ${location.pathname}${location.search}`,
         `W ${innerWidth} x ${innerHeight} dpr ${devicePixelRatio}`,
         `mq≤1023 ${matchMedia('(max-width: 1023px)').matches}  mq≥1024 ${matchMedia('(min-width: 1024px)').matches}`,
-        `css ${q('style[data-plugin-css*="mobile"]')}  frame ${!!frame}`,
+        `css ${q(PLUGIN_STYLE_SELECTOR)}  frame ${!!frame}`,
         `previewCol ${vis('[data-aionui-preview-col]')}  explorerCol ${vis('[data-aionui-explorer-col]')}`,
         `previewOpen ${frame?.hasAttribute('data-aionui-preview-open') ?? '?'}  explorerOpen ${frame?.hasAttribute('data-aionui-explorer-open') ?? '?'}  previewFull ${frame?.hasAttribute('data-mobile-preview-full') ?? '?'}`,
         `header ${vis('[data-phase] header')} h${Math.round(document.querySelector('[data-phase] header')?.getBoundingClientRect().height ?? 0)}  composer ${q('textarea')}`,
@@ -217,7 +218,7 @@ export function installDebugBadge(ctx: ClientContext): void {
             `barB ${pair('[data-slot="conversation.composer.bar"] > [class$="_root"]')} seatB ${pair('[class$="_composerSeat"]')} scrollB ${pair('[class$="_scrollBody"]')}`,
             `sabPad ${barRoot === null ? '—' : getComputedStyle(barRoot).paddingBottom}`,
             `botList ${bottomOf('[data-mobile-nav="home-list"]')} fab ${bottomOf('[data-mobile-nav="home-fab"]')}`,
-            `cssLen ${document.querySelector('style[data-plugin-css*="mobile"]')?.textContent?.length ?? 0}`,
+            `cssLen ${document.querySelector(PLUGIN_STYLE_SELECTOR)?.textContent?.length ?? 0}`,
           ].join('\n')
         })(),
         `genui cards ${document.querySelectorAll('[data-genui]').length}  panel ${q('[data-genui-panel]')}`,
