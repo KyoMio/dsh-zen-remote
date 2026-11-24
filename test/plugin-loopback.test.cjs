@@ -258,3 +258,29 @@ test('a chunked plugin answer streams in order with its whitelisted headers', as
     await dsh.stop()
   }
 })
+
+test('D23-3: resolveUpstreamTokenUrl drives loopback exchange via webserver/entry-url when authenticatedUrl is absent', async () => {
+  const { resolveUpstreamTokenUrl } = await import('../lib/upstream-token.js')
+  const dsh = await startFakeDsh()
+  try {
+    const webServer = { port: dsh.target().port, protocol: 'http:' }
+    const relayCtx = {
+      reflect: { get: (name) => (name === 'connection' ? {} : name === 'webServer' ? webServer : undefined) },
+      emit(thisArg, event, baseUrl, entries) {
+        assert.equal(thisArg, webServer)
+        assert.equal(event, 'webserver/entry-url')
+        entries.push({ label: 'dsh web', url: `${baseUrl}/?token=token-good`, open: true })
+      },
+    }
+    const loopback = createPluginLoopback({
+      getTarget: dsh.target,
+      getTokenUrl: () => resolveUpstreamTokenUrl(relayCtx, webServer, `http://127.0.0.1:${dsh.target().port}`),
+    })
+    const res = await bufferedGet(loopback, '/panel/data', 'sessionId=s1')
+    assert.equal(res.status, 200)
+    assert.deepEqual(JSON.parse(res.body), { ok: true, path: '/panel/data', query: '?sessionId=s1' })
+    assert.equal(dsh.state.tokenHits, 1)
+  } finally {
+    await dsh.stop()
+  }
+})

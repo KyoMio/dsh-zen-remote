@@ -2161,3 +2161,114 @@ test('D23-1: createAdmitFn routes all 6 route groups through connection.authenti
   assert.equal(legacy.counts().directCalls, legacyProbes.length)
   assert.equal(legacy.counts().subFiberCalls, 0)
 })
+
+test('D23-3: index relayCtx pluginLoopback resolves token via webserver/entry-url when authenticatedUrl is absent', async (t) => {
+  const index = await import(INDEX_URL)
+  const dshServer = http.createServer((req, res) => {
+    const u = new URL(req.url ?? '/', 'http://127.0.0.1')
+    if (u.pathname === '/' && u.searchParams.get('token') === 'entry-tok') {
+      res.writeHead(303, { 'set-cookie': 'dsh-auth=ok; Path=/; HttpOnly', location: '/' })
+      res.end()
+      return
+    }
+    if (u.pathname === '/panel/ping' && req.headers.cookie === 'dsh-auth=ok') {
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ ok: true, from: 'loopback-entry-url' }))
+      return
+    }
+    res.writeHead(401)
+    res.end('unauthorized')
+  })
+  const dshBase = await listen(dshServer)
+  t.after(() => { dshServer.closeAllConnections(); return close(dshServer) })
+  const dshPort = Number(new URL(dshBase).port)
+
+  const webRoutes = []
+  const disposers = []
+  const pluginCalls = []
+  const provides = []
+  const services = {
+    logger: { info() {}, warn() {} },
+    webServer: {
+      port: dshPort,
+      protocol: 'http:',
+      register(entry) { webRoutes.push(entry); return () => {} },
+    },
+    typertGateway: { invoke: async () => ({}), stream: async () => (async function* () {})() },
+    connection: { admit: () => ({ peer: {} }) },
+    sessions: { get: () => undefined },
+    sessionQuery: {},
+  }
+  const listeners = []
+  const ctx = {
+    logger: services.logger,
+    plugin(mod, cfg) { pluginCalls.push({ mod, cfg }) },
+    provide(name, val) { provides.push({ name, val }); return () => {} },
+    on(event, listener) { listeners.push({ event, listener }); return () => {} },
+    effect(fn) {
+      const stop = fn()
+      if (typeof stop === 'function') disposers.push(stop)
+      return stop
+    },
+    emit(thisArg, event, baseUrl, entries) {
+      if (thisArg === services.webServer && event === 'webserver/entry-url') {
+        entries.push({ label: 'dsh web', url: `${baseUrl}/?token=entry-tok`, open: true })
+      }
+    },
+    reflect: { get: (name) => services[name] },
+    inject(deps, cb) {
+      if (deps.every((d) => services[d] !== undefined)) {
+        cb(Object.assign(Object.create(ctx), services))
+      }
+    },
+  }
+  t.after(() => { while (disposers.length > 0) disposers.pop()() })
+
+  index.apply(ctx, { role: 'peer', autoShareNewSessions: true })
+  const onCreated = listeners.find((l) => l.event === 'agent/created')?.listener
+  onCreated({ agent: { id: 's1', session: { id: 's1', header: { version: 4, id: 's1', createdAt: Date.now(), isSeeded: false } } }, source: 'startup' })
+  const zrService = provides.find((p) => p.name === 'zenRemote')?.val
+  disposers.push(zrService.bridge({
+    plugin: 'entry-url-panel',
+    version: '1.0.0',
+    routes: [{ path: '/panel/ping', scope: 'server', methods: ['GET'] }],
+  }))
+  const relayEntry = webRoutes.find((r) => r.kind === 'prefix' && r.path === '/_dsh/zen-remote/relay')
+  const secret = pluginCalls.find((c) => typeof c.cfg?.relaySecret === 'string' && c.cfg.relaySecret.length > 0).cfg.relaySecret
+
+  const relaySrv = http.createServer((req, res) => { void relayEntry.handler(req, res) })
+  const relayBase = await listen(relaySrv)
+  t.after(() => { relaySrv.closeAllConnections(); return close(relaySrv) })
+
+  const hsRes = await fetch(`${relayBase}/_dsh/zen-remote/relay/v1/handshake`, {
+    method: 'POST',
+    headers: {
+      'x-zen-remote-secret': secret,
+      'x-zen-remote-via': 'gateway',
+      'x-zen-remote-role': 'desktop-client',
+      'x-zen-remote-device': 'peer:abcd1234',
+      'content-type': 'application/json',
+    },
+    body: '{}',
+  })
+  assert.equal(hsRes.status, 200)
+  const hsBody = await hsRes.json()
+
+  const res = await fetch(`${relayBase}/_dsh/zen-remote/relay/v1/plugin`, {
+    method: 'POST',
+    headers: {
+      'x-zen-remote-secret': secret,
+      'x-zen-remote-via': 'gateway',
+      'x-zen-remote-role': 'desktop-client',
+      'x-zen-remote-device': 'peer:abcd1234',
+      'x-zr-plugin': 'entry-url-panel',
+      'x-zr-plugin-version': '1.0.0',
+      'x-zr-plugin-digest': hsBody.plugins['entry-url-panel'].digest,
+      'x-zr-method': 'GET',
+      'x-zr-path': '/panel/ping',
+      'x-zr-query': 'sessionId=s1',
+    },
+  })
+  assert.equal(res.status, 200)
+  assert.deepEqual(await res.json(), { ok: true, from: 'loopback-entry-url' })
+})

@@ -92,6 +92,7 @@ import { createVerificationManager } from './wizard/verify.js'
 import type { BridgeDeclaration, BridgeRegistry, BridgeStatus, ServerPluginEntry, ZenRemoteService } from './plugin-bridge.js'
 import { createPluginLoopback } from './plugin-loopback.js'
 import { createPluginTunnel } from './plugin-tunnel.js'
+import { resolveUpstreamTokenUrl } from './upstream-token.js'
 import { createLogRing, createPluginLog } from './log-ring.js'
 import { DEFAULT_MAX_UPLOAD_BYTES } from './upload-limits.js'
 import { applyUnshadowedRowKeys, clearUnshadowedRowKeys, writeCliConfig } from './cli/config-writer.js'
@@ -1447,12 +1448,9 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           return { protocol: webServer?.protocol === 'https:' ? ('https:' as const) : ('http:' as const), port }
         }
         const getTokenUrl = () => {
-          const connection = relayCtx.reflect.get('connection') as
-            | { authenticatedUrl?: (base: string) => string | undefined }
-            | undefined
-          if (typeof connection?.authenticatedUrl !== 'function') return undefined
+          const webServerObj = relayCtx.reflect.get('webServer')
           const { protocol, port } = getLoopbackTarget()
-          return connection.authenticatedUrl(`${protocol}//127.0.0.1:${port}`)
+          return resolveUpstreamTokenUrl(relayCtx, webServerObj, `${protocol}//127.0.0.1:${port}`)
         }
         // One loopback executor for BOTH plugin halves (the HTTP forward and
         // the PB-10 tunnel): a single cookie cache behind two consumers.
