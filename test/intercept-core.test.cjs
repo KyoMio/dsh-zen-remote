@@ -2603,3 +2603,94 @@ test('PR78-3: mergedMultiSnapshotStream reattaches when a re-paired RelayClient 
   localGate.finish()
   handle.uninstall()
 })
+
+test('PR78-R3-L1: mergedMultiSnapshotStream skips reopen after forbidden-method until host reconnects or handshake changes', async () => {
+  const gateway = new FakeTypertGateway()
+  const localGate = createGate()
+  const origOpen = gateway.openWireStream.bind(gateway)
+  gateway.openWireStream = (endpoint, ...rest) =>
+    endpoint === 'sessionStatus/follow' ? localGate.iterable : origOpen(endpoint, ...rest)
+
+  const relay = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '11111111', serverName: 'S-old', dshVersion: '0.2.1-rc.5', fingerprints: {} },
+  })
+  const origOpenStream = relay.openStream.bind(relay)
+  let openAttempts = 0
+  let rejectUnsupported = true
+  relay.openStream = (namespace, method, args, signal, options) => {
+    if (namespace === 'sessionStatus' && method === 'follow') {
+      openAttempts += 1
+      if (rejectUnsupported) {
+        return (async function* () {
+          throw new RelayError('forbidden-method', 'forbidden method', 403)
+        })()
+      }
+    }
+    return origOpenStream(namespace, method, args, signal, options)
+  }
+
+  const scheduledTimers = []
+  const poolEntries = [
+    { id: 'e1', serverId: '11111111', serverName: 'S-old', displayName: 'S-old', client: relay },
+  ]
+  const pool = {
+    entries: () => poolEntries,
+    getByServerId: (sid) => poolEntries.find((e) => e.serverId === sid),
+  }
+  const handle = installIntercept({
+    raw: gateway,
+    pool,
+    getServerId: () => undefined,
+    clock: {
+      now: () => 0,
+      setTimeout: (fn) => { scheduledTimers.push(fn); return scheduledTimers.length },
+      clearTimeout: () => {},
+      random: () => 0.5,
+    },
+    log: () => {},
+  })
+
+  const controller1 = new AbortController()
+  const stream1 = await gateway.wireTap('sessionStatus/follow', { args: {} }, undefined, gateway.operatorPeer(), controller1.signal, { signal: controller1.signal })
+  const iter1 = stream1[Symbol.asyncIterator]()
+  localGate.push({ type: 'baseline', items: [] })
+  assert.deepEqual((await iter1.next()).value, { type: 'baseline', items: [] })
+
+  await waitUntil(() => openAttempts === 1)
+  await new Promise((r) => setTimeout(r, 25))
+  assert.equal(scheduledTimers.length, 0, 'forbidden-method must not arm a reopen timer')
+  assert.equal(handle.diagnostics().recentFailures.some((f) => f.code === 'forbidden-method'), false)
+
+  // Heartbeat while remaining online must NOT clear unsupported cache or re-probe
+  relay.transition('online')
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(openAttempts, 1)
+
+  // Second subscription on the same still-online connection skips probing immediately
+  const controller2 = new AbortController()
+  const stream2 = await gateway.wireTap('sessionStatus/follow', { args: {} }, undefined, gateway.operatorPeer(), controller2.signal, { signal: controller2.signal })
+  const iter2 = stream2[Symbol.asyncIterator]()
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(openAttempts, 1)
+
+  // Reconnect after going offline clears unsupported cache and re-probes once
+  rejectUnsupported = false
+  relay.transition('offline')
+  relay.handshakeInfo = { relayProtocol: 1, serverId: '11111111', serverName: 'S-new', dshVersion: '0.2.3-alpha.2', fingerprints: { sessionStatus: 1 } }
+  relay.transition('online')
+
+  await waitUntil(() => openAttempts >= 2)
+  const upgradedRec = { sessionId: 's-1', completedTurn: 1, failed: false, readTurn: 0, manualUnread: false }
+  const activeRemote = relay.streams[relay.streams.length - 1]
+  activeRemote.gate.push({ type: 'baseline', items: [upgradedRec] })
+  assert.deepEqual((await iter1.next()).value, {
+    type: 'changed',
+    state: { ...upgradedRec, sessionId: toVirtual('11111111', 's-1') },
+  })
+
+  controller1.abort()
+  controller2.abort()
+  void iter2.return?.()
+  localGate.finish()
+  handle.uninstall()
+})

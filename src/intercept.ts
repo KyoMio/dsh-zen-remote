@@ -3520,6 +3520,9 @@ interface MultiSnapshotStreamDeps {
   clock: RelayClock
   watchUninstall: (fn: () => void) => () => void
   watchPool?: (fn: () => void) => () => void
+  isEndpointUnsupported?: (client: RelayClient, endpoint: string) => boolean
+  markEndpointUnsupported?: (client: RelayClient, endpoint: string) => void
+  clearUnsupported?: (client: RelayClient) => void
 }
 
 /**
@@ -3528,7 +3531,22 @@ interface MultiSnapshotStreamDeps {
  * (keyed by `entry.serverId`).
  */
 async function* mergedMultiSnapshotStream(deps: MultiSnapshotStreamDeps): AsyncGenerator<unknown, void, undefined> {
-  const { namespace, method, endpoint, createMerger, local, singleRelay, pool, signal, recordFailure, log, clock } = deps
+  const {
+    namespace,
+    method,
+    endpoint,
+    createMerger,
+    local,
+    singleRelay,
+    pool,
+    signal,
+    recordFailure,
+    log,
+    clock,
+    isEndpointUnsupported,
+    markEndpointUnsupported,
+    clearUnsupported,
+  } = deps
   if (signal?.aborted === true) return
   const merger = createMerger()
   const channel = createFrameChannel()
@@ -3570,12 +3588,13 @@ async function* mergedMultiSnapshotStream(deps: MultiSnapshotStreamDeps): AsyncG
   const pumpSlot = async (slot: ForgeSlot): Promise<void> => {
     try {
       while (alive && !slot.removed) {
-        if (slot.client.state !== 'online') {
+        if (slot.client.state !== 'online' || isEndpointUnsupported?.(slot.client, endpoint) === true) {
           await waitAny()
           continue
         }
         const controller = new AbortController()
         slot.controller = controller
+        let unsupported = false
         try {
           const stream = slot.client.openStream(namespace, method, {}, controller.signal)
           let served = false
@@ -3588,13 +3607,20 @@ async function* mergedMultiSnapshotStream(deps: MultiSnapshotStreamDeps): AsyncG
             pushAll(merger.onRemote(slot.serverId, frame))
           }
         } catch (error) {
-          if (alive && !slot.removed && !controller.signal.aborted && signal?.aborted !== true) {
+          if (error instanceof RelayError && error.code === 'forbidden-method') {
+            markEndpointUnsupported?.(slot.client, endpoint)
+            unsupported = true
+          } else if (alive && !slot.removed && !controller.signal.aborted && signal?.aborted !== true) {
             recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
           }
         } finally {
           if (slot.controller === controller) slot.controller = undefined
         }
         if (!alive || slot.removed) return
+        if (unsupported) {
+          await waitAny()
+          continue
+        }
         if (slot.client.state === 'online') {
           await waitReopen(clock, waitAny, slot.reopenDelayMs)
           slot.reopenDelayMs = Math.min(slot.reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS)
@@ -3620,9 +3646,11 @@ async function* mergedMultiSnapshotStream(deps: MultiSnapshotStreamDeps): AsyncG
       slot.offState = client.subscribe((state) => {
         try {
           if (state === 'unpaired' || state === 'revoked') {
+            clearUnsupported?.(client)
             slot.controller?.abort()
             pushAll(merger.onRemoteGone(serverId))
           } else if (state === 'offline' || state === 'connecting' || state === 'incompatible') {
+            clearUnsupported?.(client)
             slot.controller?.abort()
           }
         } finally {
@@ -6309,6 +6337,41 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     return { args: { ...args, request: { ...request, provider: providerParts.id } } }
   }
 
+  const unsupportedEndpoints = new WeakMap<
+    RelayClient,
+    { dshVersion: string | undefined; fingerprints: unknown; endpoints: Set<string> }
+  >()
+  const clearUnsupported = (client: RelayClient): void => {
+    unsupportedEndpoints.delete(client)
+  }
+  const isEndpointUnsupported = (client: RelayClient, endpoint: string): boolean => {
+    if (client.state !== 'online') {
+      unsupportedEndpoints.delete(client)
+      return false
+    }
+    const entry = unsupportedEndpoints.get(client)
+    if (entry === undefined) return false
+    const info = client.handshakeInfo
+    if (info?.dshVersion !== entry.dshVersion || info?.fingerprints !== entry.fingerprints) {
+      unsupportedEndpoints.delete(client)
+      return false
+    }
+    return entry.endpoints.has(endpoint)
+  }
+  const markEndpointUnsupported = (client: RelayClient, endpoint: string): void => {
+    const info = client.handshakeInfo
+    let entry = unsupportedEndpoints.get(client)
+    if (
+      entry === undefined ||
+      info?.dshVersion !== entry.dshVersion ||
+      info?.fingerprints !== entry.fingerprints
+    ) {
+      entry = { dshVersion: info?.dshVersion, fingerprints: info?.fingerprints, endpoints: new Set() }
+      unsupportedEndpoints.set(client, entry)
+    }
+    entry.endpoints.add(endpoint)
+  }
+
   /**
    * Non-owner peers (e.g. LiveShare viewers) must never ride Zen Remote's
    * owner-credential forwarding or receive merged remote server streams; they
@@ -6518,6 +6581,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             log,
             clock,
             watchUninstall,
+            isEndpointUnsupported,
+            markEndpointUnsupported,
+            clearUnsupported,
           })
         })()
       }
