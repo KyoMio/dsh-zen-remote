@@ -1131,3 +1131,47 @@ test('MS-4: a WebSocket upgrade opens its tunnel on its own server\'s relay; an 
     await h.stop()
   }
 })
+
+test('D23-2: wrappedMatch adapter branch preserves original auth and omits absent auth', () => {
+  const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
+  const { createBridgeRegistry } = require('../lib/plugin-bridge.js')
+  const { normalizeAdapter } = require('../lib/plugin-adapter-core.js')
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  const noop = () => {}
+  exact.set('/adapted/anon', { kind: 'exact', path: '/adapted/anon', auth: 'anonymous', handler: noop })
+  exact.set('/adapted/deny', { kind: 'exact', path: '/adapted/deny', auth: 'deny', handler: noop })
+  exact.set('/adapted/plain', { kind: 'exact', path: '/adapted/plain', handler: noop })
+
+  const adapter = normalizeAdapter({
+    plugin: 'adapted-auth',
+    versions: ['1.0.0'],
+    routes: [
+      { path: '/adapted/anon', match: 'exact', locator: { in: 'query', name: 'sessionId' } },
+      { path: '/adapted/deny', match: 'exact', locator: { in: 'query', name: 'sessionId' } },
+      { path: '/adapted/plain', match: 'exact', locator: { in: 'query', name: 'sessionId' } },
+    ],
+  }, '1.0.0')
+
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry: createBridgeRegistry(),
+    adapters: [adapter],
+    relay: {},
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'adapted-auth', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  try {
+    assert.equal(webServer.match('/adapted/anon').auth, 'anonymous')
+    assert.equal(webServer.match('/adapted/deny').auth, 'deny')
+    assert.equal('auth' in webServer.match('/adapted/plain'), false)
+  } finally {
+    handle.uninstall()
+  }
+})

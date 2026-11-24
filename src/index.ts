@@ -579,6 +579,11 @@ export async function handleUpload(
   }
 }
 
+/** WebRoute extended with DSH 0.2.2-rc.2+ `auth` policy (ignored on older hosts). */
+type WebRouteWithAuth = Parameters<Context['webServer']['register']>[0] & {
+  auth?: 'anonymous' | 'required' | 'deny'
+}
+
 /**
  * Wrap `connection.admit(req)` in an optional `connection.authentication` sub-fiber
  * so Cordis 4.2 permits nested service reads on DSH >=0.2.2-rc.2 without blocking
@@ -1522,11 +1527,16 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
             }),
           },
         })
-        const unregister = relayCtx.webServer.register({
+        const relayRoute: WebRouteWithAuth = {
           kind: 'prefix',
           path: RELAY_PREFIX,
+          // Gateway and peer-tunnel relay requests carry `x-zen-remote-secret`
+          // rather than DSH browser cookies; `WebServer`'s `anonymous` policy
+          // still enforces Host/Origin checks while older hosts ignore `auth`.
+          auth: 'anonymous',
           handler,
-        })
+        }
+        const unregister = relayCtx.webServer.register(relayRoute)
         // Publish the handler for the admin shares route's viewer counts
         // (T33a2) BEFORE the route is reachable, so no request can hit a
         // mounted route with an unpublished handler.
@@ -2406,9 +2416,10 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
   // per request through unwrapVolatile, so an edit lands without waiting for
   // a row reload.
   ctx.inject(['webServer'], (webCtx) => {
-    webCtx.effect(() => webCtx.webServer.register({
+    const configRoute: WebRouteWithAuth = {
       kind: 'exact',
       path: CLIENT_CONFIG_ROUTE,
+      auth: 'required',
       handler: (req, res) => {
         if (req.method !== 'GET') {
           res.setHeader('Allow', 'GET')
@@ -2425,7 +2436,8 @@ export function apply(ctx: Context, config: MobileNavConfig = {}): void {
           ...clamped('keyboardSafetyPadPx', unwrapVolatile(config.keyboardSafetyPadPx) as number | undefined, 0, 200),
         })
       },
-    }), 'dsh-mobile-nav: client config route')
+    }
+    webCtx.effect(() => webCtx.webServer.register(configRoute), 'dsh-mobile-nav: client config route')
   })
   // Share-image transcript route (issue #7): needs the sessionQuery service
   // every standard dsh-base composition provides, plus the connection

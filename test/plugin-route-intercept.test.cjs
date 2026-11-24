@@ -727,3 +727,60 @@ test('T4 refusal log throttling: refusalLogWindowMs=0 disables throttling', asyn
   assert.equal(debugs.filter((entry) => entry.format.includes('refused for')).length, 0)
   assert.equal(handle.diagnostics().refused, 3)
 })
+
+test('D23-2: wrappedMatch and wrappedUpgradesGet preserve original auth without synthesizing absent auth', () => {
+  const exact = new Map()
+  const prefixes = new Map()
+  const upgrades = new Map()
+  const webServer = {
+    exact,
+    prefixes,
+    upgrades,
+    match(pathname) {
+      return exact.get(pathname) ?? prefixes.get(pathname)
+    },
+  }
+  const noop = () => {}
+  exact.set('/panel/anon', { kind: 'exact', path: '/panel/anon', auth: 'anonymous', handler: noop })
+  exact.set('/panel/deny', { kind: 'exact', path: '/panel/deny', auth: 'deny', handler: noop })
+  exact.set('/panel/plain', { kind: 'exact', path: '/panel/plain', handler: noop })
+  upgrades.set('/panel/ws-anon', { path: '/panel/ws-anon', auth: 'anonymous', handler: noop })
+  upgrades.set('/panel/ws-deny', { path: '/panel/ws-deny', auth: 'deny', handler: noop })
+  upgrades.set('/panel/ws-plain', { path: '/panel/ws-plain', handler: noop })
+
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'auth-panel',
+    version: '1.0.0',
+    routes: [
+      { path: '/panel/anon', scope: 'session' },
+      { path: '/panel/deny', scope: 'session' },
+      { path: '/panel/plain', scope: 'session' },
+      { path: '/panel/ws-anon', scope: 'session', upgrade: true },
+      { path: '/panel/ws-deny', scope: 'session', upgrade: true },
+      { path: '/panel/ws-plain', scope: 'session', upgrade: true },
+    ],
+  })
+
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay: {},
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'auth-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  try {
+    assert.equal(webServer.match('/panel/anon').auth, 'anonymous')
+    assert.equal(webServer.match('/panel/deny').auth, 'deny')
+    const plainMatch = webServer.match('/panel/plain')
+    assert.equal('auth' in plainMatch, false, 'must not fabricate auth when original route omits it')
+
+    assert.equal(webServer.upgrades.get('/panel/ws-anon').auth, 'anonymous')
+    assert.equal(webServer.upgrades.get('/panel/ws-deny').auth, 'deny')
+    const plainUpgrade = webServer.upgrades.get('/panel/ws-plain')
+    assert.equal('auth' in plainUpgrade, false, 'must not fabricate auth when original upgrade omits it')
+  } finally {
+    handle.uninstall()
+  }
+})

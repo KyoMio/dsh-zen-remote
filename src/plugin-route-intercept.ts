@@ -1654,11 +1654,15 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     const route = savedMatch.call(this, pathname)
     if (!installed) return route
     if (typeof pathname !== 'string' || !pathname.startsWith('/')) return route
+    const authProp = isRecord(route) && 'auth' in route && route.auth !== undefined
+      ? { auth: route.auth }
+      : {}
     const adapterHit = adapterRouteOf(pathname)
     if (adapterHit !== undefined) {
       return {
         kind: 'exact',
         path: pathname,
+        ...authProp,
         handler: adapterSurrogateHandler(adapterHit, handlerOf(route)),
       }
     }
@@ -1667,6 +1671,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       return {
         kind: 'exact',
         path: pathname,
+        ...authProp,
         handler: surrogateHandler(declared, handlerOf(route)),
       }
     }
@@ -2367,8 +2372,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     const originalHandler = entry !== undefined && isRecord(entry) && typeof (entry as { handler?: unknown }).handler === 'function'
       ? (entry as { handler: unknown }).handler
       : undefined
+    const authProp = entry !== undefined && isRecord(entry) && 'auth' in entry && entry.auth !== undefined
+      ? { auth: entry.auth }
+      : {}
     return {
       path: pathname,
+      ...authProp,
       handler: surrogateUpgrade(declared, originalHandler),
     }
   } as unknown as typeof targetWithUpgrades.upgrades.get

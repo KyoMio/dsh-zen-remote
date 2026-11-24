@@ -446,7 +446,12 @@ test('T22a: the host role registers the relay prefix route and mints a fresh 64-
   const relay = first.routes.find((r) => r.path === RELAY_PREFIX)
   assert.ok(relay, 'the relay route is registered as a prefix route')
   assert.equal(relay.path, '/_dsh/zen-remote/relay')
+  assert.equal(relay.auth, 'anonymous', 'D23-2: relay route declares auth: anonymous for 0.2.2-rc.2+ WebServer')
   assert.equal(typeof relay.handler, 'function')
+  // Simulate DSH 0.2.2-rc.2+ WebServer auth policy default ('required' when omitted):
+  // anonymous lets secret-bearing requests without browser cookies reach relay.handler.
+  const effectivePolicy = relay.auth ?? 'required'
+  assert.equal(effectivePolicy, 'anonymous')
   const gwConfig = first.plugins.find((c) => c.module.name === 'dsh-zen-remote-gateway').config
   assert.match(gwConfig.relaySecret, /^[0-9a-f]{64}$/, 'the gateway sub-plugin carries a 64-hex relaySecret')
   const pushConfig = first.plugins.find((c) => c.module.name === 'dsh-zen-remote-push').config
@@ -516,6 +521,30 @@ test('T22a-fix: the minted relaySecret opens the registered relay handler, a wro
   assert.equal(wrong.status, 401, 'any other secret is refused')
   const absent = await call(undefined)
   assert.equal(absent.status, 401, 'no secret is refused')
+
+  // Simulate DSH 0.2.2-rc.2+ WebServer default auth policy ('required' when omitted):
+  // a cookie-less request carrying x-zen-remote-secret reaches relayRoute (anonymous)
+  // while CLIENT_CONFIG_ROUTE (required) rejects cookie-less requests with 401.
+  const dispatchWithWebAuth = async (route, req) => {
+    const policy = route.auth ?? 'required'
+    const res = fakeRes()
+    if (policy === 'required' && !req.headers.cookie) {
+      res.writeHead(401)
+      res.end('unauthorized')
+      return res
+    }
+    await route.handler(req, res)
+    return res
+  }
+  const relayThroughGate = await dispatchWithWebAuth(relayRoute, {
+    method: 'GET',
+    url: '/_dsh/zen-remote/relay/ping',
+    headers: { 'x-zen-remote-via': 'gateway', 'x-zen-remote-role': 'desktop-client', 'x-zen-remote-device': 'dev-1', 'x-zen-remote-secret': secret },
+  })
+  assert.equal(relayThroughGate.status, 200)
+  const configRoute = record.routes.find((r) => r.path === index.CLIENT_CONFIG_ROUTE)
+  const configThroughGate = await dispatchWithWebAuth(configRoute, { method: 'GET', url: index.CLIENT_CONFIG_ROUTE, headers: {} })
+  assert.equal(configThroughGate.status, 401)
 })
 
 // ---- T22c: activity tracking wiring ------------------------------------------
@@ -1275,6 +1304,7 @@ test('T17: the client-config route re-reads volatile row fields and the effectiv
   index.apply(ctx, row)
   const route = routes.find((r) => r.path === index.CLIENT_CONFIG_ROUTE)
   assert.ok(route, 'the client-config route mounts with just a webServer')
+  assert.equal(route.auth, 'required', 'D23-2: client-config route declares auth: required')
   const server = http.createServer((req, res) => { void route.handler(req, res) })
   const base = await listen(server)
   try {
