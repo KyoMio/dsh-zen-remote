@@ -127,6 +127,8 @@ const T53_TARGETS = [
   '[data-sidebar-right-guide-entry="sidechat"]',
   '[data-sidebar-right-guide-entry="files"]:not([aria-keyshortcuts])',
   '[data-dsh-dock-fallback]',
+  '[data-dsh-guide-grid="true"] [class$="_moreSlot"]:has([data-guide-more="true"])',
+  '[data-dsh-guide-grid="true"] [data-guide-more="true"]',
 ]
 
 test('PB-14: every T53 rule sits behind the bridge stamp and fires only while unbridged', () => {

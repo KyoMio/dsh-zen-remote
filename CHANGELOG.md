@@ -8,7 +8,7 @@
 
 ### 优化
 
-- **适配 DSH-better-sidebar 0.33.0**：线面与 0.30.0 代逐字相同（同一 digest `394de9f588d37092`），列入已验证版本。其准入改造（`requestRejection` 优先、缺席走 `connection.authentication` 子 fiber 里的 `admit`）不改桥接面——循环回传操作员凭据在两条支路都满足。上游把安装下限抬到 DSH `>=0.2.2-rc.3`（`engines.dsh`），更老宿主停在 0.30.x 仍照常桥接，故我们的 `engines.dsh` 下限不动。
+- **适配 DSH-better-sidebar 0.33.0**：线面与 0.30.0 代逐字相同（同一 digest `394de9f588d37092`），列入已验证版本。其准入改造（`requestRejection` 优先、缺席走 `connection.authentication` 子 fiber 里的 `admit`）不改桥接面——循环回传操作员凭据在两条支路都满足。上游把安装下限抬到 DSH `>=0.2.2-rc.3`（`engines.dsh`），更老宿主停在 0.30.x 仍照常桥接，故我们的 `engines.dsh` 下限不动。同时补齐两项细节：适配器响应头白名单一并透传 `x-content-type-options` 与 `referrer-policy`，未桥接的远程会话也隐藏 0.33.0 起始页接管的「更多」菜单入口。
 
 ## 2.5.5（2026-11-23）
 

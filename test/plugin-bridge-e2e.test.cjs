@@ -937,6 +937,8 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
       res.writeHead(200, {
         'content-type': 'text/html; charset=utf-8',
         'content-security-policy': 'sandbox allow-scripts allow-popups allow-downloads allow-modals; object-src \'none\'',
+        'x-content-type-options': 'nosniff',
+        'referrer-policy': 'no-referrer',
       })
       res.end('<html><body>preview</body></html>')
       return
@@ -1083,10 +1085,12 @@ test('e2e PB-12: the better-sidebar adapter reads, writes and serves the html pr
     assert.equal(dshHits[1].body.cwd, undefined, 'the server hook stripped the cwd before the loopback')
     assert.equal(dshHits[1].body.message, 'ship it')
 
-    // HTML: the segment id rewrites, and the CSP header survives the hop.
+    // HTML: the segment id rewrites, and the CSP + hardening headers survive the hop.
     const html = await fetch(`http://127.0.0.1:${subPort}/sidebar/html/${encodeURIComponent(virtual)}/index.html`)
     assert.equal(html.status, 200)
     assert.match(html.headers.get('content-security-policy') ?? '', /sandbox allow-scripts/, 'the CSP sandbox travelled')
+    assert.equal(html.headers.get('x-content-type-options'), 'nosniff', 'nosniff header travelled')
+    assert.equal(html.headers.get('referrer-policy'), 'no-referrer', 'referrer-policy header travelled')
     assert.equal((await html.text()).includes('preview'), true)
     assert.equal(dshHits[2].sessionId, 'session-a', 'the html segment arrived as the REAL id')
 
