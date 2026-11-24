@@ -20,6 +20,7 @@ const {
   createForgeStatesState,
   filterWorkspaceValueResult,
   filterSessionSearchResult,
+  filterSessionStatusFrame,
 } = require('../lib/relay-filter.js')
 
 const yes = () => true
@@ -422,4 +423,47 @@ test('API-6 filterWorkspaceValueResult & filterSessionSearchResult: drop unshare
     items: [{ sessionId: 's-shared', snippet: 'ok' }],
     hasMore: true,
   })
+})
+
+test('D23-5 filterSessionStatusFrame: filters baseline/changed by accessibility and maintains unfiltered cache', () => {
+  const shared = new Set(['s-shared'])
+  const isAccessible = (id) => shared.has(id)
+  const cache = new Map()
+
+  const r1 = { sessionId: 's-shared', completedTurn: 2, failed: false, readTurn: 1, manualUnread: false }
+  const r2 = { sessionId: 's-secret', completedTurn: 3, failed: true, readTurn: 0, manualUnread: true }
+  const r3 = { sessionId: 's-other', completedTurn: 1, failed: false, readTurn: 1, manualUnread: false }
+
+  const baseOut = filterSessionStatusFrame(snapshot({ type: 'baseline', items: [r1, r2, 'bad-row'] }), isAccessible, cache)
+  assert.deepEqual(baseOut, { type: 'baseline', items: [r1] })
+  assert.deepEqual([...cache.keys()], ['s-shared', 's-secret'])
+  assert.deepEqual(cache.get('s-secret'), r2)
+
+  // Unshared changed is suppressed from wire output, yet updates cache
+  const r2v2 = { ...r2, completedTurn: 4, failed: false }
+  assert.equal(filterSessionStatusFrame(snapshot({ type: 'changed', state: r2v2 }), isAccessible, cache), undefined)
+  assert.deepEqual(cache.get('s-secret'), r2v2)
+
+  // Shared changed passes through and updates cache
+  const r1v2 = { ...r1, readTurn: 2 }
+  assert.deepEqual(
+    filterSessionStatusFrame(snapshot({ type: 'changed', state: r1v2 }), isAccessible, cache),
+    { type: 'changed', state: r1v2 },
+  )
+  assert.deepEqual(cache.get('s-shared'), r1v2)
+
+  // New baseline replaces cache
+  const r3v1 = { ...r3 }
+  assert.deepEqual(
+    filterSessionStatusFrame(snapshot({ type: 'baseline', items: [r3v1] }), only(['s-other']), cache),
+    { type: 'baseline', items: [r3v1] },
+  )
+  assert.deepEqual([...cache.keys()], ['s-other'])
+
+  // Malformed frames return undefined without touching cache
+  assert.equal(filterSessionStatusFrame(null, yes, cache), undefined)
+  assert.equal(filterSessionStatusFrame({ type: 'unknown' }, yes, cache), undefined)
+  assert.equal(filterSessionStatusFrame({ type: 'baseline', items: 'bad' }, yes, cache), undefined)
+  assert.equal(filterSessionStatusFrame({ type: 'changed', state: { sessionId: '' } }, yes, cache), undefined)
+  assert.deepEqual([...cache.keys()], ['s-other'])
 })

@@ -100,6 +100,7 @@ export const FINGERPRINT_GROUP_PACKAGES: Readonly<Record<string, string>> = {
   actionCards: '@deepseek-ai/dsh-action-cards',
   trajectory: '@deepseek-ai/dsh-client-ui-trajectory',
   forge: '@deepseek-ai/dsh-experimental-client-ui-forge',
+  sessionStatus: '@deepseek-ai/dsh-client-ui-session-status',
 }
 
 /** Length of a fingerprint hex string (excluding the algorithm prefix). */

@@ -104,6 +104,7 @@ import {
   composeMergedWorkspaceFrames,
   createControlMerger,
   createForgeStatesMerger,
+  createSessionStatusMerger,
   createWorkspaceMerger,
   localWorkspaceLists,
   mergeAgentPresetRosters,
@@ -288,10 +289,11 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'agentPresets/read': [],
   // workspace — the global follow stream, merged like the two session/* reads
   'workspace/follow': [],
-  // forgePanel — 31 session-scoped endpoints (top-level sessionId) + 1 global stream
+  // forgePanel — 35 session-scoped endpoints (top-level sessionId) + 1 global stream
   'forgePanel/follow': ['sessionId'],
   'forgePanel/branches': ['sessionId'],
   'forgePanel/diffBases': ['sessionId'],
+  'forgePanel/worktreeBases': ['sessionId'],
   'forgePanel/localCommits': ['sessionId'],
   'forgePanel/localDiff': ['sessionId'],
   'forgePanel/localText': ['sessionId'],
@@ -302,6 +304,7 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'forgePanel/changeRequestText': ['sessionId'],
   'forgePanel/changeRequestViewed': ['sessionId'],
   'forgePanel/reviewerCandidates': ['sessionId'],
+  'forgePanel/changesLens': ['sessionId'],
   'forgePanel/requestWorktree': ['sessionId'],
   'forgePanel/cancelWorktree': ['sessionId'],
   'forgePanel/continueInProject': ['sessionId'],
@@ -310,10 +313,12 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'forgePanel/stopCreation': ['sessionId'],
   'forgePanel/worktreeCleanup': ['sessionId'],
   'forgePanel/refresh': ['sessionId'],
+  'forgePanel/revisit': ['sessionId'],
   'forgePanel/track': ['sessionId'],
   'forgePanel/dismiss': ['sessionId'],
   'forgePanel/setFileViewed': ['sessionId'],
   'forgePanel/changeRequestReviewWrite': ['sessionId'],
+  'forgePanel/reviewStage': ['sessionId'],
   'forgePanel/submitReview': ['sessionId'],
   'forgePanel/requestReviews': ['sessionId'],
   'forgePanel/rerunChecks': ['sessionId'],
@@ -321,6 +326,9 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'forgePanel/updateBranch': ['sessionId'],
   'forgePanel/merge': ['sessionId'],
   'forgePanel/changeRequestStates': [],
+  // sessionStatus (0.2.3) — per-session reading mark & global follow stream
+  'sessionStatus/mark': ['sessionId'],
+  'sessionStatus/follow': [],
   // The forwarded-event subscription (T32): the client reaches it through
   // relay.openStream('$zr','events') directly, never through the local
   // gateway — the empty fields entry exists to keep the two tables pinned
@@ -444,10 +452,11 @@ export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
   'terminal/retain',
   // 0.2.2-rc.2: live Agent-terminal roster (WebTerminalInfo[]); read-only.
   'terminal/watch',
-  // forgePanel: follow stream + 12 unary reads + global PR badge stream
+  // forgePanel: follow/changesLens streams + 14 unary reads + global PR badge stream
   'forgePanel/follow',
   'forgePanel/branches',
   'forgePanel/diffBases',
+  'forgePanel/worktreeBases',
   'forgePanel/localCommits',
   'forgePanel/localDiff',
   'forgePanel/localText',
@@ -458,7 +467,11 @@ export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
   'forgePanel/changeRequestText',
   'forgePanel/changeRequestViewed',
   'forgePanel/reviewerCandidates',
+  'forgePanel/revisit',
+  'forgePanel/changesLens',
   'forgePanel/changeRequestStates',
+  // sessionStatus (0.2.3): global reading-state follow stream
+  'sessionStatus/follow',
   // Global search & agent preset reads
   'session/search',
   'agentPresets/list',
@@ -3487,7 +3500,17 @@ async function* mergedGlobalStreamMulti(deps: MergedGlobalStreamMultiDeps): Asyn
   }
 }
 
-interface ForgeStatesStreamDeps {
+interface MultiSnapshotMerger {
+  onLocal(frame: unknown): unknown[]
+  onRemote(serverId: string, frame: unknown): unknown[]
+  onRemoteGone(serverId: string): unknown[]
+}
+
+interface MultiSnapshotStreamDeps {
+  namespace: string
+  method: string
+  endpoint: string
+  createMerger: () => MultiSnapshotMerger
   local: AsyncIterable<unknown>
   singleRelay?: RelayClient
   pool?: RelayPool
@@ -3497,16 +3520,35 @@ interface ForgeStatesStreamDeps {
   clock: RelayClock
   watchUninstall: (fn: () => void) => () => void
   watchPool?: (fn: () => void) => () => void
+  isEndpointUnsupported?: (client: RelayClient, endpoint: string) => boolean
+  markEndpointUnsupported?: (client: RelayClient, endpoint: string) => void
+  clearUnsupported?: (client: RelayClient) => void
 }
 
 /**
- * Merged `forgePanel/changeRequestStates` stream across local + single relay or
- * multi-server pool (keyed by `entry.serverId`).
+ * Merged global snapshot stream (`forgePanel/changeRequestStates` or
+ * `sessionStatus/follow`) across local + single relay or multi-server pool
+ * (keyed by `entry.serverId`).
  */
-async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGenerator<unknown, void, undefined> {
-  const { local, singleRelay, pool, signal, recordFailure, log, clock } = deps
+async function* mergedMultiSnapshotStream(deps: MultiSnapshotStreamDeps): AsyncGenerator<unknown, void, undefined> {
+  const {
+    namespace,
+    method,
+    endpoint,
+    createMerger,
+    local,
+    singleRelay,
+    pool,
+    signal,
+    recordFailure,
+    log,
+    clock,
+    isEndpointUnsupported,
+    markEndpointUnsupported,
+    clearUnsupported,
+  } = deps
   if (signal?.aborted === true) return
-  const merger = createForgeStatesMerger()
+  const merger = createMerger()
   const channel = createFrameChannel()
   let alive = true
   const waiters: (() => void)[] = []
@@ -3546,14 +3588,15 @@ async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGener
   const pumpSlot = async (slot: ForgeSlot): Promise<void> => {
     try {
       while (alive && !slot.removed) {
-        if (slot.client.state !== 'online') {
+        if (slot.client.state !== 'online' || isEndpointUnsupported?.(slot.client, endpoint) === true) {
           await waitAny()
           continue
         }
         const controller = new AbortController()
         slot.controller = controller
+        let unsupported = false
         try {
-          const stream = slot.client.openStream('forgePanel', 'changeRequestStates', {}, controller.signal)
+          const stream = slot.client.openStream(namespace, method, {}, controller.signal)
           let served = false
           for await (const frame of stream) {
             if (!alive || slot.removed || controller.signal.aborted) break
@@ -3564,13 +3607,20 @@ async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGener
             pushAll(merger.onRemote(slot.serverId, frame))
           }
         } catch (error) {
-          if (alive && !slot.removed && !controller.signal.aborted && signal?.aborted !== true) {
-            recordFailure('forgePanel/changeRequestStates', error instanceof RelayError ? error.code : 'internal')
+          if (error instanceof RelayError && error.code === 'forbidden-method') {
+            markEndpointUnsupported?.(slot.client, endpoint)
+            unsupported = true
+          } else if (alive && !slot.removed && !controller.signal.aborted && signal?.aborted !== true) {
+            recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
           }
         } finally {
           if (slot.controller === controller) slot.controller = undefined
         }
         if (!alive || slot.removed) return
+        if (unsupported) {
+          await waitAny()
+          continue
+        }
         if (slot.client.state === 'online') {
           await waitReopen(clock, waitAny, slot.reopenDelayMs)
           slot.reopenDelayMs = Math.min(slot.reopenDelayMs * 2, REMOTE_REOPEN_MAX_MS)
@@ -3579,7 +3629,7 @@ async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGener
         await waitAny()
       }
     } catch (error) {
-      if (alive) log?.('forgePanel/changeRequestStates remote leg stopped: %s', messageOf(error))
+      if (alive) log?.('%s remote leg stopped: %s', endpoint, messageOf(error))
     }
   }
 
@@ -3596,9 +3646,11 @@ async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGener
       slot.offState = client.subscribe((state) => {
         try {
           if (state === 'unpaired' || state === 'revoked') {
+            clearUnsupported?.(client)
             slot.controller?.abort()
             pushAll(merger.onRemoteGone(serverId))
           } else if (state === 'offline' || state === 'connecting' || state === 'incompatible') {
+            clearUnsupported?.(client)
             slot.controller?.abort()
           }
         } finally {
@@ -3619,6 +3671,10 @@ async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGener
         const sid = entry.serverId
         if (sid === undefined) continue
         seen.add(sid)
+        const existing = slots.get(sid)
+        if (existing !== undefined && existing.client !== entry.client) {
+          removeSlot(sid)
+        }
         if (!slots.has(sid)) attachSlot(sid, entry.client)
       }
       for (const sid of [...slots.keys()]) {
@@ -6281,6 +6337,53 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     return { args: { ...args, request: { ...request, provider: providerParts.id } } }
   }
 
+  const unsupportedEndpoints = new WeakMap<
+    RelayClient,
+    { dshVersion: string | undefined; fingerprints: unknown; endpoints: Set<string> }
+  >()
+  const clearUnsupported = (client: RelayClient): void => {
+    unsupportedEndpoints.delete(client)
+  }
+  const isEndpointUnsupported = (client: RelayClient, endpoint: string): boolean => {
+    if (client.state !== 'online') {
+      unsupportedEndpoints.delete(client)
+      return false
+    }
+    const entry = unsupportedEndpoints.get(client)
+    if (entry === undefined) return false
+    const info = client.handshakeInfo
+    if (info?.dshVersion !== entry.dshVersion || info?.fingerprints !== entry.fingerprints) {
+      unsupportedEndpoints.delete(client)
+      return false
+    }
+    return entry.endpoints.has(endpoint)
+  }
+  const markEndpointUnsupported = (client: RelayClient, endpoint: string): void => {
+    const info = client.handshakeInfo
+    let entry = unsupportedEndpoints.get(client)
+    if (
+      entry === undefined ||
+      info?.dshVersion !== entry.dshVersion ||
+      info?.fingerprints !== entry.fingerprints
+    ) {
+      entry = { dshVersion: info?.dshVersion, fingerprints: info?.fingerprints, endpoints: new Set() }
+      unsupportedEndpoints.set(client, entry)
+    }
+    entry.endpoints.add(endpoint)
+  }
+
+  /**
+   * Non-owner peers (e.g. LiveShare viewers) must never ride Zen Remote's
+   * owner-credential forwarding or receive merged remote server streams; they
+   * fall through straight to DSH's own Gateway and remoteAccess checks.
+   */
+  const isNonOwnerPeer = (peer: unknown): boolean => {
+    if (!isPlainObject(peer)) return false
+    const principal = peer.principal
+    if (!isPlainObject(principal)) return false
+    return principal.kind !== 'owner'
+  }
+
   const wrappedDispatch = function wrappedDispatch(
     this: unknown,
     endpoint: string,
@@ -6291,7 +6394,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // An uninstalled wrap is INERT, not absent: another plugin may have
     // wrapped over us and kept a reference to this very function, so it must
     // degrade to a plain passthrough instead of forwarding anything.
-    if (!installed || interceptBypass.getStore() === true) {
+    if (!installed || interceptBypass.getStore() === true || isNonOwnerPeer(peer)) {
       return (chainTarget.dispatchRpc as (...callArgs: unknown[]) => unknown).call(raw, endpoint, payload, signal, peer)
     }
     counters.dispatchRpc += 1
@@ -6369,7 +6472,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
     // (undefined on older hosts and on the 5-argument wireStream.open path).
     uplinkWindow?: unknown,
   ): unknown {
-    if (!installed || interceptBypass.getStore() === true) {
+    if (!installed || interceptBypass.getStore() === true || isNonOwnerPeer(peer)) {
       return (chainTarget.openWireStream as (...callArgs: unknown[]) => unknown).call(
         raw,
         endpoint,
@@ -6448,7 +6551,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           lastFollowedSession = { kind: 'local' }
         }
       }
-      if (endpoint === 'forgePanel/changeRequestStates') {
+      if (endpoint === 'forgePanel/changeRequestStates' || endpoint === 'sessionStatus/follow') {
         if (probe !== undefined) {
           return (chainTarget.openWireStream as (...callArgs: unknown[]) => unknown).call(
             raw,
@@ -6462,10 +6565,15 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           )
         }
         const open = chainTarget.openWireStream as (this: unknown, ...callArgs: unknown[]) => unknown
+        const isSessionStatus = endpoint === 'sessionStatus/follow'
         return (async (): Promise<unknown> => {
           const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control, uplinkWindow)
           if (!isAsyncIterable(local)) return local
-          return mergedForgeStatesStream({
+          return mergedMultiSnapshotStream({
+            namespace: isSessionStatus ? 'sessionStatus' : 'forgePanel',
+            method: isSessionStatus ? 'follow' : 'changeRequestStates',
+            endpoint,
+            createMerger: isSessionStatus ? createSessionStatusMerger : createForgeStatesMerger,
             local,
             ...(pool !== undefined ? { pool, watchPool } : { singleRelay }),
             signal,
@@ -6473,6 +6581,9 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
             log,
             clock,
             watchUninstall,
+            isEndpointUnsupported,
+            markEndpointUnsupported,
+            clearUnsupported,
           })
         })()
       }

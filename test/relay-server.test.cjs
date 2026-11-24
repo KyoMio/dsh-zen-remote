@@ -73,6 +73,7 @@ function makeParts(name, overrides = {}) {
     ...(overrides.uploadCapBytes !== undefined ? { uploadCapBytes: overrides.uploadCapBytes } : {}),
     ...(overrides.drainDeadlineMs !== undefined ? { drainDeadlineMs: overrides.drainDeadlineMs } : {}),
     ...(overrides.drainSlackBytes !== undefined ? { drainSlackBytes: overrides.drainSlackBytes } : {}),
+    ...(overrides.compressFrame !== undefined ? { compressFrame: overrides.compressFrame } : {}),
   })
   return { handler, calls, streamCalls, gateway, store, home }
 }
@@ -2556,4 +2557,283 @@ test('Slice 3: POST /v1/invoke honors x-zr-if-version for binary methods and ski
     ),
   )
   assert.equal(unsharedRes.status, 403)
+})
+
+test('PR78-2: queued sessionStatus/follow frames are re-checked against share accessibility before write after unshare', async () => {
+  const { EventEmitter } = require('node:events')
+  const { Readable } = require('node:stream')
+
+  let pushFrame
+  let finishStream
+  const parts = makeParts('pr78-session-status-drain-gate', {
+    stream: async () => ({
+      [Symbol.asyncIterator]() {
+        const queue = []
+        let waiter = null
+        let done = false
+        pushFrame = (item) => {
+          if (waiter) {
+            const w = waiter
+            waiter = null
+            w({ value: item, done: false })
+          } else {
+            queue.push(item)
+          }
+        }
+        finishStream = () => {
+          done = true
+          if (waiter) {
+            const w = waiter
+            waiter = null
+            w({ value: undefined, done: true })
+          }
+        }
+        return {
+          next() {
+            if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false })
+            if (done) return Promise.resolve({ value: undefined, done: true })
+            return new Promise((resolve) => { waiter = resolve })
+          },
+          return() {
+            done = true
+            return Promise.resolve({ value: undefined, done: true })
+          },
+        }
+      },
+    }),
+  })
+  parts.store.share('session-b')
+
+  const req = Object.assign(
+    Readable.from([Buffer.from(JSON.stringify({ namespace: 'sessionStatus', method: 'follow', args: {} }))]),
+    {
+      method: 'POST',
+      url: '/_dsh/zen-remote/relay/v1/stream',
+      headers: { ...AUTH, 'content-type': 'application/json' },
+      socket: { remoteAddress: '127.0.0.1' },
+    },
+  )
+
+  const writes = []
+  let backpressured = true
+  let sawFirstFrame = null
+  const firstFrameWritten = new Promise((resolve) => { sawFirstFrame = resolve })
+  let finishedRes = null
+  const resDone = new Promise((resolve) => { finishedRes = resolve })
+
+  const res = Object.assign(new EventEmitter(), {
+    statusCode: 200,
+    headersSent: false,
+    writableEnded: false,
+    destroyed: false,
+    _headers: new Map(),
+    setHeader(k, v) { this._headers.set(k.toLowerCase(), v) },
+    getHeader(k) { return this._headers.get(k.toLowerCase()) },
+    flushHeaders() { this.headersSent = true },
+    writeHead(code) { this.statusCode = code; this.headersSent = true; return this },
+    write(chunk) {
+      const text = Buffer.isBuffer(chunk) ? chunk.toString('utf8') : String(chunk)
+      writes.push(text)
+      if (writes.length === 1 && sawFirstFrame) sawFirstFrame()
+      // Apply backpressure right on the first frame so subsequent writes queue on writeChain
+      return !backpressured
+    },
+    end(chunk) {
+      if (chunk !== undefined) this.write(chunk)
+      this.writableEnded = true
+      this.emit('finish')
+      if (finishedRes) finishedRes()
+    },
+    destroy() {
+      this.destroyed = true
+      this.emit('close')
+      if (finishedRes) finishedRes()
+    },
+  })
+
+  let handlerError = null
+  let handlerSettled = false
+  const runPromise = parts.handler(req, res).then(
+    () => { handlerSettled = true },
+    (err) => { handlerSettled = true; handlerError = err },
+  )
+  while (!pushFrame) {
+    if (handlerSettled) {
+      throw handlerError ?? new Error(`handler returned early (status=${res.statusCode}, writes=${writes.join('')})`)
+    }
+    await new Promise((r) => setTimeout(r, 5))
+  }
+
+  const recA = (turn) => ({ sessionId: 'session-a', completedTurn: turn, failed: false, readTurn: turn - 1, manualUnread: false })
+  const recB = (turn) => ({ sessionId: 'session-b', completedTurn: turn, failed: false, readTurn: turn - 1, manualUnread: false })
+
+  // 1. Upstream sends baseline([A, B]); session-a is cached server-side, [B] is written & backpressured
+  pushFrame({ type: 'baseline', items: [recA(1), recB(1)] })
+  await firstFrameWritten
+
+  // 2. While writeChain is blocked on drain: share(session-a) queues changed(session-a) on writeChain,
+  //    then unshare(session-a) revokes it before drain releases writeChain
+  parts.store.share('session-a')
+  parts.store.unshare('session-a')
+  await new Promise((r) => setTimeout(r, 10))
+
+  // 3. Release backpressure, send a session-b update, and end stream
+  backpressured = false
+  res.emit('drain')
+  pushFrame({ type: 'changed', state: recB(2) })
+  await new Promise((r) => setTimeout(r, 20))
+  finishStream()
+  await Promise.all([runPromise, resDone])
+
+  const parsed = writes
+    .join('')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+
+  const frames = parsed.filter((entry) => entry.type === 'frame').map((entry) => entry.frame)
+  // Queued changed(session-a) MUST be dropped; NO written frame may expose session-a
+  for (const frame of frames) {
+    if (frame.type === 'changed') {
+      assert.notEqual(frame.state.sessionId, 'session-a')
+    } else if (frame.type === 'baseline') {
+      assert.equal(frame.items.some((item) => item.sessionId === 'session-a'), false)
+    }
+  }
+  assert.equal(frames.some((f) => f.type === 'changed' && f.state.sessionId === 'session-b'), true)
+})
+
+test('PR78-R2-M1: gzip-negotiated sessionStatus/follow rechecks accessibility on both compression failure and success', async (t) => {
+  const idA = 'session-a'
+  const idB = 'session-b-keep'
+  let compressCount = 0
+  let pushFrame
+  let finishStream
+  let parts
+
+  parts = makeParts('pr78-r2-gzip-recheck', {
+    compressFrame: async (input) => {
+      compressCount += 1
+      // Revoke session-a while async compression is in flight:
+      // #1 baseline -> reject compression; #2 changed -> reject compression; #3 changed -> resolve valid gzip
+      parts.store.unshare(idA)
+      if (compressCount <= 2) {
+        throw new Error('simulated zlib failure')
+      }
+      return zlib.gzipSync(input, { level: 1 })
+    },
+    stream: async () => ({
+      [Symbol.asyncIterator]() {
+        const queue = []
+        let waiter = null
+        let done = false
+        pushFrame = (item) => {
+          if (waiter) {
+            const w = waiter
+            waiter = null
+            w({ value: item, done: false })
+          } else {
+            queue.push(item)
+          }
+        }
+        finishStream = () => {
+          done = true
+          if (waiter) {
+            const w = waiter
+            waiter = null
+            w({ value: undefined, done: true })
+          }
+        }
+        return {
+          next() {
+            if (queue.length > 0) return Promise.resolve({ value: queue.shift(), done: false })
+            if (done) return Promise.resolve({ value: undefined, done: true })
+            return new Promise((resolve) => { waiter = resolve })
+          },
+          return() {
+            done = true
+            return Promise.resolve({ value: undefined, done: true })
+          },
+        }
+      },
+    }),
+  })
+  assert.equal(parts.store.share(idA), true)
+  assert.equal(parts.store.share(idB), true)
+
+  const server = await startServer(parts.handler)
+  t.after(() => server.stop())
+
+  const resPromise = server.fetch(
+    '/_dsh/zen-remote/relay/v1/stream',
+    post(
+      '/s',
+      { namespace: 'sessionStatus', method: 'follow', args: {} },
+      { ...AUTH, 'content-type': 'application/json', 'x-zr-accept-encoding': 'gzip' },
+    ),
+  )
+
+  while (!pushFrame) await new Promise((r) => setTimeout(r, 5))
+
+  const mkState = (sessionId, turn, extra = {}) => ({
+    sessionId,
+    completedTurn: turn,
+    failed: false,
+    readTurn: turn - 1,
+    manualUnread: false,
+    ...extra,
+  })
+
+  // 1. Baseline (>1024 B via pad on cached idA): compressCount=1 unshares idA and fails -> filtered baseline excludes idA
+  pushFrame({ type: 'baseline', items: [mkState(idA, 1, { pad: 'p'.repeat(1100) }), mkState(idB, 1)] })
+  const res = await resPromise
+  assert.equal(res.status, 200)
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  const lines = []
+  const readUntil = async (predicate) => {
+    while (!predicate()) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const split = buf.split('\n')
+      buf = split.pop() ?? ''
+      for (const raw of split) {
+        if (!raw) continue
+        const obj = JSON.parse(raw)
+        lines.push(obj.type === 'gz' ? JSON.parse(zlib.gunzipSync(Buffer.from(obj.b64, 'base64')).toString('utf8')) : obj)
+      }
+    }
+  }
+
+  await readUntil(() => lines.some((l) => l.type === 'frame'))
+
+  // 2. Changed (>1024 B): compressCount=2 unshares idA and fails -> frame must be dropped completely
+  parts.store.share(idA)
+  await new Promise((r) => setTimeout(r, 15))
+  pushFrame({ type: 'changed', state: mkState(idB, 2) })
+  await readUntil(() => lines.some((l) => l.type === 'frame' && l.frame?.type === 'changed' && l.frame?.state?.completedTurn === 2))
+
+  // 3. Changed (>1024 B): compressCount=3 unshares idA and succeeds -> frame must ALSO be dropped
+  parts.store.share(idA)
+  await new Promise((r) => setTimeout(r, 15))
+  pushFrame({ type: 'changed', state: mkState(idB, 3) })
+  await new Promise((r) => setTimeout(r, 20))
+  finishStream()
+  await readUntil(() => lines.some((l) => l.type === 'end'))
+
+  assert.equal(compressCount, 3)
+  const frames = lines.filter((l) => l.type === 'frame').map((l) => l.frame)
+  for (const frame of frames) {
+    if (frame.type === 'changed') {
+      assert.notEqual(frame.state.sessionId, idA)
+    } else if (frame.type === 'baseline') {
+      assert.equal(frame.items.some((item) => item.sessionId === idA), false)
+      assert.equal(frame.items.some((item) => item.sessionId === idB), true)
+    }
+  }
+  assert.equal(frames.some((f) => f.type === 'changed' && f.state.sessionId === idB && f.state.completedTurn === 2), true)
+  assert.equal(frames.some((f) => f.type === 'changed' && f.state.sessionId === idB && f.state.completedTurn === 3), true)
 })

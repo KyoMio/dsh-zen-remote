@@ -411,7 +411,7 @@ test('compareFingerprints: hostile junk degrades to unavailable, never different
   assert.deepEqual(compareFingerprints(undefined, undefined), { identical: [], different: [], unavailable: [] })
 })
 
-test('API-3: FINGERPRINT_GROUP_PACKAGES covers all 13 package groups + events = 14 keys with registry-tier hashing and unavailable fallback', async () => {
+test('API-3: FINGERPRINT_GROUP_PACKAGES covers all 14 package groups + events = 15 keys with registry-tier hashing and unavailable fallback', async () => {
   const expectedGroups = [
     'session',
     'workspace',
@@ -426,6 +426,7 @@ test('API-3: FINGERPRINT_GROUP_PACKAGES covers all 13 package groups + events = 
     'actionCards',
     'trajectory',
     'forge',
+    'sessionStatus',
   ]
   assert.deepEqual(Object.keys(FINGERPRINT_GROUP_PACKAGES), expectedGroups)
 
@@ -433,19 +434,42 @@ test('API-3: FINGERPRINT_GROUP_PACKAGES covers all 13 package groups + events = 
     { id: '@deepseek-ai/dsh-experimental-client-ui-forge#forgePanel/follow', mode: 'stream' },
     { id: '@deepseek-ai/dsh-agent-team#agentTeams/setEnabled', mode: 'invoke' },
     { id: '@deepseek-ai/dsh-terminal#terminal/create', mode: 'invoke' },
+    { id: '@deepseek-ai/dsh-client-ui-session-status#sessionStatus/follow', mode: 'stream' },
   ]
   const fingerprints = await computeFingerprints({
     reflect: { get: (name) => (name === 'typert' ? { local: { list: () => fakeDescriptors } } : undefined) },
   })
-  assert.equal(Object.keys(fingerprints).length, 14)
+  assert.equal(Object.keys(fingerprints).length, 15)
   assert.match(fingerprints.forge, /^r:[0-9a-f]{12}$/)
   assert.match(fingerprints.agentTeam, /^r:[0-9a-f]{12}$/)
   assert.match(fingerprints.terminal, /^r:[0-9a-f]{12}$/)
+  assert.match(fingerprints.sessionStatus, /^r:[0-9a-f]{12}$/)
   assert.equal(fingerprints.officeKit, FINGERPRINT_UNAVAILABLE)
 
   const peerFingerprints = { ...fingerprints, officeKit: 'r:112233445566' }
   const diff = compareFingerprints(fingerprints, peerFingerprints)
   assert.equal(diff.different.length, 0)
   assert.ok(diff.identical.includes('forge'))
+  assert.ok(diff.identical.includes('sessionStatus'))
   assert.ok(diff.unavailable.includes('officeKit'))
+})
+
+test('D23-6: old host lacking sessionStatus resolves to unavailable and never falsely reports different', async () => {
+  const hostFingerprints = await computeFingerprints({
+    reflect: {
+      get: (name) =>
+        name === 'typert'
+          ? { local: { list: () => [{ id: '@deepseek-ai/dsh-api-session-controller#session/list', mode: 'invoke' }] } }
+          : undefined,
+    },
+  })
+  assert.equal(hostFingerprints.sessionStatus, FINGERPRINT_UNAVAILABLE)
+
+  const clientFingerprints = {
+    ...hostFingerprints,
+    sessionStatus: 'r:deadbeef1234',
+  }
+  const verdict = compareFingerprints(hostFingerprints, clientFingerprints)
+  assert.deepEqual(verdict.different, [])
+  assert.ok(verdict.unavailable.includes('sessionStatus'))
 })

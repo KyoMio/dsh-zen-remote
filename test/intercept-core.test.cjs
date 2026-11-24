@@ -2339,3 +2339,360 @@ test('API-6: session/search & agentPresets/* merge across local and remote, prot
   })
   handle.uninstall()
 })
+
+test('D23-5: sessionStatus/mark restores virtual sessionId and sessionStatus/follow merges across pool servers', async () => {
+  assert.deepEqual(CLIENT_METHOD_FIELDS['sessionStatus/mark'], ['sessionId'])
+  assert.deepEqual(CLIENT_METHOD_FIELDS['sessionStatus/follow'], [])
+  assert.equal(isRemoteWrite('sessionStatus/mark'), true)
+  assert.equal(REMOTE_READ_METHODS.has('sessionStatus/follow'), true)
+
+  const gateway = new FakeTypertGateway()
+  const localGate = createGate()
+  const origOpen = gateway.openWireStream.bind(gateway)
+  gateway.openWireStream = (endpoint, ...rest) =>
+    endpoint === 'sessionStatus/follow' ? localGate.iterable : origOpen(endpoint, ...rest)
+  const relay1 = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '11111111', serverName: 'S1', dshVersion: '0.0.0', fingerprints: {} },
+  })
+  const relay2 = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '22222222', serverName: 'S2', dshVersion: '0.0.0', fingerprints: {} },
+  })
+  const poolEntries = [
+    { id: 'e1', serverId: '11111111', serverName: 'S1', displayName: 'S1', client: relay1 },
+    { id: 'e2', serverId: '22222222', serverName: 'S2', displayName: 'S2', client: relay2 },
+  ]
+  const pool = {
+    entries: () => poolEntries,
+    getByServerId: (sid) => poolEntries.find((e) => e.serverId === sid),
+  }
+  const handle = installIntercept({
+    raw: gateway,
+    pool,
+    getServerId: () => undefined,
+    log: () => {},
+  })
+
+  // sessionStatus/mark forwards restored sessionId
+  const markOk = await gateway.rpcBridge(
+    'sessionStatus/mark',
+    { args: { sessionId: toVirtual('11111111', 's-1'), action: { type: 'unread' } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(markOk.ok, true)
+  const markInvokes = relay1.invokes.filter((c) => c.namespace === 'sessionStatus')
+  assert.equal(markInvokes.length, 1)
+  assert.deepEqual(
+    { namespace: markInvokes[0].namespace, method: markInvokes[0].method, args: markInvokes[0].args },
+    { namespace: 'sessionStatus', method: 'mark', args: { sessionId: 's-1', action: { type: 'unread' } } },
+  )
+
+  // Offline write refuses remote-offline
+  relay1.transition('offline')
+  const markOffline = await gateway.rpcBridge(
+    'sessionStatus/mark',
+    { args: { sessionId: toVirtual('11111111', 's-1'), action: { type: 'read', throughTurn: 1 } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(markOffline.ok, false)
+  assert.equal(markOffline.error.code, 'remote-offline')
+  relay1.transition('online')
+
+  // sessionStatus/follow merges local + pool servers
+  const controller = new AbortController()
+  const stream = await gateway.wireTap('sessionStatus/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const iter = stream[Symbol.asyncIterator]()
+  const nextFrame = () => iter.next().then((r) => r.value)
+
+  const lRec = { sessionId: 'local-1', completedTurn: 1, failed: false, readTurn: 0, manualUnread: false }
+  const r1Rec = { sessionId: 's-1', completedTurn: 2, failed: false, readTurn: 1, manualUnread: false }
+  const r2Rec = { sessionId: 's-2', completedTurn: 3, failed: true, readTurn: 0, manualUnread: true }
+
+  localGate.push({ type: 'baseline', items: [lRec] })
+  assert.deepEqual(await nextFrame(), { type: 'baseline', items: [lRec] })
+
+  await waitUntil(() => relay1.streams.length === 1 && relay2.streams.length === 1)
+  relay1.streams[0].gate.push({ type: 'baseline', items: [r1Rec] })
+  assert.deepEqual(await nextFrame(), { type: 'changed', state: { ...r1Rec, sessionId: toVirtual('11111111', 's-1') } })
+
+  relay2.streams[0].gate.push({ type: 'baseline', items: [r2Rec] })
+  assert.deepEqual(await nextFrame(), { type: 'changed', state: { ...r2Rec, sessionId: toVirtual('22222222', 's-2') } })
+
+  // Unpairing relay1 evicts relay1's records while preserving local + relay2
+  relay1.transition('unpaired')
+  assert.deepEqual(await nextFrame(), {
+    type: 'baseline',
+    items: [lRec, { ...r2Rec, sessionId: toVirtual('22222222', 's-2') }],
+  })
+
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('D23-6: forgePanel/{worktreeBases,revisit,reviewStage,changesLens} classify read/write, restore sessionId, and keep changesLens unheld', async () => {
+  assert.equal(SESSION_STREAM_HOLD_ENDPOINTS.has('forgePanel/changesLens'), false)
+  assert.equal(isRemoteWrite('forgePanel/worktreeBases'), false)
+  assert.equal(isRemoteWrite('forgePanel/revisit'), false)
+  assert.equal(isRemoteWrite('forgePanel/changesLens'), false)
+  assert.equal(isRemoteWrite('forgePanel/reviewStage'), true)
+
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+
+  // Online read & write restore virtual sessionId -> original sessionId
+  relay.invokeValue = { bases: ['main'] }
+  const basesRes = await gateway.rpcBridge('forgePanel/worktreeBases', { args: { sessionId: VIRTUAL_ID, query: '' } }, undefined, undefined)
+  assert.equal(basesRes.ok, true)
+  assert.deepEqual(relay.invokes.at(-1).args, { sessionId: LOCAL_ID, query: '' })
+
+  const revisitRes = await gateway.rpcBridge('forgePanel/revisit', { args: { sessionId: VIRTUAL_ID } }, undefined, undefined)
+  assert.equal(revisitRes.ok, true)
+  assert.deepEqual(relay.invokes.at(-1).args, { sessionId: LOCAL_ID })
+
+  const stageRes = await gateway.rpcBridge('forgePanel/reviewStage', { args: { sessionId: VIRTUAL_ID, url: 'https://git/pr/1' } }, undefined, undefined)
+  assert.equal(stageRes.ok, true)
+  assert.deepEqual(relay.invokes.at(-1).args, { sessionId: LOCAL_ID, url: 'https://git/pr/1' })
+
+  // Offline: reviewStage refuses remote-offline before invoke while revisit (read) still reaches client.invoke
+  const countBeforeOffline = relay.invokes.length
+  relay.transition('offline')
+  const stageOffline = await gateway.rpcBridge('forgePanel/reviewStage', { args: { sessionId: VIRTUAL_ID, url: 'https://git/pr/1' } }, undefined, undefined)
+  assert.equal(stageOffline.ok, false)
+  assert.equal(stageOffline.error.code, 'remote-offline')
+  assert.equal(stageOffline.error.message, '服务端离线，远程会话暂时只读')
+  assert.equal(relay.invokes.length, countBeforeOffline)
+
+  const revisitOffline = await gateway.rpcBridge('forgePanel/revisit', { args: { sessionId: VIRTUAL_ID } }, undefined, undefined)
+  assert.equal(revisitOffline.ok, true)
+  assert.equal(relay.invokes.length, countBeforeOffline + 1)
+
+  handle.uninstall()
+})
+
+test('PR78-1: non-owner peers (e.g. LiveShare viewers) bypass Zen Remote dispatch/open on wrapped RPCs and streams', async () => {
+  const gateway = new FakeTypertGateway()
+  const localDispatches = []
+  const localStreams = []
+  const origDispatch = gateway.dispatchRpc.bind(gateway)
+  const origOpen = gateway.openWireStream.bind(gateway)
+  gateway.dispatchRpc = (endpoint, payload, signal, peer) => {
+    localDispatches.push({ endpoint, payload, peer })
+    return origDispatch(endpoint, payload, signal, peer)
+  }
+  gateway.openWireStream = (endpoint, payload, uplink, peer, signal, control) => {
+    localStreams.push({ endpoint, payload, peer })
+    return origOpen(endpoint, payload, uplink, peer, signal, control)
+  }
+  const relay = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '11111111', serverName: 'S1', dshVersion: '0.0.0', fingerprints: {} },
+  })
+  const poolEntries = [
+    { id: 'e1', serverId: '11111111', serverName: 'S1', displayName: 'S1', client: relay },
+  ]
+  const pool = {
+    entries: () => poolEntries,
+    getByServerId: (sid) => poolEntries.find((e) => e.serverId === sid),
+  }
+  const handle = installIntercept({
+    raw: gateway,
+    pool,
+    getServerId: () => undefined,
+    log: () => {},
+  })
+
+  const viewerPeer = { principal: { kind: 'live-share', id: 'viewer-1' } }
+  const ownerPeer = gateway.operatorPeer()
+  const invokesBefore = relay.invokes.length
+  const streamsBefore = relay.streams.length
+
+  // Non-owner calling sessionStatus/mark with a virtual id must fall back locally instead of invoking relay
+  await gateway.rpcBridge(
+    'sessionStatus/mark',
+    { args: { sessionId: toVirtual('11111111', 's-1'), action: { type: 'unread' } } },
+    undefined,
+    viewerPeer,
+  )
+  assert.equal(localDispatches.length, 1)
+  assert.equal(localDispatches[0].peer, viewerPeer)
+  assert.equal(relay.invokes.length, invokesBefore)
+
+  // Non-owner opening sessionStatus/follow must fall back locally instead of opening relay stream
+  const viewerController = new AbortController()
+  await gateway.wireTap(
+    'sessionStatus/follow',
+    { args: {} },
+    undefined,
+    viewerPeer,
+    viewerController.signal,
+    { signal: viewerController.signal },
+  )
+  assert.equal(localStreams.length, 1)
+  assert.equal(localStreams[0].peer, viewerPeer)
+  assert.equal(relay.streams.length, streamsBefore)
+
+  // Owner peer still forwards through Zen Remote relay
+  const ownerMark = await gateway.rpcBridge(
+    'sessionStatus/mark',
+    { args: { sessionId: toVirtual('11111111', 's-1'), action: { type: 'unread' } } },
+    undefined,
+    ownerPeer,
+  )
+  assert.equal(ownerMark.ok, true)
+  assert.equal(relay.invokes.length, invokesBefore + 1)
+  assert.equal(relay.invokes[relay.invokes.length - 1].namespace, 'sessionStatus')
+
+  handle.uninstall()
+})
+
+test('PR78-3: mergedMultiSnapshotStream reattaches when a re-paired RelayClient replaces the instance for the same serverId', async () => {
+  const gateway = new FakeTypertGateway()
+  const localGate = createGate()
+  const origOpen = gateway.openWireStream.bind(gateway)
+  gateway.openWireStream = (endpoint, ...rest) =>
+    endpoint === 'sessionStatus/follow' ? localGate.iterable : origOpen(endpoint, ...rest)
+
+  const relayOld = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '11111111', serverName: 'S1-old', dshVersion: '0.0.0', fingerprints: {} },
+  })
+  const relayNew = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '11111111', serverName: 'S1-new', dshVersion: '0.0.0', fingerprints: {} },
+  })
+  const poolEntries = [
+    { id: 'e1', serverId: '11111111', serverName: 'S1-old', displayName: 'S1-old', client: relayOld },
+  ]
+  const pool = {
+    entries: () => poolEntries,
+    getByServerId: (sid) => poolEntries.find((e) => e.serverId === sid),
+  }
+  const handle = installIntercept({
+    raw: gateway,
+    pool,
+    getServerId: () => undefined,
+    log: () => {},
+  })
+
+  const controller = new AbortController()
+  const stream = await gateway.wireTap('sessionStatus/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const iter = stream[Symbol.asyncIterator]()
+  const nextFrame = () => iter.next().then((r) => r.value)
+
+  localGate.push({ type: 'baseline', items: [] })
+  assert.deepEqual(await nextFrame(), { type: 'baseline', items: [] })
+
+  await waitUntil(() => relayOld.streams.length === 1)
+  const rOldRec = { sessionId: 's-1', completedTurn: 1, failed: false, readTurn: 0, manualUnread: false }
+  relayOld.streams[0].gate.push({ type: 'baseline', items: [rOldRec] })
+  assert.deepEqual(await nextFrame(), { type: 'changed', state: { ...rOldRec, sessionId: toVirtual('11111111', 's-1') } })
+
+  // Swap client instance for the same serverId (re-pair to new host address) and notify pool
+  poolEntries[0] = { id: 'e2', serverId: '11111111', serverName: 'S1-new', displayName: 'S1-new', client: relayNew }
+  handle.notePoolEvent()
+
+  // Old stream aborted + baseline removes old records + new client subscribes
+  await waitUntil(() => relayNew.streams.length === 1)
+  assert.equal(relayOld.streams[0].aborted, true)
+  const resetBaseline = await nextFrame()
+  assert.deepEqual(resetBaseline, { type: 'baseline', items: [] })
+
+  const rNewRec = { sessionId: 's-1', completedTurn: 3, failed: false, readTurn: 3, manualUnread: false }
+  relayNew.streams[0].gate.push({ type: 'baseline', items: [rNewRec] })
+  assert.deepEqual(await nextFrame(), { type: 'changed', state: { ...rNewRec, sessionId: toVirtual('11111111', 's-1') } })
+
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})
+
+test('PR78-R3-L1: mergedMultiSnapshotStream skips reopen after forbidden-method until host reconnects or handshake changes', async () => {
+  const gateway = new FakeTypertGateway()
+  const localGate = createGate()
+  const origOpen = gateway.openWireStream.bind(gateway)
+  gateway.openWireStream = (endpoint, ...rest) =>
+    endpoint === 'sessionStatus/follow' ? localGate.iterable : origOpen(endpoint, ...rest)
+
+  const relay = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '11111111', serverName: 'S-old', dshVersion: '0.2.1-rc.5', fingerprints: {} },
+  })
+  const origOpenStream = relay.openStream.bind(relay)
+  let openAttempts = 0
+  let rejectUnsupported = true
+  relay.openStream = (namespace, method, args, signal, options) => {
+    if (namespace === 'sessionStatus' && method === 'follow') {
+      openAttempts += 1
+      if (rejectUnsupported) {
+        return (async function* () {
+          throw new RelayError('forbidden-method', 'forbidden method', 403)
+        })()
+      }
+    }
+    return origOpenStream(namespace, method, args, signal, options)
+  }
+
+  const scheduledTimers = []
+  const poolEntries = [
+    { id: 'e1', serverId: '11111111', serverName: 'S-old', displayName: 'S-old', client: relay },
+  ]
+  const pool = {
+    entries: () => poolEntries,
+    getByServerId: (sid) => poolEntries.find((e) => e.serverId === sid),
+  }
+  const handle = installIntercept({
+    raw: gateway,
+    pool,
+    getServerId: () => undefined,
+    clock: {
+      now: () => 0,
+      setTimeout: (fn) => { scheduledTimers.push(fn); return scheduledTimers.length },
+      clearTimeout: () => {},
+      random: () => 0.5,
+    },
+    log: () => {},
+  })
+
+  const controller1 = new AbortController()
+  const stream1 = await gateway.wireTap('sessionStatus/follow', { args: {} }, undefined, gateway.operatorPeer(), controller1.signal, { signal: controller1.signal })
+  const iter1 = stream1[Symbol.asyncIterator]()
+  localGate.push({ type: 'baseline', items: [] })
+  assert.deepEqual((await iter1.next()).value, { type: 'baseline', items: [] })
+
+  await waitUntil(() => openAttempts === 1)
+  await new Promise((r) => setTimeout(r, 25))
+  assert.equal(scheduledTimers.length, 0, 'forbidden-method must not arm a reopen timer')
+  assert.equal(handle.diagnostics().recentFailures.some((f) => f.code === 'forbidden-method'), false)
+
+  // Heartbeat while remaining online must NOT clear unsupported cache or re-probe
+  relay.transition('online')
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(openAttempts, 1)
+
+  // Second subscription on the same still-online connection skips probing immediately
+  const controller2 = new AbortController()
+  const stream2 = await gateway.wireTap('sessionStatus/follow', { args: {} }, undefined, gateway.operatorPeer(), controller2.signal, { signal: controller2.signal })
+  const iter2 = stream2[Symbol.asyncIterator]()
+  await new Promise((r) => setTimeout(r, 20))
+  assert.equal(openAttempts, 1)
+
+  // Reconnect after going offline clears unsupported cache and re-probes once
+  rejectUnsupported = false
+  relay.transition('offline')
+  relay.handshakeInfo = { relayProtocol: 1, serverId: '11111111', serverName: 'S-new', dshVersion: '0.2.3-alpha.2', fingerprints: { sessionStatus: 1 } }
+  relay.transition('online')
+
+  await waitUntil(() => openAttempts >= 2)
+  const upgradedRec = { sessionId: 's-1', completedTurn: 1, failed: false, readTurn: 0, manualUnread: false }
+  const activeRemote = relay.streams[relay.streams.length - 1]
+  activeRemote.gate.push({ type: 'baseline', items: [upgradedRec] })
+  assert.deepEqual((await iter1.next()).value, {
+    type: 'changed',
+    state: { ...upgradedRec, sessionId: toVirtual('11111111', 's-1') },
+  })
+
+  controller1.abort()
+  controller2.abort()
+  void iter2.return?.()
+  localGate.finish()
+  handle.uninstall()
+})

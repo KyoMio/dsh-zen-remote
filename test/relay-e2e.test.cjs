@@ -2229,3 +2229,102 @@ test('API-6 e2e: workspace/insertSessionBefore, session/search, and agentPresets
     await env.stop()
   }
 })
+
+test('D23-5 e2e: sessionStatus/mark & sessionStatus/follow enforce share filtering, live share/unshare, and disconnect cleanup', async () => {
+  const markCalls = []
+  const env = await boot({
+    shared: ['s-shared'],
+    invoke: async (call) => {
+      if (call.namespace === 'sessionStatus' && call.method === 'mark') {
+        markCalls.push(call.args)
+        return undefined
+      }
+      return { ok: true }
+    },
+  })
+  const controller = new AbortController()
+  let handle
+  try {
+    const info = await env.client.connect()
+    const V = (id) => toVirtual(info.serverId, id)
+    const localGate = makeLocalGate(controller.signal)
+    const localGateway = new LocalEventsGateway(localGate)
+    const origOpen = localGateway.openWireStream.bind(localGateway)
+    localGateway.openWireStream = (endpoint, ...rest) =>
+      endpoint === 'sessionStatus/follow' ? localGate.iterable : origOpen(endpoint, ...rest)
+
+    handle = installIntercept({
+      raw: localGateway,
+      relay: env.client,
+      getServerId: () => env.client.handshakeInfo?.serverId,
+      log: () => {},
+    })
+
+    // 1. sessionStatus/mark passes shared session with restored id, rejects unshared with not-shared
+    const markOk = await localGateway.rpcBridge('sessionStatus/mark', {
+      args: { sessionId: V('s-shared'), action: { type: 'unread' } },
+    })
+    assert.equal(markOk.ok, true)
+    assert.deepEqual(markCalls, [{ sessionId: 's-shared', action: { type: 'unread' } }])
+
+    const markDenied = await localGateway.rpcBridge('sessionStatus/mark', {
+      args: { sessionId: V('s-hidden'), action: { type: 'read', throughTurn: 1 } },
+    })
+    assert.equal(markDenied.ok, false)
+    assert.equal(markDenied.error.code, 'not-shared')
+    assert.equal(markCalls.length, 1)
+
+    // 2. sessionStatus/follow merges local + remote and tracks live share/unshare
+    const stream = await localGateway.wireTap(
+      'sessionStatus/follow',
+      { args: {} },
+      undefined,
+      localGateway.operatorPeer(),
+      controller.signal,
+      { signal: controller.signal },
+    )
+    const iter = stream[Symbol.asyncIterator]()
+    const nextFrame = () => iter.next().then((r) => r.value)
+
+    const localRec = { sessionId: 'local-1', completedTurn: 1, failed: false, readTurn: 1, manualUnread: false }
+    const sharedRec = { sessionId: 's-shared', completedTurn: 3, failed: false, readTurn: 1, manualUnread: false }
+    const hiddenRec = { sessionId: 's-hidden', completedTurn: 2, failed: true, readTurn: 0, manualUnread: true }
+
+    localGate.push({ type: 'baseline', items: [localRec] })
+    assert.deepEqual(await nextFrame(), { type: 'baseline', items: [localRec] })
+
+    await waitFor(() => env.streams.some((s) => s.call.namespace === 'sessionStatus' && s.call.method === 'follow'))
+    const remoteGate = env.streams.find((s) => s.call.namespace === 'sessionStatus' && s.call.method === 'follow')
+
+    remoteGate.push({ type: 'baseline', items: [sharedRec, hiddenRec] })
+    assert.deepEqual(await nextFrame(), {
+      type: 'changed',
+      state: { ...sharedRec, sessionId: V('s-shared') },
+    })
+
+    // Live share pushes hiddenRec as changed
+    env.store.share('s-hidden')
+    assert.deepEqual(await nextFrame(), {
+      type: 'changed',
+      state: { ...hiddenRec, sessionId: V('s-hidden') },
+    })
+
+    // Live unshare re-baselines keeping localRec + sharedRec
+    env.store.unshare('s-hidden')
+    assert.deepEqual(await nextFrame(), {
+      type: 'baseline',
+      items: [localRec, { ...sharedRec, sessionId: V('s-shared') }],
+    })
+
+    // Uninstall / disconnect clears remote records cleanly
+    handle.uninstall()
+    assert.deepEqual(await nextFrame(), {
+      type: 'baseline',
+      items: [localRec],
+    })
+  } finally {
+    controller.abort()
+    handle?.uninstall()
+    await env.stop()
+  }
+})

@@ -151,7 +151,7 @@ type SessionField =
  * (`src/relay-filter.ts` owns both implementations; the `$zr/events`
  * forwarding subscription is filtered by relay-server.ts itself — it needs
  * the per-eventId registry, not a pure frame function). */
-export type StreamFilter = 'workspace' | 'control' | 'forge-states'
+export type StreamFilter = 'workspace' | 'control' | 'forge-states' | 'session-status'
 
 /** Which standing filter the caller must apply to an invoke result before it
  * travels: `session-list` narrows the unscoped `session/list` items
@@ -401,10 +401,11 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'agentPresets/read': { fields: [] },
   // workspace — the global follow stream
   'workspace/follow': { fields: [], stream: true, streamFilter: 'workspace' },
-  // forgePanel — 31 session-scoped endpoints (top-level sessionId)
+  // forgePanel — 35 session-scoped endpoints (top-level sessionId)
   'forgePanel/follow': { fields: ['sessionId'], stream: true },
   'forgePanel/branches': { fields: ['sessionId'] },
   'forgePanel/diffBases': { fields: ['sessionId'] },
+  'forgePanel/worktreeBases': { fields: ['sessionId'] },
   'forgePanel/localCommits': { fields: ['sessionId'] },
   'forgePanel/localDiff': { fields: ['sessionId'] },
   'forgePanel/localText': { fields: ['sessionId'] },
@@ -415,6 +416,7 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'forgePanel/changeRequestText': { fields: ['sessionId'] },
   'forgePanel/changeRequestViewed': { fields: ['sessionId'] },
   'forgePanel/reviewerCandidates': { fields: ['sessionId'] },
+  'forgePanel/changesLens': { fields: ['sessionId'], stream: true },
   'forgePanel/requestWorktree': { fields: ['sessionId'] },
   'forgePanel/cancelWorktree': { fields: ['sessionId'] },
   'forgePanel/continueInProject': { fields: ['sessionId'] },
@@ -423,10 +425,12 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'forgePanel/stopCreation': { fields: ['sessionId'] },
   'forgePanel/worktreeCleanup': { fields: ['sessionId'] },
   'forgePanel/refresh': { fields: ['sessionId'] },
+  'forgePanel/revisit': { fields: ['sessionId'] },
   'forgePanel/track': { fields: ['sessionId'] },
   'forgePanel/dismiss': { fields: ['sessionId'] },
   'forgePanel/setFileViewed': { fields: ['sessionId'] },
   'forgePanel/changeRequestReviewWrite': { fields: ['sessionId'] },
+  'forgePanel/reviewStage': { fields: ['sessionId'] },
   'forgePanel/submitReview': { fields: ['sessionId'] },
   'forgePanel/requestReviews': { fields: ['sessionId'] },
   'forgePanel/rerunChecks': { fields: ['sessionId'] },
@@ -435,6 +439,9 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'forgePanel/merge': { fields: ['sessionId'] },
   // forgePanel — global PR badge state stream
   'forgePanel/changeRequestStates': { fields: [], stream: true, streamFilter: 'forge-states' },
+  // sessionStatus (0.2.3) — per-session reading mark & global follow stream
+  'sessionStatus/mark': { fields: ['sessionId'] },
+  'sessionStatus/follow': { fields: [], stream: true, streamFilter: 'session-status' },
   // the forwarded-event subscription (T32): special entry, no session fields —
   // its frames are judged per `agentId`, its answers per forwarded `eventId`
   '$zr/events': { fields: [], stream: true, events: true },

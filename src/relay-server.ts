@@ -46,9 +46,11 @@ import {
   filterModelCatalogResult,
   filterSessionListResult,
   filterSessionSearchResult,
+  filterSessionStatusFrame,
   filterWorkspaceFrame,
   filterWorkspaceValueResult,
   type ForgeStatesState,
+  type SessionReadState,
 } from './relay-filter.js'
 import { SESSION_REFERENCE_URI, collectReferenceTexts, decodeSessionReferenceUri } from './session-reference.js'
 import type { ServerPluginEntry, BridgeRegistry } from './plugin-bridge.js'
@@ -315,6 +317,9 @@ export interface RelayHandlerOptions {
    * swallows before destroying the socket (the {@link DRAIN_SLACK_BYTES}
    * bound); defaults to 8 MiB. Tests inject a small value. */
   drainSlackBytes?: number
+  /** Stream frame compressor; defaults to zlib gzip level 1. Tests inject a
+   * controllable implementation. */
+  compressFrame?: (input: Buffer) => Promise<Buffer>
   /** The plugin bridge's server half (PB-3). Absent — a wiring that never
    * mounted it, old tests — and `POST relay/v1/plugin` answers 501
    * `unsupported`, exactly like the `/api` passthrough without a dispatcher. */
@@ -1346,6 +1351,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
   const drainDeadlineMs = options.drainDeadlineMs ?? DRAIN_DEADLINE_MS
   const drainSlackBytes = options.drainSlackBytes ?? DRAIN_SLACK_BYTES
   const parentOf = options.parentOf ?? (() => undefined)
+  const compressFrame = options.compressFrame ?? ((input: Buffer) => gzipAsync(input, { level: 1 }))
   const isAccessible = (sessionId: string): boolean => store.isAccessible(sessionId, parentOf)
 
   /**
@@ -3169,28 +3175,53 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
          */
         const clientAcceptsGzip = acceptsZrGzip(req)
         let writeChain: Promise<void> = Promise.resolve()
-        const writeLine = (value: unknown, tail = false): Promise<void> => {
+        const writeLine = (
+          value: unknown,
+          tail = false,
+          prepare?: (current: unknown) => unknown | null,
+        ): Promise<void> => {
           const run = writeChain.then(async () => {
             if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
-            const lineText = JSON.stringify(value)
+            let current: unknown = value
+            if (prepare !== undefined) {
+              const prepared = prepare(current)
+              if (prepared === null) return
+              current = prepared
+            }
+            const lineText = JSON.stringify(current)
             let outBytes = Buffer.from(`${lineText}\n`, 'utf8')
             // Compression MUST run serially inside writeChain so a slow gzip
             // of a large snapshot never gets overtaken by a small event or end tail.
+            let gzBuf: Buffer | undefined
+            let didAsyncWork = false
             if (
               clientAcceptsGzip &&
               !tail &&
               outBytes.byteLength - 1 >= ZR_GZIP_MIN_BYTES &&
-              isPlainObject(value) &&
-              value.type === 'frame'
+              isPlainObject(current) &&
+              current.type === 'frame'
             ) {
+              didAsyncWork = true
               try {
-                const gzBuf = await gzipAsync(outBytes.subarray(0, outBytes.byteLength - 1), { level: 1 })
-                const wrapped = `${JSON.stringify({ type: 'gz', b64: gzBuf.toString('base64') })}\n`
-                if (wrapped.length < outBytes.byteLength) {
-                  outBytes = Buffer.from(wrapped, 'utf8')
-                }
+                gzBuf = await compressFrame(outBytes.subarray(0, outBytes.byteLength - 1))
               } catch {
                 // Fall back to uncompressed line on unexpected zlib failure.
+                gzBuf = undefined
+              }
+            }
+            if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
+            if (didAsyncWork && prepare !== undefined) {
+              const rechecked = prepare(current)
+              if (rechecked === null) return
+              if (rechecked !== current) {
+                gzBuf = undefined
+                outBytes = Buffer.from(`${JSON.stringify(rechecked)}\n`, 'utf8')
+              }
+            }
+            if (gzBuf !== undefined) {
+              const wrapped = `${JSON.stringify({ type: 'gz', b64: gzBuf.toString('base64') })}\n`
+              if (wrapped.length < outBytes.byteLength) {
+                outBytes = Buffer.from(wrapped, 'utf8')
               }
             }
             if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
@@ -3314,6 +3345,8 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         let unsubscribe = (): void => {}
         let applyToState: ((frame: unknown) => void) | undefined
         let forgeState: ForgeStatesState | undefined
+        let sessionStatusFilter: ((frame: unknown) => Record<string, unknown> | null) | undefined
+        let sessionStatusPrepare: ((current: unknown) => unknown | null) | undefined
         let companionAbort: AbortController | undefined
 
         if (decision.filter === 'workspace') {
@@ -3367,6 +3400,75 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             if (finished || clientGone) return
             for (const frame of state.onShareChange(isAccessible)) {
               void writeLine({ type: 'frame', frame })
+            }
+          })
+        } else if (decision.filter === 'session-status') {
+          const cache = new Map<string, SessionReadState>()
+          const exposed = new Set<string>()
+          sessionStatusPrepare = (current) => {
+            if (!isPlainObject(current) || current.type !== 'frame' || !isPlainObject(current.frame)) return current
+            const frame = current.frame
+            if (frame.type === 'changed') {
+              if (
+                isPlainObject(frame.state) &&
+                typeof frame.state.sessionId === 'string' &&
+                !isAccessible(frame.state.sessionId)
+              ) {
+                exposed.delete(frame.state.sessionId)
+                return null
+              }
+              return current
+            }
+            if (frame.type === 'baseline' && Array.isArray(frame.items)) {
+              const allAccessible = frame.items.every(
+                (item) => isPlainObject(item) && typeof item.sessionId === 'string' && isAccessible(item.sessionId),
+              )
+              if (allAccessible) return current
+              const nextItems = frame.items.filter(
+                (item) => isPlainObject(item) && typeof item.sessionId === 'string' && isAccessible(item.sessionId),
+              )
+              for (const item of frame.items) {
+                if (isPlainObject(item) && typeof item.sessionId === 'string' && !isAccessible(item.sessionId)) {
+                  exposed.delete(item.sessionId)
+                }
+              }
+              return { ...current, frame: { type: 'baseline', items: nextItems } }
+            }
+            return current
+          }
+          sessionStatusFilter = (frame) => {
+            const out = filterSessionStatusFrame(frame, isAccessible, cache)
+            if (out === undefined) return null
+            if (out.type === 'baseline' && Array.isArray(out.items)) {
+              exposed.clear()
+              for (const item of out.items) {
+                if (isPlainObject(item) && typeof item.sessionId === 'string') exposed.add(item.sessionId)
+              }
+            } else if (out.type === 'changed' && isPlainObject(out.state) && typeof out.state.sessionId === 'string') {
+              exposed.add(out.state.sessionId)
+            }
+            return out
+          }
+          unsubscribe = store.subscribe((event) => {
+            if (event.type !== 'shared' && event.type !== 'unshared') return
+            if (finished || clientGone) return
+            for (const id of exposed) {
+              if (!isAccessible(id)) {
+                exposed.clear()
+                const items: SessionReadState[] = []
+                for (const state of cache.values()) {
+                  if (!isAccessible(state.sessionId)) continue
+                  exposed.add(state.sessionId)
+                  items.push(state)
+                }
+                void writeLine({ type: 'frame', frame: { type: 'baseline', items } }, false, sessionStatusPrepare)
+                return
+              }
+            }
+            for (const [id, state] of cache) {
+              if (!isAccessible(id) || exposed.has(id)) continue
+              exposed.add(id)
+              void writeLine({ type: 'frame', frame: { type: 'changed', state } }, false, sessionStatusPrepare)
             }
           })
         } else if (eventsSub !== undefined) {
@@ -3424,7 +3526,9 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
                 ? (frame) => filterControlFrame(frame, isAccessible)
                 : decision.filter === 'forge-states'
                   ? (frame) => forgeState!.filterUpstreamFrame(frame, isAccessible)
-                  : namespace === 'job' && method === 'list'
+                  : decision.filter === 'session-status'
+                    ? (frame) => sessionStatusFilter!(frame)
+                    : namespace === 'job' && method === 'list'
                     // 4b: ownerless and foreign jobs stay server-side.
                     ? (frame) => filterJobListFrame(frame, ownerSessionIdOf(args))
                     : (frame) => frame
@@ -3542,7 +3646,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
                   }
                 }
               }
-              await writeLine({ type: 'frame', frame: outFrame })
+              await writeLine({ type: 'frame', frame: outFrame }, false, sessionStatusPrepare)
             }
             closeWith({ type: 'end' })
           }

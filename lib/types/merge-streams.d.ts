@@ -541,4 +541,27 @@ export declare function resolveRemotePresetName(presetId: string, rawName: unkno
  * settings never accidentally pick a remote preset id.
  */
 export declare function mergeAgentPresetRosters(localResult: unknown, remoteResult: unknown, identity: MergerIdentity, lang?: MergerLang): unknown;
+/** One Host-confirmed Session reading record (`@deepseek-ai/dsh-client-ui-session-status`). */
+export interface SessionReadRecord extends Record<string, unknown> {
+    readonly sessionId: string;
+    readonly completedTurn: number;
+    readonly failed: boolean;
+    readonly readTurn: number;
+    readonly manualUnread: boolean;
+}
+export interface SessionStatusMerger {
+    onLocal(frame: unknown): unknown[];
+    onRemote(serverId: string, frame: unknown): unknown[];
+    removeServer(serverId: string): unknown[];
+    onRemoteGone(serverId: string): unknown[];
+}
+/**
+ * Merge local and remote `sessionStatus/follow` frames into a single stream
+ * compatible with DSH's `RemoteSnapshotStream` (where every `baseline` replaces
+ * the full table and `changed` upserts one record). Remote baselines never
+ * travel raw so local or other servers' reading state is never wiped; they fold
+ * in as virtualized `changed` frames once `localSeen` is established, or emit a
+ * composed `baseline` when a server shrinks or disconnects.
+ */
+export declare function createSessionStatusMerger(): SessionStatusMerger;
 //# sourceMappingURL=merge-streams.d.ts.map
