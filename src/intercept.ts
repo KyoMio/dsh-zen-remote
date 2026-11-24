@@ -289,10 +289,11 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'agentPresets/read': [],
   // workspace — the global follow stream, merged like the two session/* reads
   'workspace/follow': [],
-  // forgePanel — 31 session-scoped endpoints (top-level sessionId) + 1 global stream
+  // forgePanel — 35 session-scoped endpoints (top-level sessionId) + 1 global stream
   'forgePanel/follow': ['sessionId'],
   'forgePanel/branches': ['sessionId'],
   'forgePanel/diffBases': ['sessionId'],
+  'forgePanel/worktreeBases': ['sessionId'],
   'forgePanel/localCommits': ['sessionId'],
   'forgePanel/localDiff': ['sessionId'],
   'forgePanel/localText': ['sessionId'],
@@ -303,6 +304,7 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'forgePanel/changeRequestText': ['sessionId'],
   'forgePanel/changeRequestViewed': ['sessionId'],
   'forgePanel/reviewerCandidates': ['sessionId'],
+  'forgePanel/changesLens': ['sessionId'],
   'forgePanel/requestWorktree': ['sessionId'],
   'forgePanel/cancelWorktree': ['sessionId'],
   'forgePanel/continueInProject': ['sessionId'],
@@ -311,10 +313,12 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'forgePanel/stopCreation': ['sessionId'],
   'forgePanel/worktreeCleanup': ['sessionId'],
   'forgePanel/refresh': ['sessionId'],
+  'forgePanel/revisit': ['sessionId'],
   'forgePanel/track': ['sessionId'],
   'forgePanel/dismiss': ['sessionId'],
   'forgePanel/setFileViewed': ['sessionId'],
   'forgePanel/changeRequestReviewWrite': ['sessionId'],
+  'forgePanel/reviewStage': ['sessionId'],
   'forgePanel/submitReview': ['sessionId'],
   'forgePanel/requestReviews': ['sessionId'],
   'forgePanel/rerunChecks': ['sessionId'],
@@ -448,10 +452,11 @@ export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
   'terminal/retain',
   // 0.2.2-rc.2: live Agent-terminal roster (WebTerminalInfo[]); read-only.
   'terminal/watch',
-  // forgePanel: follow stream + 12 unary reads + global PR badge stream
+  // forgePanel: follow/changesLens streams + 14 unary reads + global PR badge stream
   'forgePanel/follow',
   'forgePanel/branches',
   'forgePanel/diffBases',
+  'forgePanel/worktreeBases',
   'forgePanel/localCommits',
   'forgePanel/localDiff',
   'forgePanel/localText',
@@ -462,6 +467,8 @@ export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
   'forgePanel/changeRequestText',
   'forgePanel/changeRequestViewed',
   'forgePanel/reviewerCandidates',
+  'forgePanel/revisit',
+  'forgePanel/changesLens',
   'forgePanel/changeRequestStates',
   // sessionStatus (0.2.3): global reading-state follow stream
   'sessionStatus/follow',

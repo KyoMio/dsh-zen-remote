@@ -974,3 +974,29 @@ test('D23-5: sessionStatus/mark and sessionStatus/follow access control', () => 
     { allow: false, reason: 'forbidden-method' },
   )
 })
+
+test('D23-6: forgePanel/{worktreeBases,revisit,reviewStage,changesLens} enforce sessionId and mode while review*/extensions stay unregistered', () => {
+  const shared = { sessionId: 'S-shared' }
+  const secret = { sessionId: 'S-secret' }
+  for (const method of ['worktreeBases', 'revisit', 'reviewStage']) {
+    assert.deepEqual(decideInvoke('forgePanel', method, shared, only(['S-shared'])), { allow: true }, method)
+    assert.deepEqual(decideInvoke('forgePanel', method, secret, only(['S-shared'])), { allow: false, reason: 'not-shared' }, `${method} unshared`)
+    assert.deepEqual(decideInvoke('forgePanel', method, { request: shared }, yes), { allow: false, reason: 'no-session' }, `${method} wrong nesting`)
+    assert.deepEqual(decideStream('forgePanel', method, shared, yes), { allow: false, reason: 'forbidden-method' }, `${method} stream`)
+  }
+
+  assert.deepEqual(decideStream('forgePanel', 'changesLens', shared, only(['S-shared'])), { allow: true, sessionIds: ['S-shared'] })
+  assert.deepEqual(decideStream('forgePanel', 'changesLens', secret, only(['S-shared'])), { allow: false, reason: 'not-shared' })
+  assert.deepEqual(decideStream('forgePanel', 'changesLens', { request: shared }, yes), { allow: false, reason: 'no-session' })
+  assert.deepEqual(decideInvoke('forgePanel', 'changesLens', shared, yes), { allow: false, reason: 'forbidden-method' })
+
+  // Global/non-session forgePanel endpoints remain unregistered
+  for (const [method, args] of [
+    ['extensions', {}],
+    ['review', shared],
+    ['reviewFollow', shared],
+  ]) {
+    assert.deepEqual(decideInvoke('forgePanel', method, args, yes), { allow: false, reason: 'forbidden-method' }, `${method} invoke`)
+    assert.deepEqual(decideStream('forgePanel', method, args, yes), { allow: false, reason: 'forbidden-method' }, `${method} stream`)
+  }
+})

@@ -2428,3 +2428,44 @@ test('D23-5: sessionStatus/mark restores virtual sessionId and sessionStatus/fol
   localGate.finish()
   handle.uninstall()
 })
+
+test('D23-6: forgePanel/{worktreeBases,revisit,reviewStage,changesLens} classify read/write, restore sessionId, and keep changesLens unheld', async () => {
+  assert.equal(SESSION_STREAM_HOLD_ENDPOINTS.has('forgePanel/changesLens'), false)
+  assert.equal(isRemoteWrite('forgePanel/worktreeBases'), false)
+  assert.equal(isRemoteWrite('forgePanel/revisit'), false)
+  assert.equal(isRemoteWrite('forgePanel/changesLens'), false)
+  assert.equal(isRemoteWrite('forgePanel/reviewStage'), true)
+
+  const gateway = new FakeTypertGateway()
+  const relay = createFakeRelay()
+  const { handle } = install(gateway, relay)
+
+  // Online read & write restore virtual sessionId -> original sessionId
+  relay.invokeValue = { bases: ['main'] }
+  const basesRes = await gateway.rpcBridge('forgePanel/worktreeBases', { args: { sessionId: VIRTUAL_ID, query: '' } }, undefined, undefined)
+  assert.equal(basesRes.ok, true)
+  assert.deepEqual(relay.invokes.at(-1).args, { sessionId: LOCAL_ID, query: '' })
+
+  const revisitRes = await gateway.rpcBridge('forgePanel/revisit', { args: { sessionId: VIRTUAL_ID } }, undefined, undefined)
+  assert.equal(revisitRes.ok, true)
+  assert.deepEqual(relay.invokes.at(-1).args, { sessionId: LOCAL_ID })
+
+  const stageRes = await gateway.rpcBridge('forgePanel/reviewStage', { args: { sessionId: VIRTUAL_ID, url: 'https://git/pr/1' } }, undefined, undefined)
+  assert.equal(stageRes.ok, true)
+  assert.deepEqual(relay.invokes.at(-1).args, { sessionId: LOCAL_ID, url: 'https://git/pr/1' })
+
+  // Offline: reviewStage refuses remote-offline before invoke while revisit (read) still reaches client.invoke
+  const countBeforeOffline = relay.invokes.length
+  relay.transition('offline')
+  const stageOffline = await gateway.rpcBridge('forgePanel/reviewStage', { args: { sessionId: VIRTUAL_ID, url: 'https://git/pr/1' } }, undefined, undefined)
+  assert.equal(stageOffline.ok, false)
+  assert.equal(stageOffline.error.code, 'remote-offline')
+  assert.equal(stageOffline.error.message, '服务端离线，远程会话暂时只读')
+  assert.equal(relay.invokes.length, countBeforeOffline)
+
+  const revisitOffline = await gateway.rpcBridge('forgePanel/revisit', { args: { sessionId: VIRTUAL_ID } }, undefined, undefined)
+  assert.equal(revisitOffline.ok, true)
+  assert.equal(relay.invokes.length, countBeforeOffline + 1)
+
+  handle.uninstall()
+})
