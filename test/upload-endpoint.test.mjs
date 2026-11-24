@@ -237,12 +237,12 @@ test('upload endpoint integration: disk writes, caps, symlinks, and admission wa
     return { rejection: currentAdmission }
   }
 
-  for (const status of [401, 403]) {
+  for (const [status, code] of [[401, 'unauthorized'], [403, 'forbidden'], [503, 'service-unavailable']]) {
     currentAdmission = status
     const denied = await post('?session=session-live&name=denied.txt', 'x')
     assert.equal(denied.status, status)
     assert.equal(denied.body.ok, false)
-    assert.equal(denied.body.error.code, status === 401 ? 'unauthorized' : 'forbidden')
+    assert.equal(denied.body.error.code, code)
   }
   assert.deepEqual(await readdir(join(workspace, UPLOAD_DIR)), [
     '.gitignore', 'blob.bin', 'evil.txt', 'notes-1.txt', 'notes.txt',

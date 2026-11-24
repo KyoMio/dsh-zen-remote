@@ -101,12 +101,14 @@ function makeCtx() {
  * requirement. Production wiring must use the lookup, never property
  * access, for services outside its declaration list; these fakes hold it
  * to that. */
-function tightInject(services) {
+function tightInject(services, inheritedDeps = []) {
   return (deps, cb) => {
     if (!deps.every((d) => services[d] !== undefined)) return
+    const mergedDeps = [...inheritedDeps, ...deps]
     const target = {
       get: (name) => services[name],
       reflect: { get: (name) => services[name] },
+      inject: tightInject(services, mergedDeps),
       effect: (fn) => {
         const out = trackEffect(fn)
         // When the fake provides an `effectReturns` array, disposer returns
@@ -118,7 +120,7 @@ function tightInject(services) {
     const scoped = new Proxy(target, {
       get(t, prop) {
         if (typeof prop === 'symbol' || prop in t) return Reflect.get(t, prop)
-        if (deps.includes(prop)) return services[prop]
+        if (mergedDeps.includes(prop)) return services[prop]
         throw new Error(`cannot get property "${String(prop)}" without inject`)
       },
     })
@@ -1507,11 +1509,13 @@ test('peer role registers /_dsh/zen-remote/client exactly once on webServer (no 
     },
     logger: services.logger,
     reflect: { get: (name) => services[name] },
-    inject: (deps, cb) => {
+    inject: (deps, cb, inheritedDeps = []) => {
       if (!deps.every((d) => services[d] !== undefined)) return
+      const mergedDeps = [...inheritedDeps, ...deps]
       const target = {
         get: (name) => services[name],
         reflect: { get: (name) => services[name] },
+        inject: (subDeps, subCb) => ctx.inject(subDeps, subCb, mergedDeps),
         effect: (fn) => {
           try {
             const out = fn()
@@ -1526,7 +1530,7 @@ test('peer role registers /_dsh/zen-remote/client exactly once on webServer (no 
       const scoped = new Proxy(target, {
         get(t, prop) {
           if (typeof prop === 'symbol' || prop in t) return Reflect.get(t, prop)
-          if (deps.includes(prop)) return services[prop]
+          if (mergedDeps.includes(prop)) return services[prop]
           throw new Error(`cannot get property "${String(prop)}" without inject`)
         },
       })
@@ -1930,4 +1934,200 @@ test('T9: host routes track drifted gateway port via lan-gate-runtime.json, onGa
   const d3 = await readDebugReport()
   assert.equal(d3.gateway?.reachable, true)
   assert.equal(d3.gateway?.port, fallbackPort)
+})
+
+test('D23-1: createAdmitFn routes all 6 route groups through connection.authentication sub-fiber, checks owner, maps 503, and falls back when absent/unloaded', async (t) => {
+  const index = await import(INDEX_URL)
+  const share = await import(SHARE_URL)
+  const workspace = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-zen-remote-d23-1-'))
+  t.after(() => fs.rmSync(workspace, { recursive: true, force: true }))
+
+  // Build a Cordis-faithful strict context where accessing `connection.admit`
+  // throws `cannot get property "connection.authentication" without inject`
+  // unless the calling fiber (or ancestor) declared `connection.authentication`.
+  function mountAllRoutes({ role, withAuthService }) {
+    const routes = []
+    const authCleanup = []
+    const disposedAuthFibers = new Set()
+    let currentAdmission = { peer: { principal: { kind: 'owner' } } }
+    let directCalls = 0
+    let subFiberCalls = 0
+    const services = {
+      logger: { warn() {} },
+      webServer: { register: (route) => { routes.push(route); return () => {} } },
+      sessions: { get: (id) => (id === 's' ? { header: { cwd: workspace } } : undefined) },
+      sessionQuery: {
+        async readSession(id) {
+          if (id === 's') return { session: { version: 3, id: 's', createdAt: 1757000000000, cwd: workspace, isSeeded: true }, events: [] }
+          throw new Error('not found')
+        },
+      },
+      connection: { __strict: true },
+      ...(withAuthService ? { 'connection.authentication': {} } : {}),
+    }
+
+    const makeScope = (mergedDeps, fiberId) => {
+      const target = {
+        get: (name) => services[name],
+        reflect: { get: (name) => services[name] },
+        inject: (subDeps, subCb) => runInject(subDeps, subCb, mergedDeps),
+        effect: (fn) => {
+          const out = trackEffect(fn)
+          if (typeof out === 'function' && mergedDeps.includes('connection.authentication')) {
+            authCleanup.push(() => {
+              disposedAuthFibers.add(fiberId)
+              out()
+            })
+          }
+          return out
+        },
+        logger: services.logger,
+      }
+      const scoped = new Proxy(target, {
+        get(t, prop) {
+          if (typeof prop === 'symbol' || prop in t) return Reflect.get(t, prop)
+          if (mergedDeps.includes(prop)) {
+            if (prop === 'connection') {
+              return {
+                admit: () => {
+                  if (disposedAuthFibers.has(fiberId)) {
+                    throw new Error('admit called on disposed connection.authentication fiber')
+                  }
+                  if (withAuthService && !mergedDeps.includes('connection.authentication')) {
+                    throw new Error('cannot get property "connection.authentication" without inject')
+                  }
+                  if (mergedDeps.includes('connection.authentication')) subFiberCalls += 1
+                  else directCalls += 1
+                  return currentAdmission
+                },
+              }
+            }
+            return services[prop]
+          }
+          throw new Error(`cannot get property "${String(prop)}" without inject`)
+        },
+      })
+      return scoped
+    }
+
+    let nextFiberId = 0
+    const runInject = (deps, cb, inheritedDeps = []) => {
+      if (!deps.every((d) => services[d] !== undefined)) return
+      const mergedDeps = [...inheritedDeps, ...deps]
+      nextFiberId += 1
+      cb(makeScope(mergedDeps, nextFiberId))
+    }
+
+    const ctx = {
+      plugin() {},
+      provide() { return () => {} },
+      on() { return () => {} },
+      effect: trackEffect,
+      logger: services.logger,
+      reflect: { get: (name) => services[name] },
+      inject: (deps, cb) => runInject(deps, cb, []),
+    }
+
+    index.apply(ctx, { role })
+
+    const server = http.createServer((req, res) => {
+      const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname
+      const matched = routes
+        .filter((r) => (r.kind === 'exact' ? pathname === r.path : pathname === r.path || pathname.startsWith(`${r.path}/`)))
+        .sort((a, b) => b.path.length - a.path.length)[0]
+      if (!matched) {
+        res.writeHead(404)
+        res.end()
+        return
+      }
+      void matched.handler(req, res)
+    })
+
+    return {
+      routes,
+      server,
+      setAdmission(next) { currentAdmission = next },
+      unloadAuth() { while (authCleanup.length > 0) authCleanup.pop()() },
+      counts() { return { directCalls, subFiberCalls } },
+    }
+  }
+
+  // 1. DSH >=0.2.2-rc.2 host with `connection.authentication`: all 6 route groups
+  //    (5 on host role + full client route on client role) go through sub-fiber,
+  //    accept owner, reject non-owner with 403, map 503 to service-unavailable,
+  //    and fall back cleanly when `connection.authentication` unloads.
+  const host = mountAllRoutes({ role: 'host', withAuthService: true })
+  const hostBase = await listen(host.server)
+  t.after(() => close(host.server))
+
+  const makeHostProbes = (base) => [
+    { name: 'admin', method: 'GET', path: '/_dsh/zen-remote/admin/status', okStatus: 200 },
+    { name: 'wizard', method: 'GET', path: '/_dsh/zen-remote/admin/wizard/status', okStatus: 200 },
+    { name: 'client-host', method: 'GET', path: '/_dsh/zen-remote/client/remote-status', okStatus: 200 },
+    { name: 'upload', method: 'POST', path: `${index.UPLOAD_ROUTE}?session=s&name=a.txt`, body: 'hi', headers: { origin: base }, okStatus: 201 },
+    { name: 'share-export', method: 'GET', path: `${share.SHARE_EXPORT_ROUTE}?session=s`, okStatus: 200 },
+  ]
+  const hostProbes = makeHostProbes(hostBase)
+
+  for (const probe of hostProbes) {
+    host.setAdmission({ peer: { principal: { kind: 'owner' } } })
+    const ok = await fetch(`${hostBase}${probe.path}`, { method: probe.method, headers: probe.headers, body: probe.body })
+    assert.equal(ok.status, probe.okStatus, `${probe.name} admits owner`)
+
+    host.setAdmission({ peer: { principal: { kind: 'viewer' } } })
+    const nonOwner = await fetch(`${hostBase}${probe.path}`, { method: probe.method, headers: probe.headers, body: probe.body })
+    assert.equal(nonOwner.status, 403, `${probe.name} rejects non-owner principal with 403`)
+    assert.equal((await nonOwner.json()).error.code, 'forbidden')
+
+    host.setAdmission({ rejection: 503 })
+    const unavailable = await fetch(`${hostBase}${probe.path}`, { method: probe.method, headers: probe.headers, body: probe.body })
+    assert.equal(unavailable.status, 503, `${probe.name} maps 503 rejection`)
+    assert.equal((await unavailable.json()).error.code, 'service-unavailable')
+  }
+  assert.equal(host.counts().subFiberCalls, hostProbes.length * 3, 'every host route call used authCtx sub-fiber')
+  assert.equal(host.counts().directCalls, 0, 'routeCtx.connection.admit was never called while auth service active')
+
+  // Simulate `connection.authentication` unloading: subFiberAdmit resets so the
+  // disposed authCtx fiber is never invoked, falling back to routeCtx.connection.admit.
+  host.unloadAuth()
+  host.setAdmission({ peer: { principal: { kind: 'owner' } } })
+  await assert.rejects(async () => {
+    // Under our strict mock (which keeps requiring connection.authentication),
+    // falling back to routeCtx proves subFiberAdmit was cleared rather than
+    // calling the disposed authCtx (which would throw 'disposed' instead).
+    await host.routes.find((r) => r.path === '/_dsh/zen-remote/admin').handler(
+      { method: 'GET', url: '/_dsh/zen-remote/admin/status', headers: {} },
+      { setHeader() {}, writeHead() {}, end() {} },
+    )
+  }, /cannot get property "connection\.authentication" without inject/)
+
+  // 2. Client role (6th call site: full CLIENT_ROUTE_PREFIX): sub-fiber, owner check, 503.
+  const client = mountAllRoutes({ role: 'client', withAuthService: true })
+  const clientBase = await listen(client.server)
+  t.after(() => close(client.server))
+
+  client.setAdmission({ peer: { principal: { kind: 'owner' } } })
+  assert.equal((await fetch(`${clientBase}/_dsh/zen-remote/client/remote-status`)).status, 200)
+  client.setAdmission({ peer: { principal: { kind: 'peer' } } })
+  assert.equal((await fetch(`${clientBase}/_dsh/zen-remote/client/remote-status`)).status, 403)
+  client.setAdmission({ rejection: 503 })
+  const c503 = await fetch(`${clientBase}/_dsh/zen-remote/client/remote-status`)
+  assert.equal(c503.status, 503)
+  assert.equal((await c503.json()).error.code, 'service-unavailable')
+  assert.equal(client.counts().subFiberCalls, 3)
+
+  // 3. Legacy <=0.2.2-rc.1 host WITHOUT `connection.authentication`: all routes mount
+  //    and fall back to routeCtx.connection.admit; peers without `principal` are allowed.
+  const legacy = mountAllRoutes({ role: 'host', withAuthService: false })
+  const legacyBase = await listen(legacy.server)
+  t.after(() => close(legacy.server))
+
+  legacy.setAdmission({ peer: {} })
+  const legacyProbes = makeHostProbes(legacyBase)
+  for (const probe of legacyProbes) {
+    const res = await fetch(`${legacyBase}${probe.path}`, { method: probe.method, headers: probe.headers, body: probe.body })
+    assert.equal(res.status, probe.okStatus, `legacy host without connection.authentication serves ${probe.name}`)
+  }
+  assert.equal(legacy.counts().directCalls, legacyProbes.length)
+  assert.equal(legacy.counts().subFiberCalls, 0)
 })

@@ -928,17 +928,19 @@ function makeWiringCtx(services = {}) {
     plugin() {},
     on() { return () => {} },
     effect(fn) { const out = fn(); if (typeof out === 'function') effects.push(out); return out },
-    inject(deps, cb) {
+    inject(deps, cb, inheritedDeps = []) {
       if (!deps.every((d) => provided[d] !== undefined)) return
+      const mergedDeps = [...inheritedDeps, ...deps]
       const target = {
         get: (name) => provided[name],
         reflect: { get: (name) => provided[name] },
+        inject: (subDeps, subCb) => ctx.inject(subDeps, subCb, mergedDeps),
         effect: (inner) => { const out = inner(); if (typeof out === 'function') effects.push(out); return out },
       }
       const scoped = new Proxy(target, {
         get(t, prop) {
           if (typeof prop === 'symbol' || prop in t) return Reflect.get(t, prop)
-          if (deps.includes(prop)) return provided[prop]
+          if (mergedDeps.includes(prop)) return provided[prop]
           throw new Error(`cannot get property "${String(prop)}" without inject`)
         },
       })

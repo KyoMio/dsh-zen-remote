@@ -42,8 +42,8 @@ export const MAX_SHARE_TURNS = 500
 
 /** What `connection.admit` answers: the operator peer, or the refusal status.
  * Declared locally (same union as admin-routes.ts's AdminAdmission) so this
- * module stays import-free of the entry file. */
-export type ShareExportAdmission = { readonly peer: unknown } | { readonly rejection: 401 | 403 }
+ * module stays import-free of local .js modules (test imports .ts strip-only). */
+export type ShareExportAdmission = { readonly peer: unknown } | { readonly rejection: 401 | 403 | 503 }
 
 /** One exportable content block of a transcript row. */
 export type ShareBlock =
@@ -411,9 +411,14 @@ export async function handleShareExport(
   if (admit !== undefined) {
     const admission = admit(req)
     if ('rejection' in admission) {
+      const code = admission.rejection === 401
+        ? 'unauthorized'
+        : admission.rejection === 403
+          ? 'forbidden'
+          : 'service-unavailable'
       responseJson(res, admission.rejection, {
         ok: false,
-        error: { code: admission.rejection === 401 ? 'unauthorized' : 'forbidden' },
+        error: { code },
       })
       return
     }

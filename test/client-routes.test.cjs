@@ -181,7 +181,7 @@ test('an illegal address is refused locally with 400 and never forwarded', async
 })
 
 test('admit rejections relay verbatim on both routes and never reach the gateway', async () => {
-  for (const [status, code] of [[401, 'unauthorized'], [403, 'forbidden']]) {
+  for (const [status, code] of [[401, 'unauthorized'], [403, 'forbidden'], [503, 'service-unavailable']]) {
     const { server, port } = await startClientServer(makeRow(), { admit: () => ({ rejection: status }) })
     try {
       const before = gwSeen.length

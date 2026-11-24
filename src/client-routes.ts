@@ -27,6 +27,7 @@
 import { randomBytes } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { homedir } from 'node:os'
+import { admitRejectionCode } from './admin-routes.js'
 import type { AdminAdmission } from './admin-routes.js'
 import { classifyClaimResponse, classifyProbe, CLAIM_PATH, normalizeServerUrl, RELAY_PING_PATH } from './client-pairing.js'
 import type { ClaimOutcome, ProbeState } from './client-pairing.js'
@@ -973,7 +974,7 @@ export function createClientHandler(options: ClientHandlerOptions): ClientHandle
     if ('rejection' in admission) {
       responseJson(res, admission.rejection, {
         ok: false,
-        error: { code: admission.rejection === 401 ? 'unauthorized' : 'forbidden' },
+        error: { code: admitRejectionCode(admission.rejection) },
       })
       return
     }

@@ -148,6 +148,15 @@ export declare function safeUploadName(raw: string): string;
  */
 export declare function handleUpload(ctx: Context, maxBytes: number, req: IncomingMessage, res: ServerResponse, admit?: (req: IncomingMessage) => AdminAdmission, warn?: (format: string, ...args: unknown[]) => void): Promise<void>;
 /**
+ * Wrap `connection.admit(req)` in an optional `connection.authentication` sub-fiber
+ * so Cordis 4.2 permits nested service reads on DSH >=0.2.2-rc.2 without blocking
+ * route registration on DSH 0.2.1–0.2.2-rc.1 hosts, and enforce `owner` principal
+ * when `peer.principal` is present.
+ * @param routeCtx - inject context that already declared `connection`.
+ * @returns admission wrapper relaying rejections and enforcing `owner` principal.
+ */
+export declare function createAdmitFn(routeCtx: Context): (req: IncomingMessage) => AdminAdmission;
+/**
  * Host half: mount the upload route wherever a webServer and live sessions
  * exist. Both are injected INSIDE apply rather than declared as a top-level
  * `inject`, so the plugin row still loads (and the browser half still ships)
