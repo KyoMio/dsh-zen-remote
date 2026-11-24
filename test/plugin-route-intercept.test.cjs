@@ -943,3 +943,148 @@ test('PR77-1/PR77-2: wrappedMatch preserves WebResourceRoute resource and forwar
   assert.equal(seen.upgradePeers.length, 1)
   assert.equal(seen.upgradePeers[0], ownerPeer)
 })
+
+test('PR77-R2-M1: WebResourceRoute streams >16 KiB remote response across backpressure and pull drain', async (t) => {
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  exact.set('/panel/data', {
+    kind: 'exact',
+    path: '/panel/data',
+    resource: async () => new Response('local-only', { status: 200 }),
+  })
+
+  const chunkCount = 6
+  const chunkSize = 32 * 1024
+  const expectedTotal = chunkCount * chunkSize
+  const relay = {
+    pluginRequest: async () => {
+      let sent = 0
+      const stream = new ReadableStream({
+        async pull(controller) {
+          if (sent >= chunkCount) {
+            controller.close()
+            return
+          }
+          await new Promise((r) => setTimeout(r, 2))
+          controller.enqueue(new Uint8Array(chunkSize).fill(0x41 + sent))
+          sent += 1
+        },
+      })
+      return new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/octet-stream' },
+      })
+    },
+  }
+
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED)
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay,
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  const res = await webServer.match('/panel/data').resource(
+    new Request(`http://127.0.0.1/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`),
+  )
+  assert.equal(res.status, 200)
+  const reader = res.body.getReader()
+  const received = []
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    received.push(value)
+    await new Promise((r) => setTimeout(r, 5))
+  }
+  const combined = Buffer.concat(received.map((u8) => Buffer.from(u8.buffer, u8.byteOffset, u8.byteLength)))
+  assert.equal(combined.byteLength, expectedTotal)
+  assert.equal(combined[0], 0x41)
+  assert.equal(combined[expectedTotal - 1], 0x41 + chunkCount - 1)
+})
+
+test('PR77-R2-M2: WebResourceRoute rejects mid-stream upstream failures and aborts relay on downstream cancel', async (t) => {
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  exact.set('/panel/data', {
+    kind: 'exact',
+    path: '/panel/data',
+    resource: async () => new Response('local-only', { status: 200 }),
+  })
+
+  let capturedSignal
+  let mode = 'upstream-fail'
+  const relay = {
+    pluginRequest: async (_req, signal) => {
+      capturedSignal = signal
+      let step = 0
+      const stream = new ReadableStream({
+        pull(controller) {
+          if (step === 0) {
+            step += 1
+            controller.enqueue(new TextEncoder().encode(mode === 'upstream-fail' ? 'part-1' : 'chunk-1'))
+            return
+          }
+          if (mode === 'upstream-fail') {
+            controller.error(new Error('upstream stream reset'))
+          }
+        },
+      })
+      return new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'text/plain' },
+      })
+    },
+  }
+
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED)
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay,
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  // 1. Mid-stream upstream error after 200 headers must fail next read instead of hanging
+  const res1 = await webServer.match('/panel/data').resource(
+    new Request(`http://127.0.0.1/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`),
+  )
+  assert.equal(res1.status, 200)
+  const reader1 = res1.body.getReader()
+  const first1 = await reader1.read()
+  assert.equal(first1.done, false)
+  assert.equal(new TextDecoder().decode(first1.value), 'part-1')
+  await assert.rejects(() => reader1.read(), /aborted|reset/i)
+
+  // 2. Downstream cancel() must close synthetic response and abort upstream relay signal
+  mode = 'cancel-test'
+  const res2 = await webServer.match('/panel/data').resource(
+    new Request(`http://127.0.0.1/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`),
+  )
+  assert.equal(res2.status, 200)
+  const reader2 = res2.body.getReader()
+  const first2 = await reader2.read()
+  assert.equal(new TextDecoder().decode(first2.value), 'chunk-1')
+  assert.equal(capturedSignal.aborted, false)
+  await reader2.cancel('consumer gone')
+  await waitFor(() => capturedSignal.aborted)
+  assert.equal(capturedSignal.aborted, true)
+})

@@ -172,10 +172,11 @@ async function pumpResponse(
   res: ServerResponse,
   reader: { read(): Promise<{ done: boolean; value?: Uint8Array }> },
 ): Promise<void> {
-  while (true) {
+  while (!res.destroyed) {
     const { done, value } = await reader.read()
-    if (done) break
+    if (done || res.destroyed) break
     if (!res.write(value)) {
+      if (res.destroyed) break
       await new Promise<void>((resolve) => {
         const settled = (): void => {
           res.off('drain', settled)
@@ -698,18 +699,31 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     await (peer !== undefined ? originalHandler(req, res, peer) : originalHandler(req, res))
   }
 
+  const toUint8Array = (chunk: unknown, encoding?: unknown): Uint8Array | undefined => {
+    if (chunk instanceof Uint8Array) {
+      return chunk.byteLength === 0 ? undefined : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength)
+    }
+    if (typeof chunk === 'string') {
+      const buf = typeof encoding === 'string' ? Buffer.from(chunk, encoding as BufferEncoding) : Buffer.from(chunk)
+      return buf.byteLength === 0 ? undefined : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength)
+    }
+    return undefined
+  }
+
   class ResourceBridgeResponse extends ServerResponse {
     private bridgeHeadersSent = false
     private bridgeEnded = false
     private bridgeDestroyed = false
+    private bridgeClosed = false
+    private bridgeWaitingDrain = false
     private readonly bridgeHeaders = new Headers()
-    private readonly bridgeBody = new PassThrough()
+    private bridgeController: ReadableStreamDefaultController<Uint8Array> | undefined
     private bridgeSettled = false
-    private readonly onHeadReady: (status: number, headers: Headers, body: PassThrough) => void
+    private readonly onHeadReady: (status: number, headers: Headers, bridgeRes: ResourceBridgeResponse) => void
 
     constructor(
       req: IncomingMessage,
-      onHeadReady: (status: number, headers: Headers, body: PassThrough) => void,
+      onHeadReady: (status: number, headers: Headers, bridgeRes: ResourceBridgeResponse) => void,
     ) {
       super(req)
       this.onHeadReady = onHeadReady
@@ -718,6 +732,57 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         writableEnded: { get: () => this.bridgeEnded, configurable: true },
         destroyed: { get: () => this.bridgeDestroyed, configurable: true },
       })
+    }
+
+    attachStreamController(controller: ReadableStreamDefaultController<Uint8Array>): void {
+      this.bridgeController = controller
+    }
+
+    onStreamPull(): void {
+      if (
+        this.bridgeWaitingDrain &&
+        !this.bridgeClosed &&
+        !this.bridgeDestroyed &&
+        (this.bridgeController?.desiredSize ?? 0) > 0
+      ) {
+        this.bridgeWaitingDrain = false
+        this.emit('drain')
+      }
+    }
+
+    onStreamCancel(): void {
+      this.bridgeClosed = true
+      this.bridgeWaitingDrain = false
+      this.destroy()
+    }
+
+    finishIfOpen(): void {
+      if (this.bridgeClosed || this.bridgeDestroyed) return
+      this.bridgeClosed = true
+      this.bridgeWaitingDrain = false
+      try {
+        this.bridgeController?.close()
+      } catch {
+        // Controller already closed or errored.
+      }
+    }
+
+    private enqueueChunk(chunk: unknown, encoding?: unknown): boolean {
+      if (this.bridgeClosed || this.bridgeDestroyed || this.bridgeController === undefined) return false
+      const bytes = toUint8Array(chunk, encoding)
+      if (bytes === undefined) return true
+      try {
+        this.bridgeController.enqueue(bytes)
+      } catch {
+        this.bridgeClosed = true
+        this.bridgeWaitingDrain = false
+        return false
+      }
+      if ((this.bridgeController.desiredSize ?? 0) <= 0) {
+        this.bridgeWaitingDrain = true
+        return false
+      }
+      return true
     }
 
     override setHeader(name: string, value: string | number | readonly string[]): this {
@@ -758,9 +823,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       this.emitBridgeHead()
       let ok = true
       if (chunk !== undefined && chunk !== null) {
-        ok = typeof encoding === 'string'
-          ? this.bridgeBody.write(chunk, encoding as BufferEncoding)
-          : this.bridgeBody.write(chunk)
+        ok = this.enqueueChunk(chunk, typeof encoding === 'function' ? undefined : encoding)
       }
       if (typeof encoding === 'function') encoding()
       else if (typeof cb === 'function') cb()
@@ -769,26 +832,34 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
 
     override end(chunk?: unknown, encoding?: unknown, cb?: unknown): this {
       this.emitBridgeHead()
-      this.bridgeEnded = true
       if (typeof chunk === 'function') {
-        this.bridgeBody.end()
+        this.bridgeEnded = true
+        this.finishIfOpen()
         chunk()
-      } else if (typeof encoding === 'function') {
-        if (chunk !== undefined && chunk !== null) this.bridgeBody.end(chunk)
-        else this.bridgeBody.end()
-        encoding()
-      } else {
-        if (chunk !== undefined && chunk !== null) this.bridgeBody.end(chunk)
-        else this.bridgeBody.end()
-        if (typeof cb === 'function') cb()
+        return this
       }
+      if (chunk !== undefined && chunk !== null) {
+        this.enqueueChunk(chunk, typeof encoding === 'function' ? undefined : encoding)
+      }
+      this.bridgeEnded = true
+      this.finishIfOpen()
+      if (typeof encoding === 'function') encoding()
+      else if (typeof cb === 'function') cb()
       return this
     }
 
     override destroy(error?: Error): this {
       if (this.bridgeDestroyed) return this
       this.bridgeDestroyed = true
-      this.bridgeBody.destroy(error)
+      this.bridgeWaitingDrain = false
+      if (!this.bridgeClosed && !this.bridgeEnded) {
+        this.bridgeClosed = true
+        try {
+          this.bridgeController?.error(error ?? new Error('Response stream aborted'))
+        } catch {
+          // Controller already closed or errored.
+        }
+      }
       this.emit('close')
       return this
     }
@@ -797,20 +868,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       this.destroy()
     }
 
-    destroyBridgeBody(error?: Error): void {
-      this.bridgeBody.destroy(error)
-    }
-
-    endBridgeBody(): void {
-      this.bridgeBody.end()
-    }
-
     private emitBridgeHead(): void {
       if (this.bridgeHeadersSent) return
       this.bridgeHeadersSent = true
       if (!this.bridgeSettled) {
         this.bridgeSettled = true
-        this.onHeadReady(this.statusCode, this.bridgeHeaders, this.bridgeBody)
+        this.onHeadReady(this.statusCode, this.bridgeHeaders, this)
       }
     }
   }
@@ -857,23 +920,25 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       const cleanupAbort = (): void => {
         request.signal.removeEventListener('abort', onAbort)
       }
-      const syntheticRes = new ResourceBridgeResponse(syntheticReq, (statusCode, responseHeaders, bodyStream) => {
+      const syntheticRes = new ResourceBridgeResponse(syntheticReq, (statusCode, responseHeaders, bridgeRes) => {
         if (settled) return
         settled = true
         const body = request.method === 'HEAD' || statusCode === 204 || statusCode === 205 || statusCode === 304
           ? null
-          : new ReadableStream<Uint8Array>({
-              start(controller) {
-                bodyStream.on('data', (chunk: Buffer) => {
-                  controller.enqueue(new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength))
-                })
-                bodyStream.once('end', () => { controller.close() })
-                bodyStream.once('error', (err) => { controller.error(err) })
+          : new ReadableStream<Uint8Array>(
+              {
+                start(controller) {
+                  bridgeRes.attachStreamController(controller)
+                },
+                pull() {
+                  bridgeRes.onStreamPull()
+                },
+                cancel() {
+                  bridgeRes.onStreamCancel()
+                },
               },
-              cancel() {
-                bodyStream.destroy()
-              },
-            })
+              new ByteLengthQueuingStrategy({ highWaterMark: 16 * 1024 }),
+            )
         resolveResponse(new Response(body, { status: statusCode, headers: responseHeaders }))
       })
       const onAbort = (): void => {
@@ -895,22 +960,26 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           cleanupAbort()
           if (passthroughResponse !== undefined && !settled) {
             settled = true
-            syntheticRes.destroyBridgeBody()
             resolveResponse(passthroughResponse)
           } else if (!settled) {
             settled = true
-            syntheticRes.endBridgeBody()
-            resolveResponse(new Response(null, { status: syntheticRes.statusCode }))
+            if (syntheticRes.destroyed) {
+              rejectResponse(new Error('Response stream aborted'))
+            } else {
+              syntheticRes.finishIfOpen()
+              resolveResponse(new Response(null, { status: syntheticRes.statusCode }))
+            }
+          } else {
+            syntheticRes.finishIfOpen()
           }
         },
         (err: unknown) => {
           cleanupAbort()
+          const error = err instanceof Error ? err : new Error(String(err))
+          syntheticRes.destroy(error)
           if (!settled) {
             settled = true
-            syntheticRes.destroyBridgeBody()
             rejectResponse(err)
-          } else {
-            syntheticRes.destroyBridgeBody(err instanceof Error ? err : new Error(String(err)))
           }
         },
       )
