@@ -1088,3 +1088,105 @@ test('PR77-R2-M2: WebResourceRoute rejects mid-stream upstream failures and abor
   await waitFor(() => capturedSignal.aborted)
   assert.equal(capturedSignal.aborted, true)
 })
+
+test('PR77-R3-M1: WebResourceRoute rejects pre-aborted Request before touching relay', async (t) => {
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  exact.set('/panel/data', {
+    kind: 'exact',
+    path: '/panel/data',
+    resource: async () => new Response('local-only', { status: 200 }),
+  })
+
+  let relayCalls = 0
+  const registry = createBridgeRegistry()
+  registry.register(DECLARED)
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay: {
+      pluginRequest: async () => {
+        relayCalls += 1
+        return new Response('should not run', { status: 200 })
+      },
+    },
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  const ac = new AbortController()
+  ac.abort('cancelled-before-dispatch')
+  const req = new Request(`http://127.0.0.1/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`, {
+    signal: ac.signal,
+  })
+  await assert.rejects(
+    () => webServer.match('/panel/data').resource(req),
+    /cancelled-before-dispatch|abort/i,
+  )
+  assert.equal(relayCalls, 0)
+})
+
+test('PR77-R3-L3: WebResourceRoute HEAD settles immediately and aborts unwanted upstream body (e.g. proxy 502)', async (t) => {
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  exact.set('/panel/data', {
+    kind: 'exact',
+    path: '/panel/data',
+    resource: async () => new Response('local-only', { status: 200 }),
+  })
+
+  let capturedSignal
+  let upstreamCancelled = false
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'test-panel',
+    version: '1.0.0',
+    routes: [{ path: '/panel/data', scope: 'session', methods: ['GET', 'HEAD'] }],
+  })
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    relay: {
+      pluginRequest: async (_req, signal) => {
+        capturedSignal = signal
+        const stream = new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('<html>502 Bad Gateway</html>'))
+          },
+          cancel() {
+            upstreamCancelled = true
+          },
+        })
+        return new Response(stream, {
+          status: 502,
+          headers: { 'content-type': 'text/html' },
+        })
+      },
+    },
+    getServerId: () => SERVER_ID,
+    getStatus: () => [{ plugin: 'test-panel', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' }],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  const res = await webServer.match('/panel/data').resource(
+    new Request(`http://127.0.0.1/panel/data?sessionId=${encodeURIComponent(VIRTUAL)}`, { method: 'HEAD' }),
+  )
+  assert.equal(res.status, 502)
+  assert.equal(res.body, null)
+  await waitFor(() => capturedSignal?.aborted === true && upstreamCancelled)
+  assert.equal(capturedSignal.aborted, true)
+  assert.equal(upstreamCancelled, true)
+})

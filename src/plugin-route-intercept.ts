@@ -168,15 +168,14 @@ function rewriteIdsAtFields(root: unknown, fields: readonly string[], serverId: 
  * backpressure — the one discipline every verbatim passthrough runs. The
  * `close` listener settles the wait when the browser vanishes mid-body (a
  * lost drain event would otherwise hang the write loop). */
-async function pumpResponse(
+async function writeChunksWithBackpressure(
   res: ServerResponse,
-  reader: { read(): Promise<{ done: boolean; value?: Uint8Array }> },
-): Promise<void> {
-  while (!res.destroyed) {
-    const { done, value } = await reader.read()
-    if (done || res.destroyed) break
-    if (!res.write(value)) {
-      if (res.destroyed) break
+  chunks: readonly Buffer[],
+): Promise<boolean> {
+  for (const chunk of chunks) {
+    if (res.destroyed) return false
+    if (!res.write(chunk)) {
+      if (res.destroyed) return false
       await new Promise<void>((resolve) => {
         const settled = (): void => {
           res.off('drain', settled)
@@ -186,7 +185,45 @@ async function pumpResponse(
         res.once('drain', settled)
         res.once('close', settled)
       })
+      if (res.destroyed) return false
     }
+  }
+  return !res.destroyed
+}
+
+async function pumpResponse(
+  res: ServerResponse,
+  reader: { read(): Promise<{ done: boolean; value?: Uint8Array }>; cancel?: (reason?: unknown) => Promise<void> },
+): Promise<void> {
+  while (!res.destroyed) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (res.destroyed) {
+      await reader.cancel?.().catch(() => {})
+      break
+    }
+    if (!res.write(value)) {
+      if (res.destroyed) {
+        await reader.cancel?.().catch(() => {})
+        break
+      }
+      await new Promise<void>((resolve) => {
+        const settled = (): void => {
+          res.off('drain', settled)
+          res.off('close', settled)
+          resolve()
+        }
+        res.once('drain', settled)
+        res.once('close', settled)
+      })
+      if (res.destroyed) {
+        await reader.cancel?.().catch(() => {})
+        break
+      }
+    }
+  }
+  if (res.destroyed) {
+    await reader.cancel?.().catch(() => {})
   }
 }
 
@@ -229,6 +266,10 @@ async function answerRewriteIds(
   let size = 0
   let overflow = false
   while (true) {
+    if (res.destroyed) {
+      await reader.cancel().catch(() => {})
+      return
+    }
     const { done, value } = await reader.read()
     if (done) break
     size += value.length
@@ -240,23 +281,18 @@ async function answerRewriteIds(
       break
     }
   }
+  if (res.destroyed) {
+    await reader.cancel().catch(() => {})
+    return
+  }
   if (overflow) {
     res.writeHead(response.status, verbatimHeaders)
-    for (const chunk of chunks) {
-      if (!res.write(chunk)) {
-        await new Promise<void>((resolve) => {
-          const settled = (): void => {
-            res.off('drain', settled)
-            res.off('close', settled)
-            resolve()
-          }
-          res.once('drain', settled)
-          res.once('close', settled)
-        })
-      }
+    if (await writeChunksWithBackpressure(res, chunks)) {
+      await pumpResponse(res, reader)
+      if (!res.destroyed) res.end()
+    } else {
+      await reader.cancel().catch(() => {})
     }
-    await pumpResponse(res, reader)
-    res.end()
     return
   }
   const text = Buffer.concat(chunks).toString('utf8')
@@ -768,7 +804,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     }
 
     private enqueueChunk(chunk: unknown, encoding?: unknown): boolean {
-      if (this.bridgeClosed || this.bridgeDestroyed || this.bridgeController === undefined) return false
+      if (this.bridgeClosed || this.bridgeDestroyed || this.bridgeController === undefined) return true
       const bytes = toUint8Array(chunk, encoding)
       if (bytes === undefined) return true
       try {
@@ -776,13 +812,21 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
       } catch {
         this.bridgeClosed = true
         this.bridgeWaitingDrain = false
-        return false
+        return true
       }
       if ((this.bridgeController.desiredSize ?? 0) <= 0) {
         this.bridgeWaitingDrain = true
         return false
       }
       return true
+    }
+
+    closeNullBody(): void {
+      if (this.bridgeDestroyed) return
+      this.bridgeClosed = true
+      this.bridgeWaitingDrain = false
+      this.bridgeDestroyed = true
+      this.emit('close')
     }
 
     override setHeader(name: string, value: string | number | readonly string[]): this {
@@ -869,7 +913,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
     }
 
     private emitBridgeHead(): void {
-      if (this.bridgeHeadersSent) return
+      if (this.bridgeHeadersSent || this.bridgeDestroyed) return
       this.bridgeHeadersSent = true
       if (!this.bridgeSettled) {
         this.bridgeSettled = true
@@ -893,6 +937,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         const headers = new Headers(request.headers)
         headers.delete('x-zen-remote-loopback')
         return invokeOriginal(new Request(request, { headers }))
+      }
+      if (request.signal.aborted) {
+        const reason: unknown = request.signal.reason
+        throw reason instanceof Error
+          ? reason
+          : new Error(typeof reason === 'string' && reason !== '' ? reason : 'Request aborted')
       }
 
       const parsedUrl = new URL(request.url, 'http://local')
@@ -940,6 +990,9 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
               new ByteLengthQueuingStrategy({ highWaterMark: 16 * 1024 }),
             )
         resolveResponse(new Response(body, { status: statusCode, headers: responseHeaders }))
+        if (body === null) {
+          bridgeRes.closeNullBody()
+        }
       })
       const onAbort = (): void => {
         syntheticRes.abortBridge()
@@ -1859,6 +1912,10 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         let size = 0
         let overflow = false
         while (true) {
+          if (res.destroyed) {
+            await reader.cancel().catch(() => {})
+            return
+          }
           const { done, value } = await reader.read()
           if (done) break
           size += value.length
@@ -1870,6 +1927,10 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             break
           }
         }
+        if (res.destroyed) {
+          await reader.cancel().catch(() => {})
+          return
+        }
         if (overflow) {
           adapterResponsePassthroughs += 1
           res.writeHead(response.status, {
@@ -1878,21 +1939,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
             ...Object.assign({}, ...allowlistedHeaders),
           })
-          for (const chunk of chunks) {
-            if (!res.write(chunk)) {
-              await new Promise<void>((resolve) => {
-                const settled = (): void => {
-                  res.off('drain', settled)
-                  res.off('close', settled)
-                  resolve()
-                }
-                res.once('drain', settled)
-                res.once('close', settled)
-              })
-            }
+          if (await writeChunksWithBackpressure(res, chunks)) {
+            await pumpResponse(res, reader)
+            if (!res.destroyed) res.end()
+          } else {
+            await reader.cancel().catch(() => {})
           }
-          await pumpResponse(res, reader)
-          res.end()
           return
         }
         const text = Buffer.concat(chunks).toString('utf8')

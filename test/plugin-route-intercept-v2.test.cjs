@@ -1240,6 +1240,7 @@ test('PR77-2: v2 json-body replay, adapter handler, and jsonBodyUpgrade preserve
       { path: '/adapted/cmd', match: 'exact', methods: ['POST'], locator: { in: 'json-body', fields: ['sessionId'] } },
     ],
   }, '1.0.0')
+  registry.registerNormalized(adapter.declaration)
 
   const handle = installPluginRouteIntercept({
     webServer,
@@ -1312,4 +1313,121 @@ test('PR77-2: v2 json-body replay, adapter handler, and jsonBodyUpgrade preserve
   await new Promise((r) => setTimeout(r, 30))
   assert.equal(seen.wsPeers.length, 1)
   assert.equal(seen.wsPeers[0], ownerPeer)
+})
+
+test('PR77-R3-M2: >8 MiB overflow flush in both answerRewriteIds and adapterSurrogateHandler exits on downstream close', async (t) => {
+  const { EventEmitter } = require('node:events')
+  const { Readable } = require('node:stream')
+  const { installPluginRouteIntercept } = require('../lib/plugin-route-intercept.js')
+  const { createBridgeRegistry } = require('../lib/plugin-bridge.js')
+  const { normalizeAdapter } = require('../lib/plugin-adapter-core.js')
+
+  const exact = new Map()
+  const webServer = {
+    exact,
+    prefixes: new Map(),
+    upgrades: new Map(),
+    match(pathname) { return exact.get(pathname) },
+  }
+  exact.set('/v2/big', { kind: 'exact', path: '/v2/big', handler: async (_r, res) => res.end('local') })
+  exact.set('/adapted/big', { kind: 'exact', path: '/adapted/big', handler: async (_r, res) => res.end('local') })
+
+  let readerCancelled = 0
+  const makeBigRelay = () => ({
+    pluginRequest: async () => {
+      let sent = 0
+      const stream = new ReadableStream({
+        pull(controller) {
+          if (sent < 10) {
+            sent += 1
+            controller.enqueue(new Uint8Array(1024 * 1024).fill(0x20))
+            return
+          }
+          controller.close()
+        },
+        cancel() {
+          readerCancelled += 1
+        },
+      })
+      return new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })
+    },
+  })
+
+  const registry = createBridgeRegistry()
+  registry.register({
+    plugin: 'v2-big',
+    version: '1.0.0',
+    routes: [
+      { path: '/v2/big', scope: 'session', rewriteIds: true },
+    ],
+  })
+  const adapter = normalizeAdapter({
+    plugin: 'adapted-big',
+    versions: ['1.0.0'],
+    client: {
+      response: (ctx) => ctx.body,
+    },
+    routes: [
+      { path: '/adapted/big', match: 'exact', locator: { in: 'query', name: 'sessionId' } },
+    ],
+  }, '1.0.0')
+  registry.registerNormalized(adapter.declaration)
+
+  const handle = installPluginRouteIntercept({
+    webServer,
+    registry,
+    adapters: [adapter],
+    relay: makeBigRelay(),
+    getServerId: () => SERVER_ID,
+    getStatus: () => [
+      { plugin: 'v2-big', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' },
+      { plugin: 'adapted-big', bridged: true, localVersion: '1.0.0', serverVersion: '1.0.0' },
+    ],
+    log: () => {},
+  })
+  t.after(() => handle.uninstall())
+
+  for (const pathname of ['/v2/big', '/adapted/big']) {
+    const req = Object.assign(Readable.from([]), {
+      url: `${pathname}?sessionId=${encodeURIComponent(VA)}`,
+      method: 'GET',
+      headers: {},
+      destroy() {},
+    })
+    let writeCount = 0
+    const res = Object.assign(new EventEmitter(), {
+      statusCode: 200,
+      headersSent: false,
+      writableEnded: false,
+      destroyed: false,
+      setHeader() {},
+      writeHead(code) { this.statusCode = code; this.headersSent = true; return this },
+      write() {
+        writeCount += 1
+        if (writeCount === 1) {
+          // Simulate backpressure followed by abrupt client close (no drain ever fires)
+          setTimeout(() => {
+            res.destroyed = true
+            res.emit('close')
+          }, 15)
+          return false
+        }
+        throw new Error(`write called ${writeCount} times after close`)
+      },
+      end() {
+        this.writableEnded = true
+      },
+      destroy() {
+        this.destroyed = true
+        this.emit('close')
+      },
+    })
+    await webServer.match(pathname).handler(req, res)
+    assert.equal(writeCount, 1)
+    assert.equal(res.destroyed, true)
+  }
+  assert.equal(readerCancelled, 2)
 })

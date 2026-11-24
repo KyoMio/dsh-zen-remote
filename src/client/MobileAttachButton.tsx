@@ -4,7 +4,7 @@ import type { PropsLocale, PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots
 import { IconPaperclipOutlineRegular } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { SessionId } from './compat/types.ts'
 import { NS } from './locales.ts'
-import { appendDraftOf, parseUploadResponse, rememberThumbnail, uploadUrl, writeMention } from './attach-upload.ts'
+import { appendDraftOf, parseUploadResponse, rememberThumbnail, uploadErrorSummary, uploadUrl, writeMention } from './attach-upload.ts'
 
 /** Full props for the composer attachment seat. */
 export type MobileAttachButtonProps =
@@ -64,7 +64,7 @@ async function uploadFile(sessionId: SessionId, file: File): Promise<string> {
 export function MobileAttachButton({ t, sessionId, useInput, inputActions, useSessions }: MobileAttachButtonProps) {
   const picker = useRef<HTMLInputElement>(null)
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<{ label: string; detail: string } | null>(null)
   const draft = useInput((state) => state.draft)
   // Same session-row read the share icon/menu use (RemoteHeaderIcon.tsx):
   // `origin: 'subagent'` is the only subagent signal that reaches slot
@@ -108,7 +108,10 @@ export function MobileAttachButton({ t, sessionId, useInput, inputActions, useSe
         written = writeMention(inputActions, (appends || liveDraft.current === written) ? written : liveDraft.current, relPath)
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause))
+      setError({
+        label: uploadErrorSummary(cause, t),
+        detail: cause instanceof Error ? cause.message : String(cause),
+      })
     } finally {
       setBusy(false)
     }
@@ -129,7 +132,7 @@ export function MobileAttachButton({ t, sessionId, useInput, inputActions, useSe
         data-busy={busy ? '' : undefined}
         aria-label={t('attach')}
         aria-busy={busy}
-        title={error ?? (busy ? t('attachBusy') : t('attach'))}
+        title={error?.detail ?? (busy ? t('attachBusy') : t('attach'))}
         onClick={() => {
           setError(null)
           picker.current?.click()
@@ -138,7 +141,7 @@ export function MobileAttachButton({ t, sessionId, useInput, inputActions, useSe
         <IconPaperclipOutlineRegular size={16} />
         {error === null ? null : (
           <span data-mobile-nav="attach-error" role="status" onClick={(e) => { e.stopPropagation(); setError(null) }}>
-            {t('attachFailed')}
+            {error.label}
           </span>
         )}
       </button>
