@@ -119,4 +119,18 @@ export declare function filterWorkspaceValueResult(value: unknown, isAccessible:
 /** Filter `session/search`'s `{ items, hasMore }` result so only hits whose
  * `sessionId` passes `isAccessible` leave the server. */
 export declare function filterSessionSearchResult(value: unknown, isAccessible: Accessibility): unknown;
+/** One Host-confirmed Session reading record (`@deepseek-ai/dsh-client-ui-session-status`). */
+export interface SessionReadState extends Record<string, unknown> {
+    readonly sessionId: string;
+    readonly completedTurn: number;
+    readonly failed: boolean;
+    readonly readTurn: number;
+    readonly manualUnread: boolean;
+}
+/**
+ * Filter one `sessionStatus/follow` frame against `isAccessible` while updating
+ * the unfiltered `cache` of Host reading records so share/unshare changes can
+ * synthesize `changed` or pruned `baseline` frames without reopening upstream.
+ */
+export declare function filterSessionStatusFrame(frame: unknown, isAccessible: Accessibility, cache?: Map<string, SessionReadState>): Record<string, unknown> | undefined;
 //# sourceMappingURL=relay-filter.d.ts.map

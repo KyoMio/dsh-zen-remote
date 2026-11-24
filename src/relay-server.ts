@@ -46,9 +46,11 @@ import {
   filterModelCatalogResult,
   filterSessionListResult,
   filterSessionSearchResult,
+  filterSessionStatusFrame,
   filterWorkspaceFrame,
   filterWorkspaceValueResult,
   type ForgeStatesState,
+  type SessionReadState,
 } from './relay-filter.js'
 import { SESSION_REFERENCE_URI, collectReferenceTexts, decodeSessionReferenceUri } from './session-reference.js'
 import type { ServerPluginEntry, BridgeRegistry } from './plugin-bridge.js'
@@ -3314,6 +3316,7 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
         let unsubscribe = (): void => {}
         let applyToState: ((frame: unknown) => void) | undefined
         let forgeState: ForgeStatesState | undefined
+        let sessionStatusFilter: ((frame: unknown) => Record<string, unknown> | null) | undefined
         let companionAbort: AbortController | undefined
 
         if (decision.filter === 'workspace') {
@@ -3367,6 +3370,44 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
             if (finished || clientGone) return
             for (const frame of state.onShareChange(isAccessible)) {
               void writeLine({ type: 'frame', frame })
+            }
+          })
+        } else if (decision.filter === 'session-status') {
+          const cache = new Map<string, SessionReadState>()
+          const exposed = new Set<string>()
+          sessionStatusFilter = (frame) => {
+            const out = filterSessionStatusFrame(frame, isAccessible, cache)
+            if (out === undefined) return null
+            if (out.type === 'baseline' && Array.isArray(out.items)) {
+              exposed.clear()
+              for (const item of out.items) {
+                if (isPlainObject(item) && typeof item.sessionId === 'string') exposed.add(item.sessionId)
+              }
+            } else if (out.type === 'changed' && isPlainObject(out.state) && typeof out.state.sessionId === 'string') {
+              exposed.add(out.state.sessionId)
+            }
+            return out
+          }
+          unsubscribe = store.subscribe((event) => {
+            if (event.type !== 'shared' && event.type !== 'unshared') return
+            if (finished || clientGone) return
+            for (const id of exposed) {
+              if (!isAccessible(id)) {
+                exposed.clear()
+                const items: SessionReadState[] = []
+                for (const state of cache.values()) {
+                  if (!isAccessible(state.sessionId)) continue
+                  exposed.add(state.sessionId)
+                  items.push(state)
+                }
+                void writeLine({ type: 'frame', frame: { type: 'baseline', items } })
+                return
+              }
+            }
+            for (const [id, state] of cache) {
+              if (!isAccessible(id) || exposed.has(id)) continue
+              exposed.add(id)
+              void writeLine({ type: 'frame', frame: { type: 'changed', state } })
             }
           })
         } else if (eventsSub !== undefined) {
@@ -3424,7 +3465,9 @@ export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
                 ? (frame) => filterControlFrame(frame, isAccessible)
                 : decision.filter === 'forge-states'
                   ? (frame) => forgeState!.filterUpstreamFrame(frame, isAccessible)
-                  : namespace === 'job' && method === 'list'
+                  : decision.filter === 'session-status'
+                    ? (frame) => sessionStatusFilter!(frame)
+                    : namespace === 'job' && method === 'list'
                     // 4b: ownerless and foreign jobs stay server-side.
                     ? (frame) => filterJobListFrame(frame, ownerSessionIdOf(args))
                     : (frame) => frame

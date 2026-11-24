@@ -2337,3 +2337,94 @@ test('API-6: session/search & agentPresets/* merge across local and remote, prot
   })
   handle.uninstall()
 })
+
+test('D23-5: sessionStatus/mark restores virtual sessionId and sessionStatus/follow merges across pool servers', async () => {
+  assert.deepEqual(CLIENT_METHOD_FIELDS['sessionStatus/mark'], ['sessionId'])
+  assert.deepEqual(CLIENT_METHOD_FIELDS['sessionStatus/follow'], [])
+  assert.equal(isRemoteWrite('sessionStatus/mark'), true)
+  assert.equal(REMOTE_READ_METHODS.has('sessionStatus/follow'), true)
+
+  const gateway = new FakeTypertGateway()
+  const localGate = createGate()
+  const origOpen = gateway.openWireStream.bind(gateway)
+  gateway.openWireStream = (endpoint, ...rest) =>
+    endpoint === 'sessionStatus/follow' ? localGate.iterable : origOpen(endpoint, ...rest)
+  const relay1 = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '11111111', serverName: 'S1', dshVersion: '0.0.0', fingerprints: {} },
+  })
+  const relay2 = createControllableRelay({
+    handshakeInfo: { relayProtocol: 1, serverId: '22222222', serverName: 'S2', dshVersion: '0.0.0', fingerprints: {} },
+  })
+  const poolEntries = [
+    { id: 'e1', serverId: '11111111', serverName: 'S1', displayName: 'S1', client: relay1 },
+    { id: 'e2', serverId: '22222222', serverName: 'S2', displayName: 'S2', client: relay2 },
+  ]
+  const pool = {
+    entries: () => poolEntries,
+    getByServerId: (sid) => poolEntries.find((e) => e.serverId === sid),
+  }
+  const handle = installIntercept({
+    raw: gateway,
+    pool,
+    getServerId: () => undefined,
+    log: () => {},
+  })
+
+  // sessionStatus/mark forwards restored sessionId
+  const markOk = await gateway.rpcBridge(
+    'sessionStatus/mark',
+    { args: { sessionId: toVirtual('11111111', 's-1'), action: { type: 'unread' } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(markOk.ok, true)
+  const markInvokes = relay1.invokes.filter((c) => c.namespace === 'sessionStatus')
+  assert.equal(markInvokes.length, 1)
+  assert.deepEqual(
+    { namespace: markInvokes[0].namespace, method: markInvokes[0].method, args: markInvokes[0].args },
+    { namespace: 'sessionStatus', method: 'mark', args: { sessionId: 's-1', action: { type: 'unread' } } },
+  )
+
+  // Offline write refuses remote-offline
+  relay1.transition('offline')
+  const markOffline = await gateway.rpcBridge(
+    'sessionStatus/mark',
+    { args: { sessionId: toVirtual('11111111', 's-1'), action: { type: 'read', throughTurn: 1 } } },
+    undefined,
+    undefined,
+  )
+  assert.equal(markOffline.ok, false)
+  assert.equal(markOffline.error.code, 'remote-offline')
+  relay1.transition('online')
+
+  // sessionStatus/follow merges local + pool servers
+  const controller = new AbortController()
+  const stream = await gateway.wireTap('sessionStatus/follow', { args: {} }, undefined, gateway.operatorPeer(), controller.signal, { signal: controller.signal })
+  const iter = stream[Symbol.asyncIterator]()
+  const nextFrame = () => iter.next().then((r) => r.value)
+
+  const lRec = { sessionId: 'local-1', completedTurn: 1, failed: false, readTurn: 0, manualUnread: false }
+  const r1Rec = { sessionId: 's-1', completedTurn: 2, failed: false, readTurn: 1, manualUnread: false }
+  const r2Rec = { sessionId: 's-2', completedTurn: 3, failed: true, readTurn: 0, manualUnread: true }
+
+  localGate.push({ type: 'baseline', items: [lRec] })
+  assert.deepEqual(await nextFrame(), { type: 'baseline', items: [lRec] })
+
+  await waitUntil(() => relay1.streams.length === 1 && relay2.streams.length === 1)
+  relay1.streams[0].gate.push({ type: 'baseline', items: [r1Rec] })
+  assert.deepEqual(await nextFrame(), { type: 'changed', state: { ...r1Rec, sessionId: toVirtual('11111111', 's-1') } })
+
+  relay2.streams[0].gate.push({ type: 'baseline', items: [r2Rec] })
+  assert.deepEqual(await nextFrame(), { type: 'changed', state: { ...r2Rec, sessionId: toVirtual('22222222', 's-2') } })
+
+  // Unpairing relay1 evicts relay1's records while preserving local + relay2
+  relay1.transition('unpaired')
+  assert.deepEqual(await nextFrame(), {
+    type: 'baseline',
+    items: [lRec, { ...r2Rec, sessionId: toVirtual('22222222', 's-2') }],
+  })
+
+  controller.abort()
+  localGate.finish()
+  handle.uninstall()
+})

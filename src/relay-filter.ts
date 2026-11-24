@@ -469,3 +469,52 @@ export function filterSessionSearchResult(value: unknown, isAccessible: Accessib
   }
   return { ...value, items, hasMore: Boolean(value.hasMore) }
 }
+
+/** One Host-confirmed Session reading record (`@deepseek-ai/dsh-client-ui-session-status`). */
+export interface SessionReadState extends Record<string, unknown> {
+  readonly sessionId: string
+  readonly completedTurn: number
+  readonly failed: boolean
+  readonly readTurn: number
+  readonly manualUnread: boolean
+}
+
+/**
+ * Filter one `sessionStatus/follow` frame against `isAccessible` while updating
+ * the unfiltered `cache` of Host reading records so share/unshare changes can
+ * synthesize `changed` or pruned `baseline` frames without reopening upstream.
+ */
+export function filterSessionStatusFrame(
+  frame: unknown,
+  isAccessible: Accessibility,
+  cache?: Map<string, SessionReadState>,
+): Record<string, unknown> | undefined {
+  if (!isPlainObject(frame)) return undefined
+  if (frame.type === 'baseline') {
+    if (!Array.isArray(frame.items)) return undefined
+    const validItems: SessionReadState[] = []
+    for (const item of frame.items) {
+      if (isPlainObject(item) && typeof item.sessionId === 'string' && item.sessionId !== '') {
+        validItems.push(item as SessionReadState)
+      }
+    }
+    if (cache !== undefined) {
+      cache.clear()
+      for (const item of validItems) cache.set(item.sessionId, item)
+    }
+    return {
+      ...frame,
+      type: 'baseline',
+      items: validItems.filter((item) => isAccessible(item.sessionId)),
+    }
+  }
+  if (frame.type === 'changed') {
+    const state = frame.state
+    if (!isPlainObject(state) || typeof state.sessionId !== 'string' || state.sessionId === '') return undefined
+    const record = state as SessionReadState
+    cache?.set(record.sessionId, record)
+    if (!isAccessible(record.sessionId)) return undefined
+    return { ...frame, type: 'changed', state: record }
+  }
+  return undefined
+}

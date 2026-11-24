@@ -991,6 +991,8 @@ test('T34-fix: every client-table method classifies read or write; the T31 write
     'forgePanel/markReady',
     'forgePanel/updateBranch',
     'forgePanel/merge',
+    // D23-5: sessionStatus reading mark
+    'sessionStatus/mark',
   ])
   for (const endpoint of Object.keys(CLIENT_METHOD_FIELDS)) {
     assert.ok(

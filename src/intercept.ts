@@ -104,6 +104,7 @@ import {
   composeMergedWorkspaceFrames,
   createControlMerger,
   createForgeStatesMerger,
+  createSessionStatusMerger,
   createWorkspaceMerger,
   localWorkspaceLists,
   mergeAgentPresetRosters,
@@ -321,6 +322,9 @@ export const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField
   'forgePanel/updateBranch': ['sessionId'],
   'forgePanel/merge': ['sessionId'],
   'forgePanel/changeRequestStates': [],
+  // sessionStatus (0.2.3) — per-session reading mark & global follow stream
+  'sessionStatus/mark': ['sessionId'],
+  'sessionStatus/follow': [],
   // The forwarded-event subscription (T32): the client reaches it through
   // relay.openStream('$zr','events') directly, never through the local
   // gateway — the empty fields entry exists to keep the two tables pinned
@@ -459,6 +463,8 @@ export const REMOTE_READ_METHODS: ReadonlySet<string> = new Set([
   'forgePanel/changeRequestViewed',
   'forgePanel/reviewerCandidates',
   'forgePanel/changeRequestStates',
+  // sessionStatus (0.2.3): global reading-state follow stream
+  'sessionStatus/follow',
   // Global search & agent preset reads
   'session/search',
   'agentPresets/list',
@@ -3487,7 +3493,17 @@ async function* mergedGlobalStreamMulti(deps: MergedGlobalStreamMultiDeps): Asyn
   }
 }
 
-interface ForgeStatesStreamDeps {
+interface MultiSnapshotMerger {
+  onLocal(frame: unknown): unknown[]
+  onRemote(serverId: string, frame: unknown): unknown[]
+  onRemoteGone(serverId: string): unknown[]
+}
+
+interface MultiSnapshotStreamDeps {
+  namespace: string
+  method: string
+  endpoint: string
+  createMerger: () => MultiSnapshotMerger
   local: AsyncIterable<unknown>
   singleRelay?: RelayClient
   pool?: RelayPool
@@ -3500,13 +3516,14 @@ interface ForgeStatesStreamDeps {
 }
 
 /**
- * Merged `forgePanel/changeRequestStates` stream across local + single relay or
- * multi-server pool (keyed by `entry.serverId`).
+ * Merged global snapshot stream (`forgePanel/changeRequestStates` or
+ * `sessionStatus/follow`) across local + single relay or multi-server pool
+ * (keyed by `entry.serverId`).
  */
-async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGenerator<unknown, void, undefined> {
-  const { local, singleRelay, pool, signal, recordFailure, log, clock } = deps
+async function* mergedMultiSnapshotStream(deps: MultiSnapshotStreamDeps): AsyncGenerator<unknown, void, undefined> {
+  const { namespace, method, endpoint, createMerger, local, singleRelay, pool, signal, recordFailure, log, clock } = deps
   if (signal?.aborted === true) return
-  const merger = createForgeStatesMerger()
+  const merger = createMerger()
   const channel = createFrameChannel()
   let alive = true
   const waiters: (() => void)[] = []
@@ -3553,7 +3570,7 @@ async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGener
         const controller = new AbortController()
         slot.controller = controller
         try {
-          const stream = slot.client.openStream('forgePanel', 'changeRequestStates', {}, controller.signal)
+          const stream = slot.client.openStream(namespace, method, {}, controller.signal)
           let served = false
           for await (const frame of stream) {
             if (!alive || slot.removed || controller.signal.aborted) break
@@ -3565,7 +3582,7 @@ async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGener
           }
         } catch (error) {
           if (alive && !slot.removed && !controller.signal.aborted && signal?.aborted !== true) {
-            recordFailure('forgePanel/changeRequestStates', error instanceof RelayError ? error.code : 'internal')
+            recordFailure(endpoint, error instanceof RelayError ? error.code : 'internal')
           }
         } finally {
           if (slot.controller === controller) slot.controller = undefined
@@ -3579,7 +3596,7 @@ async function* mergedForgeStatesStream(deps: ForgeStatesStreamDeps): AsyncGener
         await waitAny()
       }
     } catch (error) {
-      if (alive) log?.('forgePanel/changeRequestStates remote leg stopped: %s', messageOf(error))
+      if (alive) log?.('%s remote leg stopped: %s', endpoint, messageOf(error))
     }
   }
 
@@ -6448,7 +6465,7 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           lastFollowedSession = { kind: 'local' }
         }
       }
-      if (endpoint === 'forgePanel/changeRequestStates') {
+      if (endpoint === 'forgePanel/changeRequestStates' || endpoint === 'sessionStatus/follow') {
         if (probe !== undefined) {
           return (chainTarget.openWireStream as (...callArgs: unknown[]) => unknown).call(
             raw,
@@ -6462,10 +6479,15 @@ export function installIntercept(options: InstallInterceptOptions): InterceptHan
           )
         }
         const open = chainTarget.openWireStream as (this: unknown, ...callArgs: unknown[]) => unknown
+        const isSessionStatus = endpoint === 'sessionStatus/follow'
         return (async (): Promise<unknown> => {
           const local = await open.call(raw, endpoint, payload, uplink, peer, signal, control, uplinkWindow)
           if (!isAsyncIterable(local)) return local
-          return mergedForgeStatesStream({
+          return mergedMultiSnapshotStream({
+            namespace: isSessionStatus ? 'sessionStatus' : 'forgePanel',
+            method: isSessionStatus ? 'follow' : 'changeRequestStates',
+            endpoint,
+            createMerger: isSessionStatus ? createSessionStatusMerger : createForgeStatesMerger,
             local,
             ...(pool !== undefined ? { pool, watchPool } : { singleRelay }),
             signal,

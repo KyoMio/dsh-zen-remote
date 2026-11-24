@@ -126,7 +126,7 @@
  * (`src/relay-filter.ts` owns both implementations; the `$zr/events`
  * forwarding subscription is filtered by relay-server.ts itself — it needs
  * the per-eventId registry, not a pure frame function). */
-export type StreamFilter = 'workspace' | 'control' | 'forge-states';
+export type StreamFilter = 'workspace' | 'control' | 'forge-states' | 'session-status';
 /** Which standing filter the caller must apply to an invoke result before it
  * travels: `session-list` narrows the unscoped `session/list` items
  * (relay-filter.ts), `session-reference-candidates` drops the @-mention

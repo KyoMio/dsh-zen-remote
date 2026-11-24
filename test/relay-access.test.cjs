@@ -947,3 +947,30 @@ test('decideUploadQuery: whitelists optional single valid MIME mediaType and dro
     )
   }
 })
+
+test('D23-5: sessionStatus/mark and sessionStatus/follow access control', () => {
+  assert.deepEqual(
+    decideInvoke('sessionStatus', 'mark', { sessionId: 'S-shared', action: { type: 'unread' } }, only(['S-shared'])),
+    { allow: true },
+  )
+  assert.deepEqual(
+    decideInvoke('sessionStatus', 'mark', { sessionId: 'S-secret', action: { type: 'unread' } }, only(['S-shared'])),
+    { allow: false, reason: 'not-shared' },
+  )
+  assert.deepEqual(
+    decideInvoke('sessionStatus', 'mark', { request: { sessionId: 'S-shared' } }, yes),
+    { allow: false, reason: 'no-session' },
+  )
+  assert.deepEqual(
+    decideStream('sessionStatus', 'mark', { sessionId: 'S-shared' }, yes),
+    { allow: false, reason: 'forbidden-method' },
+  )
+  assert.deepEqual(
+    decideStream('sessionStatus', 'follow', {}, no),
+    { allow: true, filter: 'session-status', sessionIds: [] },
+  )
+  assert.deepEqual(
+    decideInvoke('sessionStatus', 'follow', {}, yes),
+    { allow: false, reason: 'forbidden-method' },
+  )
+})

@@ -11,7 +11,7 @@
 const { test } = require('node:test')
 const assert = require('node:assert/strict')
 
-const { createWorkspaceMerger, createControlMerger, createForgeStatesMerger, mergeSessionList, mergeModelCatalogs, mergeSessionSearch, mergeAgentPresetRosters, resolveRemotePresetName, virtualizeProjectionValue, sessionSummaryAddedFrames, virtualSessionIdsInWorkspaceFrames, virtualizeModelSelectionValue, localWorkspaceLists, composeMergedWorkspaceFrames } = require('../lib/merge-streams.js')
+const { createWorkspaceMerger, createControlMerger, createForgeStatesMerger, createSessionStatusMerger, mergeSessionList, mergeModelCatalogs, mergeSessionSearch, mergeAgentPresetRosters, resolveRemotePresetName, virtualizeProjectionValue, sessionSummaryAddedFrames, virtualSessionIdsInWorkspaceFrames, virtualizeModelSelectionValue, localWorkspaceLists, composeMergedWorkspaceFrames } = require('../lib/merge-streams.js')
 const { toVirtual, VIRTUAL_GROUP_NAME_MARK, encodeServerIdZeroWidth, decodeServerIdZeroWidth } = require('../lib/virtual-id.js')
 
 const SID = 'a1b2c3d4'
@@ -1977,4 +1977,79 @@ test('API-6 mergeSessionSearch, mergeAgentPresetRosters & agentPreset projection
 
   assert.equal(virtualizeProjectionValue('agentPreset', 'ptc', SID), V('ptc'))
   assert.equal(virtualizeProjectionValue('agentPreset', '', SID), '')
+})
+
+test('D23-5 createSessionStatusMerger(): holds until local baseline, virtualizes per server, re-baselines on shrink or removeServer', () => {
+  const m = createSessionStatusMerger()
+  const rec = (sessionId, completedTurn = 1, readTurn = 0, manualUnread = false) => ({
+    sessionId,
+    completedTurn,
+    failed: false,
+    readTurn,
+    manualUnread,
+  })
+
+  const l1 = rec('l-1', 2, 1)
+  const l2 = rec('l-2', 3, 3)
+  const r1 = rec('s-1', 4, 2)
+  const r2 = rec('s-2', 5, 0, true)
+  const r3 = rec('s-1', 1, 0) // Same raw id on srv-2 must not collide with srv-1 or local
+
+  // Remote frames and local changed before local baseline are held/ignored safely
+  assert.deepEqual(m.onRemote('srv-1', { type: 'baseline', items: [r1] }), [])
+  assert.deepEqual(m.onLocal({ type: 'changed', state: l2 }), [])
+
+  // First local baseline composes local + cached virtual remote items
+  assert.deepEqual(m.onLocal({ type: 'baseline', items: [l1] }), [
+    {
+      type: 'baseline',
+      items: [l1, { ...r1, sessionId: toVirtual('srv-1', 's-1') }],
+    },
+  ])
+
+  // Local changed passes through unchanged
+  assert.deepEqual(m.onLocal({ type: 'changed', state: l2 }), [{ type: 'changed', state: l2 }])
+
+  // Second server baseline emits virtualized changed frames (never raw baseline)
+  assert.deepEqual(m.onRemote('srv-2', { type: 'baseline', items: [r3] }), [
+    { type: 'changed', state: { ...r3, sessionId: toVirtual('srv-2', 's-1') } },
+  ])
+
+  // Expanding baseline on srv-1 emits virtualized changed frames
+  assert.deepEqual(m.onRemote('srv-1', { type: 'baseline', items: [r1, r2] }), [
+    { type: 'changed', state: { ...r1, sessionId: toVirtual('srv-1', 's-1') } },
+    { type: 'changed', state: { ...r2, sessionId: toVirtual('srv-1', 's-2') } },
+  ])
+
+  // Remote changed virtualizes sessionId
+  const r2Updated = rec('s-2', 5, 5, false)
+  assert.deepEqual(m.onRemote('srv-1', { type: 'changed', state: r2Updated }), [
+    { type: 'changed', state: { ...r2Updated, sessionId: toVirtual('srv-1', 's-2') } },
+  ])
+
+  // Shrinking baseline on srv-1 (s-1 removed/unshared) emits composed baseline keeping local + srv-2 + r2Updated
+  assert.deepEqual(m.onRemote('srv-1', { type: 'baseline', items: [r2Updated] }), [
+    {
+      type: 'baseline',
+      items: [
+        l1,
+        l2,
+        { ...r2Updated, sessionId: toVirtual('srv-1', 's-2') },
+        { ...r3, sessionId: toVirtual('srv-2', 's-1') },
+      ],
+    },
+  ])
+
+  // removeServer('srv-1') clears srv-1 only and keeps local + srv-2
+  assert.deepEqual(m.removeServer('srv-1'), [
+    {
+      type: 'baseline',
+      items: [
+        l1,
+        l2,
+        { ...r3, sessionId: toVirtual('srv-2', 's-1') },
+      ],
+    },
+  ])
+  assert.deepEqual(m.removeServer('srv-1'), [], 'second removeServer is no-op')
 })

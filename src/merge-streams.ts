@@ -1831,3 +1831,122 @@ export function mergeAgentPresetRosters(
   if (remotePresets.length === 0) return localResult
   return { ...localResult, presets: [...localResult.presets, ...remotePresets] }
 }
+
+/** One Host-confirmed Session reading record (`@deepseek-ai/dsh-client-ui-session-status`). */
+export interface SessionReadRecord extends Record<string, unknown> {
+  readonly sessionId: string
+  readonly completedTurn: number
+  readonly failed: boolean
+  readonly readTurn: number
+  readonly manualUnread: boolean
+}
+
+export interface SessionStatusMerger {
+  onLocal(frame: unknown): unknown[]
+  onRemote(serverId: string, frame: unknown): unknown[]
+  removeServer(serverId: string): unknown[]
+  onRemoteGone(serverId: string): unknown[]
+}
+
+/**
+ * Merge local and remote `sessionStatus/follow` frames into a single stream
+ * compatible with DSH's `RemoteSnapshotStream` (where every `baseline` replaces
+ * the full table and `changed` upserts one record). Remote baselines never
+ * travel raw so local or other servers' reading state is never wiped; they fold
+ * in as virtualized `changed` frames once `localSeen` is established, or emit a
+ * composed `baseline` when a server shrinks or disconnects.
+ */
+export function createSessionStatusMerger(): SessionStatusMerger {
+  let localSeen = false
+  const localRecords = new Map<string, SessionReadRecord>()
+  const remoteRecords = new Map<string, Map<string, SessionReadRecord>>()
+
+  const isValidRecord = (raw: unknown): raw is SessionReadRecord =>
+    isPlainObject(raw) && typeof raw.sessionId === 'string' && raw.sessionId !== ''
+
+  const allRemoteVirtualItems = (): SessionReadRecord[] => {
+    const out: SessionReadRecord[] = []
+    for (const serverMap of remoteRecords.values()) {
+      for (const item of serverMap.values()) out.push(item)
+    }
+    return out
+  }
+
+  const composedBaseline = (): Record<string, unknown> => ({
+    type: 'baseline',
+    items: [...localRecords.values(), ...allRemoteVirtualItems()],
+  })
+
+  const removeServer = (serverId: string): unknown[] => {
+    const removed = remoteRecords.delete(serverId)
+    if (!removed || !localSeen) return []
+    return [composedBaseline()]
+  }
+
+  return {
+    onLocal(frame: unknown): unknown[] {
+      if (!isPlainObject(frame)) return []
+      if (frame.type === 'baseline') {
+        if (!Array.isArray(frame.items)) return []
+        localSeen = true
+        localRecords.clear()
+        for (const item of frame.items) {
+          if (isValidRecord(item)) localRecords.set(item.sessionId, item)
+        }
+        return [composedBaseline()]
+      }
+      if (frame.type === 'changed') {
+        if (!isValidRecord(frame.state)) return []
+        localRecords.set(frame.state.sessionId, frame.state)
+        if (!localSeen) return []
+        return [{ type: 'changed', state: frame.state }]
+      }
+      return []
+    },
+
+    onRemote(serverId: string, frame: unknown): unknown[] {
+      if (!isPlainObject(frame)) return []
+      if (frame.type === 'baseline') {
+        if (!Array.isArray(frame.items)) return []
+        const prev = remoteRecords.get(serverId)
+        const next = new Map<string, SessionReadRecord>()
+        for (const item of frame.items) {
+          if (!isValidRecord(item)) continue
+          const virtualId = toVirtual(serverId, item.sessionId)
+          next.set(virtualId, { ...item, sessionId: virtualId })
+        }
+        let pruned = false
+        if (prev !== undefined) {
+          for (const virtualId of prev.keys()) {
+            if (!next.has(virtualId)) {
+              pruned = true
+              break
+            }
+          }
+        }
+        if (next.size === 0) remoteRecords.delete(serverId)
+        else remoteRecords.set(serverId, next)
+        if (!localSeen) return []
+        if (pruned) return [composedBaseline()]
+        return [...next.values()].map((state) => ({ type: 'changed', state }))
+      }
+      if (frame.type === 'changed') {
+        if (!isValidRecord(frame.state)) return []
+        let serverMap = remoteRecords.get(serverId)
+        if (serverMap === undefined) {
+          serverMap = new Map<string, SessionReadRecord>()
+          remoteRecords.set(serverId, serverMap)
+        }
+        const virtualId = toVirtual(serverId, frame.state.sessionId)
+        const virtualState: SessionReadRecord = { ...frame.state, sessionId: virtualId }
+        serverMap.set(virtualId, virtualState)
+        if (!localSeen) return []
+        return [{ type: 'changed', state: virtualState }]
+      }
+      return []
+    },
+
+    removeServer,
+    onRemoteGone: removeServer,
+  }
+}

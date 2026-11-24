@@ -151,7 +151,7 @@ type SessionField =
  * (`src/relay-filter.ts` owns both implementations; the `$zr/events`
  * forwarding subscription is filtered by relay-server.ts itself — it needs
  * the per-eventId registry, not a pure frame function). */
-export type StreamFilter = 'workspace' | 'control' | 'forge-states'
+export type StreamFilter = 'workspace' | 'control' | 'forge-states' | 'session-status'
 
 /** Which standing filter the caller must apply to an invoke result before it
  * travels: `session-list` narrows the unscoped `session/list` items
@@ -435,6 +435,9 @@ const RELAY_METHODS: Record<string, RelayMethod> = {
   'forgePanel/merge': { fields: ['sessionId'] },
   // forgePanel — global PR badge state stream
   'forgePanel/changeRequestStates': { fields: [], stream: true, streamFilter: 'forge-states' },
+  // sessionStatus (0.2.3) — per-session reading mark & global follow stream
+  'sessionStatus/mark': { fields: ['sessionId'] },
+  'sessionStatus/follow': { fields: [], stream: true, streamFilter: 'session-status' },
   // the forwarded-event subscription (T32): special entry, no session fields —
   // its frames are judged per `agentId`, its answers per forwarded `eventId`
   '$zr/events': { fields: [], stream: true, events: true },
