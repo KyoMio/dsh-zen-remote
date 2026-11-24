@@ -1,5 +1,6 @@
 node_modules/
 *.log
+*.tsbuildinfo
 .DS_Store
 .pnpm-store/
 .learnings/
