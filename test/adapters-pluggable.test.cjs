@@ -85,8 +85,13 @@ test('PB-11 pluggable: every registered adapter is well-formed', async () => {
     assert.ok(typeof adapter.plugin === 'string' && adapter.plugin !== '', 'plugin named')
     assert.ok(Array.isArray(adapter.versions) && adapter.versions.length > 0, `${adapter.plugin}: versions non-empty`)
     // Normalizing against the FIRST listed version must succeed — the route
-    // table (paths, locators, methods) is legal.
-    const normalized = core.normalizeAdapter(adapter, adapter.versions[0])
+    // table (paths, locators, methods) is legal. PB-27: an adapter declaring
+    // generation-gated routes requires the surface digest even for a listed
+    // version — the wiring always computes it, so this check offers the
+    // adapter's own first whitelist key (the generation its first version
+    // belongs to).
+    const firstSurface = adapter.surfaces !== undefined ? Object.keys(adapter.surfaces)[0] : undefined
+    const normalized = core.normalizeAdapter(adapter, adapter.versions[0], firstSurface === undefined ? undefined : { surfaceDigest: firstSurface })
     assert.ok(normalized.routes.length > 0)
     assert.ok(/^[0-9a-f]{16}$/u.test(normalized.digest), `${adapter.plugin}: the digest is the 16-hex form`)
   }

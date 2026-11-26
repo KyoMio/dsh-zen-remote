@@ -1706,13 +1706,34 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         const method = req.method ?? 'GET'
         const hasBody = method !== 'GET' && method !== 'HEAD'
 
+        // PB-27 r4: the browser wrapper's per-request truth, SCOPED. The
+        // deny hooks' `currentSessionId` is the backend's LAST REPORT —
+        // shared process-wide and up to a second stale across a session
+        // switch — so the first uncached clue load after switching back to
+        // a local session would be refused off the previous window's remote
+        // value (the r2 verdict's finding). The page knows its own truth in
+        // the same frame the attribute flips and annotates its clue calls
+        // with `x-zen-remote-panel-session: local`; read it HERE, strip it
+        // so the annotation never reaches the local plugin (the passthrough
+        // replays the request's own headers), and pass it to the hooks as
+        // `panelHint` — but ONLY the clue surface's hooks read it: every
+        // other hook judges by the report alone, so the hint can never
+        // weaken a non-clue refusal (the r3 finding).
+        const panelHint = typeof req.headers['x-zen-remote-panel-session'] === 'string' ? req.headers['x-zen-remote-panel-session'] : undefined
+        delete req.headers['x-zen-remote-panel-session']
+
         // The route's deny hook runs BEFORE any id locating: a request the
         // adapter refuses on path grounds (better-sidebar's open.external
         // from a remote panel, the side-chat methods) answers here — these
         // requests often carry NO session field, so the classify below
         // would otherwise read them as local and let them through.
+        // PB-27 r4: the report rides UNMODIFIED — the annotation never
+        // blanks it (the r3 regression blanked it for every hook, letting
+        // an annotated open.external pass as "no remote panel"). The hint
+        // rides along as its own field; whether it counts is EACH HOOK's
+        // decision — only better-sidebar's clue surface reads it.
         if (route.deny !== undefined) {
-          const denial = route.deny({ pathname, method, currentSessionId: getCurrentSession?.() })
+          const denial = route.deny({ pathname, method, currentSessionId: getCurrentSession?.(), ...(panelHint !== undefined ? { panelHint } : {}) })
           if (denial !== undefined) {
             answerUnbridged(res, plugin, denial)
             return
@@ -1806,7 +1827,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         const rewrite = rewriteAdapterRequest(route, pathname, searchParams, bodyGiven ? parsedBody : undefined, verdict.hits, (virtualId) => fromVirtual(virtualId)!.id)
         // The client hook: refuse, or replace the parsed body wholesale.
         // The hook sees the REWRITTEN body — the ids are already real (the
-        // design's order: locate → rewrite → hook → forward).
+        // design's order: locate → rewrite → hook → forward). PB-27: an
+        // allow verdict may also name this forward's header-wait override
+        // (selection.translate outlives the plain 15 s budget) — a per-call
+        // performance fact, never wire shape, so it rides the verdict and
+        // not the route table.
+        let hookHeaderTimeoutMs: number | undefined
         const hook = adapter.hooks.client?.request
         if (hook !== undefined) {
           const hookedBody = bodyGiven && rewrite.bodyText !== undefined ? JSON.parse(rewrite.bodyText) : bodyGiven ? parsedBody : undefined
@@ -1823,6 +1849,9 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           }
           if (hookedBody !== undefined && hookVerdict.body !== undefined) {
             rewrite.bodyText = JSON.stringify(hookVerdict.body)
+          }
+          if (typeof hookVerdict.headerTimeoutMs === 'number' && Number.isFinite(hookVerdict.headerTimeoutMs) && hookVerdict.headerTimeoutMs > 0) {
+            hookHeaderTimeoutMs = hookVerdict.headerTimeoutMs
           }
         }
 
@@ -1868,6 +1897,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             ...(bodyStream !== null && contentLength !== undefined ? { contentLength } : {}),
             ...(accept !== undefined ? { accept } : {}),
             ...(range !== undefined ? { range } : {}),
+            ...(hookHeaderTimeoutMs !== undefined ? { headerTimeoutMs: hookHeaderTimeoutMs } : {}),
           },
           controller.signal,
         )

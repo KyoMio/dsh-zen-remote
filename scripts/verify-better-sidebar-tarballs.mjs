@@ -21,6 +21,9 @@ const PLUGIN_SOURCES = [
   '/tmp/bs-versions/0.28.1/lib/index.js',
   '/tmp/bs-versions/0.28.2/lib/index.js',
   '/tmp/bs-versions/0.30.0/lib/index.js',
+  '/tmp/bs-versions/0.30.1/lib/index.js',
+  '/tmp/bs-versions/0.33.0/lib/index.js',
+  '/tmp/bs-versions/0.34.0-alpha.0/lib/index.js',
 ]
 
 const absent = PLUGIN_SOURCES.filter((p) => !fs.existsSync(p))
@@ -36,11 +39,22 @@ const adaptersMod = await importLib('adapters/index.js')
 const names = new Set()
 for (const sourcePath of PLUGIN_SOURCES) {
   const source = fs.readFileSync(sourcePath, 'utf8')
-  for (const match of source.matchAll(/"([a-zA-Z]+\.[a-zA-Z-]+)":\s*(?:async\s*)?\(/g)) {
+  for (const match of source.matchAll(/"([a-zA-Z]+(?:\.[a-zA-Z-]+)+)":\s*(?:async\s*)?\(/g)) {
     names.add(match[1])
   }
+  // 0.34.0-alpha.0: the clue service registers its seam through `registerApi`
+  // — literal names, constant-keyed names (the share surface) and the
+  // workspaceForSession constant. Verified against the build: the wire set
+  // and the set of `"clues.*"` string literals coincide exactly, so the
+  // literal scan is the honest extraction for this family.
+  for (const match of source.matchAll(/"(clues\.[a-zA-Z.]+)"/g)) {
+    names.add(match[1].replace(/\.$/u, ''))
+  }
+  for (const match of source.matchAll(/'(clues\.[a-zA-Z.]+)'/g)) {
+    names.add(match[1].replace(/\.$/u, ''))
+  }
 }
-const sidebarNames = [...names].filter((name) => /^(session|fs|git|changes|subagents|workflows|teams|settings|open|archive|sidechat)\./.test(name))
+const sidebarNames = [...names].filter((name) => /^(session|fs|git|changes|subagents|workflows|teams|settings|open|archive|sidechat|clues|selection)\./.test(name))
 assert.ok(sidebarNames.length >= 45, `the extraction found the union table (${sidebarNames.length} names)`)
 const missing = sidebarNames.filter((name) => adapterMod.SIDEBAR_METHODS[name] === undefined)
 assert.deepEqual(missing, [], `methods the plugin dispatches but the table lacks: ${missing.join(', ')}`)
@@ -73,4 +87,21 @@ for (const version of raw.versions) {
   assert.ok(raw.surfaces[digest] !== undefined, `${version}'s surface digest ${digest} is whitelisted`)
 }
 assert.deepEqual(Object.keys(raw.surfaces).sort(), [...computed].sort())
+
+// PB-27: the generation gate — normalizeAdapter over each REAL build's own
+// digest must produce the pre-0.34 route table (no share routes) for the ten
+// old generations, and the 15-route table (the four gated share routes in)
+// for 0.34.0-alpha.0 alone. The byte-identity of the old tables against the
+// pre-gate zen-remote is pinned in test/adapter-better-sidebar.test.cjs.
+const coreMod = await importLib('plugin-adapter-core.js')
+for (const version of raw.versions) {
+  const digest = digestOf(version)
+  const normalized = coreMod.normalizeAdapter(raw, version, { surfaceDigest: digest })
+  const shareRoutes = normalized.routes.filter((route) => route.path.startsWith('/sidebar/clues/share/'))
+  if (version === '0.34.0-alpha.0') {
+    assert.equal(shareRoutes.length, 4, 'the 0.34 generation carries the four gated share routes')
+  } else {
+    assert.equal(shareRoutes.length, 0, `${version} keeps the pre-0.34 table — no share routes`)
+  }
+}
 console.log('verify-better-sidebar-tarballs: all assertions passed')

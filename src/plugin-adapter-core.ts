@@ -52,7 +52,18 @@ export type AdapterLocator =
  * one (the request itself carries no session field, so the classify step
  * would otherwise read it as local) and the side-chat methods wholesale.
  * A `deny` hit answers the bridge's uniform 503 with that reason; returning
- * `undefined` falls through to the normal classify. */
+ * `undefined` falls through to the normal classify.
+ *
+ * `requiresSurface` (optional, PB-27) marks a route that exists only in ONE
+ * wire-surface generation of the plugin: the 16-hex surface digest that
+ * generation produces. The wiring extracts the INSTALLED build's digest
+ * even for listed versions when any route declares this field; a route
+ * whose digest does not match the installed build is DROPPED before the
+ * route table is folded and digested. That is what keeps the older
+ * generations' digests byte-identical to what a zen-remote without the
+ * route would compute — adding a generation's routes must never alter the
+ * bridging contract of the generations that do not serve them (the mixed-
+ * version matrix compares adapter digests across machines). */
 export interface AdapterRoute {
   path: string
   match: 'exact' | 'prefix'
@@ -62,7 +73,8 @@ export interface AdapterRoute {
   upgrade?: boolean
   locator: AdapterLocator
   local?: boolean
-  deny?: (info: { pathname: string; method: string; currentSessionId: string | undefined }) => string | undefined
+  requiresSurface?: string
+  deny?: (info: { pathname: string; method: string; currentSessionId: string | undefined; panelHint?: string }) => string | undefined
 }
 
 /** One adapter route after validation: every scalar filled with its
@@ -80,6 +92,12 @@ export interface NormalizedAdapterRoute {
   upgrade: boolean
   locator: AdapterLocator
   local: boolean
+  /** The generation gate the route declared, kept on the normalized form so
+   * diagnostics can tell a dropped route apart from an undeclared one. It
+   * never enters the route-table digest: by the time the digest is computed
+   * the non-matching routes have already been dropped, and a matching one is
+   * exactly the route its generation serves. */
+  requiresSurface?: string
   deny?: AdapterRoute['deny']
 }
 
@@ -109,9 +127,16 @@ export interface AdapterRequestContext {
  * body and/or the query — the better-sidebar adapter strips the `cwd`
  * query field of the file/upload routes so the backend resolves it from
  * the session), or refuse with a reason — the refusal travels the bridge's
- * uniform 503 shape on the client half, a 403 on the server half. */
+ * uniform 503 shape on the client half, a 403 on the server half.
+ * `headerTimeoutMs` (client half only, PB-27) overrides the relay's
+ * header-wait budget for THIS forward: the one better-sidebar consumer is
+ * `selection.translate`, whose upstream answer lands only after the model
+ * finishes (up to ~90 s) — far past the relay's plain 15 s. A timeout is
+ * a per-call performance fact, not wire shape: it never enters the
+ * route-table digest, and caller cancellation rides the request's own
+ * signal exactly as before. */
 export type AdapterVerdict =
-  | { allow: true; body?: unknown; query?: URLSearchParams }
+  | { allow: true; body?: unknown; query?: URLSearchParams; headerTimeoutMs?: number }
   | { allow: false; reason: string }
 
 /** The context of `client.response`: the parsed JSON answer plus the
@@ -230,15 +255,41 @@ export function normalizeAdapter(input: unknown, installedVersion: string, optio
   if (!Array.isArray(routes) || routes.length === 0) fail('routes', 'must be a non-empty array')
   if (routes.length > MAX_ROUTES) fail('routes', `${routes.length} routes exceeds the ${MAX_ROUTES} cap`)
 
+  // PB-27: the generation gate. A route carrying `requiresSurface` exists
+  // only in the wire-surface generation that digest names; the INSTALLED
+  // build's digest decides inclusion, so the same adapter binary produces
+  // the OLD generations' route tables (and digests) byte-identically to
+  // what a zen-remote without the new routes would compute. When the
+  // adapter declares such routes at all, the wiring MUST offer a digest —
+  // for listed versions too — otherwise every gated route would silently
+  // drop and the generation they belong to would bridge half a surface:
+  // refuse loudly instead (fail closed, no guessing).
+  const hasGatedRoutes = (routes as unknown[]).some((route) => isRecord(route) && route.requiresSurface !== undefined)
+  const installedSurfaceDigest = options?.surfaceDigest
+  if (hasGatedRoutes && installedSurfaceDigest === undefined) {
+    fail('routes', 'the adapter declares requiresSurface routes but no surface digest was offered for the installed build')
+  }
+
   const seen = new Set<string>()
-  const normalized: NormalizedAdapterRoute[] = routes.map((route, index): NormalizedAdapterRoute => {
+  const normalized: NormalizedAdapterRoute[] = []
+  for (const [routeIndex, route] of (routes as unknown[]).entries()) {
+    const index = routeIndex
     if (!isRecord(route)) fail(`routes[${index}]`, 'expected an object')
     for (const key of Object.keys(route)) {
-      if (key !== 'path' && key !== 'match' && key !== 'methods' && key !== 'maxBody' && key !== 'stream' && key !== 'upgrade' && key !== 'locator' && key !== 'local' && key !== 'deny') {
+      if (key !== 'path' && key !== 'match' && key !== 'methods' && key !== 'maxBody' && key !== 'stream' && key !== 'upgrade' && key !== 'locator' && key !== 'local' && key !== 'deny' && key !== 'requiresSurface') {
         fail(`routes[${index}].${key}`, 'unknown field (typo guard)')
       }
     }
-    const { path, match, methods, maxBody, stream, upgrade, locator, local, deny } = route
+    // The generation gate itself: validated before the drop decision so a
+    // malformed gate never hides behind a matching digest.
+    const requiresSurface = (route as { requiresSurface?: unknown }).requiresSurface
+    if (requiresSurface !== undefined && (typeof requiresSurface !== 'string' || !/^[0-9a-f]{16}$/u.test(requiresSurface))) {
+      fail(`routes[${index}].requiresSurface`, 'must be a 16-hex surface digest')
+    }
+    if (typeof requiresSurface === 'string' && requiresSurface !== installedSurfaceDigest) {
+      continue
+    }
+    const { path, match, methods, maxBody, stream, upgrade, locator, local, deny } = route as unknown as AdapterRoute
     if (typeof path !== 'string' || path === '' || !path.startsWith('/') || path.includes('?') || path.includes('#') || path.includes('..') || /\s/u.test(path)) {
       fail(`routes[${index}].path`, `"${String(path)}" must be a plain absolute path`)
     }
@@ -295,7 +346,7 @@ export function normalizeAdapter(input: unknown, installedVersion: string, optio
     if (local !== undefined && local !== true && local !== false) fail(`routes[${index}].local`, 'must be a boolean')
     const normalizedLocal: boolean = local === true
     if (deny !== undefined && typeof deny !== 'function') fail(`routes[${index}].deny`, 'must be a function or omitted')
-    return {
+    normalized.push({
       path,
       match,
       methods: normalizedMethods,
@@ -304,9 +355,11 @@ export function normalizeAdapter(input: unknown, installedVersion: string, optio
       upgrade: normalizedUpgrade,
       locator: locator as AdapterLocator,
       local: normalizedLocal,
+      ...(typeof requiresSurface === 'string' ? { requiresSurface } : {}),
       ...(deny !== undefined && typeof deny === 'function' ? { deny: deny as AdapterRoute['deny'] } : {}),
-    }
-  })
+    })
+  }
+  if (normalized.length === 0) fail('routes', 'no routes apply to the installed build')
   normalized.sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
 
   const digest = adapterDigestOf(plugin, installedVersion, normalized)

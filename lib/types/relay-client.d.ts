@@ -356,6 +356,13 @@ export interface RelayPluginRequest {
     /** The one request header passed through to the plugin beside `range`. */
     accept?: string;
     range?: string;
+    /** Per-call header-wait override in milliseconds (PB-27): a bridged call
+     * whose upstream answer legitimately outlives the plain request budget
+     * (better-sidebar's `selection.translate` waits for the model — up to
+     * ~90 s) names its own ceiling here. Still bounded by the same 900 s cap;
+     * the timeout judges THIS call and never moves the link state, exactly
+     * like the plain budget. */
+    headerTimeoutMs?: number;
 }
 /** The inputs of one {@link RelayClient.upload} round-trip. */
 export interface RelayUploadOptions {

@@ -31,6 +31,145 @@
  * path because the URL is all it sees). */
 const API_ROUTES: ReadonlySet<string> = new Set(['/api/changes.summary', '/api/changes.diff'])
 
+/** PB-27 finding 4: the clue surface's URL shapes. better-sidebar's clue
+ * calls POST `/sidebar/api/clues.*` (the method name in the path tail —
+ * `/sidebar/api/clues.list`, `/sidebar/api/clues.saveEdit`, …) and the four
+ * pack share routes POST under `/sidebar/clues/share/`. All of it is
+ * workspace-keyed — there is nothing a remote session may legitimately
+ * read or write there, so inside a remote session these calls are blocked
+ * at the fetch layer, before the network. */
+const CLUE_API_PREFIX = '/sidebar/api/clues.'
+const CLUE_API_EXACT = '/sidebar/api/clues'
+const CLUE_SHARE_PREFIX = '/sidebar/clues/share/'
+
+/** The remote-session probe, overridable in tests: whether the CURRENT
+ * session on screen is a remote one, read off the same html attribute
+ * remote-session.ts's guard writes and remote-session.css.ts's hiding keys
+ * on. Reading the attribute rather than the backend's current-session
+ * report is the whole point of the fix: the report lags a switch by up to
+ * a second (and is shared process-wide), while the attribute moves with
+ * the main view in the same frame the panels read — a local session's clue
+ * load can no longer be judged by a stale remote value, and a remote
+ * panel's clue call can no longer slip through a stale local one. */
+export interface RemoteSessionProbe {
+  (): boolean
+}
+const defaultRemoteProbe: RemoteSessionProbe = () => {
+  const doc = (globalThis as { document?: { documentElement?: { hasAttribute?: (name: string) => boolean } } }).document
+  return doc?.documentElement?.hasAttribute?.('data-zr-remote-session') === true
+}
+let remoteSessionProbe: RemoteSessionProbe = defaultRemoteProbe
+/** Test seam: swap the probe for one install generation. Not part of the
+ * public surface. */
+export function setRemoteSessionProbeForTests(probe: RemoteSessionProbe | undefined): void {
+  remoteSessionProbe = probe ?? defaultRemoteProbe
+}
+
+/** Whether one parsed path is a clue call the remote session must not
+ * reach — the `/sidebar/api/clues.*` methods and the four share routes. */
+export function isCluePath(pathname: string): boolean {
+  return pathname.startsWith(CLUE_API_PREFIX) || pathname === CLUE_API_EXACT || pathname.startsWith(CLUE_SHARE_PREFIX)
+}
+
+/** The synthetic refusal answer, in the plugin's own envelope shape: the
+ * clue UI unwraps `/sidebar` responses through its readEnvelope, which
+ * turns a non-ok status into a SidebarApiError carrying the wire code —
+ * exactly what the intercept layer's 503 refusal produces. The blocked
+ * call therefore degrades inside the panel's ordinary error path instead
+ * of throwing a foreign shape, and the clue surfaces are hidden by the
+ * stylesheet anyway, so this response exists for the race and the
+ * background pollers, not for a user to read. */
+function clueBlockedBody(): string {
+  return JSON.stringify({ ok: false, error: { code: 'remote-clues-unsupported', message: 'The clue library stays on this machine; it is not available in a remote session.' } })
+}
+
+/** The per-request truth (PB-27 r3): the backend deny hook's current-session
+ * report lags a session switch by up to a second and is shared process-wide,
+ * so the FIRST uncached clue load after switching back to a local session
+ * would be refused off the stale remote value. The page itself knows the
+ * truth in the same frame — the wrapper therefore annotates every LOCAL
+ * session's clue call with this header. The intercept reads it BEFORE its
+ * report and strips it before the local plugin: the annotation judges only
+ * the deny decision, never the upstream payload. Only the exact value
+ * `local` speaks — anything else is ignored, so a remote panel can never
+ * gain from it (its calls are blocked here anyway). */
+export const PANEL_SESSION_HEADER = 'x-zen-remote-panel-session'
+const PANEL_SESSION_LOCAL = 'local'
+
+/** Whether one parsed path is a clue call at all (same-origin enforced by
+ * the caller): the annotation's target — never mind the probe. */
+function isClueCall(input: unknown, baseHref: string): boolean {
+  const raw = typeof input === 'string' || input instanceof URL
+    ? input
+    : typeof input === 'object' && input !== null && typeof (input as { url?: unknown }).url === 'string'
+      ? (input as { url: string }).url
+      : undefined
+  if (raw === undefined) return false
+  let parsed: URL
+  let base: URL
+  try {
+    parsed = new URL(raw, baseHref)
+    base = new URL(baseHref)
+  } catch {
+    return false
+  }
+  if (parsed.origin !== base.origin) return false
+  return isCluePath(parsed.pathname)
+}
+
+/** The annotated init for a LOCAL session's clue call: the original init
+ * plus the panel-session header, the caller's own headers (plain object or
+ * tuple array) preserved. A call without init gains a minimal object; a
+ * Headers-shaped instance is flattened — the plugin's own clue traffic uses
+ * plain objects, but the wrapper wraps ALL of window.fetch, so the other
+ * shapes must not corrupt. */
+function annotateClueInit(init: RequestInit | undefined): RequestInit {
+  const base: Record<string, string> = {}
+  const given = init?.headers
+  if (given !== undefined && given !== null) {
+    if (Array.isArray(given)) {
+      for (const entry of given as Array<[string, string]>) {
+        if (Array.isArray(entry) && entry.length === 2) base[entry[0]] = entry[1]
+      }
+    } else if (typeof (given as Headers).forEach === 'function') {
+      ;(given as Headers).forEach((value, key) => { base[key] = value })
+    } else {
+      Object.assign(base, given as Record<string, string>)
+    }
+  }
+  base[PANEL_SESSION_HEADER] = PANEL_SESSION_LOCAL
+  return { ...(init ?? {}), headers: base }
+}
+
+/**
+ * The block decision, pure: whether one fetch call is a clue request that
+ * must not leave this machine. Only same-origin clue paths count, and only
+ * while the probe says the session on screen is remote — local sessions
+ * (and every non-clue path) pass through untouched.
+ */
+export function shouldBlockClueCall(input: unknown, baseHref: string, isRemote: boolean): boolean {
+  if (!isRemote) return false
+  // String and URL inputs, plus Request-shaped objects (a `url` string) —
+  // the clue calls themselves use strings, but the wrapper wraps ALL of
+  // window.fetch, so the decision must not misjudge the other shapes.
+  const raw = typeof input === 'string' || input instanceof URL
+    ? input
+    : typeof input === 'object' && input !== null && typeof (input as { url?: unknown }).url === 'string'
+      ? (input as { url: string }).url
+      : undefined
+  if (raw === undefined) return false
+  let parsed: URL
+  let base: URL
+  try {
+    parsed = new URL(raw, baseHref)
+    base = new URL(baseHref)
+  } catch {
+    return false
+  }
+  if (parsed.origin !== base.origin) return false
+  return isCluePath(parsed.pathname)
+}
+
 /** Prefix of the sub-client backend route the rewritten calls land on. */
 export const CLIENT_HTTP_ROUTE_PREFIX = '/_dsh/zen-remote/client/http/'
 
@@ -98,6 +237,27 @@ export function installRemoteApiFetch(host: FetchHost): () => void {
       // An uninstalled wrapper still referenced by an outer wrapper passes
       // through untouched — it no longer speaks for a live install.
       if (!active) return original(input, init)
+      // PB-27 finding 4: inside a remote session the clue surface is OFF —
+      // its entry points are hidden by the stylesheet and its calls are
+      // blocked HERE, before the network. The probe reads the same html
+      // attribute the hiding keys on, so the block moves with the session
+      // switch in the same frame and never inherits the backend report's
+      // 1 s lag in either direction.
+      const isRemoteNow = remoteSessionProbe()
+      if (shouldBlockClueCall(input, host.location.href, isRemoteNow)) {
+        return Promise.resolve(new Response(clueBlockedBody(), {
+          status: 503,
+          headers: { 'content-type': 'application/json' },
+        }))
+      }
+      // PB-27 r3: the mirror half — a LOCAL session's clue call reaches the
+      // network WITH the per-request annotation, so the backend deny hook
+      // judges this request by the page's same-frame truth instead of the
+      // shared report's 1 s lag. Without it the first uncached clue load
+      // after switching back refused 503 until the report caught up.
+      if (!isRemoteNow && isClueCall(input, host.location.href)) {
+        return original(input, annotateClueInit(init))
+      }
       const method = init?.method ?? (typeof input === 'string' || input instanceof URL ? 'GET' : input.method)
       const rewritten = rewriteRemoteApiUrl(input, method, host.location.href)
       if (rewritten === undefined) return original(input, init)

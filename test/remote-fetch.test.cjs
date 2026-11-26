@@ -186,3 +186,160 @@ test('install: an uninstalled wrapper still held by an outer wrapper passes thro
   assert.equal(seen.input, `api/changes.summary?sessionId=${VIRTUAL_ID}&seq=1`)
   assert.deepEqual(originalCalls, [`api/changes.summary?sessionId=${VIRTUAL_ID}&seq=1`])
 })
+
+// ---- PB-27 finding 4: the clue surface is blocked at the fetch layer in a remote session ----
+
+test('clue block: /sidebar/api/clues.* and the share routes are blocked only while the probe says remote', async () => {
+  const { shouldBlockClueCall, isCluePath } = await load()
+  // The shape coverage: api methods, the exact root, and the four shares.
+  assert.equal(isCluePath('/sidebar/api/clues.list'), true)
+  assert.equal(isCluePath('/sidebar/api/clues.saveEdit'), true)
+  assert.equal(isCluePath('/sidebar/api/clues'), true)
+  for (const p of ['/sidebar/clues/share/export-preview', '/sidebar/clues/share/export', '/sidebar/clues/share/import-preview', '/sidebar/clues/share/import']) {
+    assert.equal(isCluePath(p), true, `${p} is a clue path`)
+  }
+  // NOT clue paths: every other sidebar method, the agent loopback routes
+  // (they are the host's own channel, and a local host answers them), and
+  // the ordinary /api surface.
+  assert.equal(isCluePath('/sidebar/api/fs.tree'), false)
+  assert.equal(isCluePath('/sidebar/api/selection.translate'), false)
+  assert.equal(isCluePath('/sidebar/agent/clues/read'), false, 'the agent loopback route is not a browser clue call')
+  assert.equal(isCluePath('/api/changes.summary'), false)
+  // The decision gates on the remote probe…
+  assert.equal(shouldBlockClueCall('/sidebar/api/clues.list', BASE, true), true)
+  assert.equal(shouldBlockClueCall('/sidebar/api/clues.list', BASE, false), false, 'a local session never blocks')
+  // …on same-origin…
+  assert.equal(shouldBlockClueCall('https://evil.test/sidebar/api/clues.list', BASE, true), false, 'cross-origin passes through untouched')
+  // …and document-relative URLs resolve against the page.
+  assert.equal(shouldBlockClueCall('sidebar/api/clues.list', BASE, true), true)
+  // Request-shaped objects decide by their url.
+  assert.equal(shouldBlockClueCall({ url: `${BASE}sidebar/clues/share/export` }, BASE, true), true)
+  // Unparseable input never blocks.
+  assert.equal(shouldBlockClueCall(undefined, BASE, true), false)
+  assert.equal(shouldBlockClueCall(42, BASE, true), false)
+})
+
+test('clue block: the wrapper answers the synthetic refusal without touching the network — and the SAME call passes through the moment the session goes local (switch regression)', async () => {
+  const { installRemoteApiFetch, setRemoteSessionProbeForTests } = await load()
+  const originalCalls = []
+  const host = {
+    location: { href: BASE },
+    fetch: async (input, init) => {
+      originalCalls.push(String(input))
+      return new Response(JSON.stringify({ ok: true, value: { local: true } }), { status: 200, headers: { 'content-type': 'application/json' } })
+    },
+  }
+  // The session on screen IS remote (the html attribute is set — the probe
+  // reads exactly what the stylesheet hiding keys on).
+  let remote = true
+  setRemoteSessionProbeForTests(() => remote)
+  try {
+    const uninstall = installRemoteApiFetch(host)
+
+    const blocked = await host.fetch('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.equal(blocked.status, 503, 'the blocked call answers the refusal status')
+    const blockedBody = await blocked.json()
+    assert.equal(blockedBody.ok, false)
+    assert.equal(blockedBody.error.code, 'remote-clues-unsupported', 'the envelope carries the wire code the UI degrades on')
+    assert.equal(originalCalls.length, 0, 'the call never reached the network')
+
+    // The share window's export call is blocked the same way.
+    const share = await host.fetch('/sidebar/clues/share/export', { method: 'POST', body: '{}' })
+    assert.equal(share.status, 503)
+    assert.equal(originalCalls.length, 0)
+
+    // THE SWITCH REGRESSION (the verdict's finding): the user switches back
+    // to a LOCAL session — the attribute comes off in the same frame the
+    // panel reads — and the very next clue load must reach the local plugin
+    // immediately, not inherit the backend report's 1 s lag. Flip the probe
+    // and fire the identical request.
+    remote = false
+    const local = await host.fetch('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.equal(local.status, 200, 'the same call passes through the instant the session is local')
+    assert.deepEqual(await local.json(), { ok: true, value: { local: true } })
+    assert.equal(originalCalls.length, 1, 'it reached the network exactly once')
+    assert.equal(originalCalls[0], '/sidebar/api/clues.list')
+
+    // …and switching TO remote re-engages the block at once (the reverse
+    // race: a remote panel's clue call must not slip through a stale local
+    // value either).
+    remote = true
+    const again = await host.fetch('/sidebar/api/clues.list', { method: 'POST', body: '{}' })
+    assert.equal(again.status, 503)
+    assert.equal(originalCalls.length, 1, 'no further network call')
+
+    // Non-clue calls are never blocked even remotely — fs.tree rides the
+    // adapter bridge in a remote session, so it must reach the network.
+    const tree = await host.fetch('/sidebar/api/fs.tree', { method: 'POST', body: '{}' })
+    assert.equal(tree.status, 200)
+    assert.equal(originalCalls.length, 2)
+
+    uninstall()
+  } finally {
+    setRemoteSessionProbeForTests(undefined)
+  }
+})
+
+test('clue block: with no probe override and no document, nothing is blocked (host-role safety)', async () => {
+  const { shouldBlockClueCall } = await load()
+  // The default probe answers false off-DOM (tests, workers, host tooling):
+  // isRemote false means the decision never fires.
+  assert.equal(shouldBlockClueCall('/sidebar/api/clues.list', BASE, false), false)
+})
+
+test('clue annotate: a LOCAL session\'s clue calls carry the panel-session header; remote and non-clue calls never do', async () => {
+  const { installRemoteApiFetch, setRemoteSessionProbeForTests } = await load()
+  const originalCalls = []
+  const original = async (input, init) => {
+    originalCalls.push({ input: String(input), init })
+    return { ok: true, url: String(input), status: 200, json: async () => ({ ok: true }) }
+  }
+  const host = { location: { href: BASE }, fetch: original }
+  let remote = false
+  setRemoteSessionProbeForTests(() => remote)
+  try {
+    const uninstall = installRemoteApiFetch(host)
+    // Local session: the clue call passes through AND carries the
+    // per-request truth the backend deny hook judges before its stale report.
+    await host.fetch('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.equal(originalCalls.length, 1)
+    const headers = originalCalls[0].init.headers
+    assert.equal(headers['x-zen-remote-panel-session'], 'local', 'the annotation rides the clue call')
+    assert.equal(headers['content-type'], 'application/json', 'the original headers survive')
+
+    // The share routes annotate too.
+    await host.fetch('/sidebar/clues/share/export', { method: 'POST', body: '{}' })
+    assert.equal(originalCalls[1].init.headers['x-zen-remote-panel-session'], 'local')
+
+    // Non-clue calls never carry it — fs.tree is session-scoped bridged
+    // traffic, the adapter layer's business, not the panel hint's.
+    await host.fetch('/sidebar/api/fs.tree', { method: 'POST', body: '{}' })
+    assert.equal(originalCalls[2].init?.headers?.['x-zen-remote-panel-session'], undefined, 'non-clue calls are never annotated')
+
+    // Headers given as an array-of-tuples or a Headers-shaped object still
+    // gain the annotation without losing their entries.
+    await host.fetch('/sidebar/api/clues.list', {
+      method: 'POST', headers: [['x-custom', 'yes']], body: '{}',
+    })
+    const arrHeaders = originalCalls[3].init.headers
+    assert.equal(arrHeaders['x-zen-remote-panel-session'], 'local')
+    assert.equal(arrHeaders['x-custom'], 'yes', 'tuple-form entries survive')
+
+    // Remote: the call is BLOCKED before the network — no annotation, no send.
+    remote = true
+    const blocked = await host.fetch('/sidebar/api/clues.list', { method: 'POST', body: '{}' })
+    assert.equal(blocked.status, 503)
+    assert.equal(originalCalls.length, 4, 'blocked remotely: nothing more reached the network')
+
+    uninstall()
+  } finally {
+    setRemoteSessionProbeForTests(undefined)
+  }
+})
+

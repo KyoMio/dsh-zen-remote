@@ -99,7 +99,24 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
   // bridging works on hosts with or without requestRejection. The plugin
   // gates itself on engines.dsh >=0.2.2-rc.3 — older hosts simply stay on
   // the still-bridged 0.30.x line, so our engines.dsh floor does not move.
-  versions: ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0', '0.30.1', '0.33.0'],
+  // 0.34.0-alpha.0 (DSH >=0.2.3-alpha.2, the alpha line — rc hosts keep
+  // 0.33.0 and its still-bridged surface): the JSON api grows
+  // `selection.translate` (a session-scoped model-spend write, forwarded
+  // like git.suggest-message) and the whole `clues.*` family — 48 methods
+  // addressed by workspaceId, NOT sessionId. zen-remote's bridge locates,
+  // authorizes and rewrites along SESSION ids; a workspace key has no
+  // authorization unit to map to, so the clue surface refuses in remote
+  // sessions wholesale (the route deny hooks below + the client-half
+  // api guard), rather than silently leaking a LOCAL workspace's library
+  // into a remote view. The four raw share routes
+  // (/sidebar/clues/share/export[-preview]/import[-preview]) are the same
+  // workspace-scoped face and deny the same way. The two agent loopback
+  // routes /sidebar/agent/clues/read|commit are the host's own injection
+  // channel for the AGENT process (POST, loopback-only literal-peer
+  // fences), never a browser face — nothing to bridge, they ride the
+  // surface digest as literals only. No wire exists for workspace-id
+  // virtualization yet: when one lands, the clue family is the consumer.
+  versions: ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0', '0.30.1', '0.33.0', '0.34.0-alpha.0'],
   // PB-19 (ADR-0003): the wire-surface whitelist. Keys are digest16 over the
   // PB-18 extractor's reduction (`surface.ts` beside this file) of the npm
   // builds' lib/index.js, computed off /tmp/bs-versions/{version}/lib/index.js:
@@ -119,6 +136,11 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
     '6ed29a896101e681': 'the 0.28.0 generation (0.28.0-alpha.0 identical)',
     '65a0acaeb56f87d9': 'the 0.28.1 generation (0.28.2 identical)',
     '394de9f588d37092': 'the 0.30.0 generation',
+    // 0.34.0-alpha.0: the extractor's namespace/method patterns widened for
+    // the clues family (clues/selection namespaces, multi-dot keys) — every
+    // older generation re-hashes to its listed digest byte-identically
+    // (verified against /tmp/bs-versions/), only the 0.34 surface is new.
+    '4988812a1d408484': 'the 0.34.0-alpha.0 generation (clues + selection.translate)',
   },
   routes: [
     {
@@ -130,7 +152,7 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
       methods: ['POST'],
       maxBody: SIDEBAR_IMAGE_PROMPT_MAX_BODY_BYTES,
       locator: { in: 'json-body', fields: ['sessionId', 'rootSessionId', 'childId'] },
-      deny: ({ pathname, currentSessionId }) => {
+      deny: ({ pathname, currentSessionId, panelHint }) => {
         const name = apiMethodOf(pathname)
         if (name === '') return undefined
         // Opening apps/URLs on the HOST is a remote-panel no: refused when
@@ -144,6 +166,40 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
         // so they forward like everything else.)
         if (name === 'open.external' && currentSessionId !== undefined && isVirtual(currentSessionId)) {
           return 'remote-open-unsupported'
+        }
+        // 0.34.0-alpha.0: every `clues.*` method is addressed by workspaceId,
+        // never a session id the bridge could authorize on (the UI sends
+        // `{ workspaceId, … }` payloads; sessionId is an optional side field
+        // on clues.read at most). Without the refusal, a remote panel's clue
+        // traffic classifies LOCAL — the sub-client's own plugin would answer
+        // with the LOCAL machine's library inside a remote session's view,
+        // or a not-found the user cannot place. Refuse up front whenever the
+        // browser currently looks at a remote session; the client-half
+        // request hook below additionally refuses EVERY clues forward, so no
+        // clue request crosses the relay even in a mixed context.
+        //
+        // PB-27 finding 4 (known, accepted): `currentSessionId` is the
+        // BACKEND's last report — shared process-wide, up to a second stale
+        // across a session switch — so this hook can misjudge in BOTH
+        // directions during the overlap. That is why the primary gate moved
+        // to the browser: the clue entries are hidden and every clue fetch
+        // is blocked inside the page (remote-session.css.ts / remote-fetch.ts)
+        // off the SAME html attribute the panels render from, with zero lag
+        // in either direction. This hook stays as belt-and-braces for clue
+        // calls no entry point can account for (a foreign automation, a
+        // misloaded plugin state): while the html attribute says remote the
+        // report cannot be MORE wrong than the page itself, and when both
+        // lag together the server-half refusal — unconditional, per-request —
+        // still bounds the damage to a refusal, never a leak.
+        if (name.startsWith('clues.') && currentSessionId !== undefined && isVirtual(currentSessionId)) {
+          // PB-27 r4: the clue surface alone may read the browser's
+          // panel hint — a truthfully-local page's annotated clue call
+          // passes even while the report lags remote (the r2 finding).
+          // The exact value `local` only, and only the deny judgment:
+          // the ids in the payload still classify on their own below.
+          if (panelHint !== 'local') {
+            return 'remote-clues-unsupported'
+          }
         }
         return undefined
       },
@@ -194,6 +250,42 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
     // client.response hook below virtualizes the pushed threadId so the
     // browser's `wantedRef.includes(frame.threadId)` comparison fires.
     { path: '/sidebar/ws/sidechat', match: 'exact', methods: ['GET'], upgrade: true, locator: { in: 'json-body', fields: ['threadIds'] } },
+    // 0.34.0-alpha.0: the clue pack share surface (lib/index.js
+    // CLUES_SHARE_ROUTE_PATHS) — four exact POST routes taking a workspaceId
+    // in the JSON body / the query, NEVER a session id. Same refusal shape
+    // as the clues API methods: a remote panel must not fall through to the
+    // local plugin's share service. Declared (not just omitted) precisely so
+    // the deny hook intercepts them — undeclared, the interceptor never sees
+    // them and the local plugin answers with the local machine's workspace.
+    // The locator is a never-present query field: no real request locates
+    // anything, every LOCAL request passes through untouched, and a remote
+    // context is refused by the hook before locating anyway.
+    // `requiresSurface` (PB-27): these routes exist only in the 0.34 wire
+    // generation. Gated on that generation's digest, they enter the route
+    // table ONLY when the installed build hashes to it — the ten pre-0.34
+    // generations keep byte-identical route tables and digests to what
+    // zen-remote shipped before 0.34 existed, so upgrading ONE end never
+    // strands the other's older sidebar in the hidden regime.
+    {
+      path: '/sidebar/clues/share/export-preview', match: 'exact', methods: ['POST'],
+      locator: { in: 'query', name: 'sessionId' }, requiresSurface: '4988812a1d408484',
+      deny: ({ currentSessionId, panelHint }) => (currentSessionId !== undefined && isVirtual(currentSessionId) && panelHint !== 'local' ? 'remote-clues-unsupported' : undefined),
+    },
+    {
+      path: '/sidebar/clues/share/export', match: 'exact', methods: ['POST'],
+      locator: { in: 'query', name: 'sessionId' }, requiresSurface: '4988812a1d408484',
+      deny: ({ currentSessionId, panelHint }) => (currentSessionId !== undefined && isVirtual(currentSessionId) && panelHint !== 'local' ? 'remote-clues-unsupported' : undefined),
+    },
+    {
+      path: '/sidebar/clues/share/import-preview', match: 'exact', methods: ['POST'],
+      locator: { in: 'query', name: 'sessionId' }, requiresSurface: '4988812a1d408484',
+      deny: ({ currentSessionId, panelHint }) => (currentSessionId !== undefined && isVirtual(currentSessionId) && panelHint !== 'local' ? 'remote-clues-unsupported' : undefined),
+    },
+    {
+      path: '/sidebar/clues/share/import', match: 'exact', methods: ['POST'],
+      locator: { in: 'query', name: 'sessionId' }, requiresSurface: '4988812a1d408484',
+      deny: ({ currentSessionId, panelHint }) => (currentSessionId !== undefined && isVirtual(currentSessionId) && panelHint !== 'local' ? 'remote-clues-unsupported' : undefined),
+    },
   ],
   client: {
     request: (ctx) => {
@@ -202,8 +294,24 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
       // even if a future plugin version starts carrying session fields
       // on it (which would flip it into the remote branch).
       if (name === 'open.external') return { allow: false, reason: 'remote-open-unsupported' }
+      // 0.34.0-alpha.0: NO clue call crosses the relay, ever. The clue
+      // surface is workspace-keyed — a forwarded call would land on the
+      // SERVER's clue service with the sub-client's meaningless workspaceId
+      // (at best a not-found) or, worse, a coincidentally valid one. The
+      // route's deny hook already refuses the remote-panel shape before
+      // locating; this is the forward-path wall behind it.
+      if (name.startsWith('clues.')) return { allow: false, reason: 'remote-clues-unsupported' }
       // Unknown method: refuse — never guess what a drifted version means.
       if (name !== '' && SIDEBAR_METHODS[name] === undefined) return { allow: false, reason: 'adapter-method-unknown' }
+      // 0.34.0-alpha.0: the selection translation answers ONLY when the
+      // model finishes — the upstream budget is 90 s
+      // (lib/index.js TRANSLATION_TIMEOUT_MS), four times the relay's
+      // plain 15 s header wait. Widen THIS call's header budget past the
+      // upstream budget (plus margin); cancellation keeps riding the
+      // request's own abort signal, and every other method keeps the
+      // plain budget. A timeout is a per-call performance fact — it is a
+      // hook verdict field precisely so it never enters the route digest.
+      if (name === 'selection.translate') return { allow: true, headerTimeoutMs: 120_000 }
       return { allow: true }
     },
     response: (ctx) => {
@@ -232,6 +340,23 @@ export const dshBetterSidebarAdapter: BridgeAdapter = {
   },
   server: {
     request: (ctx) => {
+      // PB-27 (0.34.0-alpha.0): the clue surface is refused on the SERVER
+      // half as the boundary of last resort. The relay's share check
+      // authorizes SESSIONS; the clue service is workspace-keyed, so a
+      // forwarded clue call reaching the plugin would read or write
+      // workspaces the shared session never authorized. The sub-client's
+      // own walls (the deny hook, the forward-path refusal) are the first
+      // line; this one cannot be bypassed by a stale, compromised or
+      // misfiring sub-client — no clues.* call and none of the four share
+      // routes ever reach the loopback. Refusing here is unconditional:
+      // the loopback exists ONLY for bridged remote calls, and a clue
+      // call's correct remote answer is always "unsupported".
+      if (ctx.pathname.startsWith('/sidebar/api/clues.') || ctx.pathname === '/sidebar/api/clues') {
+        return { allow: false, reason: 'remote-clues-unsupported' }
+      }
+      if (ctx.pathname.startsWith('/sidebar/clues/share/')) {
+        return { allow: false, reason: 'remote-clues-unsupported' }
+      }
       // Strip the client-supplied cwd: the backend resolves the working
       // directory from the (already validated) session id's own header,
       // falling back to the persisted record — a remote panel never

@@ -380,4 +380,56 @@ html[data-zr-remote-session="1"] .zr-download-action[data-phase="error"] {
 [role="tree"] [role="treeitem"][data-row-key^="workspace:zr~"][data-zr-hidden-ws="1"] {
   display: none !important;
 }
+
+/* ---------- 0.34.0-alpha.0: the clue surface never appears in a remote session (PB-27 finding 4) ----------
+   The clue library is WORKSPACE-keyed — no session id authorizes it, so the
+   adapter refuses every clues.* call and the four share routes in remote
+   sessions, on both halves. Unlike the T53 surfaces above, the hiding here
+   is NOT gated on the bridge stamp: a bridged better-sidebar serves files,
+   git and side chat from the server, but the clue library is still the
+   LOCAL machine's, and showing it inside a remote session's view is the
+   exact confusion the refusal exists to prevent. Every rule therefore keys
+   on the remote-session attribute ALONE. Entry points hidden:
+   - [data-clue-tab] — the tab body root the clues workbench renders
+     (0.34.0-alpha.0 lib/client.js ~54703); hiding the root empties the
+     already-open tab while React keeps mounting harmlessly underneath.
+   - the chip — the tab strip's clues chip carries the descriptor glyph,
+     which is the ONLY [class$="_clues"] span in the tree (the icon module's
+     own suffix, verified against the 0.34 build; the other five tab icons
+     use their own suffixes), so :has() pins the clues chip without touching
+     the files/changes/tasks/sidechat chips — those MUST stay visible when
+     bridged.
+   - the guide capsule — the host's empty-sidebar doorway button
+     [data-sidebar-right-guide-entry="clues"]: the kind string is the tab
+     descriptor id, registered by this plugin alone.
+   - the floating windows — share ([data-clue-share-window]), scope
+     ([data-clue-scope-window]) and pack ([data-clue-pack-window]) portal to
+     document.body, escaping the tab body's display:none, so each needs its
+     own rule on its own root marker.
+   - [data-dsh-better-sidebar-clue-notice] — the transient bottom-right
+     strip: clue work it announces cannot happen remotely, so the strip
+     itself must not surface there.
+   The backend half of the same disable lives in client/remote-fetch.ts:
+   while this attribute is set, /sidebar/api/clues.* and the share routes
+   never reach the network at all — closing the switch-over race the
+   verdict describes (a local session's clue load judged by the stale
+   remote report), because the fetch layer reads the SAME html attribute
+   the panel rendering does, not the 1 s backend poll. */
+html[data-zr-remote-session="1"] [data-clue-tab] {
+  display: none !important;
+}
+html[data-zr-remote-session="1"] [data-dockkit-tab]:has([class$="_clues"]) {
+  display: none !important;
+}
+html[data-zr-remote-session="1"] [data-sidebar-right-guide-entry="clues"] {
+  display: none !important;
+}
+html[data-zr-remote-session="1"] [data-clue-share-window],
+html[data-zr-remote-session="1"] [data-clue-scope-window],
+html[data-zr-remote-session="1"] [data-clue-pack-window] {
+  display: none !important;
+}
+html[data-zr-remote-session="1"] [data-dsh-better-sidebar-clue-notice] {
+  display: none !important;
+}
 `

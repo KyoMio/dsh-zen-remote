@@ -1448,7 +1448,9 @@ test('e2e PB-26b: ws/sidechat watch frames rewrite both ways through the frame g
   // PB-26b sidechat route and the threadId response hook.
   const adaptersMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'adapters', 'index.js')).href)
   const rawAdapter = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
-  const adapter = normalizeAdapter(rawAdapter, '0.25.0')
+  // PB-27: adapters that declare generation-gated routes require the
+  // installed build's surface digest; 0.25.0 is the first generation.
+  const adapter = normalizeAdapter(rawAdapter, '0.25.0', { surfaceDigest: 'd383e5af5b95e456' })
 
   // The tunnel's server half — the frame gate lives in its send route.
   const pluginTunnelMod = await import(pathToFileURL(path.join(__dirname, '..', 'lib', 'plugin-tunnel.js')).href)
