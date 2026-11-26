@@ -21,6 +21,9 @@ const PLUGIN_SOURCES = [
   '/tmp/bs-versions/0.28.1/lib/index.js',
   '/tmp/bs-versions/0.28.2/lib/index.js',
   '/tmp/bs-versions/0.30.0/lib/index.js',
+  '/tmp/bs-versions/0.30.1/lib/index.js',
+  '/tmp/bs-versions/0.33.0/lib/index.js',
+  '/tmp/bs-versions/0.34.0-alpha.0/lib/index.js',
 ]
 
 const absent = PLUGIN_SOURCES.filter((p) => !fs.existsSync(p))
@@ -36,11 +39,22 @@ const adaptersMod = await importLib('adapters/index.js')
 const names = new Set()
 for (const sourcePath of PLUGIN_SOURCES) {
   const source = fs.readFileSync(sourcePath, 'utf8')
-  for (const match of source.matchAll(/"([a-zA-Z]+\.[a-zA-Z-]+)":\s*(?:async\s*)?\(/g)) {
+  for (const match of source.matchAll(/"([a-zA-Z]+(?:\.[a-zA-Z-]+)+)":\s*(?:async\s*)?\(/g)) {
     names.add(match[1])
   }
+  // 0.34.0-alpha.0: the clue service registers its seam through `registerApi`
+  // — literal names, constant-keyed names (the share surface) and the
+  // workspaceForSession constant. Verified against the build: the wire set
+  // and the set of `"clues.*"` string literals coincide exactly, so the
+  // literal scan is the honest extraction for this family.
+  for (const match of source.matchAll(/"(clues\.[a-zA-Z.]+)"/g)) {
+    names.add(match[1].replace(/\.$/u, ''))
+  }
+  for (const match of source.matchAll(/'(clues\.[a-zA-Z.]+)'/g)) {
+    names.add(match[1].replace(/\.$/u, ''))
+  }
 }
-const sidebarNames = [...names].filter((name) => /^(session|fs|git|changes|subagents|workflows|teams|settings|open|archive|sidechat)\./.test(name))
+const sidebarNames = [...names].filter((name) => /^(session|fs|git|changes|subagents|workflows|teams|settings|open|archive|sidechat|clues|selection)\./.test(name))
 assert.ok(sidebarNames.length >= 45, `the extraction found the union table (${sidebarNames.length} names)`)
 const missing = sidebarNames.filter((name) => adapterMod.SIDEBAR_METHODS[name] === undefined)
 assert.deepEqual(missing, [], `methods the plugin dispatches but the table lacks: ${missing.join(', ')}`)

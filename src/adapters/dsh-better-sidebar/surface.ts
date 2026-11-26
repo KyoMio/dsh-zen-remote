@@ -35,10 +35,14 @@ export interface BetterSidebarSurface {
   methods: string[]
 }
 
-/** The dispatcher namespaces the plugin has used across 0.25.0–0.28.2. The
- * same object-key regex also matches unrelated tables in the bundle, so only
- * these prefixes count (the PB-12 test's filter, verbatim). */
-const NAMESPACE_PATTERN = /^(session|fs|git|changes|subagents|workflows|teams|settings|open|archive|sidechat)\./u
+/** The dispatcher namespaces the plugin has used across 0.25.0–0.34.0-alpha.0.
+ * The same object-key regex also matches unrelated tables in the bundle, so
+ * only these prefixes count (the PB-12 test's filter, verbatim, plus the
+ * 0.34.0-alpha.0 additions `clues` and `selection`). Appending a namespace is
+ * digest-stable for the OLD generations — the old builds dispatch nothing
+ * under it — but it must be verified per generation (done for 0.33.0:
+ * `394de9f588d37092` unchanged). */
+const NAMESPACE_PATTERN = /^(session|fs|git|changes|subagents|workflows|teams|settings|open|archive|sidechat|clues|selection)\./u
 
 /** A healthy build of any supported generation yields at least this many
  * dispatch keys (0.25.0 already serves 45+). Fewer means the extractor lost
@@ -52,8 +56,12 @@ export const MIN_SURFACE_METHODS = 45
  * (PB-18 review nit — the `i` flag is deliberately absent). */
 const ROUTE_PATTERN = /\/sidebar\/[a-z0-9./:-]+/gu
 
-/** `"ns.method":` dispatch-table entries (`async` optional after the colon). */
-const METHOD_PATTERN = /"([a-zA-Z]+\.[a-zA-Z-]+)":\s*(?:async\s*)?\(/gu
+/** `"ns.method":` dispatch-table entries (`async` optional after the colon).
+ * The name is one-or-more dot-separated segments: 0.34.0-alpha.0's clue
+ * surface nests two deep (`clues.pins.list`, `clues.share.exportProgress`).
+ * Widening the segment count is digest-stable for the old generations —
+ * their dispatch keys are all exactly one dot deep — verified on 0.33.0. */
+const METHOD_PATTERN = /"([a-zA-Z]+(?:\.[a-zA-Z-]+)+)":\s*(?:async\s*)?\(/gu
 
 /** Reduce one build's lib/index.js source to its surface fingerprint.
  * Deterministic: same source in, same sorted arrays out — the digest below is

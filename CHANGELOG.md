@@ -4,6 +4,12 @@
 [GitHub Releases](https://github.com/KyoMio/dsh-zen-remote/releases)（tag 驱动自动生成）。
 界面半边的细节叙事另见 [`docs/interface.md`](docs/interface.md) 的「更新日志」一节。
 
+## 未发布
+
+### 优化
+
+- **适配 DSH-better-sidebar 0.34.0-alpha.0**（DSH 0.2.3 alpha 线宿主；rc 线宿主继续用仍桥接的 0.33.0）：文件浏览、编辑器、git、终端推送等原有界面在远程会话照常桥接；新增的选区翻译（`selection.translate`）随会话转发、在主服务端消耗模型额度。新增的 `clues.*` 线索库一族与四条 clue pack 分享路由按 workspaceId 寻址、不携带会话 id，桥接的授权与会话改写全部以会话 id 为轴、没有可映射的授权单位，因此远程会话里**线索面整体拒绝**（`remote-clues-unsupported`）——宁可空着，也不让子客户端本机的线索库混进远程会话的视图；本机会话完全不受影响。
+
 ## 2.5.6（2026-11-24）
 
 ### 新增

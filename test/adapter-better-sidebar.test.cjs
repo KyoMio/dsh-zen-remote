@@ -112,8 +112,8 @@ test('PB-15: the 0.26.0 additions carry the right dispositions; both versions no
   // 0.33.0 are wire-identical to 0.30.0 (same `394de9f588d37092` surface
   // digest).
   const { adapter } = await loadAdapter()
-  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0', '0.30.1', '0.33.0'])
-  for (const version of ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0', '0.30.1', '0.33.0']) {
+  assert.deepEqual(adapter.versions, ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0', '0.30.1', '0.33.0', '0.34.0-alpha.0'])
+  for (const version of ['0.25.0', '0.26.0', '0.26.1', '0.28.0-alpha.0', '0.28.0', '0.28.1', '0.28.2', '0.30.0', '0.30.1', '0.33.0', '0.34.0-alpha.0']) {
     const core = await importLib('plugin-adapter-core.js')
     const adaptersMod = await importLib('adapters/index.js')
     const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
@@ -994,4 +994,144 @@ test('PB-26b-fix: a failed tunnel send tears the exchange down completely — co
     handle.uninstall()
     await host.stop()
   }
+})
+
+// ---- 0.34.0-alpha.0: selection.translate forwards, the clue surface refuses ------------
+
+test('0.34.0-alpha.0: selection.translate is a session-scoped write in the table; the 48 clue methods are all registered (never forwarded)', async () => {
+  const adapterMod = await importLib('adapters/dsh-better-sidebar/methods.js')
+  assert.deepEqual({ ...adapterMod.SIDEBAR_METHODS['selection.translate'] }, { kind: 'write', sessionField: 'sessionId' })
+  // Every clues.* table entry carries NO sessionField — the wire payloads
+  // are workspace-keyed; a sessionField here would be a lie the locator
+  // could act on.
+  const clueEntries = Object.entries(adapterMod.SIDEBAR_METHODS).filter(([name]) => name.startsWith('clues.'))
+  assert.equal(clueEntries.length, 48, 'the whole 0.34 clue family is registered')
+  for (const [name, spec] of clueEntries) {
+    assert.equal(spec.sessionField, undefined, `${name} carries no session field`)
+    assert.equal(spec.rewrite, undefined, `${name} has no response rewrite`)
+  }
+})
+
+test('0.34.0-alpha.0: selection.translate forwards with its real id; every clue shape refuses — remote-context deny, forward-wall, share routes — while locals pass through', async () => {
+  const host = await startFakeHost()
+  const relay = fakeRelayClient()
+  const { adapter } = await loadAdapter()
+  const handle = await installedIntercept(host, relay, adapter, { currentSession: virtual('session-a') })
+  try {
+    // selection.translate: session-scoped like git.suggest-message — forwards.
+    const translate = await host.get('/sidebar/api/selection.translate', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: virtual('session-a'), text: 'hello', language: 'zh' }),
+    })
+    assert.equal(translate.status, 200)
+    assert.equal(relay.forwarded.length, 1)
+    assert.equal(JSON.parse(relay.forwarded[0].body).sessionId, 'session-a', 'the id arrived REAL')
+    assert.equal(relay.forwarded[0].path, '/sidebar/api/selection.translate')
+
+    // A workspace-keyed clue call from a REMOTE panel: no session field in
+    // the payload, the deny hook answers before locating — the local plugin
+    // NEVER sees it (it would answer with the local machine's library).
+    const clueList = await host.get('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.equal(clueList.status, 503)
+    assert.equal((await clueList.json()).error.reason, 'remote-clues-unsupported')
+    assert.equal(host.hits.local, 0, 'the clue call never fell to the local plugin')
+
+    // The workspaceForSession probe carries a REAL session field in the
+    // payload — the deny hook still fires first, same refusal.
+    const probe = await host.get('/sidebar/api/clues.workspaceForSession', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId: virtual('session-a') }),
+    })
+    assert.equal(probe.status, 503)
+    assert.equal((await probe.json()).error.reason, 'remote-clues-unsupported')
+    assert.equal(host.hits.local, 0)
+    assert.equal(relay.forwarded.length, 1, 'no clue call ever left for the relay')
+
+    // The four share routes refuse the same way in a remote context.
+    for (const path of ['/sidebar/clues/share/export-preview', '/sidebar/clues/share/export', '/sidebar/clues/share/import-preview', '/sidebar/clues/share/import']) {
+      const share = await host.get(path, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ workspaceId: 'ws-1' }),
+      })
+      assert.equal(share.status, 503, `${path} refuses in a remote context`)
+      assert.equal((await share.json()).error.reason, 'remote-clues-unsupported')
+    }
+    assert.equal(host.hits.local, 0, 'no share route fell to the local plugin')
+    handle.uninstall()
+
+    // A LOCAL panel keeps every clue shape exactly as without zen-remote:
+    // nothing located → passthrough to the local plugin, hook silent.
+    const localHandle = await installedIntercept(host, relay, adapter, { currentSession: 'session-local' })
+    const localList = await host.get('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.deepEqual(await localList.json(), { ok: true, value: { local: true } })
+    assert.equal(host.hits.local, 1, 'the local clue call reached the local plugin')
+    const localShare = await host.get('/sidebar/clues/share/export', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    // The fake host has no share handler — a 404 proves the interceptor
+    // passed it through instead of refusing (its own answer would be 503).
+    assert.equal(localShare.status, 404, 'the local share POST passed through the intercept')
+    assert.equal(relay.forwarded.length, 1, 'nothing local ever left for the relay')
+    localHandle.uninstall()
+  } finally {
+    handle.uninstall()
+    await host.stop()
+  }
+})
+
+test('0.34.0-alpha.0: a clue call that somehow classifies remote dies on the forward wall (client-half request hook)', async () => {
+  // The route deny hook keys on the BROWSER's current session. A clue call
+  // that slips past it with a virtual session field (a future UI attaching
+  // sessionId, a stale cache replayed in a mixed context) must still not
+  // cross the relay: the client-half request hook refuses every clues.*
+  // forward unconditionally.
+  const adapterMod = await importLib('adapters/dsh-better-sidebar/index.js')
+  const hook = adapterMod.dshBetterSidebarAdapter.client.request
+  for (const name of ['clues.list', 'clues.workspaceForSession', 'clues.share.import', 'clues.saveEdit']) {
+    const verdict = hook({
+      method: 'POST',
+      pathname: `/sidebar/api/${name}`,
+      route: adapterMod.dshBetterSidebarAdapter.routes[0],
+      query: new URLSearchParams(),
+      body: { sessionId: 'session-a' },
+    })
+    assert.deepEqual(verdict, { allow: false, reason: 'remote-clues-unsupported' }, `${name} never crosses the relay`)
+  }
+  // selection.translate and the pre-0.34 families still pass the wall.
+  for (const name of ['selection.translate', 'fs.tree', 'git.suggest-message']) {
+    const verdict = hook({
+      method: 'POST',
+      pathname: `/sidebar/api/${name}`,
+      route: adapterMod.dshBetterSidebarAdapter.routes[0],
+      query: new URLSearchParams(),
+      body: { sessionId: 'session-a' },
+    })
+    assert.deepEqual(verdict, { allow: true }, `${name} still forwards`)
+  }
+})
+
+test('0.34.0-alpha.0: the surface digest is whitelisted; the extractor widened namespaces re-hash older generations byte-identically', async () => {
+  const mod = await importLib('adapters/dsh-better-sidebar/surface.js')
+  const core = await importLib('plugin-adapter-core.js')
+  const adaptersMod = await importLib('adapters/index.js')
+  const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
+  assert.equal(typeof raw.surfaces['4988812a1d408484'], 'string', 'the 0.34.0-alpha.0 generation is whitelisted')
+  // The widened extraction (clues/selection namespaces, multi-dot keys) is
+  // additive-only: a synthetic pre-0.34 shape hashes exactly as before.
+  const pre34 = `const api = {\n  "fs.tree": async () => {},\n  "git.graph": async () => {},\n}\nregister("/sidebar/api");\n`
+  const withClues = `${pre34}  "clues.list": async () => {},\n  "clues.pins.list": async () => {},\n`
+  const a = mod.extractBetterSidebarSurface(pre34)
+  const b = mod.extractBetterSidebarSurface(withClues)
+  assert.notEqual(mod.betterSidebarSurfaceDigest(a), mod.betterSidebarSurfaceDigest(b), 'clues keys change the digest')
+  assert.ok(b.methods.includes('clues.pins.list'), 'multi-dot names extract')
+  // An unlisted 0.34.x alpha with the same wire surface registers.
+  const normalized = core.normalizeAdapter(raw, '0.34.0-alpha.9', { surfaceDigest: '4988812a1d408484' })
+  assert.equal(normalized.declaration.version, '0.34.0-alpha.9')
 })
