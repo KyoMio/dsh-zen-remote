@@ -51,7 +51,18 @@ export type AdapterLocator = {
  * one (the request itself carries no session field, so the classify step
  * would otherwise read it as local) and the side-chat methods wholesale.
  * A `deny` hit answers the bridge's uniform 503 with that reason; returning
- * `undefined` falls through to the normal classify. */
+ * `undefined` falls through to the normal classify.
+ *
+ * `requiresSurface` (optional, PB-27) marks a route that exists only in ONE
+ * wire-surface generation of the plugin: the 16-hex surface digest that
+ * generation produces. The wiring extracts the INSTALLED build's digest
+ * even for listed versions when any route declares this field; a route
+ * whose digest does not match the installed build is DROPPED before the
+ * route table is folded and digested. That is what keeps the older
+ * generations' digests byte-identical to what a zen-remote without the
+ * route would compute — adding a generation's routes must never alter the
+ * bridging contract of the generations that do not serve them (the mixed-
+ * version matrix compares adapter digests across machines). */
 export interface AdapterRoute {
     path: string;
     match: 'exact' | 'prefix';
@@ -61,6 +72,7 @@ export interface AdapterRoute {
     upgrade?: boolean;
     locator: AdapterLocator;
     local?: boolean;
+    requiresSurface?: string;
     deny?: (info: {
         pathname: string;
         method: string;
@@ -82,6 +94,12 @@ export interface NormalizedAdapterRoute {
     upgrade: boolean;
     locator: AdapterLocator;
     local: boolean;
+    /** The generation gate the route declared, kept on the normalized form so
+     * diagnostics can tell a dropped route apart from an undeclared one. It
+     * never enters the route-table digest: by the time the digest is computed
+     * the non-matching routes have already been dropped, and a matching one is
+     * exactly the route its generation serves. */
+    requiresSurface?: string;
     deny?: AdapterRoute['deny'];
 }
 /** The two hook faces an adapter may implement (both optional — an adapter
@@ -109,11 +127,19 @@ export interface AdapterRequestContext {
  * body and/or the query — the better-sidebar adapter strips the `cwd`
  * query field of the file/upload routes so the backend resolves it from
  * the session), or refuse with a reason — the refusal travels the bridge's
- * uniform 503 shape on the client half, a 403 on the server half. */
+ * uniform 503 shape on the client half, a 403 on the server half.
+ * `headerTimeoutMs` (client half only, PB-27) overrides the relay's
+ * header-wait budget for THIS forward: the one better-sidebar consumer is
+ * `selection.translate`, whose upstream answer lands only after the model
+ * finishes (up to ~90 s) — far past the relay's plain 15 s. A timeout is
+ * a per-call performance fact, not wire shape: it never enters the
+ * route-table digest, and caller cancellation rides the request's own
+ * signal exactly as before. */
 export type AdapterVerdict = {
     allow: true;
     body?: unknown;
     query?: URLSearchParams;
+    headerTimeoutMs?: number;
 } | {
     allow: false;
     reason: string;

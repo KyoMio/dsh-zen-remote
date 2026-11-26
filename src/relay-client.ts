@@ -508,6 +508,13 @@ export interface RelayPluginRequest {
   /** The one request header passed through to the plugin beside `range`. */
   accept?: string
   range?: string
+  /** Per-call header-wait override in milliseconds (PB-27): a bridged call
+   * whose upstream answer legitimately outlives the plain request budget
+   * (better-sidebar's `selection.translate` waits for the model — up to
+   * ~90 s) names its own ceiling here. Still bounded by the same 900 s cap;
+   * the timeout judges THIS call and never moves the link state, exactly
+   * like the plain budget. */
+  headerTimeoutMs?: number
 }
 
 /** The inputs of one {@link RelayClient.upload} round-trip. */
@@ -2025,11 +2032,20 @@ export function createRelayClient(options: CreateRelayClientOptions): RelayClien
     // The header wait gets the plain request timeout for a bodyless call;
     // with a BODY (PB-9) the budget scales with its declared size like the
     // upload's (a slow body is a slow call, never a dead link), and the
-    // timeout never moves the connection state.
+    // timeout never moves the connection state. PB-27: a per-call override
+    // wins when the caller names one — still capped at the same 900 s
+    // ceiling every other budget obeys, and still armored with exactly one
+    // recovery margin.
     const hasBody = request.body !== undefined && request.body !== null
-    const headerTimeoutMs = hasBody
-      ? sizeBackedTimeoutMs(requestTimeoutMs, request.contentLength) + peerRecoveryMarginMs
-      : requestTimeoutMs + peerRecoveryMarginMs
+    const explicitHeaderTimeoutMs =
+      typeof request.headerTimeoutMs === 'number' && Number.isFinite(request.headerTimeoutMs) && request.headerTimeoutMs > 0
+        ? Math.min(request.headerTimeoutMs, Math.max(requestTimeoutMs, INVOKE_TIMEOUT_CAP_MS))
+        : undefined
+    const headerTimeoutMs = explicitHeaderTimeoutMs !== undefined
+      ? explicitHeaderTimeoutMs + peerRecoveryMarginMs
+      : hasBody
+        ? sizeBackedTimeoutMs(requestTimeoutMs, request.contentLength) + peerRecoveryMarginMs
+        : requestTimeoutMs + peerRecoveryMarginMs
     let timedOut = false
     const timer = setTimeout(() => {
       timedOut = true

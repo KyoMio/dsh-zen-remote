@@ -88,9 +88,13 @@ test('PB-19: an unlisted version registers through its surface digest; a miss, a
   // installed version does not hash to never disturbs the normal path —
   // here a key NO listed version hashes to.
   const noised = { ...raw, surfaces: { ...raw.surfaces, abcdef0123456789: 'a key no version hashes to' } }
-  const listed = core.normalizeAdapter(noised, '0.25.0')
+  const listed = core.normalizeAdapter(noised, '0.25.0', { surfaceDigest: 'd383e5af5b95e456' })
   assert.equal(listed.declaration.version, '0.25.0')
   assert.equal(listed.digest, core.adapterDigestOf('dsh-better-sidebar', '0.25.0', listed.routes))
+  // PB-27: a LISTED version without the digest refuses closed the moment the
+  // adapter declares generation-gated routes — the wiring must never bridge
+  // half a surface because the extraction step failed silently.
+  assert.throws(() => core.normalizeAdapter(noised, '0.25.0'), /requiresSurface/)
 })
 
 test('PB-15: the 0.26.0 additions carry the right dispositions; both versions normalize; /sidebar/write is declared', async () => {
@@ -117,7 +121,7 @@ test('PB-15: the 0.26.0 additions carry the right dispositions; both versions no
     const core = await importLib('plugin-adapter-core.js')
     const adaptersMod = await importLib('adapters/index.js')
     const raw = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
-    const normalized = core.normalizeAdapter(raw, version)
+    const normalized = core.normalizeAdapter(raw, version, { surfaceDigest: SURFACE_DIGEST_BY_VERSION[version] })
     assert.equal(normalized.plugin, 'dsh-better-sidebar', `${version} normalizes`)
   }
 
@@ -182,12 +186,31 @@ function wsDecodeClientFrame(chunk) {
   return { opcode, text: payload.toString('utf8') }
 }
 
-async function loadAdapter() {
+// PB-27: the generation gate makes the surface digest mandatory input for
+// EVERY normalize — the wiring computes it even for listed versions, so the
+// tests do the same. The map mirrors the adapter's own surfaces table; it
+// stays here, keyed by version, so a normalized fixture cannot silently
+// pass a digest of the wrong generation.
+const SURFACE_DIGEST_BY_VERSION = {
+  '0.25.0': 'd383e5af5b95e456',
+  '0.26.0': '96465143373a31a7',
+  '0.26.1': '96465143373a31a7',
+  '0.28.0-alpha.0': '6ed29a896101e681',
+  '0.28.0': '6ed29a896101e681',
+  '0.28.1': '65a0acaeb56f87d9',
+  '0.28.2': '65a0acaeb56f87d9',
+  '0.30.0': '394de9f588d37092',
+  '0.30.1': '394de9f588d37092',
+  '0.33.0': '394de9f588d37092',
+  '0.34.0-alpha.0': '4988812a1d408484',
+}
+
+async function loadAdapter(version = '0.25.0') {
   const adaptersMod = await importLib('adapters/index.js')
   const core = await importLib('plugin-adapter-core.js')
   const adapter = adaptersMod.ADAPTERS.find((entry) => entry.plugin === 'dsh-better-sidebar')
   assert.ok(adapter !== undefined, 'the adapter is registered')
-  return { adapter: core.normalizeAdapter(adapter, '0.25.0'), rawAdapter: adapter }
+  return { adapter: core.normalizeAdapter(adapter, version, { surfaceDigest: SURFACE_DIGEST_BY_VERSION[version] }), rawAdapter: adapter }
 }
 
 function startFakeHost() {
@@ -354,7 +377,7 @@ async function installedIntercept(host, relay, adapter, { currentSession } = {})
     registry,
     relay,
     getServerId: () => SERVER_ID,
-    getStatus: () => bridgeMod.compareBridges(registry.list(), { 'dsh-better-sidebar': { version: '0.25.0', digest: adapter.digest, serverScopeConsent: true } }, true),
+    getStatus: () => bridgeMod.compareBridges(registry.list(), { 'dsh-better-sidebar': { version: adapter.declaration.version, digest: adapter.digest, serverScopeConsent: true } }, true),
     adapters: [adapter],
     getCurrentSession: () => currentSession,
   })
@@ -580,7 +603,7 @@ test('PB-12 client: the three response rewrites — session.cwd, subagents.live 
 
 // ---- 3. the server half --------------------------------------------------------
 
-async function startServerSide({ consent = true, loopbackHits, loopbackHeaders, parentOf } = {}) {
+async function startServerSide({ consent = true, loopbackHits, loopbackHeaders, parentOf, adapterVersion = '0.25.0' } = {}) {
   const relayServerMod = await importLib('relay-server.js')
   const shareStoreMod = await importLib('share-store.js')
   const store = shareStoreMod.createShareStore({ file: path.join(TMP_ROOT, `srv-${Math.random().toString(36).slice(2)}.json`), idleHours: 48 })
@@ -608,7 +631,7 @@ async function startServerSide({ consent = true, loopbackHits, loopbackHeaders, 
       }
     },
   }
-  const { adapter } = await loadAdapter()
+  const { adapter } = await loadAdapter(adapterVersion)
   const bridgeMod = await importLib('plugin-bridge.js')
   const registry = bridgeMod.createBridgeRegistry()
   registry.registerNormalized(adapter.declaration)
@@ -640,7 +663,7 @@ async function startServerSide({ consent = true, loopbackHits, loopbackHeaders, 
           'x-zen-remote-role': 'desktop-client',
           'x-zen-remote-device': 'dev-1',
           'x-zr-plugin': 'dsh-better-sidebar',
-          'x-zr-plugin-version': '0.25.0',
+          'x-zr-plugin-version': adapter.declaration.version,
           'x-zr-plugin-digest': adapter.digest,
           'x-zr-path': pluginPath,
           'x-zr-query': query ?? '',
@@ -724,6 +747,46 @@ test('0.28.0-alpha.0 / 0.28.0: git.graph is a session-scoped read; changes.ops d
     assert.equal(graphBody.wait, true, 'only changes.ops loses wait')
     assert.equal(graphBody.cwd, undefined, 'cwd still stripped')
     assert.equal(graphBody.branch, 'main')
+  } finally {
+    await server.stop()
+  }
+})
+
+test('PB-27 finding 1: the server hook refuses every clues.* call and the four share routes BEFORE the loopback — the boundary a sub-client cannot bypass', async () => {
+  const loopbackHits = []
+  const server = await startServerSide({ loopbackHits, adapterVersion: '0.34.0-alpha.0' })
+  try {
+    // A clue API call that a stale, compromised or misfiring sub-client
+    // forwarded WITH a valid shared session id: the share check passes (the
+    // session IS shared), and only the server hook stands between the
+    // request and the local plugin's workspace-keyed clue service.
+    for (const name of ['clues.list', 'clues.read', 'clues.saveEdit', 'clues.share.import']) {
+      const res = await server.pluginPost(`/sidebar/api/${name}`, '', {
+        body: JSON.stringify({ sessionId: 'session-a', workspaceId: 'ws-1' }),
+      })
+      assert.equal(res.status, 403, `${name} is refused on the server half`)
+      assert.equal((await res.json()).error.code, 'remote-clues-unsupported')
+    }
+    assert.equal(loopbackHits.length, 0, 'no clue call reached the local plugin')
+
+    // The four share routes, session located in the query the way their
+    // never-present locator reads it — same refusal, same side of the wall.
+    for (const sharePath of ['/sidebar/clues/share/export-preview', '/sidebar/clues/share/export', '/sidebar/clues/share/import-preview', '/sidebar/clues/share/import']) {
+      const res = await server.pluginPost(sharePath, 'sessionId=session-a', {
+        body: JSON.stringify({ workspaceId: 'ws-1' }),
+      })
+      assert.equal(res.status, 403, `${sharePath} is refused on the server half`)
+      assert.equal((await res.json()).error.code, 'remote-clues-unsupported')
+    }
+    assert.equal(loopbackHits.length, 0, 'no share route reached the local plugin')
+
+    // The refusal is clue-shaped, not request-shaped: an ordinary bridged
+    // call on the same adapter still flows to the loopback untouched.
+    const tree = await server.pluginPost('/sidebar/api/fs.tree', '', {
+      body: JSON.stringify({ sessionId: 'session-a', path: 'src' }),
+    })
+    assert.equal(tree.status, 200)
+    assert.equal(loopbackHits.length, 1, 'fs.tree still reaches the loopback')
   } finally {
     await server.stop()
   }
@@ -1015,7 +1078,8 @@ test('0.34.0-alpha.0: selection.translate is a session-scoped write in the table
 test('0.34.0-alpha.0: selection.translate forwards with its real id; every clue shape refuses — remote-context deny, forward-wall, share routes — while locals pass through', async () => {
   const host = await startFakeHost()
   const relay = fakeRelayClient()
-  const { adapter } = await loadAdapter()
+  // The 0.34 generation: the gated share routes exist only here (PB-27).
+  const { adapter } = await loadAdapter('0.34.0-alpha.0')
   const handle = await installedIntercept(host, relay, adapter, { currentSession: virtual('session-a') })
   try {
     // selection.translate: session-scoped like git.suggest-message — forwards.
@@ -1104,8 +1168,10 @@ test('0.34.0-alpha.0: a clue call that somehow classifies remote dies on the for
     })
     assert.deepEqual(verdict, { allow: false, reason: 'remote-clues-unsupported' }, `${name} never crosses the relay`)
   }
-  // selection.translate and the pre-0.34 families still pass the wall.
-  for (const name of ['selection.translate', 'fs.tree', 'git.suggest-message']) {
+  // selection.translate passes the wall — with its widened header budget
+  // verdict (PB-27 finding 3, the 90 s upstream budget) — and the pre-0.34
+  // families forward with the plain verdict.
+  for (const name of ['fs.tree', 'git.suggest-message']) {
     const verdict = hook({
       method: 'POST',
       pathname: `/sidebar/api/${name}`,
@@ -1115,6 +1181,14 @@ test('0.34.0-alpha.0: a clue call that somehow classifies remote dies on the for
     })
     assert.deepEqual(verdict, { allow: true }, `${name} still forwards`)
   }
+  const translate = hook({
+    method: 'POST',
+    pathname: '/sidebar/api/selection.translate',
+    route: adapterMod.dshBetterSidebarAdapter.routes[0],
+    query: new URLSearchParams(),
+    body: { sessionId: 'session-a', text: 'hello', language: 'zh' },
+  })
+  assert.deepEqual(translate, { allow: true, headerTimeoutMs: 120_000 }, 'selection.translate forwards with the widened header budget')
 })
 
 test('0.34.0-alpha.0: the surface digest is whitelisted; the extractor widened namespaces re-hash older generations byte-identically', async () => {

@@ -3623,3 +3623,72 @@ test('Slice 3: relay-client PreviewCache sends x-zr-if-version, reuses cached by
   assert.equal(seenIfVersions[5], undefined, 'stop() cleared PreviewCache')
   assert.equal(fullTransfers, 4)
 })
+
+test('PB-27: a per-call headerTimeoutMs override outlives the plain budget; a call without it still times out on time; caller abort still wins over the long budget', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  t.after(() => t.mock.timers.reset())
+
+  // The slow upstream: answers 200 at the 200 ms tick — past the plain
+  // 120 ms request budget, inside a 300 ms per-call override. Resolves are
+  // real timers too, so the mock clock drives both sides.
+  const client = createRelayClient({
+    getServerUrl: () => 'http://127.0.0.1:1',
+    getToken: () => 'tok-pb27',
+    requestTimeoutMs: 120,
+    infoRefreshMs: 0,
+    fetchImpl: async (url, init) => {
+      if (new URL(String(url)).pathname.endsWith('/v1/handshake')) {
+        return new Response(JSON.stringify(HANDSHAKE_OK()[1]), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          resolve(new Response('{"ok":true,"value":{"text":"译文"}}', { status: 200, headers: { 'content-type': 'application/json' } }))
+        }, 200)
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(timer)
+          reject(new DOMException('Aborted', 'AbortError'))
+        }, { once: true })
+      })
+    },
+  })
+  t.after(() => client.stop())
+  await client.connect()
+  assert.equal(client.state, 'online')
+
+  const request = {
+    plugin: 'dsh-better-sidebar',
+    version: '0.34.0-alpha.0',
+    digest: 'd',
+    path: '/sidebar/api/selection.translate',
+    query: '',
+    method: 'POST',
+  }
+
+  // Without the override: the plain 120 ms budget fires first → request-timeout.
+  const plain = client.pluginRequest(request)
+  await Promise.resolve()
+  t.mock.timers.tick(120)
+  await assert.rejects(
+    () => plain,
+    (error) => error instanceof RelayError && error.code === 'request-timeout',
+  )
+  assert.equal(client.state, 'online', 'a call timeout never moves the link state')
+
+  // With the override at 300 ms: the same 200 ms upstream answer ARRIVES —
+  // the verdict the auditor's 20 s simulation demands of the 90 s translation.
+  const overridden = client.pluginRequest({ ...request, headerTimeoutMs: 300 })
+  await Promise.resolve()
+  t.mock.timers.tick(250)
+  const response = await overridden
+  assert.equal(response.status, 200)
+  assert.equal(JSON.parse(await response.text()).ok, true, 'the slow answer arrives inside the override')
+
+  // Cancellation keeps winning over the long budget: an external abort at
+  // 50 ms rejects the call immediately, not at 300 ms.
+  const ac = new AbortController()
+  const cancelled = client.pluginRequest({ ...request, headerTimeoutMs: 300 }, ac.signal)
+  await Promise.resolve()
+  ac.abort()
+  await assert.rejects(() => cancelled)
+  assert.equal(client.state, 'online')
+})

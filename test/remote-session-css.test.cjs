@@ -179,3 +179,48 @@ test('PB-14: the unbridged tab body spends the note variable as its ::before', (
     'the note copy must live in the effect (per-locale), never inline in the sheet',
   )
 })
+
+// ---- PB-27 finding 4: the clue hiding is UNGATED on the bridge stamp --------
+
+test('PB-27: every clue rule keys on the remote-session attribute ALONE — bridged or not, the clue surface stays hidden in a remote session', () => {
+  const CLUE_TARGETS = [
+    '[data-clue-tab]',
+    '[data-dockkit-tab]:has([class$="_clues"])',
+    '[data-sidebar-right-guide-entry="clues"]',
+    '[data-clue-share-window]',
+    '[data-clue-scope-window]',
+    '[data-clue-pack-window]',
+    '[data-dsh-better-sidebar-clue-notice]',
+  ]
+  for (const target of CLUE_TARGETS) {
+    assert.ok(
+      sheet.includes(`html[data-zr-remote-session="1"] ${target}`),
+      `the ${target} rule keys on the remote-session attribute`,
+    )
+    // The whole point of finding 4's fix: unlike the T53 surfaces, the clue
+    // hiding does NOT lift when the plugin is bridged — the library is the
+    // local machine's either way. No clue selector may carry the bridge
+    // stamp's :not() gate.
+    assert.ok(
+      !sheet.includes(`html[data-zr-remote-session="1"]:not([data-zr-bridge-dsh-better-sidebar="1"]) ${target}`),
+      `the ${target} rule must not be gated on the bridge stamp`,
+    )
+  }
+  // Each target hides, none styles.
+  for (const target of ['[data-clue-tab]', '[data-sidebar-right-guide-entry="clues"]', '[data-dsh-better-sidebar-clue-notice]']) {
+    const ruleIndex = sheet.indexOf(`html[data-zr-remote-session="1"] ${target} {`)
+    assert.ok(ruleIndex >= 0, `${target} has a rule`)
+    assert.ok(sheet.slice(ruleIndex, ruleIndex + 200).includes('display: none !important'), `${target} hides`)
+  }
+  // The chip rule discriminates on the clues glyph suffix — it must not be
+  // the broad _chipIcon one (that would hide the bridged files/changes/tasks
+  // chips too).
+  assert.match(
+    sheet,
+    /html\[data-zr-remote-session="1"\] \[data-dockkit-tab\]:has\(\[class\$="_clues"\]\) \{\s*display: none !important;/,
+  )
+  // The chip suffix is the plural clues glyph's — never the singular or a
+  // contains-match that could catch an unrelated class.
+  assert.ok(!sheet.includes('[class*="_clues"]'), 'no contains-match on the clues glyph class')
+  assert.ok(!sheet.includes('[class$="_clue"]'), 'no singular clue suffix')
+})

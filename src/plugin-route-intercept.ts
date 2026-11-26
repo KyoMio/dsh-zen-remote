@@ -1806,7 +1806,12 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         const rewrite = rewriteAdapterRequest(route, pathname, searchParams, bodyGiven ? parsedBody : undefined, verdict.hits, (virtualId) => fromVirtual(virtualId)!.id)
         // The client hook: refuse, or replace the parsed body wholesale.
         // The hook sees the REWRITTEN body — the ids are already real (the
-        // design's order: locate → rewrite → hook → forward).
+        // design's order: locate → rewrite → hook → forward). PB-27: an
+        // allow verdict may also name this forward's header-wait override
+        // (selection.translate outlives the plain 15 s budget) — a per-call
+        // performance fact, never wire shape, so it rides the verdict and
+        // not the route table.
+        let hookHeaderTimeoutMs: number | undefined
         const hook = adapter.hooks.client?.request
         if (hook !== undefined) {
           const hookedBody = bodyGiven && rewrite.bodyText !== undefined ? JSON.parse(rewrite.bodyText) : bodyGiven ? parsedBody : undefined
@@ -1823,6 +1828,9 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
           }
           if (hookedBody !== undefined && hookVerdict.body !== undefined) {
             rewrite.bodyText = JSON.stringify(hookVerdict.body)
+          }
+          if (typeof hookVerdict.headerTimeoutMs === 'number' && Number.isFinite(hookVerdict.headerTimeoutMs) && hookVerdict.headerTimeoutMs > 0) {
+            hookHeaderTimeoutMs = hookVerdict.headerTimeoutMs
           }
         }
 
@@ -1868,6 +1876,7 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
             ...(bodyStream !== null && contentLength !== undefined ? { contentLength } : {}),
             ...(accept !== undefined ? { accept } : {}),
             ...(range !== undefined ? { range } : {}),
+            ...(hookHeaderTimeoutMs !== undefined ? { headerTimeoutMs: hookHeaderTimeoutMs } : {}),
           },
           controller.signal,
         )

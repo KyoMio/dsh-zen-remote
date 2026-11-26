@@ -25,6 +25,31 @@
  * complete not-relayed registry still lives beside the server's in
  * src/relay-access.ts.
  */
+/** The remote-session probe, overridable in tests: whether the CURRENT
+ * session on screen is a remote one, read off the same html attribute
+ * remote-session.ts's guard writes and remote-session.css.ts's hiding keys
+ * on. Reading the attribute rather than the backend's current-session
+ * report is the whole point of the fix: the report lags a switch by up to
+ * a second (and is shared process-wide), while the attribute moves with
+ * the main view in the same frame the panels read — a local session's clue
+ * load can no longer be judged by a stale remote value, and a remote
+ * panel's clue call can no longer slip through a stale local one. */
+export interface RemoteSessionProbe {
+    (): boolean;
+}
+/** Test seam: swap the probe for one install generation. Not part of the
+ * public surface. */
+export declare function setRemoteSessionProbeForTests(probe: RemoteSessionProbe | undefined): void;
+/** Whether one parsed path is a clue call the remote session must not
+ * reach — the `/sidebar/api/clues.*` methods and the four share routes. */
+export declare function isCluePath(pathname: string): boolean;
+/**
+ * The block decision, pure: whether one fetch call is a clue request that
+ * must not leave this machine. Only same-origin clue paths count, and only
+ * while the probe says the session on screen is remote — local sessions
+ * (and every non-clue path) pass through untouched.
+ */
+export declare function shouldBlockClueCall(input: unknown, baseHref: string, isRemote: boolean): boolean;
 /** Prefix of the sub-client backend route the rewritten calls land on. */
 export declare const CLIENT_HTTP_ROUTE_PREFIX = "/_dsh/zen-remote/client/http/";
 /** The fetch face this module wraps; injectable so tests drive a fake. */

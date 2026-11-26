@@ -87,4 +87,21 @@ for (const version of raw.versions) {
   assert.ok(raw.surfaces[digest] !== undefined, `${version}'s surface digest ${digest} is whitelisted`)
 }
 assert.deepEqual(Object.keys(raw.surfaces).sort(), [...computed].sort())
+
+// PB-27: the generation gate — normalizeAdapter over each REAL build's own
+// digest must produce the pre-0.34 route table (no share routes) for the ten
+// old generations, and the 15-route table (the four gated share routes in)
+// for 0.34.0-alpha.0 alone. The byte-identity of the old tables against the
+// pre-gate zen-remote is pinned in test/adapter-better-sidebar.test.cjs.
+const coreMod = await importLib('plugin-adapter-core.js')
+for (const version of raw.versions) {
+  const digest = digestOf(version)
+  const normalized = coreMod.normalizeAdapter(raw, version, { surfaceDigest: digest })
+  const shareRoutes = normalized.routes.filter((route) => route.path.startsWith('/sidebar/clues/share/'))
+  if (version === '0.34.0-alpha.0') {
+    assert.equal(shareRoutes.length, 4, 'the 0.34 generation carries the four gated share routes')
+  } else {
+    assert.equal(shareRoutes.length, 0, `${version} keeps the pre-0.34 table — no share routes`)
+  }
+}
 console.log('verify-better-sidebar-tarballs: all assertions passed')
