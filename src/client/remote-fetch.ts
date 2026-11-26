@@ -83,6 +83,64 @@ function clueBlockedBody(): string {
   return JSON.stringify({ ok: false, error: { code: 'remote-clues-unsupported', message: 'The clue library stays on this machine; it is not available in a remote session.' } })
 }
 
+/** The per-request truth (PB-27 r3): the backend deny hook's current-session
+ * report lags a session switch by up to a second and is shared process-wide,
+ * so the FIRST uncached clue load after switching back to a local session
+ * would be refused off the stale remote value. The page itself knows the
+ * truth in the same frame — the wrapper therefore annotates every LOCAL
+ * session's clue call with this header. The intercept reads it BEFORE its
+ * report and strips it before the local plugin: the annotation judges only
+ * the deny decision, never the upstream payload. Only the exact value
+ * `local` speaks — anything else is ignored, so a remote panel can never
+ * gain from it (its calls are blocked here anyway). */
+export const PANEL_SESSION_HEADER = 'x-zen-remote-panel-session'
+const PANEL_SESSION_LOCAL = 'local'
+
+/** Whether one parsed path is a clue call at all (same-origin enforced by
+ * the caller): the annotation's target — never mind the probe. */
+function isClueCall(input: unknown, baseHref: string): boolean {
+  const raw = typeof input === 'string' || input instanceof URL
+    ? input
+    : typeof input === 'object' && input !== null && typeof (input as { url?: unknown }).url === 'string'
+      ? (input as { url: string }).url
+      : undefined
+  if (raw === undefined) return false
+  let parsed: URL
+  let base: URL
+  try {
+    parsed = new URL(raw, baseHref)
+    base = new URL(baseHref)
+  } catch {
+    return false
+  }
+  if (parsed.origin !== base.origin) return false
+  return isCluePath(parsed.pathname)
+}
+
+/** The annotated init for a LOCAL session's clue call: the original init
+ * plus the panel-session header, the caller's own headers (plain object or
+ * tuple array) preserved. A call without init gains a minimal object; a
+ * Headers-shaped instance is flattened — the plugin's own clue traffic uses
+ * plain objects, but the wrapper wraps ALL of window.fetch, so the other
+ * shapes must not corrupt. */
+function annotateClueInit(init: RequestInit | undefined): RequestInit {
+  const base: Record<string, string> = {}
+  const given = init?.headers
+  if (given !== undefined && given !== null) {
+    if (Array.isArray(given)) {
+      for (const entry of given as Array<[string, string]>) {
+        if (Array.isArray(entry) && entry.length === 2) base[entry[0]] = entry[1]
+      }
+    } else if (typeof (given as Headers).forEach === 'function') {
+      ;(given as Headers).forEach((value, key) => { base[key] = value })
+    } else {
+      Object.assign(base, given as Record<string, string>)
+    }
+  }
+  base[PANEL_SESSION_HEADER] = PANEL_SESSION_LOCAL
+  return { ...(init ?? {}), headers: base }
+}
+
 /**
  * The block decision, pure: whether one fetch call is a clue request that
  * must not leave this machine. Only same-origin clue paths count, and only
@@ -185,11 +243,20 @@ export function installRemoteApiFetch(host: FetchHost): () => void {
       // attribute the hiding keys on, so the block moves with the session
       // switch in the same frame and never inherits the backend report's
       // 1 s lag in either direction.
-      if (shouldBlockClueCall(input, host.location.href, remoteSessionProbe())) {
+      const isRemoteNow = remoteSessionProbe()
+      if (shouldBlockClueCall(input, host.location.href, isRemoteNow)) {
         return Promise.resolve(new Response(clueBlockedBody(), {
           status: 503,
           headers: { 'content-type': 'application/json' },
         }))
+      }
+      // PB-27 r3: the mirror half — a LOCAL session's clue call reaches the
+      // network WITH the per-request annotation, so the backend deny hook
+      // judges this request by the page's same-frame truth instead of the
+      // shared report's 1 s lag. Without it the first uncached clue load
+      // after switching back refused 503 until the report caught up.
+      if (!isRemoteNow && isClueCall(input, host.location.href)) {
+        return original(input, annotateClueInit(init))
       }
       const method = init?.method ?? (typeof input === 'string' || input instanceof URL ? 'GET' : input.method)
       const rewritten = rewriteRemoteApiUrl(input, method, host.location.href)

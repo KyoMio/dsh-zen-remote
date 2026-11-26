@@ -43,6 +43,17 @@ export declare function setRemoteSessionProbeForTests(probe: RemoteSessionProbe 
 /** Whether one parsed path is a clue call the remote session must not
  * reach — the `/sidebar/api/clues.*` methods and the four share routes. */
 export declare function isCluePath(pathname: string): boolean;
+/** The per-request truth (PB-27 r3): the backend deny hook's current-session
+ * report lags a session switch by up to a second and is shared process-wide,
+ * so the FIRST uncached clue load after switching back to a local session
+ * would be refused off the stale remote value. The page itself knows the
+ * truth in the same frame — the wrapper therefore annotates every LOCAL
+ * session's clue call with this header. The intercept reads it BEFORE its
+ * report and strips it before the local plugin: the annotation judges only
+ * the deny decision, never the upstream payload. Only the exact value
+ * `local` speaks — anything else is ignored, so a remote panel can never
+ * gain from it (its calls are blocked here anyway). */
+export declare const PANEL_SESSION_HEADER = "x-zen-remote-panel-session";
 /**
  * The block decision, pure: whether one fetch call is a clue request that
  * must not leave this machine. Only same-origin clue paths count, and only

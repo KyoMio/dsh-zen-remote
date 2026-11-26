@@ -214,7 +214,7 @@ async function loadAdapter(version = '0.25.0') {
 }
 
 function startFakeHost() {
-  const hits = { local: 0, localWs: 0, localSidechat: 0 }
+  const hits = { local: 0, localWs: 0, localSidechat: 0, localHeaders: [] }
   let raw
   const server = http.createServer((req, res) => {
     Promise.resolve(raw.match(new URL(req.url ?? '/', 'http://x').pathname)).then(async (route) => {
@@ -264,6 +264,7 @@ function startFakeHost() {
         kind: 'prefix', path: '/sidebar/api',
         handler: async (req, res) => {
           hits.local += 1
+          hits.localHeaders.push({ pathname: req.url, panelSession: req.headers['x-zen-remote-panel-session'] })
           res.writeHead(200, { 'content-type': 'application/json' })
           res.end(JSON.stringify({ ok: true, value: { local: true } }))
         },
@@ -1209,3 +1210,81 @@ test('0.34.0-alpha.0: the surface digest is whitelisted; the extractor widened n
   const normalized = core.normalizeAdapter(raw, '0.34.0-alpha.9', { surfaceDigest: '4988812a1d408484' })
   assert.equal(normalized.declaration.version, '0.34.0-alpha.9')
 })
+
+test('PB-27 r3: the browser annotate overrides a STALE remote report — a local clue read passes on the first try after switching back', async () => {
+  // The r2 verdict's finding: the user switches back to a LOCAL session,
+  // the first uncached clue load fires at once — but the backend's current-
+  // session report is still the PREVIOUS window's remote value (up to 1 s
+  // behind, shared process-wide). The deny hook must judge THIS request by
+  // the browser wrapper's per-request annotation
+  // (x-zen-remote-panel-session: local), not by the stale report: the call
+  // passes to the local plugin on the first try — no 503, no retry wait.
+  const host = await startFakeHost()
+  const relay = fakeRelayClient()
+  const { adapter } = await loadAdapter('0.34.0-alpha.0')
+  // The STALE value: the intercept still reports a remote session.
+  const handle = await installedIntercept(host, relay, adapter, { currentSession: virtual('session-a') })
+  try {
+    // Before the fix: no annotation, the stale report refuses (the
+    // r2 reproduction — first try 503s, loopback zero hits).
+    const without = await host.get('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.equal(without.status, 503, 'unannotated: the stale report still refuses (unchanged belt-and-braces)')
+    assert.equal((await without.json()).error.reason, 'remote-clues-unsupported')
+    assert.equal(host.hits.local, 0)
+
+    // The annotated call — the exact shape the browser wrapper sends once
+    // the page is local — passes to the LOCAL plugin on the first try.
+    const withHint = await host.get('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-zen-remote-panel-session': 'local' },
+      body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.equal(withHint.status, 200, 'the annotated local call passes despite the stale remote report')
+    assert.deepEqual(await withHint.json(), { ok: true, value: { local: true } })
+    assert.equal(host.hits.local, 1, 'the local plugin was hit')
+    assert.equal(relay.forwarded.length, 0, 'nothing crossed the relay')
+    // …and the annotation never reaches the local plugin itself.
+    assert.equal(host.hits.localHeaders[0].panelSession, undefined, 'the annotation header is stripped before the plugin')
+
+    // The four share routes judge the same way (same hook shape).
+    const share = await host.get('/sidebar/clues/share/export?sessionId=&workspaceId=ws-1', {
+      method: 'POST', headers: { 'x-zen-remote-panel-session': 'local' }, body: '{}',
+    })
+    assert.notEqual(share.status, 503, 'an annotated share call is not refused by the stale report either')
+
+    // REGRESSION: the wall itself stands — an UNANNOTATED remote clue call
+    // (the remote panel shape, blocked in the browser anyway) still refuses.
+    const remote = await host.get('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.equal(remote.status, 503)
+    assert.equal((await remote.json()).error.reason, 'remote-clues-unsupported')
+
+    // The hint is narrow: it must not smuggle a REAL virtual session's
+    // located ids — a call that carries virtual session ids still classifies
+    // remote and refuses at the forward wall (annotation or not).
+    const virtualClue = await host.get('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-zen-remote-panel-session': 'local' },
+      body: JSON.stringify({ workspaceId: 'ws-1', sessionId: virtual('session-a') }),
+    })
+    assert.equal(virtualClue.status, 503, 'a virtual session id in the payload still refuses')
+    assert.equal(relay.forwarded.length, 0)
+
+    // Other deny-hook consumers do not inherit the hint unless annotated:
+    // open.external unannotated still refuses under the stale report.
+    const openUnannotated = await host.get('/sidebar/api/open.external', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'reveal', path: '/etc' }),
+    })
+    assert.equal(openUnannotated.status, 503, 'open.external keeps refusing from the stale report when unannotated')
+
+    handle.uninstall()
+  } finally {
+    handle.uninstall()
+    await host.stop()
+  }
+})
+
