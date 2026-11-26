@@ -1706,34 +1706,34 @@ export function installPluginRouteIntercept(options: InstallPluginRouteIntercept
         const method = req.method ?? 'GET'
         const hasBody = method !== 'GET' && method !== 'HEAD'
 
-        // PB-27 r3: the browser wrapper's per-request truth. The deny
-        // hooks' `currentSessionId` is the backend's LAST REPORT — shared
-        // process-wide and up to a second stale across a session switch —
-        // so the first uncached clue load after switching back to a local
-        // session would be refused off the previous window's remote value
-        // (the r2 verdict's finding). The page knows its own truth in the
-        // same frame the attribute flips and annotates its clue calls with
-        // `x-zen-remote-panel-session: local`; read it HERE, strip it so the
-        // annotation never reaches the local plugin (the passthrough replays
-        // the request's own headers), and let it take precedence over the
-        // report for THIS request alone — every other request keeps the
-        // report. Only the exact value `local` speaks: anything else is
-        // ignored, and the override can only PASS a local call — the located
-        // ids of the request still classify on their own (a virtual session
-        // id in the payload still refuses or forwards by the usual rules),
-        // so the hint never smuggles a remote context into local handling.
+        // PB-27 r4: the browser wrapper's per-request truth, SCOPED. The
+        // deny hooks' `currentSessionId` is the backend's LAST REPORT —
+        // shared process-wide and up to a second stale across a session
+        // switch — so the first uncached clue load after switching back to
+        // a local session would be refused off the previous window's remote
+        // value (the r2 verdict's finding). The page knows its own truth in
+        // the same frame the attribute flips and annotates its clue calls
+        // with `x-zen-remote-panel-session: local`; read it HERE, strip it
+        // so the annotation never reaches the local plugin (the passthrough
+        // replays the request's own headers), and pass it to the hooks as
+        // `panelHint` — but ONLY the clue surface's hooks read it: every
+        // other hook judges by the report alone, so the hint can never
+        // weaken a non-clue refusal (the r3 finding).
         const panelHint = typeof req.headers['x-zen-remote-panel-session'] === 'string' ? req.headers['x-zen-remote-panel-session'] : undefined
         delete req.headers['x-zen-remote-panel-session']
-        const denySessionOverride = panelHint === 'local'
 
         // The route's deny hook runs BEFORE any id locating: a request the
         // adapter refuses on path grounds (better-sidebar's open.external
         // from a remote panel, the side-chat methods) answers here — these
         // requests often carry NO session field, so the classify below
         // would otherwise read them as local and let them through.
+        // PB-27 r4: the report rides UNMODIFIED — the annotation never
+        // blanks it (the r3 regression blanked it for every hook, letting
+        // an annotated open.external pass as "no remote panel"). The hint
+        // rides along as its own field; whether it counts is EACH HOOK's
+        // decision — only better-sidebar's clue surface reads it.
         if (route.deny !== undefined) {
-          const denySession = denySessionOverride ? undefined : getCurrentSession?.()
-          const denial = route.deny({ pathname, method, currentSessionId: denySession })
+          const denial = route.deny({ pathname, method, currentSessionId: getCurrentSession?.(), ...(panelHint !== undefined ? { panelHint } : {}) })
           if (denial !== undefined) {
             answerUnbridged(res, plugin, denial)
             return

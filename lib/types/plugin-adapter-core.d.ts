@@ -77,6 +77,7 @@ export interface AdapterRoute {
         pathname: string;
         method: string;
         currentSessionId: string | undefined;
+        panelHint?: string;
     }) => string | undefined;
 }
 /** One adapter route after validation: every scalar filled with its

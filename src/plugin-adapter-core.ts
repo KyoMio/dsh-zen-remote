@@ -74,7 +74,7 @@ export interface AdapterRoute {
   locator: AdapterLocator
   local?: boolean
   requiresSurface?: string
-  deny?: (info: { pathname: string; method: string; currentSessionId: string | undefined }) => string | undefined
+  deny?: (info: { pathname: string; method: string; currentSessionId: string | undefined; panelHint?: string }) => string | undefined
 }
 
 /** One adapter route after validation: every scalar filled with its

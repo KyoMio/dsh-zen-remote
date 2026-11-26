@@ -1288,3 +1288,62 @@ test('PB-27 r3: the browser annotate overrides a STALE remote report — a local
   }
 })
 
+test('PB-27 r4: the panel hint is scoped to the clue surface alone — an annotated NON-clue request still judges by the report', async () => {
+  // The r3 regression (three-review finding): the r3 override blanked the
+  // report for EVERY deny hook, so a remote session's annotated
+  // open.external — a no-session-field call — would pass as "no remote
+  // panel" and land on the local plugin, opening a link on the sub-client's
+  // own machine. The hint must speak only for the clue surface's hooks.
+  const host = await startFakeHost()
+  const relay = fakeRelayClient()
+  const { adapter } = await loadAdapter('0.34.0-alpha.0')
+  const handle = await installedIntercept(host, relay, adapter, { currentSession: virtual('session-a') })
+  try {
+    // 复验一 (the core regression): annotated open.external under a remote
+    // report must STILL refuse — the hint means nothing outside clues.
+    const annotatedOpen = await host.get('/sidebar/api/open.external', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-zen-remote-panel-session': 'local' },
+      body: JSON.stringify({ action: 'reveal', path: '/etc' }),
+    })
+    assert.equal(annotatedOpen.status, 503, 'annotated non-clue calls do NOT pass — the hint is scoped')
+    assert.equal((await annotatedOpen.json()).error.reason, 'remote-open-unsupported')
+    assert.equal(host.hits.local, 0, 'nothing reached the local plugin')
+    // Every ordinary no-hint session method keeps its report-driven
+    // judgment: fs.tree with a virtual id still forwards.
+    const tree = await host.get('/sidebar/api/fs.tree', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-zen-remote-panel-session': 'local' },
+      body: JSON.stringify({ sessionId: virtual('session-a'), path: 'src' }),
+    })
+    assert.equal(tree.status, 200)
+    assert.equal(relay.forwarded.length, 1, 'session-scoped forwards are unaffected by the hint')
+
+    // 复验二 regression: the r3 behavior must not degrade — the annotated
+    // clue read still passes on the first try under the stale report.
+    const clue = await host.get('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-zen-remote-panel-session': 'local' },
+      body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.equal(clue.status, 200, 'the annotated clue read still passes')
+    assert.deepEqual(await clue.json(), { ok: true, value: { local: true } })
+    assert.equal(relay.forwarded.length, 1, 'clues still never cross the relay')
+
+    // 复验三: no smuggling — a NON-exact hint value is ignored everywhere,
+    // and the unannotated clue call still refuses off the remote report.
+    const wrongValue = await host.get('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-zen-remote-panel-session': 'locale' },
+      body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.equal(wrongValue.status, 503, 'only the exact value local speaks')
+    const smuggled = await host.get('/sidebar/api/clues.list', {
+      method: 'POST', headers: { 'content-type': 'application/json', 'x-zen-remote-panel-session': 'local' },
+      body: JSON.stringify({ workspaceId: 'ws-1', sessionId: virtual('session-a') }),
+    })
+    assert.equal(smuggled.status, 503, 'a virtual id in the payload still refuses')
+
+    handle.uninstall()
+  } finally {
+    handle.uninstall()
+    await host.stop()
+  }
+})
+
