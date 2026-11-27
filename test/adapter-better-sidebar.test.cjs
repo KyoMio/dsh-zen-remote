@@ -1174,6 +1174,30 @@ test('0.34.0-alpha.0: a clue call that somehow classifies remote dies on the for
     })
     assert.deepEqual(verdict, { allow: false, reason: 'remote-clues-unsupported' }, `${name} never crosses the relay`)
   }
+  // Symmetric with server.request: bare /sidebar/api/clues and all four
+  // /sidebar/clues/share/* routes also refuse unconditionally in client.request.
+  assert.deepEqual(
+    hook({
+      method: 'POST',
+      pathname: '/sidebar/api/clues',
+      route: adapterMod.dshBetterSidebarAdapter.routes[0],
+      query: new URLSearchParams(),
+      body: { sessionId: 'session-a' },
+    }),
+    { allow: false, reason: 'remote-clues-unsupported' },
+    '/sidebar/api/clues never crosses the relay',
+  )
+  for (const sharePath of ['/sidebar/clues/share/export-preview', '/sidebar/clues/share/export', '/sidebar/clues/share/import-preview', '/sidebar/clues/share/import']) {
+    const shareRoute = adapterMod.dshBetterSidebarAdapter.routes.find((entry) => entry.path === sharePath)
+    const verdict = hook({
+      method: 'POST',
+      pathname: sharePath,
+      route: shareRoute,
+      query: new URLSearchParams({ sessionId: 'session-a' }),
+      body: undefined,
+    })
+    assert.deepEqual(verdict, { allow: false, reason: 'remote-clues-unsupported' }, `${sharePath} never crosses the relay`)
+  }
   // selection.translate passes the wall — with its widened header budget
   // verdict (PB-27 finding 3, the 90 s upstream budget) — and the pre-0.34
   // families forward with the plain verdict.
@@ -1195,6 +1219,27 @@ test('0.34.0-alpha.0: a clue call that somehow classifies remote dies on the for
     body: { sessionId: 'session-a', text: 'hello', language: 'zh' },
   })
   assert.deepEqual(translate, { allow: true, headerTimeoutMs: 120_000 }, 'selection.translate forwards with the widened header budget')
+})
+
+test('BS34-2: client.request blocks /sidebar/clues/share/export with panelHint=local and virtual sessionId before crossing relay', async () => {
+  const host = await startFakeHost()
+  const relay = fakeRelayClient()
+  const { adapter } = await loadAdapter('0.34.0-alpha.0')
+  const handle = await installedIntercept(host, relay, adapter, { currentSession: virtual('session-a') })
+  try {
+    const res = await host.get(`/sidebar/clues/share/export?sessionId=${encodeURIComponent(virtual('session-a'))}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-zen-remote-panel-session': 'local' },
+      body: JSON.stringify({ workspaceId: 'ws-1' }),
+    })
+    assert.equal(res.status, 503)
+    assert.equal((await res.json()).error.reason, 'remote-clues-unsupported')
+    assert.equal(relay.forwarded.length, 0, 'the share route never crossed the relay')
+    assert.equal(host.hits.local, 0, 'the local plugin never ran')
+  } finally {
+    handle.uninstall()
+    await host.stop()
+  }
 })
 
 test('0.34.0-alpha.0: the surface digest is whitelisted; the extractor widened namespaces re-hash older generations byte-identically', async () => {
