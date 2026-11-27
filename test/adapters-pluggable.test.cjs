@@ -77,6 +77,13 @@ test('PB-11 pluggable: the import scan — only the wiring sees the adapters dir
   assert.deepEqual(subdirImporters, [], `no file may import an adapter subdirectory or the types outside adapters/ — found: ${subdirImporters.join(', ')}`)
 })
 
+test('BS34-3: src/client/remote-fetch.ts stays generic with no hardcoded plugin literals', () => {
+  const text = fs.readFileSync(path.join(SRC, 'client', 'remote-fetch.ts'), 'utf8')
+  for (const forbidden of ['/sidebar/', 'clues', 'dsh-better-sidebar']) {
+    assert.ok(!text.includes(forbidden), `src/client/remote-fetch.ts must not contain ${JSON.stringify(forbidden)}`)
+  }
+})
+
 test('PB-11 pluggable: every registered adapter is well-formed', async () => {
   const adaptersMod = await importLib('adapters/index.js')
   const core = await importLib('plugin-adapter-core.js')
