@@ -9,13 +9,20 @@ on:
       - 'lib/**'
       - 'test/**'
       - 'scripts/**'
+      - 'pwa/**'
+      - 'bin/**'
+      - 'dsh-push.mjs'
+      - 'gateway-server/**'
       - 'package.json'
       - 'pnpm-lock.yaml'
       - 'tsconfig*.json'
       - 'lan-gate*'
+      - 'LICENSE'
+      - 'CHANGELOG.md'
+      - 'llms.txt'
       - 'docs/**'
       - 'README*.md'
-      - '.github/workflows/ci.yml'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 jobs:

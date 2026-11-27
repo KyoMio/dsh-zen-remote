@@ -66,8 +66,7 @@ const PERM = `${ROW} > [class$="_tools"] > [class$="_modes"]`
  */
 const MODEL_MENU = `:is(${MODEL} > [class$="_menu"], body > [id$="-menu"][class$="_menu"]:is([role="menu"], [role="group"]))`
 
-export const COMPOSER_CSS = `
-/* ---------- phone composer (< 768px) ---------- */
+export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- */
 
 /* The file picker the attachment button drives (S7) — hidden at EVERY width,
    deliberately OUTSIDE the phone media block below. A bare <input type="file">

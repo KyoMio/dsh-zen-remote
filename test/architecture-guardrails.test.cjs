@@ -1,21 +1,22 @@
 'use strict'
-// architecture-guardrails.test.cjs — ZR-3 static guardrails.
-// Every check fails with the exact repair guidance from the optimization
-// plan (Phase 2, ZR-3 table). Source-analysis style follows the repo's
-// existing test conventions (text scans over src/, no runtime typescript
-// require in the HOT path — ts is only used for the program-closure check,
-// matching scripts/check-orphan-lib.mjs).
+// architecture-guardrails.test.cjs — ZR-3 static & behavioral guardrails.
 const assert = require('node:assert/strict')
 const { execFileSync } = require('node:child_process')
 const fs = require('node:fs')
+const http = require('node:http')
+const os = require('node:os')
 const path = require('node:path')
 const test = require('node:test')
+const { pathToFileURL } = require('node:url')
+const ts = require('typescript')
+const { request } = require('./util.cjs')
 
 const root = path.join(__dirname, '..')
 const read = (...parts) => fs.readFileSync(path.join(root, ...parts), 'utf8')
 
 function walk(dir, rel = '') {
   const out = []
+  if (!fs.existsSync(dir)) return out
   for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
     const abs = path.join(dir, entry.name)
     const relPath = rel ? `${rel}/${entry.name}` : entry.name
@@ -26,30 +27,93 @@ function walk(dir, rel = '') {
 }
 
 const srcFiles = walk(path.join(root, 'src'))
-  .filter((f) => /\.tsx?$/.test(f) && !f.endsWith('.d.ts'))
+  .filter((f) => /\.tsx?$/.test(f) && !f.endsWith('.d.ts') && !/\.test\.tsx?$/.test(f))
   .map((f) => `src/${f}`)
+
+function scriptKindFor(filePath) {
+  if (filePath.endsWith('.tsx')) return ts.ScriptKind.TSX
+  if (filePath.endsWith('.ts') || filePath.endsWith('.mts') || filePath.endsWith('.cts')) return ts.ScriptKind.TS
+  return ts.ScriptKind.JS
+}
+
+function lineOf(sourceFile, node) {
+  return sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
+}
 
 // ---------------------------------------------------------------------------
 // ① tsconfig include 漏网：new src non-test files must be inside one of the
-// two programs' input closures (include + transitive imports). Otherwise tsc
-// never emits them to lib/ and the plugin crashes at runtime with
-// ERR_MODULE_NOT_FOUND (2026-10-25 GW-1).
+// two programs' input closures (include + transitive imports), and any
+// src/client-data/*.ts imported by host files must be covered by tsconfig.json
+// so tsc emits lib/client-data/*.js instead of only .client-build/.
 // ---------------------------------------------------------------------------
 function programClosure(configPath) {
-  const raw = execFileSync(process.execPath, [
-    '-e',
-    `const ts=require('typescript');const c=ts.readConfigFile(${JSON.stringify(configPath)},ts.sys.readFile);const p=ts.parseJsonConfigFileContent(c.config,ts.sys,${JSON.stringify(path.dirname(configPath))});const prog=ts.createProgram(p.fileNames,p.options);const names=prog.getSourceFiles().map(f=>f.fileName).filter(n=>!n.includes('node_modules'));console.log(JSON.stringify(names))`,
-  ], { cwd: root, encoding: 'utf8' })
-  return new Set(JSON.parse(raw).map((f) => path.relative(root, f).split('\\').join('/')))
+  const configFile = ts.readConfigFile(configPath, ts.sys.readFile)
+  assert.ok(!configFile.error, `无法读取 ${configPath}`)
+  const parsed = ts.parseJsonConfigFileContent(configFile.config, ts.sys, path.dirname(configPath))
+  const prog = ts.createProgram(parsed.fileNames, parsed.options)
+  const out = new Set()
+  for (const sf of prog.getSourceFiles()) {
+    if (prog.isSourceFileFromExternalLibrary(sf) || prog.isSourceFileDefaultLibrary(sf)) continue
+    const rel = path.relative(root, sf.fileName).split('\\').join('/')
+    if (rel.startsWith('..') || rel.startsWith('node_modules/')) continue
+    out.add(rel)
+  }
+  return out
+}
+
+function collectModuleSpecifiers(filePath) {
+  const text = read(filePath)
+  const sf = ts.createSourceFile(filePath, text, ts.ScriptTarget.Latest, true, scriptKindFor(filePath))
+  const specifiers = []
+  const visit = (node) => {
+    if ((ts.isImportDeclaration(node) || ts.isExportDeclaration(node)) && node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)) {
+      specifiers.push(node.moduleSpecifier.text)
+    } else if (ts.isCallExpression(node) && node.arguments.length >= 1 && ts.isStringLiteral(node.arguments[0])) {
+      const callee = node.expression
+      if (callee.kind === ts.SyntaxKind.ImportKeyword || (ts.isIdentifier(callee) && callee.text === 'require')) {
+        specifiers.push(node.arguments[0].text)
+      }
+    }
+    ts.forEachChild(node, visit)
+  }
+  ts.forEachChild(sf, visit)
+  return specifiers
 }
 
 test('① every non-test src file is inside a tsconfig program closure', () => {
-  const closure = new Set([...programClosure(path.join(root, 'tsconfig.json')), ...programClosure(path.join(root, 'tsconfig.client.json'))])
+  const hostClosure = programClosure(path.join(root, 'tsconfig.json'))
+  const clientClosure = programClosure(path.join(root, 'tsconfig.client.json'))
+  const closure = new Set([...hostClosure, ...clientClosure])
   const uncovered = srcFiles.filter((f) => !closure.has(f))
   assert.deepEqual(
     uncovered,
     [],
     `${uncovered[0] ?? ''} 未被入口引用且不在 tsconfig*.json 的 include 中，tsc 不会产出到 lib/。请显式加入 include 或由入口引用。`,
+  )
+
+  const binFiles = walk(path.join(root, 'bin')).filter((f) => /\.(mjs|cjs)$/.test(f)).map((f) => `bin/${f}`)
+  const hostEntryFiles = [
+    ...[...hostClosure].filter((f) => f.startsWith('src/') && !f.startsWith('src/client-data/')),
+    'lan-gate.mjs',
+    'dsh-push.mjs',
+    ...binFiles,
+  ]
+  const missingHostClientData = []
+  for (const hostFile of hostEntryFiles) {
+    if (!fs.existsSync(path.join(root, hostFile))) continue
+    for (const spec of collectModuleSpecifiers(hostFile)) {
+      const match = /(?:^|\/)(?:lib\/)?client-data\/([^/'"]+?)(?:\.(?:[cm]?js|ts))?$/.exec(spec)
+      if (!match) continue
+      const target = `src/client-data/${match[1]}.ts`
+      if (fs.existsSync(path.join(root, target)) && !hostClosure.has(target)) {
+        missingHostClientData.push(`${hostFile} -> ${target}`)
+      }
+    }
+  }
+  assert.deepEqual(
+    missingHostClientData,
+    [],
+    `宿主引用了 src/client-data/ 模块但未进入 tsconfig.json 闭包（tsc 不会产出到 lib/client-data/）：${missingHostClientData[0] ?? ''}。请将其加入 tsconfig.json include。`,
   )
 })
 
@@ -60,21 +124,33 @@ test('① every non-test src file is inside a tsconfig program closure', () => {
 // ---------------------------------------------------------------------------
 test('② only lan-gate.mjs may reference the lan-gate-server module', () => {
   const offenders = []
-  const scanFiles = [
-    ...srcFiles,
-    ...walk(path.join(root, 'scripts')).map((f) => `scripts/${f}`).filter((f) => /\.mjs$/.test(f)),
-  ]
+  const binFiles = walk(path.join(root, 'bin')).filter((f) => /\.(mjs|cjs)$/.test(f)).map((f) => `bin/${f}`)
+  const scriptFiles = walk(path.join(root, 'scripts')).filter((f) => /\.(mjs|cjs)$/.test(f)).map((f) => `scripts/${f}`)
+  const scanFiles = [...srcFiles, 'dsh-push.mjs', ...binFiles, ...scriptFiles]
+    .filter((f) => f !== 'lan-gate.mjs' && f !== 'scripts/lan-gate.mjs')
+
   for (const f of scanFiles) {
-    if (f.endsWith('.css.ts')) continue
-    const text = read(f)
-    const lines = text.split('\n')
-    lines.forEach((line, i) => {
-      const stripped = line.trim()
-      if (stripped.startsWith('*') || stripped.startsWith('//')) return
-      if (/lan-gate-server/.test(line) && /(import|require|from|spawn|execFile|fork)\b/.test(line)) {
-        offenders.push(`${f}:${i + 1}`)
+    const sf = ts.createSourceFile(f, read(f), ts.ScriptTarget.Latest, true, scriptKindFor(f))
+    const isCssFile = f.endsWith('.css.ts')
+    const visit = (node) => {
+      if (
+        ts.isStringLiteral(node) ||
+        ts.isNoSubstitutionTemplateLiteral(node) ||
+        ts.isTemplateHead(node) ||
+        ts.isTemplateMiddle(node) ||
+        ts.isTemplateTail(node)
+      ) {
+        const isModuleSpec = ts.isImportDeclaration(node.parent) || ts.isExportDeclaration(node.parent)
+        const text = isCssFile && !isModuleSpec
+          ? node.text.replace(/\/\*[\s\S]*?\*\//g, '')
+          : node.text
+        if (text.includes('lan-gate-server')) {
+          offenders.push(`${f}:${lineOf(sf, node)}`)
+        }
       }
-    })
+      ts.forEachChild(node, visit)
+    }
+    ts.forEachChild(sf, visit)
   }
   assert.deepEqual(
     offenders,
@@ -84,30 +160,16 @@ test('② only lan-gate.mjs may reference the lan-gate-server module', () => {
 })
 
 // ---------------------------------------------------------------------------
-// ③ 禁用多层宿主嵌套猜想选择器 — AST/template level (ZR-3 R1 item 5):
-// the line-level scan was evaded by rewrapping the selector across lines
-// (format-comparison.json). Here the TypeScript AST hands us the template
-// nodes, ${CONST} interpolations are resolved through module-scope const
-// evaluation, selectors are split rule-head by rule-head on the FINAL
-// string, and nested templates are walked recursively — rewrapping,
-// requoting or reformatting cannot change what the selector IS.
-// Exemption: a `zr-depth-ok` comment inside the same template, which ships
-// with the artifact so the justification can never be stripped silently.
+// ③ 禁用多层宿主嵌套猜想选择器 — evaluates the compiled styles modules inside
+// lib/client.js directly so template interpolation, rewrapping, and requoting
+// cannot evade inspection. Exemptions live in test/css-depth-allowlist.json as
+// verbatim whitespace-normalized selectors grouped per sheet.
 // ---------------------------------------------------------------------------
-const ts = require('typescript')
-
-// The accident shape: class-suffix chains (host emotion class names) linked
-// by 2+ child combinators — the selector only matches when the host wraps
-// content in EXACTLY that many layers, and silently dies when the wrapper
-// count changes. This is what silently failed three times.
-const CLASS_CHAIN_RE = /\[class[*$^]?="[^"]+"\][^,{]*>\s*[^,{]*\[class[*$^]?="[^"]+"\][^,{]*>\s*[^,{]*\[class/
 
 // Evaluate the styles half of the SHIPPED bundle instead of guessing what
 // source templates compose to: lib/client.js is what the browser actually
 // runs, so a scan over its evaluated strings cannot drift from runtime
-// reality. The bundle is plain CJS factories keyed in __modules; platform
-// requires (react et al.) are never touched by the styles modules, which
-// are pure string constants plus string functions.
+// reality.
 function evaluateClientBundle() {
   const src = fs.readFileSync(path.join(root, 'lib', 'client.js'), 'utf8')
   const sf = ts.createSourceFile('client.js', src, ts.ScriptTarget.Latest, true)
@@ -148,16 +210,28 @@ function evaluateClientBundle() {
   return styles
 }
 
-// Split a selector list on TOP-LEVEL commas only — commas nested inside
-// :is()/:not()/:has() parentheses belong to one selector, not to the group.
+// Split a selector list on top-level commas only — commas inside (...), [...],
+// or quoted attribute values belong to one selector, not to the group.
 function splitSelectorList(text) {
   const out = []
-  let depth = 0
+  let parenDepth = 0
+  let bracketDepth = 0
+  let quote = null
   let cur = ''
-  for (const ch of text) {
-    if (ch === '(') depth += 1
-    if (ch === ')') depth = Math.max(0, depth - 1)
-    if (ch === ',' && depth === 0) {
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (quote) {
+      cur += ch
+      if (ch === '\\' && i + 1 < text.length) { cur += text[i + 1]; i += 1; continue }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; cur += ch; continue }
+    if (ch === '(') parenDepth += 1
+    else if (ch === ')') parenDepth = Math.max(0, parenDepth - 1)
+    else if (ch === '[') bracketDepth += 1
+    else if (ch === ']') bracketDepth = Math.max(0, bracketDepth - 1)
+    if (ch === ',' && parenDepth === 0 && bracketDepth === 0) {
       out.push(cur)
       cur = ''
     } else {
@@ -168,16 +242,14 @@ function splitSelectorList(text) {
   return out
 }
 
-// Split css text into rules. A rule is {head, isAtRule}: head is the full
-// text since the previous block boundary INCLUDING comments, because the
-// zr-depth-ok exemption binds to exactly one rule group (ZR-3 R2 item 2) —
-// a marker in this rule's head exempts only the selectors of THIS head,
-// not the stylesheet. Quotes are tracked so braces inside strings or
-// data-urls do not count as block boundaries.
+// Split CSS text into rules while tracking comments, escaped quotes, and
+// @keyframes blocks so keyframe stop percentages never masquerade as selectors.
 function* cssRules(css) {
   let chunk = ''
   let quote = null
   let inComment = false
+  let braceDepth = 0
+  let keyframesDepth = -1
   for (let i = 0; i < css.length; i++) {
     const ch = css[i]
     const next = css[i + 1]
@@ -188,43 +260,118 @@ function* cssRules(css) {
     }
     if (quote) {
       chunk += ch
+      if (ch === '\\' && i + 1 < css.length) { chunk += css[i + 1]; i += 1; continue }
       if (ch === quote) quote = null
       continue
     }
     if (ch === '/' && next === '*') { inComment = true; chunk += ch; continue }
     if (ch === '"' || ch === "'") { quote = ch; chunk += ch; continue }
     if (ch === '{') {
-      yield { head: chunk, isAtRule: /@(media|supports|container|keyframes|layer)\b/.test(chunk.trimStart().split('\n').filter((l) => l.trim() && !l.trim().startsWith('/*')).pop() ?? '') || chunk.trimStart().startsWith('@') }
+      const clean = chunk.replace(/\/\*[\s\S]*?\*\//g, '').trimStart()
+      const isAtRule = clean.startsWith('@')
+      const isKeyframes = /^@(?:-[a-z]+-)?keyframes\b/i.test(clean)
+      if (keyframesDepth === -1) {
+        if (isKeyframes) keyframesDepth = braceDepth
+        yield { head: chunk, isAtRule }
+      }
+      braceDepth += 1
       chunk = ''
       continue
     }
-    if (ch === '}') { chunk = ''; continue }
+    if (ch === '}') {
+      braceDepth = Math.max(0, braceDepth - 1)
+      if (keyframesDepth !== -1 && braceDepth <= keyframesDepth) keyframesDepth = -1
+      chunk = ''
+      continue
+    }
+    if (ch === ';') {
+      chunk = ''
+      continue
+    }
     chunk += ch
   }
 }
 
-test('③ no unjustified deep class-suffix chains guessing host DOM depth (artifact-level)', () => {
+// Option 2 selector depth predicate: flags a selector when EITHER:
+//   (1) any :has(...) argument contains a non-leading `>` or >= 2 `>` inside :has(...), OR
+//   (2) the selector contains >= 2 child combinators `>` in total (ignoring quoted `>`).
+// Benign 1-level direct-child predicates like `:has(> svg)` are allowed.
+function isDeepChainOrHas(sel) {
+  let quote = null
+  let childCount = 0
+  let parenDepth = 0
+  const hasStack = []
+  for (let i = 0; i < sel.length; i++) {
+    const ch = sel[i]
+    if (quote) {
+      if (ch === '\\' && i + 1 < sel.length) { i += 1; continue }
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      for (const frame of hasStack) frame.atArgStart = false
+      continue
+    }
+    if (sel.slice(i, i + 5).toLowerCase() === ':has(') {
+      for (const frame of hasStack) frame.atArgStart = false
+      parenDepth += 1
+      hasStack.push({ depth: parenDepth, atArgStart: true, childCount: 0, nonLeadingChild: false })
+      i += 4
+      continue
+    }
+    if (ch === '(') {
+      for (const frame of hasStack) frame.atArgStart = false
+      parenDepth += 1
+      continue
+    }
+    if (ch === ')') {
+      const top = hasStack[hasStack.length - 1]
+      if (top && top.depth === parenDepth) {
+        hasStack.pop()
+        if (top.nonLeadingChild || top.childCount >= 2) return true
+      }
+      parenDepth = Math.max(0, parenDepth - 1)
+      continue
+    }
+    if (ch === ',' && hasStack.length > 0 && hasStack[hasStack.length - 1].depth === parenDepth) {
+      hasStack[hasStack.length - 1].atArgStart = true
+      continue
+    }
+    if (ch === '>') {
+      childCount += 1
+      for (const frame of hasStack) {
+        frame.childCount += 1
+        if (!frame.atArgStart) frame.nonLeadingChild = true
+        frame.atArgStart = false
+      }
+      continue
+    }
+    if (!/\s/.test(ch)) {
+      for (const frame of hasStack) frame.atArgStart = false
+    }
+  }
+  return childCount >= 2
+}
+
+test('③ no unjustified deep child-combinator chains or nested :has() depth guesses (artifact-level)', () => {
   const allowlistDoc = JSON.parse(fs.readFileSync(path.join(root, 'test', 'css-depth-allowlist.json'), 'utf8'))
+  const styles = evaluateClientBundle()
   const offenders = []
-  for (const [where, css] of evaluateClientBundle()) {
-    const approved = (allowlistDoc.sheets[where]?.selectors ?? []).map((x) => x.replace(/\s+/g, ' ').trim())
+  const matchedBySheet = new Map()
+  for (const [where, css] of styles) {
+    const approved = new Set((allowlistDoc.sheets[where]?.selectors ?? []).map((x) => x.replace(/\s+/g, ' ').trim()))
+    const matched = new Set()
+    matchedBySheet.set(where, matched)
     for (const rule of cssRules(css)) {
-      if (rule.isAtRule) continue // at-rule prelude, selectors live in nested rules
-      // Exemption is an exact-selector allowlist (ZR-3 R3) kept OUTSIDE the
-      // stylesheets in test/css-depth-allowlist.json: entries pin COMPLETE
-      // selectors verbatim (whitespace-normalized full equality), grouped
-      // per sheet with one shared justification. Keeping the list out of
-      // the artifact means entry text can never collide with functional
-      // selector counting in other contract tests, and grafted conditions
-      // can never match because equality is not substring. A new deep-chain
-      // selector must be registered in the JSON explicitly.
+      if (rule.isAtRule) continue
       const stripped = rule.head.replace(/\/\*[\s\S]*?\*\//g, '')
       for (const selector of splitSelectorList(stripped)) {
         const sel = selector.trim().replace(/\s+/g, ' ')
-        if (!sel || sel.includes('%')) continue
-        if (!CLASS_CHAIN_RE.test(sel)) continue
-        const covered = approved.includes(sel)
-        if (!covered) {
+        if (!sel || !isDeepChainOrHas(sel)) continue
+        if (approved.has(sel)) {
+          matched.add(sel)
+        } else {
           offenders.push(`${where}: ${sel.slice(0, 90)}`)
         }
       }
@@ -235,25 +382,44 @@ test('③ no unjustified deep class-suffix chains guessing host DOM depth (artif
     [],
     `禁止用多层 :has() 或固定子代深度猜测宿主 DOM 结构。请改用 JS 沿父节点上溯（参考 foldsWholeRows 实现）；确属结构事实时把该完整选择器加进 test/css-depth-allowlist.json 对应 sheet 并确认理由覆盖它（精确匹配，新选择器必须显式登记）。（命中：${offenders[0] ?? ''}）`,
   )
+
+  const stale = []
+  for (const [where, entry] of Object.entries(allowlistDoc.sheets ?? {})) {
+    if (!styles.has(where)) {
+      stale.push(`${where}: sheet absent in lib/client.js`)
+      continue
+    }
+    const selectors = entry?.selectors ?? []
+    if (selectors.length === 0) {
+      stale.push(`${where}: empty selectors array`)
+      continue
+    }
+    const matched = matchedBySheet.get(where)
+    for (const raw of selectors) {
+      const norm = raw.replace(/\s+/g, ' ').trim()
+      if (!matched?.has(norm)) {
+        stale.push(`${where}: ${norm.slice(0, 90)}`)
+      }
+    }
+  }
+  assert.deepEqual(
+    stale,
+    [],
+    `test/css-depth-allowlist.json 存在已失效的豁免条目（目标选择器或样式表已不在 lib/client.js 中）。请从 test/css-depth-allowlist.json 删除这些过时条目：${stale[0] ?? ''}`,
+  )
 })
 
 // ---------------------------------------------------------------------------
-// ④ via 拒止墙完整性 — BEHAVIORAL (ZR-3 R1 item 3): text scanning cannot
-// prove the wall fires before dispatch (a comment mentioning the marker
-// turned a wall-less file green; requoting turned correct code red). The
-// real handlers run over real sockets here with fully recording stubs:
-// every managed route is hit with the via marker and must answer the
-// contract WITHOUT any recording stub being invoked; control requests
-// without the marker prove the route is alive (no silent 404 false-pass).
-// A route added without registering it in these tests fails closed:
-// wizard unknowns via 403-anyway mismatching the table's status
-// expectation, admin unknowns 404ing against 403.
+// ④ via 拒止墙完整性 — BEHAVIORAL: the real handlers run over real sockets
+// with recording stubs so every managed route must reject via-gateway BEFORE
+// same-origin checks and BEFORE touching any dependency or backend.
 // ---------------------------------------------------------------------------
-const http = require('node:http')
-const { pathToFileURL } = require('node:url')
-const { request } = require('./util.cjs')
-
 const VIA = { 'x-zen-remote-via': 'gateway' }
+const CROSS_ORIGIN_VIA = {
+  ...VIA,
+  origin: 'https://evil.example',
+  'sec-fetch-site': 'cross-site',
+}
 
 function serve(handler) {
   const server = http.createServer((req, res) => { void handler(req, res) })
@@ -303,8 +469,8 @@ test('④-behavioral wizard: EVERY route under the prefix rejects via-gateway be
       status: () => 'never-started',
     },
     verify: {
-      start: () => { calls.verify += 1; return { id: 'v' } },
-      status: () => ({ state: 'not-started' }),
+      start: async () => { calls.verify += 1; return { ok: true } },
+      check: async () => { calls.verify += 1; return { state: 'not-started' } },
     },
   }
   const handler = wizard.createWizardHandler({
@@ -318,33 +484,40 @@ test('④-behavioral wizard: EVERY route under the prefix rejects via-gateway be
 
   const bad = []
   for (const [name, routePath] of routes) {
-    for (const method of ['GET', 'POST']) {
+    for (const method of ['GET', 'POST', 'DELETE']) {
       const before = JSON.stringify(calls)
-      const res = await request(port, { method, path: routePath, headers: { ...VIA }, body: method === 'POST' ? '{}' : undefined })
+      const res = await request(port, {
+        method,
+        path: routePath,
+        headers: { ...CROSS_ORIGIN_VIA },
+        body: method === 'POST' ? '{}' : undefined,
+      })
       if (res.status !== 403 || !res.body.includes('via-gateway')) {
-        bad.push(`${name} ${method}: status=${res.status} (wall must fire before any route dispatch — GET included)`)
+        bad.push(`${name} ${method}: status=${res.status} (via-gateway wall must fire before same-origin and route dispatch)`)
       }
       if (JSON.stringify(calls) !== before) {
         bad.push(`${name} ${method}: a recording dependency was invoked despite the rejection`)
       }
     }
   }
-  // Control: local requests must NOT 403 via-gateway — proves the rejection
-  // above is the marker wall, not a dead server.
   const control = await request(port, { method: 'GET', path: wizard.WIZARD_STATUS_ROUTE })
   assert.notEqual(control.status, 403, 'control failed: local status request must not be rejected — the 403s above would be meaningless')
-  // Fail-closed: an unregistered route under the wizard prefix must ALSO
-  // answer 403 via-gateway — meaning a future route added without a wall
-  // review cannot silently pass (the wall precedes all dispatch by design;
-  // this is the probe that would catch a reordering).
-  const unknown = await request(port, { method: 'GET', path: `${wizard.WIZARD_ROUTE_PREFIX}/unregistered-probe`, headers: { ...VIA } })
-  assert.equal(unknown.status, 403, 'unregistered wizard route must reject via-gateway (fail-closed)')
+  for (const method of ['GET', 'POST']) {
+    const unknown = await request(port, {
+      method,
+      path: `${wizard.WIZARD_ROUTE_PREFIX}/unregistered-probe`,
+      headers: { ...CROSS_ORIGIN_VIA },
+      body: method === 'POST' ? '{}' : undefined,
+    })
+    assert.equal(unknown.status, 403, `unregistered wizard ${method} route must reject via-gateway (fail-closed)`)
+    assert.ok(unknown.body.includes('via-gateway'), `unregistered wizard ${method} must fail on via-gateway before same-origin`)
+  }
   assert.deepEqual(bad, [], bad.join('\n'))
 })
 
 test('④-behavioral admin: management routes reject via-gateway before same-origin and before the backend', async (t) => {
   const admin = await import(pathToFileURL(path.join(root, 'lib', 'admin-routes.js')).href)
-  // Mock gateway records everything it is sent — the backend-invocation probe.
+  const { createBridgeRegistry } = await import(pathToFileURL(path.join(root, 'lib', 'plugin-bridge.js')).href)
   const seen = []
   const gateway = http.createServer((req, res) => {
     seen.push(`${req.method} ${req.url}`)
@@ -355,30 +528,34 @@ test('④-behavioral admin: management routes reject via-gateway before same-ori
   t.after(() => new Promise((resolve) => gateway.close(resolve)))
   const gwPort = gateway.address().port
 
+  let bridgeCalls = 0
+  const baseRegistry = createBridgeRegistry()
+  baseRegistry.register({ plugin: 'probe-plugin', version: '1.0.0', routes: [{ path: '/probe/x', scope: 'session' }] })
+  const pluginBridge = {
+    registry: {
+      ...baseRegistry,
+      list: () => { bridgeCalls += 1; return baseRegistry.list() },
+    },
+    getConsent: () => { bridgeCalls += 1; return {} },
+    adaptedPlugins: () => { bridgeCalls += 1; return new Set() },
+  }
+
   const handler = admin.createAdminHandler({
     admit: () => ({ peer: {} }),
     gatewayBase: `http://127.0.0.1:${gwPort}`,
     getConfig: () => configSnapshot(),
+    pluginBridge,
     timeoutMs: 800,
   })
   const { server, port } = await serve(handler)
   t.after(() => new Promise((resolve) => server.close(resolve)))
 
-  // The route policy table (ZR-3 R2 item 1): every admin route constant
-  // exported by lib/admin-routes.js MUST appear here exactly once with its
-  // supported methods and per-method expectation. A new route that nobody
-  // classified fails the set-equality assertion below — the maintainer is
-  // forced to choose allow/reject instead of silently slipping through.
-  // Expectations: 'reject' = POST must 403 via-gateway with zero backend
-  // hits (GET: 403/405 acceptable, backend untouched); 'redact' = remote
-  // readable but strips pairing/topology; 'allow-excepted' = the shares
-  // toggle, covered by its own contract test.
   const POLICY = new Map([
     [admin.ADMIN_PAIR_ROUTE, { methods: ['POST'], expect: 'reject' }],
     [admin.ADMIN_ACTION_ROUTE, { methods: ['POST'], expect: 'reject' }],
     [admin.ADMIN_PUSH_TEST_ROUTE, { methods: ['POST'], expect: 'reject' }],
-    [admin.ADMIN_PLUGIN_BRIDGE_ROUTE, { methods: ['GET', 'POST'], expect: 'reject' }],
-    [admin.ADMIN_STATUS_ROUTE, { methods: ['GET', 'POST'], expect: 'redact' }],
+    [admin.ADMIN_PLUGIN_BRIDGE_ROUTE, { methods: ['GET'], expect: 'reject' }],
+    [admin.ADMIN_STATUS_ROUTE, { methods: ['GET'], expect: 'redact' }],
     [admin.ADMIN_SHARES_ROUTE, { methods: ['GET', 'POST'], expect: 'allow-excepted' }],
   ])
   const exported = Object.entries(admin)
@@ -391,32 +568,40 @@ test('④-behavioral admin: management routes reject via-gateway before same-ori
     tabled,
     `admin 路由集合与策略表不一致——新增/删除路由必须同步在测试策略表里登记它的 via 墙预期（漏登记的路由没有任何人替它做允许/拒绝的决定）。导出未登记：${exported.filter((r) => !POLICY.has(r)).join(',') || '无'}；表内已删除：${tabled.filter((r) => !exported.includes(r)).join(',') || '无'}`,
   )
-  const rejected = [...POLICY.entries()].filter(([, p]) => p.expect === 'reject').map(([r]) => r)
+  const rejected = [...POLICY.entries()].filter(([, p]) => p.expect === 'reject')
   const bad = []
-  for (const routePath of rejected) {
-    for (const method of ['POST', 'GET']) {
+  for (const [routePath, policy] of rejected) {
+    for (const method of ['GET', 'POST', 'PUT', 'DELETE', 'PATCH']) {
       seen.length = 0
-      const res = await request(port, { method, path: routePath, headers: { ...VIA }, body: method === 'POST' ? '{}' : undefined })
-      if (method === 'POST') {
-        // plugin-bridge without a wired registry 404s before any wall
-        // decision — also fail-closed, the backend is equally unreachable.
-        const acceptable = routePath === admin.ADMIN_PLUGIN_BRIDGE_ROUTE
-          ? (res.status === 404 || (res.status === 403 && res.body.includes('via-gateway')))
-          : (res.status === 403 && res.body.includes('via-gateway'))
-        if (!acceptable) {
-          bad.push(`${routePath} POST: status=${res.status} — the wall must fire before the backend`)
+      const beforeBridge = bridgeCalls
+      const res = await request(port, {
+        method,
+        path: routePath,
+        headers: { ...CROSS_ORIGIN_VIA },
+        body: method === 'POST' || method === 'PUT' || method === 'PATCH' ? '{}' : undefined,
+      })
+      if (policy.methods.includes(method)) {
+        if (res.status !== 403 || !res.body.includes('via-gateway')) {
+          bad.push(`${routePath} ${method}: status=${res.status} — via-gateway wall must fire before same-origin and backend`)
         }
-        if (seen.length !== 0) {
-          bad.push(`${routePath} POST: gateway received ${seen[0]} despite rejection`)
-        }
-      } else if (routePath !== admin.ADMIN_PLUGIN_BRIDGE_ROUTE) {
-        // GET on POST-only management routes: either the wall (403) or
-        // method enforcement (405) — never a backend call.
-        if (![403, 405].includes(res.status)) bad.push(`${routePath} GET: unexpected ${res.status}`)
-        if (seen.length !== 0) bad.push(`${routePath} GET: gateway called (${seen[0]})`)
+      } else if (![403, 405].includes(res.status)) {
+        bad.push(`${routePath} ${method}: unexpected ${res.status} for unlisted method`)
+      }
+      if (seen.length !== 0) {
+        bad.push(`${routePath} ${method}: gateway received ${seen[0]} despite rejection`)
+      }
+      if (bridgeCalls !== beforeBridge) {
+        bad.push(`${routePath} ${method}: pluginBridge recording stub was called despite rejection`)
       }
     }
   }
+
+  // Control: local GET on ADMIN_PLUGIN_BRIDGE_ROUTE without VIA proves the route is live.
+  const beforeControlBridge = bridgeCalls
+  const bridgeControl = await request(port, { method: 'GET', path: admin.ADMIN_PLUGIN_BRIDGE_ROUTE })
+  assert.equal(bridgeControl.status, 200, 'local GET plugin-bridge must return 200 so the 403 via-gateway check is meaningful')
+  assert.ok(bridgeCalls > beforeControlBridge, 'local GET plugin-bridge must hit the recording pluginBridge')
+
   // The remote-readable exception contract: status answers 200 to a remote
   // caller but MUST strip the live pairing code and topology facts.
   const st = await request(port, { method: 'GET', path: admin.ADMIN_STATUS_ROUTE, headers: { ...VIA } })
@@ -425,11 +610,11 @@ test('④-behavioral admin: management routes reject via-gateway before same-ori
   assert.equal(parsed.gateway?.pairing, null, 'remote status must strip the live pairing code')
   assert.equal(parsed.gateway?.lastForwardedSource, null, 'remote status must strip lastForwardedSource')
   assert.equal(parsed.gateway?.lastWebClaim, null, 'remote status must strip lastWebClaim')
+
   // Fail-closed probe: a route under the admin prefix that nobody registered
-  // a wall decision for. Whatever it answers, it must never reach the
-  // gateway backend — an unreviewed route cannot become a remote hole.
+  // a wall decision for must never reach the gateway backend.
   seen.length = 0
-  await request(port, { method: 'POST', path: `${admin.ADMIN_ROUTE_PREFIX}/unregistered-probe`, headers: { ...VIA }, body: '{}' })
+  await request(port, { method: 'POST', path: `${admin.ADMIN_ROUTE_PREFIX}/unregistered-probe`, headers: { ...CROSS_ORIGIN_VIA }, body: '{}' })
   assert.equal(seen.length, 0, `unregistered admin route reached the gateway backend: ${seen[0] ?? ''}`)
   assert.deepEqual(bad, [], bad.join('\n'))
 })
@@ -437,7 +622,7 @@ test('④-behavioral admin: management routes reject via-gateway before same-ori
 test('④-behavioral shares: the documented exception allows the toggle but keeps same-origin and action validation', async (t) => {
   const admin = await import(pathToFileURL(path.join(root, 'lib', 'admin-routes.js')).href)
   const { createShareStore } = await import(pathToFileURL(path.join(root, 'lib', 'share-store.js')).href)
-  const tmpHome = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'zr3-shares-'))
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'zr3-shares-'))
   t.after(() => fs.rmSync(tmpHome, { recursive: true, force: true }))
   const store = createShareStore({ file: path.join(tmpHome, 'shares.json'), idleHours: 48 })
   const seen = []
@@ -458,32 +643,62 @@ test('④-behavioral shares: the documented exception allows the toggle but keep
   const { server, port } = await serve(handler)
   t.after(() => new Promise((resolve) => server.close(resolve)))
 
-  // The exception itself: a via-gateway POST with valid same-origin shape is
-  // NOT refused by the marker wall (a phone behind the gateway must be able
-  // to toggle sharing) — but it still faces same-origin and action checks.
   const noOrigin = await request(port, {
     method: 'POST', path: admin.ADMIN_SHARES_ROUTE, headers: { ...VIA },
     body: JSON.stringify({ action: 'share', sessionId: 'sess-1' }),
   })
-  // Without an Origin header this presents as a desktop-client-shaped
-  // same-origin request (both headers absent → allowed) — the request must
-  // NOT be a via-gateway 403; the outcome is action-validation territory.
   assert.ok(noOrigin.status !== 403 || !noOrigin.body.includes('via-gateway'),
     `shares POST must not hit the marker wall (got ${noOrigin.status} via-gateway)`)
-  // And the documented exception comment must still be in the source —
-  // undocumented exceptions are indistinguishable from holes.
+
+  seen.length = 0
+  const crossOrigin = await request(port, {
+    method: 'POST',
+    path: admin.ADMIN_SHARES_ROUTE,
+    headers: { ...CROSS_ORIGIN_VIA },
+    body: JSON.stringify({ action: 'share', sessionId: 'sess-1' }),
+  })
+  assert.equal(crossOrigin.status, 403, 'shares POST with cross-origin headers must be rejected')
+  assert.equal(JSON.parse(crossOrigin.body).error?.code, 'origin-rejected', 'shares cross-origin must fail same-origin check')
+  assert.equal(seen.length, 0, 'cross-origin shares POST must not reach gateway')
+
   const src = read('src', 'admin-routes.ts')
   assert.match(src, /via-gateway POST is NOT refused/, 'shares 豁免的就地注释丢失')
 })
 
 // ---------------------------------------------------------------------------
-// ⑤ volatile config 禁止快照 — AST level (ZR-3 R1 item 5): the regex
-// matched only single-line destructuring; the same statement rewrapped
-// across lines passed. Here we walk apply()'s AST for any variable
-// declaration whose object-binding pattern initializer ultimately
-// references the `config` parameter — formatting is irrelevant by
-// construction. Only unwrapVolatile()/resolveConfig() access is legal.
+// ⑤ volatile config 禁止快照 — AST level: walk apply()'s AST for direct
+// destructuring of `config` or direct local aliases (e.g. `const row = config
+// as Record<string, unknown>`), covering both variable declarations and
+// assignment destructuring while allowing resolveConfig(config, ...),
+// someObj.config, and inner parameter shadowing.
 // ---------------------------------------------------------------------------
+function unwrapExpr(node) {
+  let cur = node
+  while (cur && (
+    ts.isParenthesizedExpression(cur) ||
+    ts.isAsExpression(cur) ||
+    ts.isTypeAssertionExpression(cur) ||
+    ts.isNonNullExpression(cur) ||
+    ts.isSatisfiesExpression(cur)
+  )) {
+    cur = cur.expression
+  }
+  return cur
+}
+
+function collectBindingNames(pattern, out = []) {
+  if (ts.isIdentifier(pattern)) {
+    out.push(pattern.text)
+    return out
+  }
+  if (ts.isObjectBindingPattern(pattern) || ts.isArrayBindingPattern(pattern)) {
+    for (const el of pattern.elements) {
+      if (ts.isBindingElement(el)) collectBindingNames(el.name, out)
+    }
+  }
+  return out
+}
+
 test('⑤ apply() must not snapshot-destructure volatile config (AST-level)', () => {
   const full = path.join(root, 'src', 'index.ts')
   const sourceFile = ts.createSourceFile(full, fs.readFileSync(full, 'utf8'), ts.ScriptTarget.Latest, true)
@@ -496,24 +711,58 @@ test('⑤ apply() must not snapshot-destructure volatile config (AST-level)', ()
   assert.ok(applyFn, 'src/index.ts 里找不到 apply()')
   const configParam = applyFn.parameters[1]
   assert.ok(configParam && ts.isIdentifier(configParam.name), 'apply() 第二参数不是 config 标识符——签名变了，护栏需要跟着改')
+
   const offenders = []
-  const lineOf = (node) => sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile)).line + 1
-  const visit = (node) => {
-    if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer) {
-      // Does the initializer mention the config identifier directly
-      // (const { x } = config / config as T / (config))? Property access on
-      // resolveConfig(...) results is fine — those are fresh reads.
-      let hitsConfig = false
-      const probe = (n) => {
-        if (ts.isIdentifier(n) && n.text === configParam.name.text) hitsConfig = true
-        ts.forEachChild(n, probe)
+  const visit = (node, aliases) => {
+    if (
+      ts.isFunctionDeclaration(node) ||
+      ts.isFunctionExpression(node) ||
+      ts.isArrowFunction(node) ||
+      ts.isMethodDeclaration(node) ||
+      ts.isGetAccessorDeclaration(node) ||
+      ts.isSetAccessorDeclaration(node)
+    ) {
+      const innerAliases = new Set(aliases)
+      for (const param of node.parameters) {
+        for (const name of collectBindingNames(param.name)) innerAliases.delete(name)
       }
-      probe(node.initializer)
-      if (hitsConfig) offenders.push(`src/index.ts:${lineOf(node)}`)
+      if (node.body) visit(node.body, innerAliases)
+      return
     }
-    ts.forEachChild(node, visit)
+    if (ts.isBlock(node)) {
+      const blockAliases = new Set(aliases)
+      ts.forEachChild(node, (child) => visit(child, blockAliases))
+      return
+    }
+    if (ts.isVariableDeclaration(node)) {
+      const inner = node.initializer ? unwrapExpr(node.initializer) : undefined
+      const isDirectConfig = Boolean(inner && ts.isIdentifier(inner) && aliases.has(inner.text))
+      if (ts.isObjectBindingPattern(node.name)) {
+        if (isDirectConfig) offenders.push(`src/index.ts:${lineOf(sourceFile, node)}`)
+        for (const name of collectBindingNames(node.name)) aliases.delete(name)
+      } else if (ts.isIdentifier(node.name)) {
+        if (isDirectConfig) aliases.add(node.name.text)
+        else aliases.delete(node.name.text)
+      }
+      if (node.initializer) visit(node.initializer, aliases)
+      return
+    }
+    if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+      const inner = unwrapExpr(node.right)
+      const isDirectConfig = Boolean(inner && ts.isIdentifier(inner) && aliases.has(inner.text))
+      if (ts.isObjectLiteralExpression(node.left)) {
+        if (isDirectConfig) offenders.push(`src/index.ts:${lineOf(sourceFile, node)}`)
+      } else if (ts.isIdentifier(node.left)) {
+        if (isDirectConfig) aliases.add(node.left.text)
+        else aliases.delete(node.left.text)
+      }
+      visit(node.right, aliases)
+      return
+    }
+    ts.forEachChild(node, (child) => visit(child, aliases))
   }
-  ts.forEachChild(applyFn, visit)
+
+  if (applyFn.body) visit(applyFn.body, new Set([configParam.name.text]))
   assert.deepEqual(
     offenders,
     [],
@@ -523,43 +772,26 @@ test('⑤ apply() must not snapshot-destructure volatile config (AST-level)', ()
 
 // ---------------------------------------------------------------------------
 // ⑥ 开源主仓脱敏守卫。敏感词表在下面的 SENSITIVE 里用拼接构造——本文件
-// 自己必须含这些词才能扫别人，但明文躺进开源仓正是本检查要拦的事，
-// 所以词表一律分段拼接、运行时拼合。拼接后的零件单独出现无害
-// （"-web"、"ops" 不是敏感词），即便如此本文件仍按路径整体豁免——
-// 不是怕误报，而是扫描器把自己的词表当作扫描输入没有任何信息量，
-// 豁免声明写在这里，删词表的时候记得一起删豁免。
+// 自己不含明文敏感词，因此也不需要路径豁免；按大小写不敏感扫描所有 git
+// 跟踪文件（含手工维护的 lib/lan-gate-server.cjs，仅跳过 tsc/esbuild
+// 再生产物）。
 // ---------------------------------------------------------------------------
 const SENSITIVE = [
   'zen-remote' + '-web',
   'zen-remote' + '-gateway' + '-site',
   '/api/v1/' + 'ops',
   '/api/v1/' + 'site',
+  'console.' + 'zen-remote.com',
+  'relay.' + 'zen-remote.com',
 ]
-const SCANNER_SELF = 'test/architecture-guardrails.test.cjs'
 
 test('⑥ no production-site or ops-route vocabulary in the open-source repo', () => {
-  // Enumeration is git-tracked files (ZR-3 R1 item 4): filesystem walking
-  // missed .github/workflows YAML because the scan list never included it,
-  // and untracked scratch files must not red the gate. Binary files are
-  // excluded by a NUL-byte sniff; a candidate that fails to read is an
-  // ERROR, never a silent skip. Case is NOT folded: the tokens are
-  // lowercase product/route names whose camelCase or uppercase variants
-  // are different words with different meanings — folding would red
-  // legitimate prose ("the site") without catching anything real.
-  const SCANNER_SELF = 'test/architecture-guardrails.test.cjs'
-  // ZR-3 R2 item 3: enumerate ALL tracked paths with -z (no extension
-  // filter — LICENSE-style extensionless public text and workflow YAML both
-  // escaped an extension whitelist). Binaries are excluded by NUL-byte
-  // sniff on content, not by name. lib/ and .client-build/ stay excluded:
-  // they are regenerated build outputs of sources already scanned, and
-  // their upstream provenance is pinned by the build+diff CI gate.
   const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'buffer' })
     .toString('utf8').split('\0').filter(Boolean)
   const offenders = []
   const unreadable = []
   for (const f of tracked) {
-    if (f === SCANNER_SELF) continue // self-exemption: the scanner carries the keyword fragments; see the header note
-    if (/^(lib|\.client-build)\//.test(f)) continue // build outputs are regenerated from scanned sources
+    if (f !== 'lib/lan-gate-server.cjs' && /^(lib|\.client-build)\//.test(f)) continue
     let buf
     try {
       buf = fs.readFileSync(path.join(root, f))
@@ -567,13 +799,13 @@ test('⑥ no production-site or ops-route vocabulary in the open-source repo', (
       unreadable.push(`${f}: ${String(e).slice(0, 60)}`)
       continue
     }
-    if (buf.includes(0)) continue // binary sniff — explicitly excluded
-    const text = buf.toString('utf8')
+    if (buf.includes(0)) continue
+    const lowerText = buf.toString('utf8').toLowerCase()
     for (const kw of SENSITIVE) {
-      const at = text.indexOf(kw)
+      const at = lowerText.indexOf(kw.toLowerCase())
       if (at !== -1) {
-        const line = text.slice(0, at).split('\n').length
-        offenders.push(`${f}:${line} 命中敏感词`)
+        const line = lowerText.slice(0, at).split('\n').length
+        offenders.push(`${f}:${line} 命中敏感词 (${kw})`)
       }
     }
   }

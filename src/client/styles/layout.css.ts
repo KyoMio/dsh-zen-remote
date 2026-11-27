@@ -1,8 +1,7 @@
 // layout — split from src/client/mobile.css.ts (2026-08-16), order preserved.
 // Do not reorder: styles/index.ts concatenates in this exact order.
 
-export const LAYOUT_CSS = `
-/* ---------- mobile-only layout ---------- */
+export const LAYOUT_CSS = `/* ---------- mobile-only layout ---------- */
 
 @media (max-width: 1023px) {
   /* --- Phone chrome ---

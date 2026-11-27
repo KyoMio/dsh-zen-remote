@@ -14,8 +14,7 @@ import { UPLOAD_DIR } from '../attach-upload.ts'
    inert. */
 const MARKET = '.dshm-ver[title="@ace-zone/dsh-market"]'
 
-export const COMPAT_CSS = `
-/* ---------- dsh-web-ui family compatibility ----------
+export const COMPAT_CSS = `  /* ---------- dsh-web-ui family compatibility ----------
      The linxin666 plugin suite extends the shell frame directly:
        - aionui-panel appends two trailing grid columns (explorer / preview)
          plus absolute drag handles to [data-dsh-frame]; its 5-track inline

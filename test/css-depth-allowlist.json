@@ -1,15 +1,19 @@
 {
-  "$schema": "ZR-3 R3 exact-selector allowlist for test/architecture-guardrails.test.cjs check ③",
-  "_howto": "Every entry is one COMPLETE selector exactly as evaluated in the artifact (whitespace-normalized). A new deep-chain selector must be registered here explicitly with justification in the sheet group reason; grafted conditions never match because the comparison is full equality, not substring.",
+  "$schema": "ZR-3 exact-selector allowlist for test/architecture-guardrails.test.cjs check ③",
+  "_howto": "Every entry is one COMPLETE selector verbatim as evaluated in lib/client.js (whitespace-normalized). New deep-chain or nested-:has() selectors must be registered explicitly with sheet-level justification; stale entries fail the gate and must be removed.",
   "sheets": {
     "client/styles/composer.css.js#COMPOSER_CSS": {
-      "reason": "the composer-bar anatomy (card/row/trailing/tools/modes) is the host composer component's documented part structure — every section comment in composer.css.ts explains the mechanics of its own rules.",
+      "reason": "the composer-bar anatomy (card/row/trailing/tools/modes/dock) and conversation.input.dock are the host composer component's documented part structure — section comments in composer.css.ts explain each rule's mechanics.",
       "selectors": [
         ":is([data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_trailing\"] > [class$=\"_standardControls\"] > [data-slot=\"conversation.input.model\"] > *:not([data-mobile-nav]) > [class$=\"_menu\"], body > [id$=\"-menu\"][class$=\"_menu\"]:is([role=\"menu\"], [role=\"group\"]))",
         ":is([data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_trailing\"] > [class$=\"_standardControls\"] > [data-slot=\"conversation.input.model\"] > *:not([data-mobile-nav]) > [class$=\"_menu\"], body > [id$=\"-menu\"][class$=\"_menu\"]:is([role=\"menu\"], [role=\"group\"])) [class$=\"_cell\"]",
         ":is([data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_trailing\"] > [class$=\"_standardControls\"] > [data-slot=\"conversation.input.model\"] > *:not([data-mobile-nav]) > [class$=\"_menu\"], body > [id$=\"-menu\"][class$=\"_menu\"]:is([role=\"menu\"], [role=\"group\"])) [class$=\"_option\"]",
         ":is([data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_trailing\"] > [class$=\"_standardControls\"] > [data-slot=\"conversation.input.model\"] > *:not([data-mobile-nav]) > [class$=\"_menu\"], body > [id$=\"-menu\"][class$=\"_menu\"]:is([role=\"menu\"], [role=\"group\"])) [role=\"menuitem\"]",
         ":is([data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_trailing\"] > [class$=\"_standardControls\"] > [data-slot=\"conversation.input.model\"] > *:not([data-mobile-nav]) > [class$=\"_menu\"], body > [id$=\"-menu\"][class$=\"_menu\"]:is([role=\"menu\"], [role=\"group\"])) [role=\"menuitemradio\"]",
+        "[data-slot=\"conversation.composer.bar\"] > [class$=\"_root\"] > [class$=\"_dock\"]",
+        "[data-slot=\"conversation.composer.bar\"] > [class$=\"_root\"] > [class$=\"_dock\"] button[class$=\"_trigger\"]",
+        "[data-slot=\"conversation.composer.bar\"] > [class$=\"_root\"] > [class$=\"_dock\"] button[class$=\"_trigger\"] > span",
+        "[data-slot=\"conversation.composer.bar\"] > [class$=\"_root\"]:has(> [class$=\"_dock\"] button)",
         "[data-slot=\"conversation.composer.bar\"] > [class$=\"_root\"]:has(> [class$=\"_dock\"] button) > [class$=\"_card\"]",
         "[data-slot=\"conversation.composer.bar\"] > [class$=\"_root\"]:has(> [class$=\"_dock\"] button) > [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_trailing\"] > [class$=\"_primary\"]",
         "[data-slot=\"conversation.composer.bar\"] > [class$=\"_root\"]:has(> [class$=\"_dock\"] button) > [class$=\"_card\"] > [class$=\"_row\"]::before",
@@ -31,23 +35,66 @@
         "[data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_trailing\"] > [class$=\"_standardControls\"] > [data-slot=\"conversation.input.model\"] > *:not([data-mobile-nav]) > [class$=\"_trigger\"] > [class$=\"_triggerLabel\"]",
         "[data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_trailing\"] > [class$=\"_standardControls\"] > [data-slot=\"conversation.input.model\"] > *:not([data-mobile-nav]) > button",
         "[data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_trailing\"] > [class$=\"_standardControls\"] > [data-slot=\"conversation.input.right\"] > *",
+        "[data-slot=\"conversation.input.dock\"] > [data-queue-dock] > *",
+        "[data-slot=\"conversation.input.dock\"] > [data-queue-dock] > *::after",
+        "[data-slot=\"conversation.input.dock\"]:has(> [data-queue-dock], > [data-mobile-nav=\"attach-chips\"], > [data-testid=\"todo-panel\"], > [data-goal-bar])",
         "body:has([data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_tools\"] > [class$=\"_modes\"] [role=\"menu\"]) [data-chat-flow] + div",
         "body:has([data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_trailing\"] > [class$=\"_standardControls\"] > [data-slot=\"conversation.input.model\"] > *:not([data-mobile-nav]) > [class$=\"_menu\"]) [data-chat-flow] + div"
       ]
     },
     "client/styles/compat.css.js#COMPAT_CSS": {
-      "reason": "the composer-bar card/row/tools/modes chain is the plugin's own documented composition (slot seats are display:contents) — the menu-icon fallback rules documented in compat.css.ts.",
+      "reason": "the composer-bar card/row/tools/modes chain (slot seats are display:contents) and conversation.composer.dock stat chip rules are documented in compat.css.ts.",
       "selectors": [
         "[data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_tools\"] > [class$=\"_modes\"] [role=\"menu\"] button[role=\"menuitem\"]:not(:has(:is([class*=\"_itemIcon_\"], [class$=\"_itemIcon\"], [class*=\"_itemIcon \"])))::before",
-        "[data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_tools\"] > [class$=\"_modes\"] button[class$=\"_trigger\"][aria-label$=\"Auto\"]::before"
+        "[data-slot=\"conversation.composer.bar\"] [class$=\"_card\"] > [class$=\"_row\"] > [class$=\"_tools\"] > [class$=\"_modes\"] button[class$=\"_trigger\"][aria-label$=\"Auto\"]::before",
+        "[data-slot=\"conversation.composer.dock\"] > :is([data-composer-stat], [data-composer-stats]) > *",
+        "[data-slot=\"conversation.composer.dock\"] > :is([data-composer-stat], [data-composer-stats]) > *:last-child"
       ]
     },
     "client/styles/layout.css.js#LAYOUT_CSS": {
-      "reason": "the composer pill composition anchored by the composer card (:has(textarea)) — documented in the NOTE in layout.css.ts.",
+      "reason": "mobile modal/settings-dialog structure ([aria-modal=\"true\"] header/navList/footer), header cluster/trigger reflow, and composer pill composition documented in layout.css.ts.",
       "selectors": [
+        ":has(> [aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"]))) > :first-child",
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"]))",
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"])) > :first-child",
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"])) > :first-child > :first-child",
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"])) > :first-child [class$=\"_navList\"]",
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"])) > :last-child",
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"])) > :last-child > :last-child",
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"])) [class$=\"_header\"]",
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"])) [class$=\"_header\"] > *",
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"])) [class$=\"_header\"] > :last-child",
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"])):has([class$=\"_navList\"])",
+        "[aria-modal=\"true\"]:not(:has(> :first-child > :last-child > button)):not([data-mobile-nav=\"info-sheet\"]):not([data-mobile-nav=\"share-range-sheet\"])",
         "[data-phase] [class*=\"_card\"]:has(textarea) [class$=\"_root\"]:has(> [class$=\"_trigger\"]) > [class$=\"_menu\"]",
         "[data-phase] [class*=\"_card\"]:has(textarea) [class$=\"_root\"]:has(> [class$=\"_trigger\"][aria-haspopup=\"menu\"]) > [class$=\"_trigger\"]",
-        "[data-phase] [class*=\"_card\"]:has(textarea) [class$=\"_root\"]:has(> [class$=\"_trigger\"][aria-haspopup=\"menu\"]) > [class$=\"_trigger\"] > [class$=\"_triggerLabel\"]"
+        "[data-phase] [class*=\"_card\"]:has(textarea) [class$=\"_root\"]:has(> [class$=\"_trigger\"][aria-haspopup=\"menu\"]) > [class$=\"_trigger\"] > [class$=\"_triggerLabel\"]",
+        "[data-phase] [class*=\"_card\"]:has(textarea) [class$=\"_row\"]:has([class$=\"_trailing\"]) > :first-child > :nth-child(2)",
+        "[data-phase] header > :first-child > :last-child",
+        "[data-phase] header [class$=\"_label\"]:has(> svg) > svg",
+        "[data-phase] header [class$=\"_root\"]:has(> button[class$=\"_trigger\"]) > button",
+        "[data-phase] header [class$=\"_root\"]:has(> button[class$=\"_trigger\"]) > button *"
+      ]
+    },
+    "client/styles/misc.css.js#MISC_CSS": {
+      "reason": "mobile modal shell discrimination (close-button header vs generic sheet) for safe-area and stacking rules documented in misc.css.ts.",
+      "selectors": [
+        "[aria-modal=\"true\"]:has(> :first-child > :last-child > button):not(:has([role=\"navigation\"])):not(:has([class*=\"ZuhsRW\"]))",
+        "[aria-modal=\"true\"]:not(:has(> :first-child > :last-child > button))"
+      ]
+    },
+    "client/styles/header.css.js#HEADER_CSS": {
+      "reason": "phone session header (< 768px) five-piece reflow over ConversationSessionHeader title-cluster and actions/lineage triggers documented in header.css.ts.",
+      "selectors": [
+        "[data-phase] header > :first-child > :last-child",
+        "[data-phase] header [data-slot=\"conversation.session.header.actions\"] > *:has(> button[class$=\"_trigger\"])",
+        "[data-phase] header [data-slot=\"conversation.session.header.lineage\"] > *:has(> button[class$=\"_trigger\"])"
+      ]
+    },
+    "client/styles/remote-session.css.js#REMOTE_SESSION_CSS": {
+      "reason": "hides the host-only menu item row inside the session header utilities overflow menu when viewing a remote session (remote-session.css.ts).",
+      "selectors": [
+        "html[data-zr-remote-session=\"1\"] [data-slot=\"conversation.session.header.utilities\"] [class$=\"_moreButton\"] ~ [role=\"menu\"] > [role=\"presentation\"] > :first-child"
       ]
     }
   }
