@@ -402,19 +402,23 @@ html[data-zr-remote-session="1"] .zr-download-action[data-phase="error"] {
    - the guide capsule — the host's empty-sidebar doorway button
      [data-sidebar-right-guide-entry="clues"]: the kind string is the tab
      descriptor id, registered by this plugin alone.
-   - the floating windows — share ([data-clue-share-window]), scope
-     ([data-clue-scope-window]) and pack ([data-clue-pack-window]) portal to
-     document.body, escaping the tab body's display:none, so each needs its
-     own rule on its own root marker.
+   - the floating windows and detail views — share ([data-clue-share-window]),
+     scope ([data-clue-scope-window]), pack ([data-clue-pack-window]), detail
+     view ([data-clue-detail-view]) and detail toolbar
+     ([data-clue-detail-toolbar]) portal inside [data-floating-window] to
+     document.body (or render docked). Hide the outer [data-floating-window]
+     shell via :has(...) so switching to a remote session never leaves empty
+     dialog chrome, and hide the inner markers directly as docked fallback;
+     non-clue [data-floating-window] shells do not match.
    - [data-dsh-better-sidebar-clue-notice] — the transient bottom-right
      strip: clue work it announces cannot happen remotely, so the strip
      itself must not surface there.
-   The backend half of the same disable lives in client/remote-fetch.ts:
-   while this attribute is set, /sidebar/api/clues.* and the share routes
-   never reach the network at all — closing the switch-over race the
-   verdict describes (a local session's clue load judged by the stale
-   remote report), because the fetch layer reads the SAME html attribute
-   the panel rendering does, not the 1 s backend poll. */
+   The backend half of the same disable lives in client/remote-fetch.ts and
+   client/adapter-rules/better-sidebar-clues.ts: while this attribute is set,
+   the plugin's clue routes never reach the network at all — closing the
+   switch-over race (a local session's clue load judged by the stale remote
+   report), because the fetch layer reads the SAME html attribute the panel
+   rendering does, not the 1 s backend poll. */
 html[data-zr-remote-session="1"] [data-clue-tab] {
   display: none !important;
 }
@@ -424,9 +428,16 @@ html[data-zr-remote-session="1"] [data-dockkit-tab]:has([class$="_clues"]) {
 html[data-zr-remote-session="1"] [data-sidebar-right-guide-entry="clues"] {
   display: none !important;
 }
+html[data-zr-remote-session="1"] [data-floating-window]:has([data-clue-share-window]),
+html[data-zr-remote-session="1"] [data-floating-window]:has([data-clue-scope-window]),
+html[data-zr-remote-session="1"] [data-floating-window]:has([data-clue-pack-window]),
+html[data-zr-remote-session="1"] [data-floating-window]:has([data-clue-detail-view]),
+html[data-zr-remote-session="1"] [data-floating-window]:has([data-clue-detail-toolbar]),
 html[data-zr-remote-session="1"] [data-clue-share-window],
 html[data-zr-remote-session="1"] [data-clue-scope-window],
-html[data-zr-remote-session="1"] [data-clue-pack-window] {
+html[data-zr-remote-session="1"] [data-clue-pack-window],
+html[data-zr-remote-session="1"] [data-clue-detail-view],
+html[data-zr-remote-session="1"] [data-clue-detail-toolbar] {
   display: none !important;
 }
 html[data-zr-remote-session="1"] [data-dsh-better-sidebar-clue-notice] {
