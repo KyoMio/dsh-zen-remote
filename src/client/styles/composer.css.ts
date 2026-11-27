@@ -206,6 +206,12 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   ${ROOT} > [class$="_dock"] button[class$="_trigger"] > span {
     display: none !important;
   }
+  /* The lifted ring's layout placeholder. Depth here is the plugin's own
+     composition, not host guessing: ROOT/card/row are the composer's own
+     nested structure (grid overlay above), the trailing/send row order is
+     fixed by the effect that moves chips into the card, and the ::before
+     only exists to reserve the ring's width inside that same row — see the
+     elastic-gap comment below for the full margin choreography. */
   ${ROOT}:has(> [class$="_dock"] button) > [class$="_card"] > [class$="_row"]::before {
     content: '';
     order: 6;

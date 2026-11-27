@@ -50,7 +50,7 @@
   ],
   "scripts": {
     "build": "node scripts/sync-doc-version.mjs && tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
-    "verify": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit",
+    "verify": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.client.json --noEmit && node scripts/check-orphan-lib.mjs",
     "test": "node scripts/run-tests.mjs && node scripts/sync-doc-version.mjs --check",
     "version": "node scripts/sync-doc-version.mjs && git add package.json README.md README.zh-CN.md",
     "prepack": "npm run build"
