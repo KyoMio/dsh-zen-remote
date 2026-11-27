@@ -34,7 +34,7 @@ import { registerGatewayWizard } from './wizard/register-wizard.ts'
 import { RemoteHeaderIcon } from './RemoteHeaderIcon.tsx'
 import { RemoteShareMenuItem } from './RemoteShareMenu.tsx'
 import { getSharesStore } from '../client-data/shares.ts'
-import { registerRemoteShareUi } from './remote-share-register.ts'
+import { probeClientConfigRole, registerRemoteShareUi } from './remote-share-register.ts'
 import { RemoteStatusIcon } from './RemoteStatusIcon.tsx'
 import { RemoteComposerBanner } from './RemoteComposerBanner.tsx'
 import { registerRemoteStatusUi } from './remote-status-register.ts'
@@ -42,6 +42,7 @@ import { mountCurrentSessionReporter } from './current-session-report.ts'
 import { mountRemoteDropGuard } from './effects/remote-drop.ts'
 import { mountRemoteGroupExpansionKeeper } from './remote-group-expansion.ts'
 import { installRemoteApiFetch } from './remote-fetch.ts'
+import { BETTER_SIDEBAR_CLUES_RULE } from './adapter-rules/better-sidebar-clues.ts'
 import { installRemoteSessionGuard } from './effects/remote-session.ts'
 import { installModelGroupSide } from './effects/model-group-side.ts'
 import { installRemoteWorkspaceVisibility } from './effects/remote-workspace-visibility.ts'
@@ -170,7 +171,23 @@ export function apply(ctx: ClientContext): void {
   // 改写与隐藏在它里面一样必要。改写只碰「同源 + 精确两条路径 + zr~ 虚拟
   // 会话 id」的 GET（remote-fetch.ts），宿主角色的桌面端（会话 id 永非虚拟）
   // 逐字节原样放行；标记属性只在虚拟会话打开时出现，卸载时还原。
-  ctx.effect(() => installRemoteApiFetch(window), 'dsh-zen-remote: remote api fetch')
+  ctx.effect(() => {
+    let disposed = false
+    let canAnnotateLocalPanel = false
+    const uninstall = installRemoteApiFetch(window, {
+      blockRules: [BETTER_SIDEBAR_CLUES_RULE],
+      shouldAnnotateLocal: () => canAnnotateLocalPanel,
+    })
+    void probeClientConfigRole().then((role) => {
+      if (!disposed && (role === 'client' || role === 'peer')) {
+        canAnnotateLocalPanel = true
+      }
+    })
+    return () => {
+      disposed = true
+      uninstall()
+    }
+  }, 'dsh-zen-remote: remote api fetch')
   installRemoteSessionGuard(ctx)
   // T74 模型选单分组按会话归属显示：0.2.0 的 MenuGroup 的 aria-labelledby 只剩
   // useId（分组 id 不再出现在标记里），旧的 zr~ 前缀选择器失效——改为 effect 给

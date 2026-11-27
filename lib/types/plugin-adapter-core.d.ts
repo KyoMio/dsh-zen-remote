@@ -54,10 +54,10 @@ export type AdapterLocator = {
  * `undefined` falls through to the normal classify.
  *
  * `requiresSurface` (optional, PB-27) marks a route that exists only in ONE
- * wire-surface generation of the plugin: the 16-hex surface digest that
- * generation produces. The wiring extracts the INSTALLED build's digest
- * even for listed versions when any route declares this field; a route
- * whose digest does not match the installed build is DROPPED before the
+ * or more wire-surface generations of the plugin: a 16-hex surface digest or
+ * a non-empty list of unique 16-hex digests. The wiring extracts the INSTALLED
+ * build's digest even for listed versions when any route declares this field; a
+ * route whose digest does not match the installed build is DROPPED before the
  * route table is folded and digested. That is what keeps the older
  * generations' digests byte-identical to what a zen-remote without the
  * route would compute — adding a generation's routes must never alter the
@@ -72,7 +72,7 @@ export interface AdapterRoute {
     upgrade?: boolean;
     locator: AdapterLocator;
     local?: boolean;
-    requiresSurface?: string;
+    requiresSurface?: string | readonly string[];
     deny?: (info: {
         pathname: string;
         method: string;
@@ -100,7 +100,7 @@ export interface NormalizedAdapterRoute {
      * never enters the route-table digest: by the time the digest is computed
      * the non-matching routes have already been dropped, and a matching one is
      * exactly the route its generation serves. */
-    requiresSurface?: string;
+    requiresSurface?: string | readonly string[];
     deny?: AdapterRoute['deny'];
 }
 /** The two hook faces an adapter may implement (both optional — an adapter

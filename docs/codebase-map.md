@@ -33,7 +33,7 @@
 | `src/plugin-bridge.ts` | 插件桥纯逻辑（PB-1）：桥接声明校验/规范化与 16 位摘要、`zenRemote` 注册表、两端 `compareBridges`；不 import DSH、不碰 I/O |
 | `src/plugin-loopback.ts` | 插件桥回环执行器（PB-3）：本机回环 GET 插件路由，token 换 cookie（401 重换一次），cookie 只存内存；https 仅对字面 127.0.0.1 放宽证书校验 |
 | `src/plugin-route-intercept.ts` | 子客户端改道（PB-4）：包装宿主 webServer 的 `match`，声明命中的虚拟 id 走 `relay.pluginRequest`；未桥接统一 503（`x-zen-remote: unbridged`），绝不落本机插件；拒绝日志按 `${kind}:${plugin}:${reason}` 5 分钟窗口节流（首条写 `log` 并附前窗抑制数、窗口内重复走 `debug`，`recordRefusal` 计数保持逐次精确累加防洗空 `logRing`） |
-| `src/plugin-adapter-core.ts` | 适配器框架核心（PB-11）：路由/定位器校验、三种定位（query/路径段/JSON 体）的「远程/本地/混合」判定与双向改写、摘要与让位判定；纯逻辑，框架两半只 import 这里 |
+| `src/plugin-adapter-core.ts` | 适配器框架核心（PB-11 / PB-27）：路由/定位器校验、三种定位（query/路径段/JSON 体）的「远程/本地/混合」判定与双向改写、`requiresSurface` 代次门（`string \| readonly string[]`、入表前严格校验 + 有 `surfaces` 时的 fail-closed 白名单闭包，不入路由表摘要）、`AdapterVerdict.headerTimeoutMs` 逐次响应头超时覆写、摘要与让位判定；纯逻辑，框架两半只 import 这里 |
 | `src/adapters/` | 适配器目录（`index.ts` 只导出 `ADAPTERS`，`types.ts` 放作者接口）——可插拔铁律见 AGENTS.md 硬约束 |
 | `src/client-data/plugin-bridge.ts` | 设置页纯函数（PB-5）：桥接状态 → 文案键、整机数据同意表切换；浏览器半边，不 import 主包 |
 | `src/fetch-route-intercept.ts` | 拦截第二半：包装宿主 `fetchRoutes` 的上传与导出——非图片附件经 `relay/v1/upload` 流式转服务端（超限本地拒、失败回宿主 200 失败信封）、虚拟 id 导出后台 403（形态检测、懒装重试、卸载守卫） |
@@ -44,6 +44,8 @@
 | `src/fingerprint.ts` | DSH 接口指纹：规范化描述符 → 分组 JSON Schema 哈希，供握手比对 |
 | `src/restart-fields.ts` / `restart-watcher.ts` | 需重启字段的指纹监测，变化即重载插件行 |
 | `src/client/**` → `lib/client.js` | 浏览器半边（经 `dsh.client` 发现）：app 外壳、slot、样式、设置区块（`settings/`）、远程部件（`remote-*` / `Remote*`）、`effects/legacy-gateway-prompt.ts`（桌面门前挂载的旧版 `0.1.0` 网关一次性引导弹窗） |
+| `src/client/remote-fetch.ts` | 浏览器端通用 `window.fetch` 拦截器：虚拟 `zr~` 请求路径与 body id 改写，以及可插拔的请求拦截与本机面板注解规则引擎（零具体插件字面量，与 `Request.headers` 保留/大小写去重） |
+| `src/client/adapter-rules/better-sidebar-clues.ts` | `dsh-better-sidebar` 0.34+ 线索面规则插件（`BETTER_SIDEBAR_CLUES_RULE`）：声明远程会话下阻塞与本机面板注解的线索路径，由 `src/client/index.tsx` 按需装配进 `remote-fetch.ts` |
 | `src/peer/version-sync.ts` → `lib/peer/version-sync.js` | 零依赖纯逻辑双向版本同步判定（semver 比较、旧 `0.1.0` 网关推断、脱敏 `sanitizeConsoleOrigin`、`versionDismissKey`），供 `PeerEngine` 与 `/client/peer/status` 共享 |
 | `src/client-data/current-session.ts` + `src/client/current-session-report.ts` | 当前会话信号浏览器上报（T62）：拦截层读不到浏览器 localStorage，由浏览器端解析宿主选择存储、变化时 POST `client/current-session`；纯函数（解析 + 变化判定）与上报循环分居 |
 | `src/client-data/remote-group-expansion.ts` + `src/client/remote-group-expansion.ts` | 服务端分组展开记忆与恢复（T64）：宿主 retainAccountKeys 每次加载清掉 zr~ 分组记录，浏览器端镜像进自己存储、按记录（默认展开）点击行恢复；纯函数与 keeper 循环分居 |

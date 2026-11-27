@@ -48,6 +48,9 @@ function startUpstream() {
   const server = net.createServer((socket) => {
     const entry = { socket, head: '', closed: false }
     state.connections.push(entry)
+    // Tunnel teardown can destroy the upstream socket before the client reads
+    // the 101 response, surfacing an expected ECONNRESET on the fake socket.
+    socket.on('error', () => { /* expected ECONNRESET on teardown */ })
     socket.on('data', (chunk) => {
       // Accumulate until the blank line (end of the HTTP head).
       if (!entry.headDone) {

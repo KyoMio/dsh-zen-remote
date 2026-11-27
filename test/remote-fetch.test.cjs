@@ -20,6 +20,10 @@ function load() {
   return import('../src/client/remote-fetch.ts?' + Math.random())
 }
 
+function loadCluesRule() {
+  return import('../src/client/adapter-rules/better-sidebar-clues.ts?' + Math.random())
+}
+
 test('rewrite: the two exact /api routes with a virtual sessionId rewrite to the relay route', async () => {
   const { CLIENT_HTTP_ROUTE_PREFIX, rewriteRemoteApiUrl } = await load()
   // The deliverables panel builds DOCUMENT-RELATIVE string URLs
@@ -187,10 +191,12 @@ test('install: an uninstalled wrapper still held by an outer wrapper passes thro
   assert.deepEqual(originalCalls, [`api/changes.summary?sessionId=${VIRTUAL_ID}&seq=1`])
 })
 
-// ---- PB-27 finding 4: the clue surface is blocked at the fetch layer in a remote session ----
+// ---- PB-27 finding 4 & BS34-3: generic block rules + better-sidebar clue rule ----
 
-test('clue block: /sidebar/api/clues.* and the share routes are blocked only while the probe says remote', async () => {
-  const { shouldBlockClueCall, isCluePath } = await load()
+test('clue block: /sidebar/api/clues.* and the share routes match BETTER_SIDEBAR_CLUES_RULE and block only while remote', async () => {
+  const { matchFetchBlockRule, shouldBlockFetchCall } = await load()
+  const { BETTER_SIDEBAR_CLUES_RULE, isCluePath } = await loadCluesRule()
+  const rules = [BETTER_SIDEBAR_CLUES_RULE]
   // The shape coverage: api methods, the exact root, and the four shares.
   assert.equal(isCluePath('/sidebar/api/clues.list'), true)
   assert.equal(isCluePath('/sidebar/api/clues.saveEdit'), true)
@@ -205,22 +211,25 @@ test('clue block: /sidebar/api/clues.* and the share routes are blocked only whi
   assert.equal(isCluePath('/sidebar/api/selection.translate'), false)
   assert.equal(isCluePath('/sidebar/agent/clues/read'), false, 'the agent loopback route is not a browser clue call')
   assert.equal(isCluePath('/api/changes.summary'), false)
+  assert.equal(matchFetchBlockRule('/sidebar/api/clues.list', BASE, []), undefined)
+  assert.equal(matchFetchBlockRule('/sidebar/api/clues.list', BASE, rules), BETTER_SIDEBAR_CLUES_RULE)
   // The decision gates on the remote probe…
-  assert.equal(shouldBlockClueCall('/sidebar/api/clues.list', BASE, true), true)
-  assert.equal(shouldBlockClueCall('/sidebar/api/clues.list', BASE, false), false, 'a local session never blocks')
+  assert.equal(shouldBlockFetchCall('/sidebar/api/clues.list', BASE, true, rules), true)
+  assert.equal(shouldBlockFetchCall('/sidebar/api/clues.list', BASE, false, rules), false, 'a local session never blocks')
   // …on same-origin…
-  assert.equal(shouldBlockClueCall('https://evil.test/sidebar/api/clues.list', BASE, true), false, 'cross-origin passes through untouched')
+  assert.equal(shouldBlockFetchCall('https://evil.test/sidebar/api/clues.list', BASE, true, rules), false, 'cross-origin passes through untouched')
   // …and document-relative URLs resolve against the page.
-  assert.equal(shouldBlockClueCall('sidebar/api/clues.list', BASE, true), true)
+  assert.equal(shouldBlockFetchCall('sidebar/api/clues.list', BASE, true, rules), true)
   // Request-shaped objects decide by their url.
-  assert.equal(shouldBlockClueCall({ url: `${BASE}sidebar/clues/share/export` }, BASE, true), true)
+  assert.equal(shouldBlockFetchCall({ url: `${BASE}sidebar/clues/share/export` }, BASE, true, rules), true)
   // Unparseable input never blocks.
-  assert.equal(shouldBlockClueCall(undefined, BASE, true), false)
-  assert.equal(shouldBlockClueCall(42, BASE, true), false)
+  assert.equal(shouldBlockFetchCall(undefined, BASE, true, rules), false)
+  assert.equal(shouldBlockFetchCall(42, BASE, true, rules), false)
 })
 
 test('clue block: the wrapper answers the synthetic refusal without touching the network — and the SAME call passes through the moment the session goes local (switch regression)', async () => {
   const { installRemoteApiFetch, setRemoteSessionProbeForTests } = await load()
+  const { BETTER_SIDEBAR_CLUES_RULE } = await loadCluesRule()
   const originalCalls = []
   const host = {
     location: { href: BASE },
@@ -234,7 +243,10 @@ test('clue block: the wrapper answers the synthetic refusal without touching the
   let remote = true
   setRemoteSessionProbeForTests(() => remote)
   try {
-    const uninstall = installRemoteApiFetch(host)
+    const uninstall = installRemoteApiFetch(host, {
+      blockRules: [BETTER_SIDEBAR_CLUES_RULE],
+      shouldAnnotateLocal: () => true,
+    })
 
     const blocked = await host.fetch('/sidebar/api/clues.list', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ workspaceId: 'ws-1' }),
@@ -285,24 +297,29 @@ test('clue block: the wrapper answers the synthetic refusal without touching the
 })
 
 test('clue block: with no probe override and no document, nothing is blocked (host-role safety)', async () => {
-  const { shouldBlockClueCall } = await load()
+  const { shouldBlockFetchCall } = await load()
+  const { BETTER_SIDEBAR_CLUES_RULE } = await loadCluesRule()
   // The default probe answers false off-DOM (tests, workers, host tooling):
   // isRemote false means the decision never fires.
-  assert.equal(shouldBlockClueCall('/sidebar/api/clues.list', BASE, false), false)
+  assert.equal(shouldBlockFetchCall('/sidebar/api/clues.list', BASE, false, [BETTER_SIDEBAR_CLUES_RULE]), false)
 })
 
-test('clue annotate: a LOCAL session\'s clue calls carry the panel-session header; remote and non-clue calls never do', async () => {
-  const { installRemoteApiFetch, setRemoteSessionProbeForTests } = await load()
+test('clue annotate: a LOCAL session\'s clue calls carry the panel-session header when shouldAnnotateLocal allows it; remote and non-clue calls never do', async () => {
+  const { installRemoteApiFetch, setRemoteSessionProbeForTests, PANEL_SESSION_HEADER } = await load()
+  const { BETTER_SIDEBAR_CLUES_RULE } = await loadCluesRule()
   const originalCalls = []
   const original = async (input, init) => {
-    originalCalls.push({ input: String(input), init })
+    originalCalls.push({ input, init })
     return { ok: true, url: String(input), status: 200, json: async () => ({ ok: true }) }
   }
   const host = { location: { href: BASE }, fetch: original }
   let remote = false
   setRemoteSessionProbeForTests(() => remote)
   try {
-    const uninstall = installRemoteApiFetch(host)
+    const uninstall = installRemoteApiFetch(host, {
+      blockRules: [BETTER_SIDEBAR_CLUES_RULE],
+      shouldAnnotateLocal: () => true,
+    })
     // Local session: the clue call passes through AND carries the
     // per-request truth the backend deny hook judges before its stale report.
     await host.fetch('/sidebar/api/clues.list', {
@@ -310,17 +327,17 @@ test('clue annotate: a LOCAL session\'s clue calls carry the panel-session heade
     })
     assert.equal(originalCalls.length, 1)
     const headers = originalCalls[0].init.headers
-    assert.equal(headers['x-zen-remote-panel-session'], 'local', 'the annotation rides the clue call')
+    assert.equal(headers[PANEL_SESSION_HEADER], 'local', 'the annotation rides the clue call')
     assert.equal(headers['content-type'], 'application/json', 'the original headers survive')
 
     // The share routes annotate too.
     await host.fetch('/sidebar/clues/share/export', { method: 'POST', body: '{}' })
-    assert.equal(originalCalls[1].init.headers['x-zen-remote-panel-session'], 'local')
+    assert.equal(originalCalls[1].init.headers[PANEL_SESSION_HEADER], 'local')
 
     // Non-clue calls never carry it — fs.tree is session-scoped bridged
     // traffic, the adapter layer's business, not the panel hint's.
     await host.fetch('/sidebar/api/fs.tree', { method: 'POST', body: '{}' })
-    assert.equal(originalCalls[2].init?.headers?.['x-zen-remote-panel-session'], undefined, 'non-clue calls are never annotated')
+    assert.equal(originalCalls[2].init?.headers?.[PANEL_SESSION_HEADER], undefined, 'non-clue calls are never annotated')
 
     // Headers given as an array-of-tuples or a Headers-shaped object still
     // gain the annotation without losing their entries.
@@ -328,7 +345,7 @@ test('clue annotate: a LOCAL session\'s clue calls carry the panel-session heade
       method: 'POST', headers: [['x-custom', 'yes']], body: '{}',
     })
     const arrHeaders = originalCalls[3].init.headers
-    assert.equal(arrHeaders['x-zen-remote-panel-session'], 'local')
+    assert.equal(arrHeaders[PANEL_SESSION_HEADER], 'local')
     assert.equal(arrHeaders['x-custom'], 'yes', 'tuple-form entries survive')
 
     // Remote: the call is BLOCKED before the network — no annotation, no send.
@@ -338,6 +355,133 @@ test('clue annotate: a LOCAL session\'s clue calls carry the panel-session heade
     assert.equal(originalCalls.length, 4, 'blocked remotely: nothing more reached the network')
 
     uninstall()
+  } finally {
+    setRemoteSessionProbeForTests(undefined)
+  }
+})
+
+test('BS34-3: Request input with omitted init preserves Request.headers and adds panel-session header', async () => {
+  const { installRemoteApiFetch, setRemoteSessionProbeForTests, PANEL_SESSION_HEADER } = await load()
+  const { BETTER_SIDEBAR_CLUES_RULE } = await loadCluesRule()
+  const originalCalls = []
+  const host = {
+    location: { href: 'http://127.0.0.1:3080/' },
+    fetch: async (input, init) => {
+      originalCalls.push({ input, init })
+      return new Response(JSON.stringify({ ok: true }), { status: 200 })
+    },
+  }
+  setRemoteSessionProbeForTests(() => false)
+  try {
+    const uninstall = installRemoteApiFetch(host, {
+      blockRules: [BETTER_SIDEBAR_CLUES_RULE],
+      shouldAnnotateLocal: () => true,
+    })
+    const req = new Request('http://127.0.0.1:3080/sidebar/api/clues.list', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-custom': 'yes' },
+    })
+    await host.fetch(req)
+    assert.equal(originalCalls.length, 1)
+    const headers = originalCalls[0].init.headers
+    assert.equal(headers['content-type'], 'application/json')
+    assert.equal(headers['x-custom'], 'yes')
+    assert.equal(headers[PANEL_SESSION_HEADER], 'local')
+    uninstall()
+  } finally {
+    setRemoteSessionProbeForTests(undefined)
+  }
+})
+
+test('BS34-3: case-variant panel-session header in init or Request is normalized and overwritten cleanly', async () => {
+  const { annotatePanelHeader, PANEL_SESSION_HEADER } = await load()
+  const fromInit = annotatePanelHeader('http://127.0.0.1:3080/sidebar/api/clues.list', {
+    method: 'POST',
+    headers: { 'X-Zen-Remote-Panel-Session': 'spoof', 'X-Custom': 'v1' },
+  })
+  const initHeaders = fromInit.headers
+  assert.equal(Object.hasOwn(initHeaders, 'X-Zen-Remote-Panel-Session'), false)
+  assert.deepEqual(
+    Object.keys(initHeaders).filter((k) => k.toLowerCase() === PANEL_SESSION_HEADER),
+    [PANEL_SESSION_HEADER],
+  )
+  assert.equal(initHeaders[PANEL_SESSION_HEADER], 'local')
+  assert.equal(initHeaders['x-custom'], 'v1')
+
+  const req = new Request('http://127.0.0.1:3080/sidebar/api/clues.list', {
+    method: 'POST',
+    headers: { 'X-Zen-Remote-Panel-Session': 'spoof', 'X-From-Req': 'yes' },
+  })
+  const fromReq = annotatePanelHeader(req, { headers: [['X-Custom', 'v2']] })
+  assert.equal(fromReq.headers[PANEL_SESSION_HEADER], 'local')
+  assert.equal(fromReq.headers['x-from-req'], 'yes')
+  assert.equal(fromReq.headers['x-custom'], 'v2')
+  assert.equal(Object.hasOwn(fromReq.headers, 'X-Zen-Remote-Panel-Session'), false)
+})
+
+test('BS34-3: shouldAnnotateLocal returning false (host role) passes local clue calls through with init untouched', async () => {
+  const { installRemoteApiFetch, setRemoteSessionProbeForTests } = await load()
+  const { BETTER_SIDEBAR_CLUES_RULE } = await loadCluesRule()
+  const originalCalls = []
+  const host = {
+    location: { href: BASE },
+    fetch: async (input, init) => {
+      originalCalls.push({ input, init })
+      return new Response(JSON.stringify({ ok: true }), { status: 200 })
+    },
+  }
+  setRemoteSessionProbeForTests(() => false)
+  try {
+    const uninstall = installRemoteApiFetch(host, {
+      blockRules: [BETTER_SIDEBAR_CLUES_RULE],
+      shouldAnnotateLocal: () => false,
+    })
+    const rawInit = { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' }
+    await host.fetch('/sidebar/api/clues.list', rawInit)
+    await host.fetch('/sidebar/api/clues.list')
+    assert.equal(originalCalls.length, 2)
+    assert.equal(originalCalls[0].init, rawInit, 'init object passes through untouched')
+    assert.equal(originalCalls[0].init.headers['x-zen-remote-panel-session'], undefined)
+    assert.equal(originalCalls[1].init, undefined, 'omitted init stays undefined')
+    uninstall()
+  } finally {
+    setRemoteSessionProbeForTests(undefined)
+  }
+})
+
+test('BS34-3: reload adoption updates active options and final uninstall resets them cleanly', async () => {
+  const { installRemoteApiFetch, setRemoteSessionProbeForTests, PANEL_SESSION_HEADER } = await load()
+  const { BETTER_SIDEBAR_CLUES_RULE } = await loadCluesRule()
+  const originalCalls = []
+  const host = {
+    location: { href: BASE },
+    fetch: async (input, init) => {
+      originalCalls.push({ input, init })
+      return new Response(JSON.stringify({ ok: true }), { status: 200 })
+    },
+  }
+  setRemoteSessionProbeForTests(() => false)
+  try {
+    const disposeA = installRemoteApiFetch(host, {
+      blockRules: [BETTER_SIDEBAR_CLUES_RULE],
+      shouldAnnotateLocal: () => false,
+    })
+    // Generation B adopts the live wrapper with updated options before A disposes.
+    const disposeB = installRemoteApiFetch(host, {
+      blockRules: [BETTER_SIDEBAR_CLUES_RULE],
+      shouldAnnotateLocal: () => true,
+    })
+    disposeA()
+    await host.fetch('/sidebar/api/clues.list', { method: 'POST', body: '{}' })
+    assert.equal(originalCalls.length, 1)
+    assert.equal(originalCalls[0].init.headers[PANEL_SESSION_HEADER], 'local', 'adopted options from B are active')
+
+    // Final uninstall cleans up options so a bare reinstall does not retain stale rules.
+    disposeB()
+    const disposeC = installRemoteApiFetch(host)
+    await host.fetch('/sidebar/api/clues.list', { method: 'POST', body: '{}' })
+    assert.equal(originalCalls[1].init.headers, undefined, 'stale options were cleared on final uninstall')
+    disposeC()
   } finally {
     setRemoteSessionProbeForTests(undefined)
   }

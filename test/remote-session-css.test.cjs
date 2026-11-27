@@ -182,14 +182,20 @@ test('PB-14: the unbridged tab body spends the note variable as its ::before', (
 
 // ---- PB-27 finding 4: the clue hiding is UNGATED on the bridge stamp --------
 
-test('PB-27: every clue rule keys on the remote-session attribute ALONE — bridged or not, the clue surface stays hidden in a remote session', () => {
+test('PB-27 / BS34-4: every clue rule keys on the remote-session attribute ALONE — bridged or not, outer floating windows and detail views stay hidden in a remote session', () => {
+  const CLUE_WINDOW_MARKERS = [
+    '[data-clue-share-window]',
+    '[data-clue-scope-window]',
+    '[data-clue-pack-window]',
+    '[data-clue-detail-view]',
+    '[data-clue-detail-toolbar]',
+  ]
   const CLUE_TARGETS = [
     '[data-clue-tab]',
     '[data-dockkit-tab]:has([class$="_clues"])',
     '[data-sidebar-right-guide-entry="clues"]',
-    '[data-clue-share-window]',
-    '[data-clue-scope-window]',
-    '[data-clue-pack-window]',
+    ...CLUE_WINDOW_MARKERS.map((m) => `[data-floating-window]:has(${m})`),
+    ...CLUE_WINDOW_MARKERS,
     '[data-dsh-better-sidebar-clue-notice]',
   ]
   for (const target of CLUE_TARGETS) {
@@ -206,12 +212,23 @@ test('PB-27: every clue rule keys on the remote-session attribute ALONE — brid
       `the ${target} rule must not be gated on the bridge stamp`,
     )
   }
+  // Never match a bare [data-floating-window] without :has(...) — non-clue
+  // floating windows must stay visible when bridged.
+  assert.ok(
+    !/html\[data-zr-remote-session="1"\] \[data-floating-window\](?!:has\()/.test(sheet),
+    'must not hide bare [data-floating-window] without :has(...)',
+  )
   // Each target hides, none styles.
   for (const target of ['[data-clue-tab]', '[data-sidebar-right-guide-entry="clues"]', '[data-dsh-better-sidebar-clue-notice]']) {
     const ruleIndex = sheet.indexOf(`html[data-zr-remote-session="1"] ${target} {`)
     assert.ok(ruleIndex >= 0, `${target} has a rule`)
     assert.ok(sheet.slice(ruleIndex, ruleIndex + 200).includes('display: none !important'), `${target} hides`)
   }
+  const windowRuleIndex = sheet.indexOf(`html[data-zr-remote-session="1"] [data-floating-window]:has(${CLUE_WINDOW_MARKERS[0]})`)
+  assert.ok(windowRuleIndex >= 0, 'clue floating-window rule exists')
+  const windowRuleEnd = sheet.indexOf('}', windowRuleIndex)
+  assert.ok(windowRuleEnd > windowRuleIndex)
+  assert.ok(sheet.slice(windowRuleIndex, windowRuleEnd + 1).includes('display: none !important'), 'clue floating-window block hides')
   // The chip rule discriminates on the clues glyph suffix — it must not be
   // the broad _chipIcon one (that would hide the bridged files/changes/tasks
   // chips too).
