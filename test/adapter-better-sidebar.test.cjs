@@ -95,6 +95,11 @@ test('PB-19: an unlisted version registers through its surface digest; a miss, a
   // adapter declares generation-gated routes — the wiring must never bridge
   // half a surface because the extraction step failed silently.
   assert.throws(() => core.normalizeAdapter(noised, '0.25.0'), /requiresSurface/)
+  // Fail-closed whitelist closure: a listed version whose extracted surface
+  // digest is not whitelisted in `surfaces` must also throw rather than
+  // silently dropping the gated routes.
+  assert.throws(() => core.normalizeAdapter(raw, '0.34.0-alpha.0', { surfaceDigest: 'deadbeefdeadbeef' }), /surfaces/)
+  assert.throws(() => core.normalizeAdapter(raw, '0.25.0', { surfaceDigest: 'deadbeefdeadbeef' }), /surfaces/)
 })
 
 test('PB-15: the 0.26.0 additions carry the right dispositions; both versions normalize; /sidebar/write is declared', async () => {
@@ -1209,6 +1214,17 @@ test('0.34.0-alpha.0: the surface digest is whitelisted; the extractor widened n
   // An unlisted 0.34.x alpha with the same wire surface registers.
   const normalized = core.normalizeAdapter(raw, '0.34.0-alpha.9', { surfaceDigest: '4988812a1d408484' })
   assert.equal(normalized.declaration.version, '0.34.0-alpha.9')
+
+  // Every pre-0.34 listed version keeps its exact pre-gate route table and
+  // byte-identical digest (excluding the requiresSurface-gated 0.34 routes).
+  const pre34Only = { ...raw, routes: raw.routes.filter((route) => route.requiresSurface === undefined) }
+  for (const version of raw.versions) {
+    if (version === '0.34.0-alpha.0') continue
+    const gated = core.normalizeAdapter(raw, version, { surfaceDigest: SURFACE_DIGEST_BY_VERSION[version] })
+    const baseline = core.normalizeAdapter(pre34Only, version)
+    assert.equal(gated.digest, baseline.digest, `${version} keeps pre-0.34 digest byte-identical`)
+    assert.equal(gated.routes.length, baseline.routes.length, `${version} drops gated 0.34 share routes`)
+  }
 })
 
 test('PB-27 r3: the browser annotate overrides a STALE remote report — a local clue read passes on the first try after switching back', async () => {

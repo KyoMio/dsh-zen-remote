@@ -55,10 +55,10 @@ export type AdapterLocator =
  * `undefined` falls through to the normal classify.
  *
  * `requiresSurface` (optional, PB-27) marks a route that exists only in ONE
- * wire-surface generation of the plugin: the 16-hex surface digest that
- * generation produces. The wiring extracts the INSTALLED build's digest
- * even for listed versions when any route declares this field; a route
- * whose digest does not match the installed build is DROPPED before the
+ * or more wire-surface generations of the plugin: a 16-hex surface digest or
+ * a non-empty list of unique 16-hex digests. The wiring extracts the INSTALLED
+ * build's digest even for listed versions when any route declares this field; a
+ * route whose digest does not match the installed build is DROPPED before the
  * route table is folded and digested. That is what keeps the older
  * generations' digests byte-identical to what a zen-remote without the
  * route would compute — adding a generation's routes must never alter the
@@ -73,7 +73,7 @@ export interface AdapterRoute {
   upgrade?: boolean
   locator: AdapterLocator
   local?: boolean
-  requiresSurface?: string
+  requiresSurface?: string | readonly string[]
   deny?: (info: { pathname: string; method: string; currentSessionId: string | undefined; panelHint?: string }) => string | undefined
 }
 
@@ -97,7 +97,7 @@ export interface NormalizedAdapterRoute {
    * never enters the route-table digest: by the time the digest is computed
    * the non-matching routes have already been dropped, and a matching one is
    * exactly the route its generation serves. */
-  requiresSurface?: string
+  requiresSurface?: string | readonly string[]
   deny?: AdapterRoute['deny']
 }
 
@@ -189,6 +189,7 @@ export interface NormalizedAdapter {
 /** The npm package name of an adapter's target, same shape the cooperative
  * declarations validate. */
 const PLUGIN_PATTERN = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/u
+const HEX16_PATTERN = /^[0-9a-f]{16}$/u
 const MAX_ROUTES = 64
 
 /** The body cap an ADAPTER route may declare: the relay's own upload
@@ -204,6 +205,35 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function fail(field: string, detail: string): never {
   throw new Error(`invalid adapter, ${field}: ${detail}`)
+}
+
+function validateRequiresSurface(value: unknown, index: number): string | readonly string[] | undefined {
+  if (value === undefined) return undefined
+  if (typeof value === 'string') {
+    if (!HEX16_PATTERN.test(value)) {
+      fail(`routes[${index}].requiresSurface`, 'must be a 16-hex surface digest')
+    }
+    return value
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) {
+      fail(`routes[${index}].requiresSurface`, 'must be a non-empty array of 16-hex surface digests')
+    }
+    const seen = new Set<string>()
+    const digests: string[] = []
+    for (const entry of value) {
+      if (typeof entry !== 'string' || !HEX16_PATTERN.test(entry)) {
+        fail(`routes[${index}].requiresSurface`, 'every entry must be a 16-hex surface digest')
+      }
+      if (seen.has(entry)) {
+        fail(`routes[${index}].requiresSurface`, `duplicate surface digest "${entry}"`)
+      }
+      seen.add(entry)
+      digests.push(entry)
+    }
+    return digests
+  }
+  fail(`routes[${index}].requiresSurface`, 'must be a 16-hex surface digest or non-empty array of unique 16-hex digests')
 }
 
 /** Validate one adapter's route table and fold it, together with the
@@ -266,8 +296,16 @@ export function normalizeAdapter(input: unknown, installedVersion: string, optio
   // refuse loudly instead (fail closed, no guessing).
   const hasGatedRoutes = (routes as unknown[]).some((route) => isRecord(route) && route.requiresSurface !== undefined)
   const installedSurfaceDigest = options?.surfaceDigest
-  if (hasGatedRoutes && installedSurfaceDigest === undefined) {
-    fail('routes', 'the adapter declares requiresSurface routes but no surface digest was offered for the installed build')
+  if (hasGatedRoutes) {
+    if (installedSurfaceDigest === undefined) {
+      fail('routes', 'the adapter declares requiresSurface routes but no surface digest was offered for the installed build')
+    }
+    // Fail-closed whitelist closure: when an adapter carries both gated routes
+    // and a surfaces table, a listed version whose extracted surface digest is
+    // not whitelisted must fail rather than silently dropping gated routes.
+    if (input.surfaces !== undefined && !Object.hasOwn(input.surfaces, installedSurfaceDigest)) {
+      fail('surfaces', `installed surface digest "${installedSurfaceDigest}" is not whitelisted in the adapter's surfaces table`)
+    }
   }
 
   const seen = new Set<string>()
@@ -282,12 +320,12 @@ export function normalizeAdapter(input: unknown, installedVersion: string, optio
     }
     // The generation gate itself: validated before the drop decision so a
     // malformed gate never hides behind a matching digest.
-    const requiresSurface = (route as { requiresSurface?: unknown }).requiresSurface
-    if (requiresSurface !== undefined && (typeof requiresSurface !== 'string' || !/^[0-9a-f]{16}$/u.test(requiresSurface))) {
-      fail(`routes[${index}].requiresSurface`, 'must be a 16-hex surface digest')
-    }
-    if (typeof requiresSurface === 'string' && requiresSurface !== installedSurfaceDigest) {
-      continue
+    const requiresSurface = validateRequiresSurface((route as { requiresSurface?: unknown }).requiresSurface, index)
+    if (requiresSurface !== undefined && installedSurfaceDigest !== undefined) {
+      const matches = typeof requiresSurface === 'string'
+        ? requiresSurface === installedSurfaceDigest
+        : requiresSurface.includes(installedSurfaceDigest)
+      if (!matches) continue
     }
     const { path, match, methods, maxBody, stream, upgrade, locator, local, deny } = route as unknown as AdapterRoute
     if (typeof path !== 'string' || path === '' || !path.startsWith('/') || path.includes('?') || path.includes('#') || path.includes('..') || /\s/u.test(path)) {
@@ -355,7 +393,7 @@ export function normalizeAdapter(input: unknown, installedVersion: string, optio
       upgrade: normalizedUpgrade,
       locator: locator as AdapterLocator,
       local: normalizedLocal,
-      ...(typeof requiresSurface === 'string' ? { requiresSurface } : {}),
+      ...(requiresSurface !== undefined ? { requiresSurface } : {}),
       ...(deny !== undefined && typeof deny === 'function' ? { deny: deny as AdapterRoute['deny'] } : {}),
     })
   }

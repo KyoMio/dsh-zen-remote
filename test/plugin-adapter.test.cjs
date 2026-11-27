@@ -155,6 +155,82 @@ test('PB-11 core: validation — versions gate, typo guard, local routes stay ou
   assert.equal(mixed.declaration.routes[0].path, '/p/data')
 })
 
+test('PB-27 core: requiresSurface supports string and readonly string[], validates strictly, fails closed on non-whitelisted surface, and keeps digests byte-identical', async () => {
+  const core = await importLib('plugin-adapter-core.js')
+  const gen1 = '0123456789abcdef'
+  const gen2 = 'fedcba9876543210'
+  const gen3 = 'aaaaaaaaaaaaaaaa'
+  const baseRoute = { path: '/p/base', match: 'exact', locator: { in: 'query', name: 'sid' } }
+  const extraRoute = { path: '/p/extra', match: 'exact', methods: ['POST'], locator: { in: 'query', name: 'sid' } }
+
+  // String gate: match keeps, miss drops; digest matches the route table with/without the route.
+  const withStringGate = {
+    plugin: 'p',
+    versions: ['1.0.0'],
+    surfaces: { [gen1]: 'gen 1', [gen2]: 'gen 2' },
+    routes: [baseRoute, { ...extraRoute, requiresSurface: gen2 }],
+  }
+  const normalizedGen1 = core.normalizeAdapter(withStringGate, '1.0.0', { surfaceDigest: gen1 })
+  const normalizedGen2 = core.normalizeAdapter(withStringGate, '1.0.0', { surfaceDigest: gen2 })
+  assert.deepEqual(normalizedGen1.routes.map((r) => r.path), ['/p/base'])
+  assert.deepEqual(normalizedGen2.routes.map((r) => r.path), ['/p/base', '/p/extra'])
+  assert.equal(normalizedGen2.routes.find((r) => r.path === '/p/extra').requiresSurface, gen2)
+
+  // Digest byte-identity: requiresSurface never enters adapterDigestOf.
+  const withoutGateBaseOnly = core.normalizeAdapter({ plugin: 'p', versions: ['1.0.0'], routes: [baseRoute] }, '1.0.0')
+  const withoutGateBoth = core.normalizeAdapter({ plugin: 'p', versions: ['1.0.0'], routes: [baseRoute, extraRoute] }, '1.0.0')
+  assert.equal(normalizedGen1.digest, withoutGateBaseOnly.digest, 'dropped gated route leaves pre-gate digest byte-identical')
+  assert.equal(normalizedGen2.digest, withoutGateBoth.digest, 'matched gated route digest excludes requiresSurface')
+
+  // Array gate: match on any entry keeps, miss drops.
+  const withArrayGate = {
+    plugin: 'p',
+    versions: ['1.0.0'],
+    surfaces: { [gen1]: 'gen 1', [gen2]: 'gen 2', [gen3]: 'gen 3' },
+    routes: [baseRoute, { ...extraRoute, requiresSurface: [gen2, gen3] }],
+  }
+  const arrayMiss = core.normalizeAdapter(withArrayGate, '1.0.0', { surfaceDigest: gen1 })
+  const arrayHit = core.normalizeAdapter(withArrayGate, '1.0.0', { surfaceDigest: gen3 })
+  assert.deepEqual(arrayMiss.routes.map((r) => r.path), ['/p/base'])
+  assert.deepEqual(arrayHit.routes.map((r) => r.path), ['/p/base', '/p/extra'])
+  assert.deepEqual(arrayHit.routes.find((r) => r.path === '/p/extra').requiresSurface, [gen2, gen3])
+  assert.equal(arrayMiss.digest, withoutGateBaseOnly.digest)
+  assert.equal(arrayHit.digest, withoutGateBoth.digest)
+
+  // Validation before drop check: bad string, non-string, empty array, bad item hex, duplicate entries.
+  const invalidGates = [
+    '',
+    'not-hex',
+    '0123456789abcde',
+    '0123456789abcdef0',
+    '0123456789ABCDEF',
+    123,
+    null,
+    {},
+    [],
+    [gen1, 'bad'],
+    [gen1, 42],
+    [gen1, gen1],
+  ]
+  for (const bad of invalidGates) {
+    assert.throws(
+      () => core.normalizeAdapter({ plugin: 'p', versions: ['1.0.0'], routes: [baseRoute, { ...extraRoute, requiresSurface: bad }] }, '1.0.0', { surfaceDigest: gen2 }),
+      /routes\[1\]\.requiresSurface/,
+      `invalid requiresSurface rejected: ${JSON.stringify(bad)}`,
+    )
+  }
+
+  // Fail-closed whitelist closure: listed version + hasGatedRoutes + surfaces present + non-whitelisted digest MUST throw.
+  assert.throws(
+    () => core.normalizeAdapter(withStringGate, '1.0.0', { surfaceDigest: 'deadbeefdeadbeef' }),
+    /surfaces/,
+    'listed version with drifted surface digest fails closed instead of silently dropping gated routes',
+  )
+  // Without a surfaces table, a valid gated adapter still normalizes by surfaceDigest.
+  const noSurfacesTable = { plugin: 'p', versions: ['1.0.0'], routes: [baseRoute, { ...extraRoute, requiresSurface: gen2 }] }
+  assert.deepEqual(core.normalizeAdapter(noSurfacesTable, '1.0.0', { surfaceDigest: gen1 }).routes.map((r) => r.path), ['/p/base'])
+})
+
 test('PB-23b core: the prefix tail red line — the four illegal shapes refuse on the RAW tail, equality and non-matches stay false', async () => {
   const core = await importLib('plugin-adapter-core.js')
   const prefix = core.normalizeAdapter(
