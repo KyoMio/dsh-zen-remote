@@ -40,25 +40,40 @@ function tsconfigInputs(configPath) {
   return JSON.parse(raw).map((f) => relative(root, f).split('\\').join('/'))
 }
 
-// tsc emit mapping for one src file, derived from the tsconfig options
-// (outDir lib, declarationDir lib/types, sourceMap+declarationMap on).
-function expectedOutputs(srcFile) {
+// tsc emit mapping per tsconfig, derived from each config's own compiler
+// options. CRITICAL: the two configs write JS to DIFFERENT outDirs —
+// tsconfig.json emits JS into lib/, but tsconfig.client.json emits JS into
+// .client-build/ (only its declarations go to lib/types). Expecting client
+// JS inside lib/ is exactly the blind spot ZR-3 R1 item 2 documented: a
+// stale client-module JS in lib/ would pass as "expected". We only collect
+// outputs that actually land under lib/.
+//   tsconfig.json:        js → lib/<rel>.js        d.ts → lib/types/<rel>.d.ts
+//   tsconfig.client.json: js → .client-build/<rel> d.ts → lib/types/<rel>.d.ts
+function expectedOutputs(srcFile, { jsOutDir }) {
   if (!/\.tsx?$/.test(srcFile) || srcFile.endsWith('.d.ts')) return []
   const noExt = srcFile.replace(/\.tsx?$/, '')
   const rel = noExt.replace(/^src\//, '')
-  return [
-    `lib/${rel}.js`,
-    `lib/${rel}.js.map`,
+  const outputs = [
     `lib/types/${rel}.d.ts`,
     `lib/types/${rel}.d.ts.map`,
   ]
+  if (jsOutDir === 'lib') {
+    outputs.push(`lib/${rel}.js`, `lib/${rel}.js.map`)
+  }
+  // jsOutDir '.client-build' — the bundle input, intentionally NOT part of
+  // the lib expectation set.
+  return outputs
 }
 
 const expected = new Set()
-for (const cfg of ['tsconfig.json', 'tsconfig.client.json']) {
-  for (const srcFile of tsconfigInputs(cfg)) {
+const CONFIGS = [
+  ['tsconfig.json', 'lib'],
+  ['tsconfig.client.json', '.client-build'],
+]
+for (const [cfg, jsOutDir] of CONFIGS) {
+  for (const srcFile of tsconfigInputs(join(root, cfg))) {
     if (!srcFile.startsWith('src/')) continue
-    for (const out of expectedOutputs(srcFile)) expected.add(out)
+    for (const out of expectedOutputs(srcFile, { jsOutDir })) expected.add(out)
   }
 }
 
@@ -79,4 +94,4 @@ if (orphans.length) {
   console.error('  说明：lib/client.js 与 lib/lan-gate-server.cjs 是打包产物（非 tsc 输出），已豁免；若确认它们也应重建，跑 pnpm build 即可。')
   process.exit(1)
 }
-console.log(`✓ lib/ 死产物门禁通过（${expected.size} 个预期产物全部对得上源码，无孤儿）`)
+console.log(`✓ lib/ 死产物门禁通过（${expected.size} 个 lib/ 落位产物（tsc JS+声明+map，客户端 JS 按配置落在 .client-build/ 不计入）全部对得上源码，无孤儿）`)

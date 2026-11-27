@@ -66,7 +66,8 @@ const PERM = `${ROW} > [class$="_tools"] > [class$="_modes"]`
  */
 const MODEL_MENU = `:is(${MODEL} > [class$="_menu"], body > [id$="-menu"][class$="_menu"]:is([role="menu"], [role="group"]))`
 
-export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- */
+export const COMPOSER_CSS = `
+/* zr-depth-ok: the lifted-ring placeholder and trailing margin choreography anchor on the composer card/row structure fixed by the plugin effect that moves chips into the card — composition, not host guessing; see the elastic-gap comment inside. *//* ---------- phone composer (< 768px) ---------- */
 
 /* The file picker the attachment button drives (S7) — hidden at EVERY width,
    deliberately OUTSIDE the phone media block below. A bare <input type="file">
@@ -206,12 +207,6 @@ export const COMPOSER_CSS = `/* ---------- phone composer (< 768px) ---------- *
   ${ROOT} > [class$="_dock"] button[class$="_trigger"] > span {
     display: none !important;
   }
-  /* The lifted ring's layout placeholder. Depth here is the plugin's own
-     composition, not host guessing: ROOT/card/row are the composer's own
-     nested structure (grid overlay above), the trailing/send row order is
-     fixed by the effect that moves chips into the card, and the ::before
-     only exists to reserve the ring's width inside that same row — see the
-     elastic-gap comment below for the full margin choreography. */
   ${ROOT}:has(> [class$="_dock"] button) > [class$="_card"] > [class$="_row"]::before {
     content: '';
     order: 6;
