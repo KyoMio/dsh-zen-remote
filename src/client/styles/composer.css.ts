@@ -68,9 +68,6 @@ const MODEL_MENU = `:is(${MODEL} > [class$="_menu"], body > [id$="-menu"][class$
 
 export const COMPOSER_CSS = `
 /* ---------- phone composer (< 768px) ---------- */
-  /* zr-depth-ok-scope: [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] — the composer card/row anatomy is the host composer component's documented part structure (every section comment in this sheet explains the specific mechanics); exemption covers only selectors containing this exact chain. */
-  /* zr-depth-ok-scope: [data-slot="conversation.composer.bar"] > [class$="_root"]:has(> [class$="_dock"] — the grid overlay root/dock composition documented in the lifted-ring section; covers only selectors containing this exact chain. */
-  /* zr-depth-ok-scope: body:has([data-slot="conversation.composer.bar"] — the menu-open scrim rules invert the anatomy chain inside :has(); same documented structure, covers only selectors containing this exact chain. */
 
 /* The file picker the attachment button drives (S7) — hidden at EVERY width,
    deliberately OUTSIDE the phone media block below. A bare <input type="file">

@@ -148,6 +148,26 @@ function evaluateClientBundle() {
   return styles
 }
 
+// Split a selector list on TOP-LEVEL commas only — commas nested inside
+// :is()/:not()/:has() parentheses belong to one selector, not to the group.
+function splitSelectorList(text) {
+  const out = []
+  let depth = 0
+  let cur = ''
+  for (const ch of text) {
+    if (ch === '(') depth += 1
+    if (ch === ')') depth = Math.max(0, depth - 1)
+    if (ch === ',' && depth === 0) {
+      out.push(cur)
+      cur = ''
+    } else {
+      cur += ch
+    }
+  }
+  out.push(cur)
+  return out
+}
+
 // Split css text into rules. A rule is {head, isAtRule}: head is the full
 // text since the previous block boundary INCLUDING comments, because the
 // zr-depth-ok exemption binds to exactly one rule group (ZR-3 R2 item 2) —
@@ -184,29 +204,26 @@ function* cssRules(css) {
 }
 
 test('③ no unjustified deep class-suffix chains guessing host DOM depth (artifact-level)', () => {
+  const allowlistDoc = JSON.parse(fs.readFileSync(path.join(root, 'test', 'css-depth-allowlist.json'), 'utf8'))
   const offenders = []
   for (const [where, css] of evaluateClientBundle()) {
+    const approved = (allowlistDoc.sheets[where]?.selectors ?? []).map((x) => x.replace(/\s+/g, ' ').trim())
     for (const rule of cssRules(css)) {
       if (rule.isAtRule) continue // at-rule prelude, selectors live in nested rules
-      // Exemption is chain-bound (ZR-3 R2 item 2): zr-depth-ok-scope
-      // comments declare the documented chain they justify as exact
-      // selector text, and a violating selector is exempted ONLY when it
-      // contains that chain literally. The declaration may live anywhere
-      // in the sheet (chains describe structure, not positions) — but an
-      // unrelated selector never contains the chain, so it can never be
-      // floated along the way a positional exemption allowed.
-      // Chain format: `zr-depth-ok-scope: <chain>` optionally followed by
-      // ` — <reason>`; the chain ends at the em-dash or the comment close.
-      const scopeMatches = [...css.matchAll(/zr-depth-ok-scope:\s*([^\u2014]+?)(?:\s*\u2014|\s*\*\/)/g)].map((m) => m[1].trim().replace(/\s+/g, ' '))
+      // Exemption is an exact-selector allowlist (ZR-3 R3) kept OUTSIDE the
+      // stylesheets in test/css-depth-allowlist.json: entries pin COMPLETE
+      // selectors verbatim (whitespace-normalized full equality), grouped
+      // per sheet with one shared justification. Keeping the list out of
+      // the artifact means entry text can never collide with functional
+      // selector counting in other contract tests, and grafted conditions
+      // can never match because equality is not substring. A new deep-chain
+      // selector must be registered in the JSON explicitly.
       const stripped = rule.head.replace(/\/\*[\s\S]*?\*\//g, '')
-      for (const selector of stripped.split(',')) {
+      for (const selector of splitSelectorList(stripped)) {
         const sel = selector.trim().replace(/\s+/g, ' ')
         if (!sel || sel.includes('%')) continue
         if (!CLASS_CHAIN_RE.test(sel)) continue
-        // The declared chain is matched as a whitespace-normalized
-        // SUBSTRING of the selector: simple, and the binding is exact —
-        // the exemption names the literal structure it justifies.
-        const covered = scopeMatches.some((scope) => sel.includes(scope))
+        const covered = approved.includes(sel)
         if (!covered) {
           offenders.push(`${where}: ${sel.slice(0, 90)}`)
         }
@@ -216,7 +233,7 @@ test('③ no unjustified deep class-suffix chains guessing host DOM depth (artif
   assert.deepEqual(
     offenders,
     [],
-    `禁止用多层 :has() 或固定子代深度猜测宿主 DOM 结构。请改用 JS 沿父节点上溯（参考 foldsWholeRows 实现）；确属结构事实时在该规则组内用 zr-depth-ok-scope: <链文本> 声明它覆盖的具体结构（豁免绑定到链文本，无关选择器不会被带走）。（命中：${offenders[0] ?? ''}）`,
+    `禁止用多层 :has() 或固定子代深度猜测宿主 DOM 结构。请改用 JS 沿父节点上溯（参考 foldsWholeRows 实现）；确属结构事实时把该完整选择器加进 test/css-depth-allowlist.json 对应 sheet 并确认理由覆盖它（精确匹配，新选择器必须显式登记）。（命中：${offenders[0] ?? ''}）`,
   )
 })
 

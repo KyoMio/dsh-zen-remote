@@ -907,7 +907,6 @@ export const COMPAT_CSS = `
        all ship icons in the menu). Self-coordinating with the plugin's own
        injection: once its svg lands it arrives inside a cloned icon span,
        the :not() stops matching, no double icon. */
-    /* zr-depth-ok-scope: [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] — the composer bar card/row/tools/modes chain is the plugin's own documented composition (slot seats are display:contents); exemption covers only selectors containing this exact chain. */
     [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] [role="menu"] button[role="menuitem"]:not(:has(:is([class*="_itemIcon_"], [class$="_itemIcon"], [class*="_itemIcon "])))::before,
     [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] button[class$="_trigger"][aria-label$="Auto"]::before {
       content: '';

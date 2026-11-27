@@ -3,7 +3,6 @@
 
 export const LAYOUT_CSS = `
 /* ---------- mobile-only layout ---------- */
-  /* zr-depth-ok-scope: [data-phase] [class*="_card"]:has(textarea) — the composer pill composition anchored by the composer card; documented in the NOTE below. Exemption covers only selectors containing this exact chain. */
 
 @media (max-width: 1023px) {
   /* --- Phone chrome ---
