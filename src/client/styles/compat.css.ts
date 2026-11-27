@@ -15,7 +15,7 @@ import { UPLOAD_DIR } from '../attach-upload.ts'
 const MARKET = '.dshm-ver[title="@ace-zone/dsh-market"]'
 
 export const COMPAT_CSS = `
-/* zr-depth-ok: menu-item icon fallback + permission pills anchor on the composer/dock structure the plugin itself injects (slot seats are display:contents, no intermediate box); documented per-rule above each selector — see the INDIRECT gate comment block. */  /* ---------- dsh-web-ui family compatibility ----------
+/* ---------- dsh-web-ui family compatibility ----------
      The linxin666 plugin suite extends the shell frame directly:
        - aionui-panel appends two trailing grid columns (explorer / preview)
          plus absolute drag handles to [data-dsh-frame]; its 5-track inline
@@ -907,6 +907,7 @@ export const COMPAT_CSS = `
        all ship icons in the menu). Self-coordinating with the plugin's own
        injection: once its svg lands it arrives inside a cloned icon span,
        the :not() stops matching, no double icon. */
+    /* zr-depth-ok-scope: [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] — the composer bar card/row/tools/modes chain is the plugin's own documented composition (slot seats are display:contents); exemption covers only selectors containing this exact chain. */
     [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] [role="menu"] button[role="menuitem"]:not(:has(:is([class*="_itemIcon_"], [class$="_itemIcon"], [class*="_itemIcon "])))::before,
     [data-slot="conversation.composer.bar"] [class$="_card"] > [class$="_row"] > [class$="_tools"] > [class$="_modes"] button[class$="_trigger"][aria-label$="Auto"]::before {
       content: '';

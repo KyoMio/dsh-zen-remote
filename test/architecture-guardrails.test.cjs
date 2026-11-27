@@ -148,35 +148,66 @@ function evaluateClientBundle() {
   return styles
 }
 
-// Split css text into rule heads: everything before each top-level `{` that
-// is not inside a comment. At-rules produce nested heads; every chunk ending
-// at `{` is treated as a potential selector list.
-function* ruleHeads(css) {
-  const stripped = css.replace(/\/\*[\s\S]*?\*\//g, '')
+// Split css text into rules. A rule is {head, isAtRule}: head is the full
+// text since the previous block boundary INCLUDING comments, because the
+// zr-depth-ok exemption binds to exactly one rule group (ZR-3 R2 item 2) —
+// a marker in this rule's head exempts only the selectors of THIS head,
+// not the stylesheet. Quotes are tracked so braces inside strings or
+// data-urls do not count as block boundaries.
+function* cssRules(css) {
   let chunk = ''
-  for (const ch of stripped) {
-    if (ch === '{') {
-      yield chunk
-      chunk = ''
-    } else if (ch === '}') {
-      chunk = ''
-    } else {
+  let quote = null
+  let inComment = false
+  for (let i = 0; i < css.length; i++) {
+    const ch = css[i]
+    const next = css[i + 1]
+    if (inComment) {
       chunk += ch
+      if (ch === '*' && next === '/') { chunk += '/'; i += 1; inComment = false }
+      continue
     }
+    if (quote) {
+      chunk += ch
+      if (ch === quote) quote = null
+      continue
+    }
+    if (ch === '/' && next === '*') { inComment = true; chunk += ch; continue }
+    if (ch === '"' || ch === "'") { quote = ch; chunk += ch; continue }
+    if (ch === '{') {
+      yield { head: chunk, isAtRule: /@(media|supports|container|keyframes|layer)\b/.test(chunk.trimStart().split('\n').filter((l) => l.trim() && !l.trim().startsWith('/*')).pop() ?? '') || chunk.trimStart().startsWith('@') }
+      chunk = ''
+      continue
+    }
+    if (ch === '}') { chunk = ''; continue }
+    chunk += ch
   }
 }
 
 test('③ no unjustified deep class-suffix chains guessing host DOM depth (artifact-level)', () => {
   const offenders = []
   for (const [where, css] of evaluateClientBundle()) {
-    const exempted = css.includes('zr-depth-ok')
-    const seen = new Set()
-    for (const head of ruleHeads(css)) {
-      for (const selector of head.split(',')) {
+    for (const rule of cssRules(css)) {
+      if (rule.isAtRule) continue // at-rule prelude, selectors live in nested rules
+      // Exemption is chain-bound (ZR-3 R2 item 2): zr-depth-ok-scope
+      // comments declare the documented chain they justify as exact
+      // selector text, and a violating selector is exempted ONLY when it
+      // contains that chain literally. The declaration may live anywhere
+      // in the sheet (chains describe structure, not positions) — but an
+      // unrelated selector never contains the chain, so it can never be
+      // floated along the way a positional exemption allowed.
+      // Chain format: `zr-depth-ok-scope: <chain>` optionally followed by
+      // ` — <reason>`; the chain ends at the em-dash or the comment close.
+      const scopeMatches = [...css.matchAll(/zr-depth-ok-scope:\s*([^\u2014]+?)(?:\s*\u2014|\s*\*\/)/g)].map((m) => m[1].trim().replace(/\s+/g, ' '))
+      const stripped = rule.head.replace(/\/\*[\s\S]*?\*\//g, '')
+      for (const selector of stripped.split(',')) {
         const sel = selector.trim().replace(/\s+/g, ' ')
-        if (!sel || sel.startsWith('@') || sel.includes('%') || seen.has(sel)) continue
-        seen.add(sel)
-        if (!exempted && CLASS_CHAIN_RE.test(sel)) {
+        if (!sel || sel.includes('%')) continue
+        if (!CLASS_CHAIN_RE.test(sel)) continue
+        // The declared chain is matched as a whitespace-normalized
+        // SUBSTRING of the selector: simple, and the binding is exact —
+        // the exemption names the literal structure it justifies.
+        const covered = scopeMatches.some((scope) => sel.includes(scope))
+        if (!covered) {
           offenders.push(`${where}: ${sel.slice(0, 90)}`)
         }
       }
@@ -185,7 +216,7 @@ test('③ no unjustified deep class-suffix chains guessing host DOM depth (artif
   assert.deepEqual(
     offenders,
     [],
-    `禁止用多层 :has() 或固定子代深度猜测宿主 DOM 结构。请改用 JS 沿父节点上溯（参考 foldsWholeRows 实现）；确属结构事实时在所属模板内加 zr-depth-ok 注释说明理由。（命中：${offenders[0] ?? ''}）`,
+    `禁止用多层 :has() 或固定子代深度猜测宿主 DOM 结构。请改用 JS 沿父节点上溯（参考 foldsWholeRows 实现）；确属结构事实时在该规则组内用 zr-depth-ok-scope: <链文本> 声明它覆盖的具体结构（豁免绑定到链文本，无关选择器不会被带走）。（命中：${offenders[0] ?? ''}）`,
   )
 })
 
@@ -316,9 +347,34 @@ test('④-behavioral admin: management routes reject via-gateway before same-ori
   const { server, port } = await serve(handler)
   t.after(() => new Promise((resolve) => server.close(resolve)))
 
-  const rejected = [
-    admin.ADMIN_PAIR_ROUTE, admin.ADMIN_ACTION_ROUTE, admin.ADMIN_PUSH_TEST_ROUTE, admin.ADMIN_PLUGIN_BRIDGE_ROUTE,
-  ]
+  // The route policy table (ZR-3 R2 item 1): every admin route constant
+  // exported by lib/admin-routes.js MUST appear here exactly once with its
+  // supported methods and per-method expectation. A new route that nobody
+  // classified fails the set-equality assertion below — the maintainer is
+  // forced to choose allow/reject instead of silently slipping through.
+  // Expectations: 'reject' = POST must 403 via-gateway with zero backend
+  // hits (GET: 403/405 acceptable, backend untouched); 'redact' = remote
+  // readable but strips pairing/topology; 'allow-excepted' = the shares
+  // toggle, covered by its own contract test.
+  const POLICY = new Map([
+    [admin.ADMIN_PAIR_ROUTE, { methods: ['POST'], expect: 'reject' }],
+    [admin.ADMIN_ACTION_ROUTE, { methods: ['POST'], expect: 'reject' }],
+    [admin.ADMIN_PUSH_TEST_ROUTE, { methods: ['POST'], expect: 'reject' }],
+    [admin.ADMIN_PLUGIN_BRIDGE_ROUTE, { methods: ['GET', 'POST'], expect: 'reject' }],
+    [admin.ADMIN_STATUS_ROUTE, { methods: ['GET', 'POST'], expect: 'redact' }],
+    [admin.ADMIN_SHARES_ROUTE, { methods: ['GET', 'POST'], expect: 'allow-excepted' }],
+  ])
+  const exported = Object.entries(admin)
+    .filter(([k, v]) => /^ADMIN_\w+_ROUTE$/.test(k) && typeof v === 'string' && v.startsWith(admin.ADMIN_ROUTE_PREFIX))
+    .map(([, v]) => v)
+    .sort()
+  const tabled = [...POLICY.keys()].sort()
+  assert.deepEqual(
+    exported,
+    tabled,
+    `admin 路由集合与策略表不一致——新增/删除路由必须同步在测试策略表里登记它的 via 墙预期（漏登记的路由没有任何人替它做允许/拒绝的决定）。导出未登记：${exported.filter((r) => !POLICY.has(r)).join(',') || '无'}；表内已删除：${tabled.filter((r) => !exported.includes(r)).join(',') || '无'}`,
+  )
+  const rejected = [...POLICY.entries()].filter(([, p]) => p.expect === 'reject').map(([r]) => r)
   const bad = []
   for (const routePath of rejected) {
     for (const method of ['POST', 'GET']) {
@@ -474,14 +530,18 @@ test('⑥ no production-site or ops-route vocabulary in the open-source repo', (
   // are different words with different meanings — folding would red
   // legitimate prose ("the site") without catching anything real.
   const SCANNER_SELF = 'test/architecture-guardrails.test.cjs'
-  const tracked = execFileSync('git', ['ls-files'], { cwd: root, encoding: 'utf8' })
-    .split('\n').filter(Boolean)
-  const TEXT_EXT = /\.(md|ts|tsx|cjs|mjs|js|json|ya?ml|txt|css|html|sh)$/
+  // ZR-3 R2 item 3: enumerate ALL tracked paths with -z (no extension
+  // filter — LICENSE-style extensionless public text and workflow YAML both
+  // escaped an extension whitelist). Binaries are excluded by NUL-byte
+  // sniff on content, not by name. lib/ and .client-build/ stay excluded:
+  // they are regenerated build outputs of sources already scanned, and
+  // their upstream provenance is pinned by the build+diff CI gate.
+  const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: root, encoding: 'buffer' })
+    .toString('utf8').split('\0').filter(Boolean)
   const offenders = []
   const unreadable = []
   for (const f of tracked) {
     if (f === SCANNER_SELF) continue // self-exemption: the scanner carries the keyword fragments; see the header note
-    if (!TEXT_EXT.test(f)) continue
     if (/^(lib|\.client-build)\//.test(f)) continue // build outputs are regenerated from scanned sources
     let buf
     try {
