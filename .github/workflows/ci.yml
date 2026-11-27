@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'lib/**'
+      - 'test/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - 'tsconfig*.json'
+      - 'lan-gate*'
+      - 'docs/**'
+      - 'README*.md'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build and verify committed lib artifacts
+        run: |
+          pnpm build
+          git diff --exit-code -- lib
+
+      - name: Typecheck
+        run: pnpm verify
+
+      - name: Run main test suite
+        run: pnpm test
