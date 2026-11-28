@@ -1,4 +1,4 @@
-export const title = "开源 gateway-server 限流与鉴权会话状态机 (ZR-7)";
+export const title = "开源 gateway-server 限流与鉴权会话状态机 (ZR-7 R1)";
 
 export const colors = {
   idle: "tan",
@@ -13,35 +13,31 @@ const wsLabel = (v) => {
   if (v.wsDecision === "rejected_1013") return "WS 超限拒连 1013";
   if (total === 0) return "WS 空闲 (0 占用)";
   if (total >= 2) return "WS 全局槽位已满";
-  return v.wsDecision === "proxy_ok"
+  return v.wsReqFromTrusted
     ? "WS 信任代理占用 (采纳 X-Real-IP)"
     : "WS 直连占用 (忽略伪造头)";
 };
 
 const authLabel = (v) => {
-  switch (v.authDecision) {
-    case "admin_bearer_ok":
-      return "Admin Bearer 放行";
-    case "admin_bearer_401":
-      return "Admin 无效 Bearer 拒 401";
-    case "admin_cookie_ok":
-      return "Admin Cookie 放行";
-    case "user_bearer_ignored":
-      return "User 路由忽略 Bearer 走 Cookie";
-    default:
-      return "HTTP 鉴权待命";
+  if (v.reqRouteKind === "none") return "HTTP 鉴权待命";
+  if (v.reqRouteKind === "admin") {
+    if (v.authActor === "api_admin") return "Admin Bearer API Key 放行";
+    if (v.authActor === "cookie_admin") return "Admin Cookie 放行";
+    return "Admin 无效 Bearer 拒 401";
   }
+  return v.reqBearerKind === "none"
+    ? "User Cookie 放行"
+    : "User 路由忽略 Bearer 走 Cookie (Finding 1)";
 };
 
 const otpLabel = (v) => {
-  switch (v.otpDecision) {
-    case "signup_denied":
-      return "Admin 注册 OTP 被拒";
-    case "reset_delivered":
-      return "Admin 重置 OTP 仅发信(无会话)";
-    default:
-      return "OTP 请求待命";
+  if (v.otpPurpose === "none") return "OTP 请求待命";
+  if (v.otpTargetRole === "admin") {
+    return v.otpPurpose === "signup"
+      ? "Admin 注册 OTP 被拒"
+      : "Admin 重置 OTP 仅发信无会话 (Finding 2)";
   }
+  return "User 注册 OTP 签发会话";
 };
 
 export const state = (v) => ({
@@ -52,35 +48,38 @@ export const state = (v) => ({
 
 export const group = (v) => {
   if (v.wsDecision === "rejected_1013") return "limit";
-  if (v.authDecision === "user_bearer_ignored" || v.otpDecision === "reset_delivered") return "finding";
-  if (v.authDecision !== "idle" || v.otpDecision !== "idle") return "auth";
+  if (v.reqRouteKind !== "none" || v.otpPurpose !== "none") return "auth";
   if (v.wsDecision !== "idle") return "ws";
   return "idle";
 };
 
 export const step = (action, from, to) => {
   switch (action) {
+    case "WsConnect":
+      if (to.wsDecision === "rejected_1013") {
+        return to.wsReqFromTrusted ? "信任代理超限 -> 1013" : "未信对端超限 -> 1013";
+      }
+      return to.wsReqFromTrusted ? "信任代理建连(采纳 X-Real-IP)" : "未信对端建连(忽略伪造头)";
     case "WsConnectUntrusted":
       return to.wsDecision === "rejected_1013" ? "未信对端超限 -> 1013" : "未信对端建连(忽略伪造头)";
-    case "WsConnectTrustedProxyA":
-    case "WsConnectTrustedProxyB":
+    case "WsConnectTrustedProxy":
       return to.wsDecision === "rejected_1013" ? "信任代理超限 -> 1013" : "信任代理建连(采纳 X-Real-IP)";
     case "WsReleasePreAuth":
       return "释放 WS 槽位";
-    case "AdminReqValidBearerWithCookie":
-      return "Admin 有效 Bearer+Cookie";
-    case "AdminReqInvalidBearerWithCookie":
-      return "Admin 无效 Bearer+Cookie -> 401";
-    case "AdminReqCookieOnly":
-      return "Admin 仅带 Cookie";
-    case "UserReqWithBearerAndCookie":
-      return "User 路由带 Bearer+Cookie";
+    case "HttpAuthCase":
+    case "HttpAuthRequest":
+      if (to.reqRouteKind === "admin" && to.authActor === "api_admin") return "Admin 有效 Bearer";
+      if (to.reqRouteKind === "admin" && to.authActor === "rejected_401") return "Admin 无效 Bearer 拒 401";
+      if (to.reqRouteKind === "admin") return "Admin Cookie 鉴权";
+      if (to.reqRouteKind === "user" && to.reqBearerKind !== "none") return "User 带 Bearer+Cookie";
+      return "User Cookie 鉴权";
     case "HttpAuthDone":
       return "HTTP 请求完成";
-    case "SignupOtpForAdmin":
-      return "Admin 请求注册 OTP";
-    case "ResetPasswordOtpForAdmin":
-      return "Admin 请求重置密码 OTP";
+    case "OtpCase":
+    case "OtpRequest":
+      if (to.otpTargetRole === "admin" && to.otpPurpose === "signup") return "Admin 请求注册 OTP";
+      if (to.otpTargetRole === "admin") return "Admin 请求重置密码 OTP";
+      return "User 注册 OTP";
     case "OtpReqDone":
       return "OTP 请求完成";
     default:

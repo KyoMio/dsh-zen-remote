@@ -1,5 +1,5 @@
 ---
-title: "配对 + Wizard 重载 + Probe 断线重连状态机 (ZR-7)"
+title: "配对 + Wizard 重载 + Probe 断线重连状态机 (ZR-7 R1)"
 ---
 stateDiagram-v2
   state "Legend" as legend {
@@ -18,37 +18,57 @@ stateDiagram-v2
   s1: 未配对 / 向导就绪(未铸码)
   s2: 未配对 / 整行重载中
   s3: 未配对 / 配对码已铸造
-  s4: 已配对 / 在线(待 WS)
-  s5: 已配对 / 离线(视图滞留 online)
-  s6: 已配对 / 在线(WS 已建连)
-  s7: 已配对 / 重连握手中
-  s8: 已配对 / 离线(等待恢复)
-  s9: 已配对 / Probe 探测中
-  s10: 已配对 / 离线(Probe 失败禁止重连)
+  s4: 已配对 / 在线(视图滞留 offline)
+  s5: 已配对 / 离线(视图 offline)
+  s6: 已配对 / 在线(视图 online)
+  s7: 已配对 / 整行重载中
+  s8: 已配对 / Probe 探测在飞
+  s9: 已配对 / 重连握手中(视图 offline)
+  s10: 已配对 / 离线(视图滞留 online)
+  s11: 已配对 / 重连握手中(视图 online)
+  s12: 已配对 / 离线(Probe 失败禁止重连)
   [*] --> s0
   s0 --> s1: 打开向导(无重启字段变更)
   s0 --> s2: 修改重启字段触发 reload
-  s1 --> s2: 修改重启字段触发 reload
   s1 --> s3: 铸造配对码
   s2 --> s1: 整行重载完成
   s3 --> s2: 修改重启字段触发 reload
   s3 --> s4: 提交配对码换取凭据
   s4 --> s1: 吊销设备
   s4 --> s5: 长连接断开
-  s4 --> s6: 已认证 WS upgrade 建连
-  s5 --> s7: 用户手动重连
-  s5 --> s8: 状态轮询同步为 offline
+  s4 --> s6: 轮询同步视图为 online
+  s4 --> s7: 修改重启字段触发 reload
+  s4 --> s8: 发送 network-hint 触发 probeHealth
+  s5 --> s7: 修改重启字段触发 reload
+  s5 --> s9: 手动触发重连
+  s5 --> s8: 发送 network-hint 触发 probeHealth
   s6 --> s1: 吊销设备
-  s6 --> s5: 长连接断开
-  s7 --> s5: 重连失败
-  s7 --> s4: 重连成功
-  s8 --> s7: 用户手动重连
-  s8 --> s9: 发送 network-hint 触发 probe
-  s7 --> s8: 重连失败
-  s9 --> s7: probe 成功 -> networkRestored
-  s9 --> s10: probe 失败(不重连)
-  s10 --> s7: 用户手动重连
-  s10 --> s9: 发送 network-hint 触发 probe
+  s6 --> s10: 长连接断开
+  s6 --> s7: 修改重启字段触发 reload
+  s7 --> s5: 整行重载完成
+  s8 --> s7: 修改重启字段触发 reload
+  s8 --> s4: probe 失败(维持当前态) or probe 成功(非离线忽略)
+  s9 --> s4: 重连成功
+  s9 --> s5: 重连失败
+  s9 --> s7: 修改重启字段触发 reload
+  s9 --> s8: 发送 network-hint 触发 probeHealth
+  s10 --> s5: 轮询同步视图为 offline
+  s10 --> s7: 修改重启字段触发 reload
+  s10 --> s11: 手动触发重连
+  s7 --> s10: 整行重载完成
+  s8 --> s9: probe 成功 -> networkRestored or probe 失败(维持当前态) or probe 成功(非离线忽略)
+  s8 --> s12: probe 失败(绝不自动重连)
+  s8 --> s6: probe 失败(维持当前态) or probe 成功(非离线忽略)
+  s11 --> s6: 重连成功
+  s11 --> s9: 轮询同步视图为 offline
+  s11 --> s10: 重连失败
+  s11 --> s7: 修改重启字段触发 reload
+  s12 --> s7: 修改重启字段触发 reload
+  s12 --> s9: 手动触发重连
+  s12 --> s8: 发送 network-hint 触发 probeHealth
+  s8 --> s11: probe 成功 -> networkRestored or probe 失败(维持当前态) or probe 成功(非离线忽略)
+  s8 --> s10: probe 失败(绝不自动重连)
+  s10 --> s12: 轮询同步视图为 offline
   class s0 blue
   class s1 blue
   class s2 orange
@@ -56,7 +76,9 @@ stateDiagram-v2
   class s4 teal
   class s5 yellow
   class s6 teal
-  class s7 yellow
-  class s8 yellow
-  class s9 purple
+  class s7 orange
+  class s8 purple
+  class s9 yellow
   class s10 yellow
+  class s11 yellow
+  class s12 yellow

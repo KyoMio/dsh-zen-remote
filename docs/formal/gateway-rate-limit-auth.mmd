@@ -1,5 +1,5 @@
 ---
-title: "开源 gateway-server 限流与鉴权会话状态机 (ZR-7)"
+title: "开源 gateway-server 限流与鉴权会话状态机 (ZR-7 R1)"
 ---
 stateDiagram-v2
   direction LR
@@ -22,25 +22,24 @@ stateDiagram-v2
       s1 --> s4: 未信对端超限 -> 1013 or 信任代理超限 -> 1013
       s2 --> s0: 释放 WS 槽位
       s2 --> s3: 未信对端建连(忽略伪造头) or 信任代理建连(采纳 X-Real-IP)
-      s2 --> s4: 信任代理超限 -> 1013 or 未信对端超限 -> 1013
+      s2 --> s4: 信任代理超限 -> 1013
       s3 --> s1: 释放 WS 槽位
-      s3 --> s4: 信任代理超限 -> 1013 or 未信对端超限 -> 1013
-      s3 --> s2: 释放 WS 槽位
+      s3 --> s4: 未信对端超限 -> 1013 or 信任代理超限 -> 1013
       s4 --> s0: 释放 WS 槽位
-      s4 --> s3: 未信对端建连(忽略伪造头) or 信任代理建连(采纳 X-Real-IP)
+      s4 --> s3: 信任代理建连(采纳 X-Real-IP) or 未信对端建连(忽略伪造头)
     }
     --
     state "HTTP_Bearer与Cookie鉴权" as r1 {
       s5: HTTP 鉴权待命
-      s6: Admin 无效 Bearer 拒 401
-      s7: Admin Bearer 放行
-      s8: Admin Cookie 放行
-      s9: User 路由忽略 Bearer 走 Cookie
+      s6: Admin Bearer API Key 放行
+      s7: Admin Cookie 放行
+      s8: User 路由忽略 Bearer 走 Cookie (Finding 1)
+      s9: Admin 无效 Bearer 拒 401
       [*] --> s5
-      s5 --> s6: Admin 无效 Bearer+Cookie -> 401
-      s5 --> s7: Admin 有效 Bearer+Cookie
-      s5 --> s8: Admin 仅带 Cookie
-      s5 --> s9: User 路由带 Bearer+Cookie
+      s5 --> s6: Admin 有效 Bearer
+      s5 --> s7: Admin Cookie 鉴权
+      s5 --> s8: User 带 Bearer+Cookie
+      s5 --> s9: Admin 无效 Bearer 拒 401
       s6 --> s5: HTTP 请求完成
       s7 --> s5: HTTP 请求完成
       s8 --> s5: HTTP 请求完成
@@ -49,13 +48,16 @@ stateDiagram-v2
     --
     state "Admin_OTP_签发门控" as r2 {
       s10: OTP 请求待命
-      s11: Admin 重置 OTP 仅发信(无会话)
+      s11: Admin 重置 OTP 仅发信无会话 (Finding 2)
       s12: Admin 注册 OTP 被拒
+      s13: User 注册 OTP 签发会话
       [*] --> s10
       s10 --> s11: Admin 请求重置密码 OTP
       s10 --> s12: Admin 请求注册 OTP
+      s10 --> s13: User 注册 OTP
       s11 --> s10: OTP 请求完成
       s12 --> s10: OTP 请求完成
+      s13 --> s10: OTP 请求完成
     }
   }
   class s4 orange

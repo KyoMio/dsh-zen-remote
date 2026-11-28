@@ -1,6 +1,6 @@
 ---
 name: verify-zen-remote-formal
-description: Formally verify pairing/wizard reload/probe reconnect, plugin bridge handshake/503 routing, and gateway-server rate-limiting/auth invariants in dsh-zen-remote with TLC and /statechart. Use after touching pairing, restart-watcher, wizard verify, relay-client reconnect, plugin-bridge/route-intercept, or gateway-server ws-hub/auth/rate-limiter.
+description: Formally verify pairing/wizard reload/probe reconnect, plugin bridge handshake/503 routing, and gateway-server pre-auth/HTTP auth invariants in dsh-zen-remote with TLC and /statechart. Use after touching pairing, restart-watcher, wizard verify, relay-client reconnect, plugin-bridge/route-intercept, or gateway-server ws-hub/auth/server.
 ---
 
 # Verify Zen Remote Formal Invariants
@@ -12,9 +12,9 @@ description: Formally verify pairing/wizard reload/probe reconnect, plugin bridg
 
 | Model (`docs/formal/`) | Covered Source Files & Functions | Plain-Sentence Guarantee |
 |---|---|---|
-| `PairingWizardReconnect.tla` | `src/restart-watcher.ts` (`startRestartWatcher`), `src/restart-fields.ts` (`RESTART_FIELDS`), `src/wizard/verify.ts` (`createVerificationManager`), `src/client/wizard/GatewayWizard.tsx`, `src/client-data/remote-status.ts` (`sendNetworkHint`), `src/client-routes.ts` (`CLIENT_NETWORK_HINT_ROUTE`), `src/relay-client.ts` (`probeHealth`, `networkRestored`, `reconnect`), `lib/lan-gate-server.cjs` (`server.on('upgrade')`) | Failed health probes never trigger auto-reconnect; network hints only fire when the view is not `online`; pairing codes only mint after a restart-field reload completes; unauthenticated WS upgrades are always rejected. |
-| `PluginBridgeRouting.tla` | `src/plugin-bridge.ts` (`createBridgeRegistry`, `compareBridges`), `src/plugin-adapter-core.ts` (`adapterOwnsRegistryEntry`), `src/index.ts` (adapter registration), `src/plugin-route-intercept.ts` (`surrogateHandler`, `answerUnbridged`, `answerUnbridgedSocket`), `src/plugin-tunnel.ts` | Bridging requires exact plugin name, version, and declaration digest match (plus server-scope consent); unbridged virtual `zr~` routes always return 503 and never reach local handlers; plugin self-declarations always take precedence over adapters. |
-| `GatewayRateLimitAuth.tla` | `gateway-server/src/peer-hub/ws-hub.ts` (`resolvePreAuthClientIp`, `setupConnection`), `gateway-server/src/peer-hub/rate-limiter.ts`, `gateway-server/src/http/auth.ts` (`requireAdmin`, `requireUser`, `handleMe`, `handleSendOtp`, `handleResetPassword`, `requestClientIp`), `gateway-server/src/server.ts` (`isBearerAdminApi`) | Untrusted peers cannot spoof `X-Real-IP`/`X-Forwarded-For` to bypass pre-auth 1013 limits; `requireAdmin` prioritizes `Authorization: Bearer` without falling back to Cookie; OTP endpoints never issue an admin session. |
+| `PairingWizardReconnect.tla` | `src/restart-watcher.ts` (`startRestartWatcher`), `src/restart-fields.ts` (`RESTART_FIELDS`), `src/wizard/verify.ts` (`createVerificationManager`), `src/client/wizard/GatewayWizard.tsx`, `src/client-data/remote-status.ts` (`sendNetworkHint`), `src/client-routes.ts` (`CLIENT_NETWORK_HINT_ROUTE`), `src/relay-client.ts` (`probeHealth`, `networkRestored`, `reconnect`), `lib/lan-gate-server.cjs` (`server.on('upgrade')`) | Failed health probes never trigger auto-reconnect; network hints only fire when the view is not `online`; pairing codes only mint after a restart-field reload completes; unauthenticated or mid-upgrade-revoked WS upgrades are rejected. |
+| `PluginBridgeRouting.tla` | `src/plugin-bridge.ts` (`createBridgeRegistry`, `compareBridges`), `src/plugin-adapter-core.ts` (`adapterOwnsRegistryEntry`), `src/index.ts` (adapter registration), `src/plugin-route-intercept.ts` (`wrappedMatch`, `surrogateHandler`, `answerUnbridged`, `answerUnbridgedSocket`), `src/plugin-tunnel.ts` (`validatePluginCall`) | Bridging requires exact plugin name, version, and declaration digest match (plus server-scope consent); registered unbridged virtual `zr~` routes always return 503 and never reach local handlers; plugin self-declarations always take precedence over adapters. |
+| `GatewayRateLimitAuth.tla` | `gateway-server/src/peer-hub/ws-hub.ts` (`resolvePreAuthClientIp`, `setupConnection`), `gateway-server/src/http/auth.ts` (`requireAdmin`, `requireUser`, `handleMe`, `handleLogout`, `handleSignup`, `handleSendOtp`, `handleResetPassword`, `requestIsHttps`, `requestClientIp`), `gateway-server/src/server.ts` (`isBearerAdminApi`), `gateway-server/src/http/routes-networks.ts` (`buildJoinEndpoint`), `gateway-server/src/http/routes-admin.ts` (`computeSuggestedHttpsUrl`) | Untrusted peers cannot spoof `X-Real-IP`/`X-Forwarded-For` to bypass WS pre-auth 1013 limits; `requireAdmin` prioritizes `Authorization: Bearer` without falling back to Cookie; OTP endpoints never issue an admin session. (Note: `peer-hub/rate-limiter.ts` post-auth DATA/control token buckets are outside this model's scope.) |
 
 ## How to Run
 
@@ -26,7 +26,7 @@ tlc -workers 1 -metadir /tmp/tlc-s2 -config docs/formal/PluginBridgeRouting.cfg 
 tlc -workers 1 -metadir /tmp/tlc-s3 -config docs/formal/GatewayRateLimitAuth.cfg docs/formal/GatewayRateLimitAuth.tla
 ```
 
-2. Run the stricter finding probe (expected exit `12` while the two documented open-source gaps in `gateway-server/src/http/auth.ts` remain open):
+2. Run the stricter finding probe (expected exit `12` while the three documented open-source gaps in `gateway-server/src/http/auth.ts` remain open):
 
 ```sh
 tlc -workers 1 -metadir /tmp/tlc-s3f -config docs/formal/GatewayRateLimitAuth-finding.cfg docs/formal/GatewayRateLimitAuth.tla
