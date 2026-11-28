@@ -243,6 +243,7 @@ async function startNode(t, gw, {
   const store = createShareStore({ file: path.join(home, 'shares.json'), idleHours: 48 });
   for (const id of shared) store.share(id);
   const followGates = [];
+  const sessionFollowGates = [];
   let invokeImpl = null;
 
   function makeGate(signal) {
@@ -291,6 +292,11 @@ async function startNode(t, gw, {
       if (call.namespace === 'workspace' && call.method === 'follow') {
         const gate = makeGate(call.signal);
         followGates.push(gate);
+        return gate.iterable;
+      }
+      if (call.namespace === 'session' && call.method === 'follow') {
+        const gate = makeGate(call.signal);
+        sessionFollowGates.push(gate);
         return gate.iterable;
       }
       throw Object.assign(new Error(`no stream fake for ${call.namespace}/${call.method}`), { code: 'test/not-implemented' });
@@ -356,6 +362,7 @@ async function startNode(t, gw, {
     engine,
     logs,
     followGates,
+    sessionFollowGates,
     set invokeImpl(fn) { invokeImpl = fn; },
     setFirewall: (v) => punchSocket.setBlocked?.(v),
     stop: () => {
@@ -932,5 +939,115 @@ describe('peer-client-e2e (cross-package PeerEngine + RelayPool + gateway-server
       'peerTuning reset back to defaults on null PATCH',
       5000,
     );
+  });
+
+  test('11. active session/follow stream survives forced direct -> relay degrade and relay -> direct upgrade without drops or reordering', async (t) => {
+    const net = await createNetwork(gw, { mode: 'key' });
+    const A = await startNode(t, gw, { name: 'stream-a', shared: ['s-stream-1'], useDefaultWelcomeStun: true });
+    const B = await startNode(t, gw, { name: 'stream-b', useDefaultWelcomeStun: true });
+
+    t.after(async () => {
+      await fetch(`${gw.base}/api/v1/admin/settings`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+        body: JSON.stringify({ forceRelay: false }),
+      }).catch(() => {});
+    });
+
+    await A.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey));
+    await B.engine.joinNetwork(inviteUri(gw, net.id, net.joinKey));
+
+    await waitFor(() => {
+      const p = A.engine.status().peers.find((x) => x.nodeId === B.identity.nodeId);
+      return p !== undefined && (p.path === 'lan' || p.path === 'p2p');
+    }, 'initial A<->B direct path', 8000);
+
+    const virtualAonB = await waitPeerOnline(B, A.identity.nodeId);
+    const stream = virtualAonB.client.openStream('session', 'follow', {
+      request: { address: { kind: 'session', sessionId: 's-stream-1' } },
+    });
+    const received = [];
+    const consuming = (async () => {
+      for await (const frame of stream) received.push(frame);
+    })();
+
+    await waitFor(() => A.sessionFollowGates.length >= 1, 'session/follow opened on A');
+    const gate = A.sessionFollowGates.at(-1);
+
+    const TOTAL = 60;
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const pushRange = async (from, to, delayMs) => {
+      for (let seq = from; seq <= to; seq += 1) {
+        gate.push({
+          type: 'event',
+          seq,
+          sessionId: 's-stream-1',
+          marker: `SECRET-STREAM-PAYLOAD-${seq}`,
+        });
+        await sleep(delayMs);
+      }
+    };
+
+    // Phase 1: stream initial events over direct path
+    await pushRange(1, 15, 10);
+    await waitFor(() => received.length >= 10, 'direct phase events delivered');
+
+    // Phase 2: force degrade to relay while events continue flowing
+    const binaryOffset = relayedBinary.length;
+    const midPush = pushRange(16, 40, 15);
+    const degradeRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+      body: JSON.stringify({ forceRelay: true }),
+    });
+    assert.equal(degradeRes.status, 200);
+    await waitFor(
+      () =>
+        A.engine.status().peers.find((x) => x.nodeId === B.identity.nodeId)?.path === 'relay' &&
+        B.engine.status().peers.find((x) => x.nodeId === A.identity.nodeId)?.path === 'relay',
+      'both nodes degraded to relay mid-stream',
+      5000,
+    );
+    await midPush;
+    await waitFor(() => received.length >= 35, 'relay phase events delivered');
+    assert.ok(relayedBinary.length > binaryOffset, 'relay frames traversed gateway during degrade');
+
+    // Phase 3: restore upgrade back to direct while trailing events continue flowing,
+    // then push final batch AFTER direct path is confirmed active.
+    const midUpgradePush = pushRange(41, 50, 15);
+    const upgradeRes = await fetch(`${gw.base}/api/v1/admin/settings`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', cookie: gw.adminCookie },
+      body: JSON.stringify({ forceRelay: false }),
+    });
+    assert.equal(upgradeRes.status, 200);
+    await waitFor(
+      () => {
+        const pA = A.engine.status().peers.find((x) => x.nodeId === B.identity.nodeId);
+        const pB = B.engine.status().peers.find((x) => x.nodeId === A.identity.nodeId);
+        return (pA?.path === 'lan' || pA?.path === 'p2p') && (pB?.path === 'lan' || pB?.path === 'p2p');
+      },
+      'both nodes upgraded back to direct mid-stream',
+      8000,
+    );
+    await midUpgradePush;
+    await pushRange(51, TOTAL, 10);
+
+    gate.finish();
+    await consuming;
+
+    assert.equal(received.length, TOTAL, `expected ${TOTAL} events without drops or duplicates, got ${received.length}`);
+    for (let i = 0; i < TOTAL; i += 1) {
+      assert.equal(received[i].seq, i + 1, `event ${i} out of order: got seq=${received[i].seq}`);
+      assert.equal(received[i].marker, `SECRET-STREAM-PAYLOAD-${i + 1}`);
+    }
+
+    const relayedSince = relayedBinary.slice(binaryOffset);
+    assert.ok(relayedSince.length > 0);
+    for (const buf of relayedSince) {
+      const text = buf.toString('utf8');
+      assert.equal(text.includes('SECRET-STREAM-PAYLOAD-'), false, 'zero plaintext stream marker leak through gateway');
+      assert.equal(text.includes(SESSION_TITLE), false, 'zero plaintext session title leak through gateway');
+    }
   });
 });
