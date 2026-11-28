@@ -223,7 +223,7 @@ CompleteProbe(ok) ==
   /\ probeResult' = IF ok THEN "ok" ELSE "fail"
   /\ IF ok /\ paired /\ wizardPhase /= "reloading" /\ relayState = "offline"
      THEN /\ relayState' = "connecting"
-          /\ lastReconnectSource' = "probe_ok"
+          /\ lastReconnectSource' = IF ok THEN "probe_ok" ELSE "probe_fail"
      ELSE /\ UNCHANGED <<relayState, lastReconnectSource>>
   /\ UNCHANGED <<configGen, rowGen, wizardPhase, codeMintedAtGen, paired,
                viewState, wsState, wsAdmittedAuthed, wsOpenAuthed>>

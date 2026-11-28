@@ -1,4 +1,4 @@
-export const title = "开源 gateway-server 限流与鉴权会话状态机 (ZR-7 R1)";
+export const title = "开源 gateway-server 限流与鉴权会话状态机 (ZR-7 R2)";
 
 export const colors = {
   idle: "tan",
@@ -22,12 +22,16 @@ const authLabel = (v) => {
   if (v.reqRouteKind === "none") return "HTTP 鉴权待命";
   if (v.reqRouteKind === "admin") {
     if (v.authActor === "api_admin") return "Admin Bearer API Key 放行";
-    if (v.authActor === "cookie_admin") return "Admin Cookie 放行";
+    if (v.authActor === "cookie_admin") {
+      return v.httpIsHttps && !v.httpFromTrusted
+        ? "Admin Cookie 放行 (采信未信 X-Forwarded-Proto: Gap 3a)"
+        : "Admin Cookie 放行";
+    }
     return "Admin 无效 Bearer 拒 401";
   }
   return v.reqBearerKind === "none"
     ? "User Cookie 放行"
-    : "User 路由忽略 Bearer 走 Cookie (Finding 1)";
+    : "User 路由忽略 Bearer 且限流折叠至 socketIp (Finding 1 + Gap 3b)";
 };
 
 const otpLabel = (v) => {
@@ -60,18 +64,14 @@ export const step = (action, from, to) => {
         return to.wsReqFromTrusted ? "信任代理超限 -> 1013" : "未信对端超限 -> 1013";
       }
       return to.wsReqFromTrusted ? "信任代理建连(采纳 X-Real-IP)" : "未信对端建连(忽略伪造头)";
-    case "WsConnectUntrusted":
-      return to.wsDecision === "rejected_1013" ? "未信对端超限 -> 1013" : "未信对端建连(忽略伪造头)";
-    case "WsConnectTrustedProxy":
-      return to.wsDecision === "rejected_1013" ? "信任代理超限 -> 1013" : "信任代理建连(采纳 X-Real-IP)";
     case "WsReleasePreAuth":
       return "释放 WS 槽位";
     case "HttpAuthCase":
     case "HttpAuthRequest":
       if (to.reqRouteKind === "admin" && to.authActor === "api_admin") return "Admin 有效 Bearer";
       if (to.reqRouteKind === "admin" && to.authActor === "rejected_401") return "Admin 无效 Bearer 拒 401";
-      if (to.reqRouteKind === "admin") return "Admin Cookie 鉴权";
-      if (to.reqRouteKind === "user" && to.reqBearerKind !== "none") return "User 带 Bearer+Cookie";
+      if (to.reqRouteKind === "admin") return "Admin Cookie 鉴权(带未信 XFP)";
+      if (to.reqRouteKind === "user" && to.reqBearerKind !== "none") return "User 代理限流+Bearer+Cookie";
       return "User Cookie 鉴权";
     case "HttpAuthDone":
       return "HTTP 请求完成";

@@ -1,10 +1,10 @@
-# ZR-7 形式化模型 ↔ 源码实现逐条对照（R1 修订版，Sync 基线 `f93eb25c`）
+# ZR-7 形式化模型 ↔ 源码实现逐条对照（R2 修订版，Sync 基线 `f93eb25c`）
 
 本文记录 `docs/formal/` 下 3 份 TLA+ 规约与 `dsh-zen-remote` 源码的逐动作对照、12 项非重言式反向变异（able-to-fail）结果、开源仓如实发现（Findings #1–#3），以及模型边界与未建模假设。
 
 - **分支 / 同步基线**：`zr7-formal-models`（基于 `dev@f93eb25c`）
 - **工具**：TLC `2.19`（`/opt/homebrew/bin/tlc` + OpenJDK 17）与 `$pstack-statechart`
-- **R1 修订说明**：移除初版所有死哨兵（`~FALSE` 重言式），全部安全不变量直接基于输入参数与协议裁决表达式计算；修正子系统 1 `probeHealth()` 与 `relayState` 正交并发、`viewState` 滞后延迟、WS `upstreamConnect` 二段式 TOCTOU 复检及配对后整行重载；补全子系统 2 未注册路由透传边界（`src/plugin-route-intercept.ts:2050-2091,2785-2802`）与服务端复核 503 路径（`src/plugin-tunnel.ts:92-173`）；补全子系统 3 Gap #3（`requestIsHttps` 与 `requestClientIp` 代理头边界）并修正 `VERIFY-SKILL.md` 覆盖文件清单。
+- **R2 修订说明**：在 R1 基础上消除 `CompleteProbe` 残留的 `lastReconnectSource' = "probe_ok"` 硬编码（使单行删除 `ok /\` 即可独立触发 `InvProbeFailNeverAutoReconnects` 违规），并以 `ResolveHttpIsHttps` / `ResolveHttpClientIp` 算子将 Gap #3a/#3b 准确挂接到 cookie 签发与用户限流路径（不再触发于 Bearer 管理接口）。
 
 ---
 
@@ -59,11 +59,11 @@
 |---|---|---|
 | `ResolvePreAuthIp` / `WsConnectUntrusted` / `WsConnectTrustedProxy` | `gateway-server/src/peer-hub/ws-hub.ts:319-331` (`resolvePreAuthClientIp`)、`:676-685` (`setupConnection`) | `socketIp ∉ trustedProxies` 时无视伪造 `x-real-ip`/`x-forwarded-for`，一律归入 `"direct"` 桶；仅 `socketIp ∈ trustedProxies` 时采纳合法 `x-real-ip` 分桶；超 per-IP 或全局上限均以 WS `1013` 拒连。 |
 | `WsReleasePreAuth` | `gateway-server/src/peer-hub/ws-hub.ts:700-708` | 认证结束或 socket 关闭时释放预认证并发槽位。 |
-| `AuthorizeHttp` / `HttpAuthRequest` | `gateway-server/src/http/auth.ts:367-423` (`requireAdmin` / `requireUser`)、`:469-472,971-991` (`handleMe` / `handleLogout`)、`gateway-server/src/server.ts:133-135` (`isBearerAdminApi`) | `requireAdmin` 优先校验 `Authorization: Bearer`，成功返 `api_admin`、失败直接 `401` 绝不回退 Cookie；非 admin 路由（`requireUser`、`handleMe`、`handleLogout`、`currentSessionTokenHash`）仅读 Cookie（Finding #1）；同时记录 `requestIsHttps`（`auth.ts:317-335`）与 `requestClientIp`（`auth.ts:475-477`）代理边界（Finding #3）。 |
+| `AuthorizeHttp` / `ResolveHttpIsHttps` / `ResolveHttpClientIp` / `HttpAuthRequest` | `gateway-server/src/http/auth.ts:367-423` (`requireAdmin` / `requireUser`)、`:317-335` (`requestIsHttps`)、`:475-477` (`requestClientIp`)、`:469-472,971-991` (`handleMe` / `handleLogout`)、`gateway-server/src/server.ts:133-135` (`isBearerAdminApi`) | `requireAdmin` 优先校验 `Authorization: Bearer`，成功返 `api_admin`、失败直接 `401` 绝不回退 Cookie；非 admin 路由仅读 Cookie（Finding #1）；`ResolveHttpIsHttps` 在 `cookie_issue` 路径无条件采信 `x-forwarded-proto`（Gap #3a），`ResolveHttpClientIp` 在 `ratelimit_user` 路径始终返回 `"socket"` 忽略 `trustedProxies`（Gap #3b）。 |
 | `OtpRequest` (`OtpCase`) | `gateway-server/src/http/auth.ts:914-969` (`handleSignup`)、`:997-1036` (`handleSendOtp`)、`:1042-1076` (`handleResetPassword`) | `signup` 对已存在 admin 邮箱置 `deliver = FALSE`；`reset_password` 对激活态 admin 仍置 `deliver = TRUE`（Finding #2）；但任何 admin 邮箱的 OTP 流程均绝不创建会话 Cookie（`otpMintedSession = FALSE`）。 |
 
-- **通过配置验证结果（`GatewayRateLimitAuth.cfg`）**：480 distinct states，3609 states generated，深度 7，5 条代码真实成立不变量 + `NoDeadlock` 全通过（0 反例，exit 0）。
-- **状态图**：[gateway-rate-limit-auth.mmd](./gateway-rate-limit-auth.mmd)（14 态 / 26 边，3 个正交区域）。
+- **通过配置验证结果（`GatewayRateLimitAuth.cfg`）**：420 distinct states，3183 states generated，深度 6，5 条代码真实成立不变量 + `NoDeadlock` 全通过（0 反例，exit 0）。
+- **状态图**：[gateway-rate-limit-auth.mmd](./gateway-rate-limit-auth.mmd)（14 态 / 27 边，3 个正交区域）。
 
 ---
 
@@ -85,11 +85,11 @@
 
 ## 五、反向变异验证（Able-to-Fail，12/12 非重言式捕获）
 
-所有变异均直接破坏对应源码守卫/裁决表达式（**零人工修改哨兵**），在 `/tmp/zr7-r1-muts` 以 `tlc -workers 1` 实测全部 exit 12：
+所有变异均仅以单点改动破坏对应源码守卫/裁决表达式（**零额外修改**），以 `tlc -workers 1` 实测全部 exit 12：
 
 | 编号 | 破坏的真实守卫 / 逻辑 | 捕获不变量 | TLC 结果 |
 |---|---|---|---|
-| **Mut1A** | `CompleteProbe` 去掉 `ok` 判定（失败也触发 `networkRestored`） | `InvProbeFailNeverAutoReconnects` | exit 12（48 distinct states） |
+| **Mut1A** | `CompleteProbe` 仅删除 `ok /\` 守卫（失败分支误走重连） | `InvProbeFailNeverAutoReconnects` | exit 12（48 distinct states） |
 | **Mut1B** | `SendNetworkHint` 去掉 `/\ viewState /= "online"` 门控 | `InvHintGatedByOnlineView` | exit 12（25 distinct states） |
 | **Mut1C** | `MintPairingCode` 允许在 `reloading` 态直接铸码 | `InvPairingCodeOnlyAfterReload` | exit 12（6 distinct states） |
 | **Mut1D** | `WsUpstreamReady` 去掉 `/\ paired` 二次核验（TOCTOU 漏放已吊销连接） | `InvUnauthWsUpgradeRejected` | exit 12（41 distinct states） |

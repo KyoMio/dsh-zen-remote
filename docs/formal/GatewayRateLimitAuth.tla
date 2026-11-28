@@ -1,6 +1,6 @@
 ---- MODULE GatewayRateLimitAuth ----
 (***************************************************************************)
-(* Subsystem 3: Open-source gateway-server Rate Limiting & Auth (ZR-7 R1)  *)
+(* Subsystem 3: Open-source gateway-server Rate Limiting & Auth (ZR-7 R2)  *)
 (*                                                                         *)
 (* Faithful abstraction of:                                                *)
 (*   - gateway-server/src/peer-hub/ws-hub.ts                               *)
@@ -10,7 +10,7 @@
 (*       requireAdmin (Bearer API key priority, never falls back to Cookie)*)
 (*       requireUser / handleMe / handleLogout (Cookie only -> Finding #1) *)
 (*       handleSendOtp / handleResetPassword (Finding #2)                  *)
-(*       requestIsHttps / requestClientIp (Gap #3)                         *)
+(*       requestIsHttps / requestClientIp (Gap #3a / #3b)                  *)
 (*   - gateway-server/src/server.ts (isBearerAdminApi CSRF boundary)       *)
 (***************************************************************************)
 EXTENDS Naturals, TLC
@@ -24,33 +24,37 @@ BucketKinds == {"none", "direct", "proxied"}
 RouteKinds == {"none", "admin", "user"}
 BearerKinds == {"none", "valid_key", "bad_key"}
 AuthActors == {"none", "api_admin", "cookie_admin", "cookie_user", "rejected_401"}
+HttpSurfaces == {"none", "bearer_api", "cookie_issue", "ratelimit_user"}
+HttpIpResults == {"none", "socket", "real_ip"}
 OtpPurposes == {"none", "signup", "reset_password"}
 Roles == {"none", "user", "admin"}
 
 VARIABLES
-  preAuthDirect,              \* pre-auth WS slots held by untrusted socketIp
-  preAuthProxiedA,            \* pre-auth WS slots via trusted proxy for client A
-  preAuthProxiedB,            \* pre-auth WS slots via trusted proxy for client B
-  wsDecision,                 \* latest WS pre-auth decision
-  wsReqFromTrusted,           \* whether latest WS connection socketIp \in trustedProxies
-  wsResolvedKind,             \* "none" | "direct" | "proxied" from resolvePreAuthClientIp
-  reqRouteKind,               \* latest HTTP route class ("admin" | "user" | "none")
-  reqBearerKind,              \* latest HTTP Bearer header kind
-  reqHasCookie,               \* whether latest HTTP request also carried a Cookie
-  authActor,                  \* resolved identity for latest HTTP request
-  otpPurpose,                 \* latest OTP flow purpose
-  otpTargetRole,              \* target account role for latest OTP flow
-  otpDelivered,               \* whether OTP email was delivered
-  otpMintedSession,           \* whether OTP flow issued a session Cookie
-  httpHttpsTrustedUntrusted,  \* Gap #3a: untrusted X-Forwarded-Proto: https trusted by requestIsHttps
-  httpRateIpCollapsedProxy    \* Gap #3b: trusted proxy HTTP req collapsed onto socketIp by requestClientIp
+  preAuthDirect,     \* pre-auth WS slots held by untrusted socketIp
+  preAuthProxiedA,   \* pre-auth WS slots via trusted proxy for client A
+  preAuthProxiedB,   \* pre-auth WS slots via trusted proxy for client B
+  wsDecision,        \* latest WS pre-auth decision
+  wsReqFromTrusted,  \* whether latest WS connection socketIp \in trustedProxies
+  wsResolvedKind,    \* "none" | "direct" | "proxied" from ResolvePreAuthIp
+  reqRouteKind,      \* latest HTTP route class ("admin" | "user" | "none")
+  reqBearerKind,     \* latest HTTP Bearer header kind
+  reqHasCookie,      \* whether latest HTTP request also carried a Cookie
+  authActor,         \* resolved identity for latest HTTP request
+  httpSurface,       \* which HTTP proxy-sensitive surface was exercised
+  httpFromTrusted,   \* whether HTTP socketIp \in trustedProxies
+  httpIsHttps,       \* output of ResolveHttpIsHttps (requestIsHttps)
+  httpClientIp,      \* output of ResolveHttpClientIp (requestClientIp)
+  otpPurpose,        \* latest OTP flow purpose
+  otpTargetRole,     \* target account role for latest OTP flow
+  otpDelivered,      \* whether OTP email was delivered
+  otpMintedSession   \* whether OTP flow issued a session Cookie
 
 vars == <<
   preAuthDirect, preAuthProxiedA, preAuthProxiedB,
   wsDecision, wsReqFromTrusted, wsResolvedKind,
   reqRouteKind, reqBearerKind, reqHasCookie, authActor,
-  otpPurpose, otpTargetRole, otpDelivered, otpMintedSession,
-  httpHttpsTrustedUntrusted, httpRateIpCollapsedProxy
+  httpSurface, httpFromTrusted, httpIsHttps, httpClientIp,
+  otpPurpose, otpTargetRole, otpDelivered, otpMintedSession
 >>
 
 TotalPreAuth == preAuthDirect + preAuthProxiedA + preAuthProxiedB
@@ -69,6 +73,12 @@ AuthorizeHttp(routeKind, bearerKind, hasCookie) ==
   ELSE IF hasCookie THEN "cookie_user"
   ELSE "rejected_401"
 
+\* Models auth.ts:317-330 (requestIsHttps): trusts x-forwarded-proto regardless of trustedProxies.
+ResolveHttpIsHttps(fromTrusted, hasXfpHttps) == hasXfpHttps
+
+\* Models auth.ts:475-477 (requestClientIp): ignores trustedProxies, always uses socket.remoteAddress.
+ResolveHttpClientIp(fromTrusted, hasRealIp) == "socket"
+
 TypeOK ==
   /\ preAuthDirect \in 0..MaxPreAuthPerIp
   /\ preAuthProxiedA \in 0..MaxPreAuthPerIp
@@ -81,12 +91,14 @@ TypeOK ==
   /\ reqBearerKind \in BearerKinds
   /\ reqHasCookie \in BOOLEAN
   /\ authActor \in AuthActors
+  /\ httpSurface \in HttpSurfaces
+  /\ httpFromTrusted \in BOOLEAN
+  /\ httpIsHttps \in BOOLEAN
+  /\ httpClientIp \in HttpIpResults
   /\ otpPurpose \in OtpPurposes
   /\ otpTargetRole \in Roles
   /\ otpDelivered \in BOOLEAN
   /\ otpMintedSession \in BOOLEAN
-  /\ httpHttpsTrustedUntrusted \in BOOLEAN
-  /\ httpRateIpCollapsedProxy \in BOOLEAN
 
 Init ==
   /\ preAuthDirect = 0
@@ -99,12 +111,14 @@ Init ==
   /\ reqBearerKind = "none"
   /\ reqHasCookie = FALSE
   /\ authActor = "none"
+  /\ httpSurface = "none"
+  /\ httpFromTrusted = FALSE
+  /\ httpIsHttps = FALSE
+  /\ httpClientIp = "none"
   /\ otpPurpose = "none"
   /\ otpTargetRole = "none"
   /\ otpDelivered = FALSE
   /\ otpMintedSession = FALSE
-  /\ httpHttpsTrustedUntrusted = FALSE
-  /\ httpRateIpCollapsedProxy = FALSE
 
 \* ---- WS Pre-Auth IP Resolution & 1013 Cap (ws-hub.ts:319-331, 676-685) ----
 
@@ -123,10 +137,9 @@ WsConnect(fromTrusted, claimed) ==
              /\ preAuthProxiedA' = IF bucket = "A" THEN preAuthProxiedA + 1 ELSE preAuthProxiedA
              /\ preAuthProxiedB' = IF bucket = "B" THEN preAuthProxiedB + 1 ELSE preAuthProxiedB
      /\ UNCHANGED <<reqRouteKind, reqBearerKind, reqHasCookie, authActor,
-                  otpPurpose, otpTargetRole, otpDelivered, otpMintedSession,
-                  httpHttpsTrustedUntrusted, httpRateIpCollapsedProxy>>
+                  httpSurface, httpFromTrusted, httpIsHttps, httpClientIp,
+                  otpPurpose, otpTargetRole, otpDelivered, otpMintedSession>>
 
-\* Untrusted peer spoofing X-Real-IP: A -> must resolve to "direct".
 WsConnectUntrusted == WsConnect(FALSE, "A")
 
 WsConnectTrustedProxy ==
@@ -142,35 +155,34 @@ WsReleasePreAuth ==
      \/ /\ preAuthProxiedB > 0
         /\ preAuthProxiedB' = preAuthProxiedB - 1
         /\ UNCHANGED <<preAuthDirect, preAuthProxiedA>>
-  /\ wsDecision' = IF (preAuthDirect' + preAuthProxiedA' + preAuthProxiedB') = 0
-                   THEN "idle" ELSE wsDecision
+  /\ wsDecision' = "idle"
   /\ wsReqFromTrusted' = FALSE
   /\ wsResolvedKind' = "none"
   /\ UNCHANGED <<reqRouteKind, reqBearerKind, reqHasCookie, authActor,
-               otpPurpose, otpTargetRole, otpDelivered, otpMintedSession,
-               httpHttpsTrustedUntrusted, httpRateIpCollapsedProxy>>
+               httpSurface, httpFromTrusted, httpIsHttps, httpClientIp,
+               otpPurpose, otpTargetRole, otpDelivered, otpMintedSession>>
 
 \* ---- HTTP Dual-Track Auth + HTTP Proxy Header Boundaries ----
 
-HttpAuthCase(routeKind, bearerKind, hasCookie, fromTrustedProxy) ==
+HttpAuthCase(routeKind, bearerKind, hasCookie, surface, fromTrusted, hasXfp, hasRealIp) ==
   /\ reqRouteKind = "none"
   /\ reqRouteKind' = routeKind
   /\ reqBearerKind' = bearerKind
   /\ reqHasCookie' = hasCookie
   /\ authActor' = AuthorizeHttp(routeKind, bearerKind, hasCookie)
-  \* Gap #3 (auth.ts:317-330, 475-477): requestIsHttps trusts x-forwarded-proto from untrusted peers;
-  \* requestClientIp ignores trustedProxies and collapses proxied clients onto socket.remoteAddress.
-  /\ httpHttpsTrustedUntrusted' = ~fromTrustedProxy
-  /\ httpRateIpCollapsedProxy' = fromTrustedProxy
+  /\ httpSurface' = surface
+  /\ httpFromTrusted' = fromTrusted
+  /\ httpIsHttps' = IF surface = "cookie_issue" THEN ResolveHttpIsHttps(fromTrusted, hasXfp) ELSE FALSE
+  /\ httpClientIp' = IF surface = "ratelimit_user" THEN ResolveHttpClientIp(fromTrusted, hasRealIp) ELSE "none"
   /\ UNCHANGED <<preAuthDirect, preAuthProxiedA, preAuthProxiedB,
                wsDecision, wsReqFromTrusted, wsResolvedKind,
                otpPurpose, otpTargetRole, otpDelivered, otpMintedSession>>
 
 HttpAuthRequest ==
-  \/ HttpAuthCase("admin", "valid_key", TRUE, TRUE)
-  \/ HttpAuthCase("admin", "bad_key", TRUE, FALSE)
-  \/ HttpAuthCase("admin", "none", TRUE, FALSE)
-  \/ HttpAuthCase("user", "valid_key", TRUE, TRUE)
+  \/ HttpAuthCase("admin", "valid_key", TRUE, "bearer_api", TRUE, FALSE, FALSE)
+  \/ HttpAuthCase("admin", "bad_key", TRUE, "bearer_api", FALSE, FALSE, FALSE)
+  \/ HttpAuthCase("admin", "none", TRUE, "cookie_issue", FALSE, TRUE, FALSE)
+  \/ HttpAuthCase("user", "valid_key", TRUE, "ratelimit_user", TRUE, FALSE, TRUE)
 
 HttpAuthDone ==
   /\ reqRouteKind /= "none"
@@ -178,8 +190,10 @@ HttpAuthDone ==
   /\ reqBearerKind' = "none"
   /\ reqHasCookie' = FALSE
   /\ authActor' = "none"
-  /\ httpHttpsTrustedUntrusted' = FALSE
-  /\ httpRateIpCollapsedProxy' = FALSE
+  /\ httpSurface' = "none"
+  /\ httpFromTrusted' = FALSE
+  /\ httpIsHttps' = FALSE
+  /\ httpClientIp' = "none"
   /\ UNCHANGED <<preAuthDirect, preAuthProxiedA, preAuthProxiedB,
                wsDecision, wsReqFromTrusted, wsResolvedKind,
                otpPurpose, otpTargetRole, otpDelivered, otpMintedSession>>
@@ -190,14 +204,12 @@ OtpCase(purpose, targetRole) ==
   /\ otpPurpose = "none"
   /\ otpPurpose' = purpose
   /\ otpTargetRole' = targetRole
-  \* signup denies existing admin email (deliver=FALSE); reset_password delivers to active admin (Finding #2).
   /\ otpDelivered' = (purpose = "reset_password" \/ targetRole = "user")
-  \* Only handleSignup for a new non-admin user mints a session Cookie; admin OTP never creates a session.
   /\ otpMintedSession' = (purpose = "signup" /\ targetRole = "user")
   /\ UNCHANGED <<preAuthDirect, preAuthProxiedA, preAuthProxiedB,
                wsDecision, wsReqFromTrusted, wsResolvedKind,
                reqRouteKind, reqBearerKind, reqHasCookie, authActor,
-               httpHttpsTrustedUntrusted, httpRateIpCollapsedProxy>>
+               httpSurface, httpFromTrusted, httpIsHttps, httpClientIp>>
 
 OtpRequest ==
   \/ OtpCase("signup", "admin")
@@ -213,7 +225,7 @@ OtpReqDone ==
   /\ UNCHANGED <<preAuthDirect, preAuthProxiedA, preAuthProxiedB,
                wsDecision, wsReqFromTrusted, wsResolvedKind,
                reqRouteKind, reqBearerKind, reqHasCookie, authActor,
-               httpHttpsTrustedUntrusted, httpRateIpCollapsedProxy>>
+               httpSurface, httpFromTrusted, httpIsHttps, httpClientIp>>
 
 Next ==
   \/ WsConnectUntrusted
@@ -254,6 +266,6 @@ InvAdminRefusedAllOtpDelivery ==
   (otpTargetRole = "admin") => ~otpDelivered
 
 InvHttpProxyTrustConsistent ==
-  /\ ~httpHttpsTrustedUntrusted
-  /\ ~httpRateIpCollapsedProxy
+  /\ (httpSurface = "cookie_issue" /\ ~httpFromTrusted) => ~httpIsHttps
+  /\ (httpSurface = "ratelimit_user" /\ httpFromTrusted) => (httpClientIp = "real_ip")
 ====
