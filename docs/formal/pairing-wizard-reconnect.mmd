@@ -1,0 +1,62 @@
+---
+title: "配对 + Wizard 重载 + Probe 断线重连状态机 (ZR-7)"
+---
+stateDiagram-v2
+  state "Legend" as legend {
+    lg0: wizard
+    lg1: reloading
+    lg2: online
+    lg3: degraded
+    lg4: probing
+  }
+  class lg0 blue
+  class lg1 orange
+  class lg2 teal
+  class lg3 yellow
+  class lg4 purple
+  s0: 未配对 / 向导空闲
+  s1: 未配对 / 向导就绪(未铸码)
+  s2: 未配对 / 整行重载中
+  s3: 未配对 / 配对码已铸造
+  s4: 已配对 / 在线(待 WS)
+  s5: 已配对 / 离线(视图滞留 online)
+  s6: 已配对 / 在线(WS 已建连)
+  s7: 已配对 / 重连握手中
+  s8: 已配对 / 离线(等待恢复)
+  s9: 已配对 / Probe 探测中
+  s10: 已配对 / 离线(Probe 失败禁止重连)
+  [*] --> s0
+  s0 --> s1: 打开向导(无重启字段变更)
+  s0 --> s2: 修改重启字段触发 reload
+  s1 --> s2: 修改重启字段触发 reload
+  s1 --> s3: 铸造配对码
+  s2 --> s1: 整行重载完成
+  s3 --> s2: 修改重启字段触发 reload
+  s3 --> s4: 提交配对码换取凭据
+  s4 --> s1: 吊销设备
+  s4 --> s5: 长连接断开
+  s4 --> s6: 已认证 WS upgrade 建连
+  s5 --> s7: 用户手动重连
+  s5 --> s8: 状态轮询同步为 offline
+  s6 --> s1: 吊销设备
+  s6 --> s5: 长连接断开
+  s7 --> s5: 重连失败
+  s7 --> s4: 重连成功
+  s8 --> s7: 用户手动重连
+  s8 --> s9: 发送 network-hint 触发 probe
+  s7 --> s8: 重连失败
+  s9 --> s7: probe 成功 -> networkRestored
+  s9 --> s10: probe 失败(不重连)
+  s10 --> s7: 用户手动重连
+  s10 --> s9: 发送 network-hint 触发 probe
+  class s0 blue
+  class s1 blue
+  class s2 orange
+  class s3 blue
+  class s4 teal
+  class s5 yellow
+  class s6 teal
+  class s7 yellow
+  class s8 yellow
+  class s9 purple
+  class s10 yellow

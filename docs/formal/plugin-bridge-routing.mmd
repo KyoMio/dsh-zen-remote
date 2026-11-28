@@ -1,0 +1,54 @@
+---
+title: "插件桥握手与路由转发状态机 (ZR-7)"
+---
+stateDiagram-v2
+  state "Legend" as legend {
+    lg0: idle
+    lg1: adapter
+    lg2: plugin
+    lg3: bridged
+    lg4: refused
+  }
+  class lg0 tan
+  class lg1 blue
+  class lg2 purple
+  class lg3 teal
+  class lg4 orange
+  s0: 未注册
+  s1: 适配器接管(v1) / 非 Bridged(离线或失配)
+  s2: 插件自声明(v2) / 非 Bridged(离线或失配)
+  s3: 适配器接管(v1) / Bridged(全一致可转发)
+  s4: 适配器接管(v1) / 非 Bridged(虚拟路由拒回 503)
+  s5: 插件自声明(v2) / Bridged(全一致可转发)
+  s6: 插件自声明(v2) / 非 Bridged(虚拟路由拒回 503)
+  [*] --> s0
+  s0 --> s1: 适配器注册 (v1, d1)
+  s0 --> s2: 插件自声明注册 (v2, d2)
+  s0 --> s3: 适配器注册 (v1, d1)
+  s0 --> s5: 插件自声明注册 (v2, d2)
+  s1 --> s0: 适配器注销
+  s1 --> s3: 握手三元组+授权全一致
+  s1 --> s4: 虚拟路由请求拒回 503 (不落本机)
+  s1 --> s2: 插件自声明覆盖适配器 (v2, d2)
+  s2 --> s0: 插件自声明注销
+  s2 --> s5: 握手三元组+授权全一致
+  s2 --> s6: 虚拟路由请求拒回 503 (不落本机)
+  s3 --> s0: 适配器注销
+  s3 --> s1: 握手失配或断线降级
+  s3 --> s2: 插件自声明覆盖适配器 (v2, d2)
+  s1 --> s5: 插件自声明覆盖适配器 (v2, d2)
+  s4 --> s0: 适配器注销
+  s4 --> s3: 握手三元组+授权全一致
+  s4 --> s2: 插件自声明覆盖适配器 (v2, d2)
+  s5 --> s0: 插件自声明注销
+  s5 --> s2: 握手失配或断线降级
+  s6 --> s0: 插件自声明注销
+  s6 --> s5: 握手三元组+授权全一致
+  s4 --> s5: 插件自声明覆盖适配器 (v2, d2)
+  class s0 tan
+  class s1 blue
+  class s2 purple
+  class s3 teal
+  class s4 orange
+  class s5 teal
+  class s6 orange

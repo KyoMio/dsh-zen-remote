@@ -46,7 +46,8 @@
     "!docs/SPEC.md",
     "!docs/spike-relay.md",
     "!docs/adr",
-    "!docs/images"
+    "!docs/images",
+    "!docs/formal"
   ],
   "scripts": {
     "build": "node scripts/sync-doc-version.mjs && tsc -p tsconfig.json && tsc -p tsconfig.client.json && node scripts/build-client.mjs",
